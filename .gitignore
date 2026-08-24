@@ -1,0 +1,55 @@
+# Rust build output
+/target/
+**/*.rs.bk
+Cargo.toml.orig
+*.pdb
+
+# Keep Cargo.lock in version control. Stackhand is an application.
+
+# Native and Zig build output
+.zig-cache/
+zig-out/
+*.dSYM/
+
+# Packaged artifacts and test output
+/artifacts/
+/coverage/
+/dist/
+*.profraw
+*.profdata
+lcov.info
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.cargo/credentials
+/.cargo/credentials.toml
+/.direnv/
+
+# Stackhand machine-local overlay names used by the current specification
+/processes.local.yaml
+/processes.local.yml
+
+# Logs and temporary runtime files
+*.log
+*.pid
+*.pid.lock
+core
+core.*
+/.cache/
+/tmp/
+
+# Editor files
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
