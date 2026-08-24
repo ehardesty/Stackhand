@@ -1,0 +1,22 @@
+[package]
+name = "stackhand"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "A prototype local development process supervisor"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.100"
+crossterm = "0.29.0"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+ratatui-ghostty = "0.2.0"
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+predicates = "3.1.3"
+
+[profile.release]
+strip = true
+lto = "thin"

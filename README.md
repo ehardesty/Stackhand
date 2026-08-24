@@ -17,6 +17,24 @@ The specification controls when it conflicts with the implementation plan. Proto
 
 The first work is a terminal-boundary prototype. It must test whether Ratatui and `libghostty-vt` can provide the required rendering, input, resize, selection, output, and packaging behavior. A separate process-ownership prototype follows it. Broader supervisor work starts only after both boundaries have enough evidence.
 
+## Build and run the terminal prototype
+
+The current Ghostty revision requires Rust 1.93 or newer and Zig 0.15.2. On macOS with Homebrew:
+
+```sh
+brew install zig@0.15
+PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
+PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run
+```
+
+Stackhand opens the shell from `SHELL`, or `/bin/sh` when `SHELL` is not set. Type in the bordered pane. Press `Ctrl-Q` to leave the prototype. Stackhand then stops the shell and restores the outer terminal.
+
+Run the automated checks with the pinned Zig version on `PATH`:
+
+```sh
+PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo test --all-targets
+```
+
 ## Canonical sources
 
 The documents in this repository are the maintained sources. Earlier drafts outside the repository are temporary inputs and can be deleted.
