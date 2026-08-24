@@ -1,0 +1,20 @@
+# Build inputs for the current terminal prototype.
+# Keep this file in sync with Cargo.lock and the upstream package metadata.
+
+schema_version = 1
+rust_version = "1.93.0"
+zig_version = "0.15.2"
+
+ghostty_repository = "https://github.com/ghostty-org/ghostty.git"
+ghostty_revision = "bebca84668947bfc92b9a30ed58712e1c34eee1d"
+
+libghostty_vt_sys_version = "0.1.1"
+libghostty_vt_wrapper_revision = "86338c17d1926c7e863f3c94d70202d3d1d60172"
+libghostty_vt_version = "0.1.1"
+ratatui_ghostty_version = "0.2.0"
+ratatui_ghostty_wrapper_revision = "be6d2d89105ca8cb867e7963888f82ba58b52316"
+
+# These are the native options passed by libghostty-vt-sys/build.rs.
+native_build_options = ["-Demit-lib-vt"]
+native_link_mode = "bundled-shared-library"
+release_profile = "strip=true,lto=thin"

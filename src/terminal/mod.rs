@@ -1,3 +1,5 @@
 mod session;
 
-pub use session::{OwnedTerminalSnapshot, TerminalEvent, TerminalSession};
+pub use session::{
+    CursorShape, OwnedCursorState, OwnedTerminalSnapshot, TerminalEvent, TerminalSession,
+};

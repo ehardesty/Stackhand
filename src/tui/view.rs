@@ -40,8 +40,8 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot) {
     );
 
     if let Some(cursor) = snapshot.cursor {
-        let x = console.x.saturating_add(cursor.x);
-        let y = console.y.saturating_add(cursor.y);
+        let x = console.x.saturating_add(cursor.position.x);
+        let y = console.y.saturating_add(cursor.position.y);
         if x < console.right() && y < console.bottom() {
             frame.set_cursor_position((x, y));
         }

@@ -6,18 +6,36 @@ fn main() -> Result<()> {
     match parse_mode(std::env::args_os().skip(1))? {
         Mode::Interactive => stackhand::app::run_interactive(),
         Mode::FixtureRoundTrip(text) => stackhand::app::run_fixture_round_trip(&text),
+        Mode::FixtureInput => stackhand::app::run_fixture_input(),
+        Mode::FixtureRendering => stackhand::app::run_fixture_rendering(),
     }
 }
 
 enum Mode {
     Interactive,
     FixtureRoundTrip(String),
+    FixtureInput,
+    FixtureRendering,
 }
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
     let Some(first) = args.next() else {
         return Ok(Mode::Interactive);
     };
+
+    if first == "--fixture-rendering" {
+        if args.next().is_some() {
+            bail!("--fixture-rendering does not accept arguments");
+        }
+        return Ok(Mode::FixtureRendering);
+    }
+
+    if first == "--fixture-input" {
+        if args.next().is_some() {
+            bail!("--fixture-input does not accept arguments");
+        }
+        return Ok(Mode::FixtureInput);
+    }
 
     if first != "--fixture-round-trip" {
         bail!("unknown argument: {}", first.to_string_lossy());
