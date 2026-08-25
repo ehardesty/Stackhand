@@ -150,7 +150,7 @@ impl UnixProcessTree {
                 // POSIX: with WNOHANG, a still-running child also returns 0
                 // and leaves si_pid set to 0. Only a non-zero si_pid means
                 // the exit event was observed.
-                return info.si_pid != 0;
+                return info.si_pid() != 0;
             }
             // The child is gone entirely (already reaped elsewhere): treat
             // it as exited so callers do not keep signaling a dead group.

@@ -22,6 +22,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use crate::runtime::{ProcessId, RunEvent, RunEventKind, RunId};
 
@@ -97,7 +99,8 @@ impl MetricsSampler {
                 // Scheduler ticks seen in the previous pass, for the rate
                 // calculation on Linux. Unused on macOS.
                 #[cfg(target_os = "linux")]
-                let mut previous: BTreeMap<u32, u64> = BTreeMap::new();
+                let mut previous: std::collections::BTreeMap<u32, u64> =
+                    std::collections::BTreeMap::new();
                 #[cfg(target_os = "linux")]
                 let mut last_pass = Instant::now();
                 loop {
@@ -290,9 +293,18 @@ fn collect_tree_linux(root_pid: u32) -> TreeObservation {
         if pid == root_pid {
             saw_root = true;
         }
-        let utime: u64 = fields.get(11).and_then(|value| value.parse()).unwrap_or(0);
-        let stime: u64 = fields.get(12).and_then(|value| value.parse()).unwrap_or(0);
-        let rss_pages: u64 = fields.get(21).and_then(|value| value.parse()).unwrap_or(0);
+        let utime: u64 = fields
+            .get(11)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let stime: u64 = fields
+            .get(12)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let rss_pages: u64 = fields
+            .get(21)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         observation.members.push(MemberSample {
             pid,
             // Raw ticks ride along; the sampler converts deltas to percent.

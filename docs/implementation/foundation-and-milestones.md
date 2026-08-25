@@ -288,6 +288,8 @@ between these two modules before Milestone 1 uses it.
 - cleanup and metrics test results;
 - go/no-go recommendation.
 
+Evidence recorded in [run ownership evidence](run-ownership-evidence.md).
+
 ### Milestone 1 — first integrated vertical slice
 
 Combine the proven terminal and runtime boundaries into a small usable supervisor.
