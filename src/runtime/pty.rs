@@ -40,6 +40,14 @@ impl SpawnCommand {
         self.args.push(arg.into());
         self
     }
+
+    pub(crate) fn program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub(crate) fn args(&self) -> &[OsString] {
+        &self.args
+    }
 }
 
 pub struct SpawnedPty {
@@ -52,6 +60,20 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
+    /// Whether the root process has exited, with its exit code when the
+    /// platform reports one. Does not consume the child handle. Used by the
+    /// Run owner's natural-exit wait.
+    #[allow(dead_code)]
+    pub(crate) fn try_wait(&mut self) -> Result<Option<i32>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child
+            .try_wait()
+            .context("could not poll the process exit state")?;
+        Ok(status.map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX)))
+    }
+
     pub fn spawn(command: SpawnCommand, geometry: TerminalGeometry) -> Result<SpawnedPty> {
         let pair = native_pty_system()
             .openpty(pty_size(geometry))

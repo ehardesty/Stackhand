@@ -1562,6 +1562,7 @@ dependencies = [
  "assert_cmd",
  "crossbeam-channel",
  "crossterm",
+ "libc",
  "libghostty-vt",
  "portable-pty",
  "predicates",

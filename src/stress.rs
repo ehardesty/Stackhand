@@ -25,6 +25,7 @@ fn start_stress_run(
     wake: Box<dyn Fn() + Send>,
 ) -> anyhow::Result<OwnedRun> {
     let (events, _run_event_log) = mpsc::channel();
+    let (output, _output_log) = mpsc::channel();
     RunRuntime.start(RunStartRequest {
         process_id: ProcessId::new(1),
         run_id: RunId::new(1),
@@ -33,6 +34,7 @@ fn start_stress_run(
             initial_geometry: geometry,
         },
         events,
+        output,
         on_output_wake: Some(wake),
     })
 }
@@ -163,7 +165,7 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
             wake_count.request();
         }),
     )?;
-    let session = run.terminal();
+    let session = run.terminal().expect("stress fixture is PTY-mode");
     let mut peak_rss_kib = baseline_rss;
     let mut snapshots = 0;
     let mut active_snapshots = 0;
@@ -334,7 +336,7 @@ sleep 5"#,
             wake_count.request();
         }),
     )?;
-    let session = run.terminal();
+    let session = run.terminal().expect("stress fixture is PTY-mode");
     let fixture_result = (|| {
         let start_deadline = Instant::now() + Duration::from_secs(2);
         while session.output_history_metrics().bytes == 0 && Instant::now() < start_deadline {

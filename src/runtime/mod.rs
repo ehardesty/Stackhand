@@ -1,8 +1,13 @@
 mod input_writer;
+mod pipe;
 mod pty;
+// The Run ownership seam is the product interface for Milestone 0B. Some of
+// its public surface (resize, natural-exit waiting) is exercised through
+// callers and tests rather than this crate's non-test code yet.
+#[allow(dead_code)]
+mod run;
 #[cfg(test)]
 pub(crate) use run::handle_for_test;
-mod run;
 
 pub(crate) use input_writer::{
     BoundedPtyWriter, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer,
@@ -12,6 +17,6 @@ pub(crate) use pty::{PtyIo, PtyProcess, PtyResizer, SpawnCommand};
 // callers outside this module tree today.
 #[allow(unused_imports)]
 pub use run::{
-    OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunMode, RunRuntime, RunStartRequest,
-    TerminalHandle,
+    OwnedRun, ProcessId, ResizeUnsupported, RunEvent, RunEventKind, RunExit, RunId, RunMode,
+    RunRuntime, RunStartRequest, TerminalHandle,
 };

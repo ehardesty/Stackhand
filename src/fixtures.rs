@@ -23,6 +23,7 @@ static FIXTURE_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// and a future Supervisor use.
 fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Result<OwnedRun> {
     let (events, _run_event_log) = mpsc::channel();
+    let (output, _output_log) = mpsc::channel();
     let run_id = FIXTURE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     RunRuntime.start(RunStartRequest {
         process_id: ProcessId::new(u32::try_from(run_id).expect("fixture run id fits u32")),
@@ -32,6 +33,7 @@ fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Resul
             initial_geometry: geometry,
         },
         events,
+        output,
         on_output_wake: None,
     })
 }
@@ -48,7 +50,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
         "printf 'fixture-ready\\r\\n'; IFS= read -r line; printf 'fixture-echo:%s\\r\\n' \"$line\"; set -- $(stty size); printf 'fixture-size:%sx%s\\r\\n' \"$2\" \"$1\"",
     );
     let mut run = start_fixture_run(command, geometry)?;
-    let session = run.terminal();
+    let session = run.terminal().expect("PTY fixture");
 
     let resized_geometry =
         TerminalGeometry::new(42, 12).expect("fixture geometry is always non-zero");
@@ -92,7 +94,7 @@ pub fn run_fixture_input() -> Result<()> {
         "stty raw -echo; printf '\\033[?1linput-normal-ready\\r\\n'; IFS= read -r normal; normal_hex=$(printf '%s' \"$normal\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nnormal-bytes:%s\\r\\n' \"$normal_hex\"; printf '\\033[?1h\\033[?1004h\\033[?1036h\\033[6ninput-ready\\r\\n'; IFS= read -r bytes; hex=$(printf '%s' \"$bytes\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\ninput-bytes:%s\\r\\n' \"$hex\"",
     );
     let mut run = start_fixture_run(command, geometry)?;
-    let session = run.terminal();
+    let session = run.terminal().expect("PTY fixture");
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
     session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -135,7 +137,7 @@ printf 'safe-bytes:%s\r\n' "$safe"
 sleep 3"#,
     );
     let mut run = start_fixture_run(command, geometry)?;
-    let session = run.terminal();
+    let session = run.terminal().expect("PTY fixture");
 
     let fixture_result = (|| {
         wait_for_fixture_text(&session, "fixture-normal-ready")?;
@@ -325,7 +327,7 @@ printf '\033[2J\033[Habcdefghijklmno'
 IFS= read -r _"#,
     );
     let mut run = start_fixture_run(command, geometry)?;
-    let session = run.terminal();
+    let session = run.terminal().expect("PTY fixture");
 
     let fixture_result = (|| {
         let primary = wait_for_snapshot(&session, |snapshot| {

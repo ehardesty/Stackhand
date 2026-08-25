@@ -21,6 +21,7 @@ pub fn run_interactive() -> Result<()> {
     let size = outer.terminal_mut().size()?;
     let geometry = TerminalGeometry::from_pane(console_area(size.into()));
     let (events, _run_event_log) = mpsc::channel();
+    let (output, _output_log) = mpsc::channel();
     let dirty = Arc::new(AtomicBool::new(true));
     let wake_dirty = Arc::clone(&dirty);
     let mut run = RunRuntime.start(RunStartRequest {
@@ -31,6 +32,7 @@ pub fn run_interactive() -> Result<()> {
             initial_geometry: geometry,
         },
         events,
+        output,
         on_output_wake: Some(Box::new(move || {
             wake_dirty.store(true, Ordering::Release);
         })),
@@ -41,7 +43,7 @@ pub fn run_interactive() -> Result<()> {
 
     let run_result = run_event_loop(
         &mut outer,
-        run.terminal(),
+        run.terminal().expect("interactive Run is PTY-mode"),
         &dirty,
         &mut snapshot,
         &mut pending_resize,
