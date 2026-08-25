@@ -83,7 +83,7 @@ fn wait_for_snapshot(
                 }
                 TerminalEvent::Exited
                 | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated { .. } => {}
+                | TerminalEvent::OutputTruncated => {}
             }
         }
         if session.is_dirty() {

@@ -13,43 +13,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail, ensure};
 
 use crate::geometry::TerminalGeometry;
-use crate::runtime::WRITER_EVENT_SLOTS;
 use crate::runtime::{PtyProcess, SpawnCommand};
 use crate::terminal::{
-    COMMAND_QUEUE_BYTES as TERMINAL_COMMAND_QUEUE_BYTES,
-    COMMAND_QUEUE_SLOTS as TERMINAL_COMMAND_QUEUE_SLOTS, INPUT_QUEUE_LIMIT_BYTES,
-    OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS, OUTPUT_QUEUE_SLOTS as TERMINAL_OUTPUT_QUEUE_SLOTS,
-    OUTPUT_READ_BUFFER_BYTES as TERMINAL_OUTPUT_READ_BUFFER_BYTES,
-    OUTPUT_WORK_BUDGET as TERMINAL_OUTPUT_WORK_BUDGET, PASTE_LIMIT_BYTES, PasteCompletion,
-    PasteRejection, SCROLLBACK_TARGET_BYTES, TerminalEvent, TerminalSession,
+    OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS, PASTE_LIMIT_BYTES, PasteCompletion,
+    PasteRejection, TerminalEvent, TerminalSession,
 };
-
-/// Maximum number of output chunks consumed by one fair scheduling turn.
-pub const OUTPUT_WORK_BUDGET: usize = TERMINAL_OUTPUT_WORK_BUDGET;
-
-/// Number of command slots in the Stackhand-owned input gate.
-pub const COMMAND_QUEUE_SLOTS: usize = TERMINAL_COMMAND_QUEUE_SLOTS;
-
-/// Byte budget for commands waiting for the serialized terminal owner.
-pub const COMMAND_QUEUE_BYTES: usize = TERMINAL_COMMAND_QUEUE_BYTES;
-
-/// Byte budget for queued input and terminal-effect write-back.
-pub const INPUT_QUEUE_BYTES: usize = INPUT_QUEUE_LIMIT_BYTES;
-
-/// Number of PTY chunks retained by the pinned terminal wrapper's reader gate.
-pub const OUTPUT_QUEUE_SLOTS: usize = TERMINAL_OUTPUT_QUEUE_SLOTS;
-
-/// Size of one PTY read performed by the pinned terminal wrapper.
-pub const OUTPUT_READ_BUFFER_BYTES: usize = TERMINAL_OUTPUT_READ_BUFFER_BYTES;
-
-/// Maximum diagnostic events retained by a stress-run control plane.
-pub const DIAGNOSTIC_QUEUE_SLOTS: usize = WRITER_EVENT_SLOTS;
-
-/// The maximum terminal scrollback target configured by the current prototype.
-///
-/// The pinned Ghostty API uses this value as a byte target. The wrapper's
-/// field name and documentation currently call it a line count.
-pub const TERMINAL_SCROLLBACK_BYTES: usize = SCROLLBACK_TARGET_BYTES;
 
 /// A redraw request gate. Many output chunks can set the gate, but only the
 /// transition from clean to pending produces a notification.
@@ -80,7 +48,8 @@ impl RedrawGate {
         self.pending.swap(false, Ordering::AcqRel)
     }
 
-    pub fn is_pending(&self) -> bool {
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
 
@@ -206,7 +175,7 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
                     // a failed stress run.
                     TerminalEvent::Exited => {}
                     TerminalEvent::StateChanged => {}
-                    TerminalEvent::OutputTruncated { .. } => {}
+                    TerminalEvent::OutputTruncated => {}
                 }
             }
 

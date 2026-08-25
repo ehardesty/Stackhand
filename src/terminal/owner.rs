@@ -9,8 +9,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::TryRecvError;
-use libghostty_vt::key;
-use libghostty_vt::render::RenderState;
 use libghostty_vt::terminal::{
     ClipboardWrite, ClipboardWriteError, Options as TerminalOptions, Terminal,
 };
@@ -18,12 +16,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::command_gate::CommandReceiver;
-use super::commands::{PendingInput, apply_command};
 use super::history::{BoundedOutputHistory, OutputHistoryMetrics};
-use super::mouse::MouseController;
-use super::render;
-use super::selection::SelectionController;
 use super::session::OwnedCursorState;
+use super::state::{PendingInput, TerminalState};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{BoundedPtyWriter, PtyResizer};
 
@@ -248,7 +243,7 @@ impl Effects {
 
 fn run_owner(
     reader: Box<dyn Read + Send>,
-    mut resizer: PtyResizer,
+    resizer: PtyResizer,
     writer: BoundedPtyWriter,
     commands: CommandReceiver,
     geometry: TerminalGeometry,
@@ -268,14 +263,8 @@ fn run_owner(
         move |_, data| effects.borrow_mut().push(data)
     })?;
     terminal.on_clipboard_write(deny_child_clipboard)?;
-    let mut render_state = RenderState::new()?;
-    let mut key_encoder = key::Encoder::new()?;
-    let mut mouse_controller = MouseController::new()?;
-    let mut selection = SelectionController::new()?;
+    let mut state = TerminalState::new(terminal, resizer, geometry)?;
     let mut history = BoundedOutputHistory::new();
-    let mut focused = true;
-    let mut cols = geometry.cols();
-    let mut rows = geometry.rows();
     let mut pending_input: Option<PendingInput> = None;
     let mut pending_effect: Option<Vec<u8>> = None;
     let mut next_selection_tick = Instant::now() + SELECTION_AUTOSCROLL_INTERVAL;
@@ -318,7 +307,7 @@ fn run_owner(
                     evicted_bytes: evicted,
                 });
             }
-            terminal.vt_write(&data);
+            state.write_output(&data);
             did_work = true;
             if effects.borrow().overflowed {
                 break;
@@ -347,18 +336,7 @@ fn run_owner(
                 }
             } else if let Ok(command) = commands.try_recv() {
                 let command_bytes = command.estimated_bytes();
-                pending_input = apply_command(
-                    command,
-                    command_bytes,
-                    &mut terminal,
-                    &mut key_encoder,
-                    &mut mouse_controller,
-                    &mut resizer,
-                    &mut focused,
-                    &mut cols,
-                    &mut rows,
-                    &mut selection,
-                )?;
+                pending_input = state.apply_command(command, command_bytes)?;
                 if pending_input.is_none() {
                     commands.complete(command_bytes);
                 }
@@ -368,21 +346,14 @@ fn run_owner(
 
         let now = Instant::now();
         if now >= next_selection_tick {
-            if selection.tick_autoscroll(&mut terminal)? {
+            if state.tick_selection_autoscroll()? {
                 did_work = true;
             }
             next_selection_tick = now + SELECTION_AUTOSCROLL_INTERVAL;
         }
 
         if did_work {
-            render(
-                &mut terminal,
-                &mut render_state,
-                focused,
-                cols,
-                rows,
-                shared,
-            );
+            render(&mut state, shared);
             shared.record(OwnerEvent::StateChanged);
             wake();
         } else {
@@ -423,15 +394,8 @@ fn spawn_reader(
         .context("could not start the PTY reader")
 }
 
-fn render(
-    terminal: &mut Terminal<'static, 'static>,
-    render_state: &mut RenderState<'static>,
-    focused: bool,
-    cols: u16,
-    rows: u16,
-    shared: &SharedOwner,
-) {
-    let area = Rect::new(0, 0, cols, rows);
+fn render(state: &mut TerminalState, shared: &SharedOwner) {
+    let area = state.area();
     let mut owned = shared
         .render
         .lock()
@@ -440,9 +404,8 @@ fn render(
         owned.buffer = Buffer::empty(area);
     }
     owned.buffer.reset();
-    owned.cursor =
-        render::render(terminal, render_state, &mut owned.buffer, focused, area).unwrap_or(None);
-    owned.mouse_tracking = terminal.is_mouse_tracking().unwrap_or(false);
+    owned.cursor = state.render(&mut owned.buffer).unwrap_or(None);
+    owned.mouse_tracking = state.mouse_tracking();
     shared.dirty.store(true, Ordering::Release);
 }
 

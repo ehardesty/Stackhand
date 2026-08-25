@@ -52,9 +52,7 @@ pub enum TerminalEvent {
         pending_bytes: usize,
         limit_bytes: usize,
     },
-    OutputTruncated {
-        evicted_bytes: usize,
-    },
+    OutputTruncated,
     StateChanged,
 }
 
@@ -177,24 +175,6 @@ impl TerminalSession {
             .try_send(TerminalCommand::Scroll(MAX_SAFE_SCROLL_DELTA));
     }
 
-    pub fn selection_press(&self, point: SelectionPoint, time: Duration) {
-        let _ = self
-            .commands
-            .try_send(TerminalCommand::SelectionPress { point, time });
-    }
-
-    pub fn selection_drag(&self, point: SelectionPoint) {
-        let _ = self
-            .commands
-            .try_send(TerminalCommand::SelectionDrag(point));
-    }
-
-    pub fn selection_release(&self, point: SelectionPoint) {
-        let _ = self
-            .commands
-            .try_send(TerminalCommand::SelectionRelease(point));
-    }
-
     pub fn select_all(&self) {
         let _ = self.commands.try_send(TerminalCommand::SelectionAll);
     }
@@ -263,9 +243,7 @@ impl TerminalSession {
             OwnerEvent::Exited => TerminalEvent::Exited,
             OwnerEvent::Failed(error) => TerminalEvent::Failed(error),
             OwnerEvent::StateChanged => TerminalEvent::StateChanged,
-            OwnerEvent::OutputTruncated { evicted_bytes } => {
-                TerminalEvent::OutputTruncated { evicted_bytes }
-            }
+            OwnerEvent::OutputTruncated { .. } => TerminalEvent::OutputTruncated,
         })
     }
 

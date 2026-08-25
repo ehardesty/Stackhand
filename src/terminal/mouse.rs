@@ -40,15 +40,14 @@ pub struct TerminalMouseEvent {
     pub kind: MouseKind,
     pub point: SelectionPoint,
     pub modifiers: MouseModifiers,
-    pub application_owned: bool,
+    pub stackhand_owned: bool,
     pub time: Duration,
 }
 
 pub struct MouseController {
     encoder: mouse::Encoder<'static>,
     pressed: Option<MouseButton>,
-    application_pressed: Option<MouseButton>,
-    application_selection_active: bool,
+    selection_active: bool,
 }
 
 impl MouseController {
@@ -56,8 +55,7 @@ impl MouseController {
         Ok(Self {
             encoder: mouse::Encoder::new()?,
             pressed: None,
-            application_pressed: None,
-            application_selection_active: false,
+            selection_active: false,
         })
     }
 
@@ -67,23 +65,16 @@ impl MouseController {
         selection: &mut SelectionController,
         event: TerminalMouseEvent,
     ) -> Result<Vec<u8>> {
-        // Keep one drag gesture with its initial owner. This prevents a mode
-        // change or a late modifier from splitting press and release across
-        // the child and Stackhand.
-        let continuing_child_gesture = self.pressed.is_some();
-        let child_owns = self.application_pressed.is_none()
-            && (continuing_child_gesture
-                || (terminal.is_mouse_tracking()? && !event.application_owned));
-        if child_owns {
-            self.application_selection_active = false;
+        if !event.stackhand_owned {
+            self.selection_active = false;
             return self.encode_child(terminal, event).map_err(Into::into);
         }
 
-        self.apply_application(terminal, selection, event)?;
+        self.apply_stackhand(terminal, selection, event)?;
         Ok(Vec::new())
     }
 
-    fn apply_application(
+    fn apply_stackhand(
         &mut self,
         terminal: &mut Terminal<'_, '_>,
         selection: &mut SelectionController,
@@ -91,21 +82,19 @@ impl MouseController {
     ) -> Result<(), libghostty_vt::Error> {
         match event.kind {
             MouseKind::Press(button) => {
-                self.application_pressed = Some(button);
                 if button == MouseButton::Left {
                     selection.press(terminal, event.point, event.time)?;
-                    self.application_selection_active = true;
+                    self.selection_active = true;
                 }
             }
-            MouseKind::Drag(MouseButton::Left) if self.application_selection_active => {
+            MouseKind::Drag(MouseButton::Left) if self.selection_active => {
                 selection.drag(terminal, event.point)?;
             }
             MouseKind::Release(button) => {
-                if button == MouseButton::Left && self.application_selection_active {
+                if button == MouseButton::Left && self.selection_active {
                     selection.release(terminal, event.point)?;
                 }
-                self.application_selection_active = false;
-                self.application_pressed = None;
+                self.selection_active = false;
             }
             MouseKind::WheelUp => {
                 terminal.scroll_viewport(ScrollViewport::Delta(-WHEEL_SCROLL_LINES));
@@ -216,7 +205,7 @@ mod tests {
         .unwrap()
     }
 
-    fn event(kind: MouseKind, col: u16, row: i32, application_owned: bool) -> TerminalMouseEvent {
+    fn event(kind: MouseKind, col: u16, row: i32, stackhand_owned: bool) -> TerminalMouseEvent {
         TerminalMouseEvent {
             kind,
             point: SelectionPoint {
@@ -224,7 +213,7 @@ mod tests {
                 surface_row: row,
             },
             modifiers: MouseModifiers::default(),
-            application_owned,
+            stackhand_owned,
             time: Duration::from_millis(10),
         }
     }
@@ -241,7 +230,7 @@ mod tests {
                 .apply(
                     &mut terminal,
                     &mut selection,
-                    event(MouseKind::Press(MouseButton::Left), 0, 0, false),
+                    event(MouseKind::Press(MouseButton::Left), 0, 0, true),
                 )
                 .unwrap()
                 .is_empty()
@@ -250,14 +239,14 @@ mod tests {
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::Drag(MouseButton::Left), 5, 0, false),
+                event(MouseKind::Drag(MouseButton::Left), 5, 0, true),
             )
             .unwrap();
         mouse
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::Release(MouseButton::Left), 5, 0, false),
+                event(MouseKind::Release(MouseButton::Left), 5, 0, true),
             )
             .unwrap();
 
@@ -278,7 +267,7 @@ mod tests {
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::WheelUp, 0, 0, false),
+                event(MouseKind::WheelUp, 0, 0, true),
             )
             .unwrap();
 
@@ -287,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn application_override_suppresses_child_sgr_bytes() {
+    fn stackhand_ownership_suppresses_child_sgr_bytes() {
         let mut terminal = terminal();
         terminal.vt_write(b"\x1b[?1003h\x1b[?1006hcontent");
         let mut selection = SelectionController::new().unwrap();
@@ -306,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn one_drag_keeps_its_initial_stackhand_owner_after_tracking_turns_on() {
+    fn stackhand_owned_drag_stays_in_selection_after_tracking_turns_on() {
         let mut terminal = terminal();
         terminal.vt_write(b"alpha beta");
         let mut selection = SelectionController::new().unwrap();
@@ -315,7 +304,7 @@ mod tests {
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::Press(MouseButton::Left), 0, 0, false),
+                event(MouseKind::Press(MouseButton::Left), 0, 0, true),
             )
             .unwrap();
         terminal.vt_write(b"\x1b[?1003h\x1b[?1006h");
@@ -324,7 +313,7 @@ mod tests {
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::Drag(MouseButton::Left), 5, 0, false),
+                event(MouseKind::Drag(MouseButton::Left), 5, 0, true),
             )
             .unwrap();
 
@@ -332,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn latched_child_gesture_refreshes_the_protocol_format_before_release() {
+    fn child_owned_gesture_refreshes_the_protocol_format_before_release() {
         let mut terminal = terminal();
         terminal.vt_write(b"\x1b[?1003h\x1b[?1006h");
         let mut selection = SelectionController::new().unwrap();
@@ -351,7 +340,7 @@ mod tests {
             .apply(
                 &mut terminal,
                 &mut selection,
-                event(MouseKind::Release(MouseButton::Left), 2, 1, true),
+                event(MouseKind::Release(MouseButton::Left), 2, 1, false),
             )
             .unwrap();
 

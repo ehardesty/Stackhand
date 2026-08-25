@@ -238,6 +238,18 @@ Proceed only if the prototype demonstrates that a modern interactive terminal ex
 
 Build a headless process-runtime prototype independent of the full TUI.
 
+#### Ownership seam to prove
+
+Give each Run one owner for its Process Tree, process I/O, output drains,
+sampler, and optional terminal session. The owner must control the complete
+shutdown order. Callers use semantic interrupt, terminate, kill, resize, and
+wait operations. They do not coordinate raw operating-system handles or stop
+the terminal and Process Tree as separate peer objects.
+
+Keep terminal semantics inside `TerminalSession`. Do not move Process Tree
+containment or shutdown policy into it. Milestone 0B must prove the interface
+between these two modules before Milestone 1 uses it.
+
 #### Required capabilities
 
 1. Spawn pipe-mode and PTY-mode processes.
@@ -266,11 +278,13 @@ Build a headless process-runtime prototype independent of the full TUI.
 
 #### Deliverables
 
+- one Run ownership module with a small semantic interface;
 - `ProcessIo` abstraction;
 - `ProcessTree` abstraction;
 - macOS/Linux implementation notes;
 - PTY-library assessment;
 - containment limitations;
+- verified Run shutdown ordering for pipe and PTY modes;
 - cleanup and metrics test results;
 - go/no-go recommendation.
 

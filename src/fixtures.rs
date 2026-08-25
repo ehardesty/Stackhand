@@ -236,7 +236,7 @@ fn wait_for_fixture_text(session: &TerminalSession, expected: &str) -> Result<St
                 }
                 TerminalEvent::Exited
                 | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated { .. } => {}
+                | TerminalEvent::OutputTruncated => {}
             }
         }
         if session.is_dirty() {
@@ -267,7 +267,7 @@ fn wait_for_input_backpressure(session: &TerminalSession) -> Result<String> {
                 TerminalEvent::Failed(error) => bail!("terminal owner failed: {error}"),
                 TerminalEvent::Exited
                 | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated { .. } => {}
+                | TerminalEvent::OutputTruncated => {}
             }
         }
         thread::sleep(Duration::from_millis(5));

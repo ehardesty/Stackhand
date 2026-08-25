@@ -9,7 +9,6 @@ use crate::terminal::{MouseButton, MouseKind, MouseModifiers, SelectionPoint, Te
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseRoute {
     pub event: TerminalMouseEvent,
-    pub stackhand_owns: bool,
     pub changes_history_view: bool,
     pub stackhand_gesture_active: bool,
 }
@@ -84,10 +83,9 @@ impl MouseRouter {
                     control: mouse.modifiers.contains(KeyModifiers::CONTROL),
                     alt: mouse.modifiers.contains(KeyModifiers::ALT),
                 },
-                application_owned: stackhand_owns,
+                stackhand_owned: stackhand_owns,
                 time,
             },
-            stackhand_owns,
             changes_history_view: stackhand_owns
                 && matches!(
                     mouse.kind,
@@ -168,8 +166,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(route.event.application_owned);
-        assert!(route.stackhand_owns);
+        assert!(route.event.stackhand_owned);
+        assert!(route.event.stackhand_owned);
         assert!(route.changes_history_view);
         assert_eq!(
             route.event.point,
@@ -192,8 +190,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!route.event.application_owned);
-        assert!(!route.stackhand_owns);
+        assert!(!route.event.stackhand_owned);
+        assert!(!route.event.stackhand_owned);
         assert!(!route.changes_history_view);
     }
 
@@ -213,7 +211,10 @@ mod tests {
                     Duration::ZERO,
                 )
                 .unwrap();
-            assert!(route.stackhand_owns, "mode {mode:?} lost mouse ownership");
+            assert!(
+                route.event.stackhand_owned,
+                "mode {mode:?} lost mouse ownership"
+            );
         }
     }
 
@@ -243,7 +244,7 @@ mod tests {
                 surface_row: -1
             }
         );
-        assert!(route.stackhand_owns);
+        assert!(route.event.stackhand_owned);
     }
 
     #[test]
@@ -277,10 +278,10 @@ mod tests {
             true,
         );
 
-        assert!(!press.stackhand_owns);
-        assert!(!drag.stackhand_owns);
+        assert!(!press.event.stackhand_owned);
+        assert!(!drag.event.stackhand_owned);
         assert!(!drag.changes_history_view);
-        assert!(!release.stackhand_owns);
+        assert!(!release.event.stackhand_owned);
         assert!(!release.changes_history_view);
         assert!(!release.stackhand_gesture_active);
     }
@@ -317,10 +318,10 @@ mod tests {
         );
 
         assert!(press.stackhand_gesture_active);
-        assert!(drag.stackhand_owns);
+        assert!(drag.event.stackhand_owned);
         assert!(drag.changes_history_view);
         assert!(drag.stackhand_gesture_active);
-        assert!(release.stackhand_owns);
+        assert!(release.event.stackhand_owned);
         assert!(release.changes_history_view);
         assert!(!release.stackhand_gesture_active);
     }

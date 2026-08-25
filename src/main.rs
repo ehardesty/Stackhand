@@ -4,13 +4,13 @@ use anyhow::{Context, Result, bail};
 
 fn main() -> Result<()> {
     match parse_mode(std::env::args_os().skip(1))? {
-        Mode::Interactive => stackhand::app::run_interactive(),
-        Mode::FixtureRoundTrip(text) => stackhand::app::run_fixture_round_trip(&text),
-        Mode::FixtureInput => stackhand::app::run_fixture_input(),
-        Mode::FixturePaste => stackhand::app::run_fixture_paste(),
-        Mode::FixtureRendering => stackhand::app::run_fixture_rendering(),
-        Mode::FixtureScrollback => stackhand::scrollback_fixture::run(),
-        Mode::FixtureMouse => stackhand::mouse_fixture::run(),
+        Mode::Interactive => stackhand::run_interactive(),
+        Mode::FixtureRoundTrip(text) => stackhand::prototype::run_fixture_round_trip(&text),
+        Mode::FixtureInput => stackhand::prototype::run_fixture_input(),
+        Mode::FixturePaste => stackhand::prototype::run_fixture_paste(),
+        Mode::FixtureRendering => stackhand::prototype::run_fixture_rendering(),
+        Mode::FixtureScrollback => stackhand::prototype::run_fixture_scrollback(),
+        Mode::FixtureMouse => stackhand::prototype::run_fixture_mouse(),
     }
 }
 

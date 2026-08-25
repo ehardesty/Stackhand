@@ -1,10 +1,13 @@
-pub mod app;
-pub mod clipboard;
+mod app;
+mod console;
 mod fixtures;
-pub mod geometry;
-pub mod mouse_fixture;
-pub mod runtime;
-pub mod scrollback_fixture;
-pub mod stress;
-pub mod terminal;
-pub mod tui;
+mod geometry;
+mod mouse_fixture;
+pub mod prototype;
+mod runtime;
+mod scrollback_fixture;
+mod stress;
+mod terminal;
+mod tui;
+
+pub use app::run_interactive;

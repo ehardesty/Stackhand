@@ -1,4 +1,4 @@
-use stackhand::stress::{run_blocked_input_output_fixture, run_sustained_output_fixture};
+use stackhand::prototype::{run_blocked_input_output_fixture, run_sustained_output_fixture};
 
 #[test]
 fn sustained_output_keeps_the_terminal_responsive_and_bounded() {

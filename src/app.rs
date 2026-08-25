@@ -5,20 +5,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::console::ConsoleInteraction;
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyProcess, SpawnCommand};
-use crate::terminal::{
-    CopyRequest, OwnedTerminalSnapshot, PasteCompletion, PasteRequest, TerminalEvent,
-    TerminalSession,
-};
-use crate::tui::{
-    ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter, OuterTerminal, console_area,
-    render,
-};
-
-pub use crate::fixtures::{
-    run_fixture_input, run_fixture_paste, run_fixture_rendering, run_fixture_round_trip,
-};
+use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent, TerminalSession};
+use crate::tui::{ConsoleWarning, OuterTerminal, console_area, render};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
@@ -36,7 +27,7 @@ pub fn run_interactive() -> Result<()> {
     let mut process = spawned.process;
     let mut snapshot = empty_snapshot(geometry);
     let mut pending_resize = PendingResize::default();
-    let mut console_view = ConsoleViewState::default();
+    let mut console = ConsoleInteraction::default();
 
     let run_result = run_event_loop(
         &mut outer,
@@ -44,7 +35,7 @@ pub fn run_interactive() -> Result<()> {
         &dirty,
         &mut snapshot,
         &mut pending_resize,
-        &mut console_view,
+        &mut console,
     );
     let process_result = process.shutdown();
     let session_result = session.shutdown();
@@ -60,15 +51,12 @@ fn run_event_loop(
     dirty: &AtomicBool,
     snapshot: &mut OwnedTerminalSnapshot,
     pending_resize: &mut PendingResize,
-    console_view: &mut ConsoleViewState,
+    console: &mut ConsoleInteraction,
 ) -> Result<()> {
-    let mut paste_requests = Vec::new();
-    let mut copy_requests = Vec::new();
-    let selection_clock = Instant::now();
-    let mut mouse_router = MouseRouter::default();
     loop {
-        poll_paste_requests(&mut paste_requests, console_view, dirty);
-        poll_copy_requests(&mut copy_requests, console_view, dirty);
+        if console.poll_requests() {
+            dirty.store(true, Ordering::Release);
+        }
         if let Some(geometry) = pending_resize.take_ready(Instant::now()) {
             session.resize(geometry);
             dirty.store(true, Ordering::Release);
@@ -78,11 +66,11 @@ fn run_event_loop(
             match session_event {
                 TerminalEvent::Failed(error) => bail!("terminal owner failed: {error}"),
                 TerminalEvent::InputBackpressure { .. } => {
-                    console_view.warning = Some(ConsoleWarning::InputBackpressure);
+                    console.warn(ConsoleWarning::InputBackpressure);
                     dirty.store(true, Ordering::Release);
                 }
-                TerminalEvent::OutputTruncated { .. } => {
-                    console_view.warning = Some(ConsoleWarning::OutputTruncated);
+                TerminalEvent::OutputTruncated => {
+                    console.warn(ConsoleWarning::OutputTruncated);
                     dirty.store(true, Ordering::Release);
                 }
                 TerminalEvent::Exited => return Ok(()),
@@ -94,7 +82,7 @@ fn run_event_loop(
             *snapshot = session.snapshot();
             outer
                 .terminal_mut()
-                .draw(|frame| render(frame, snapshot, *console_view))?;
+                .draw(|frame| render(frame, snapshot, console.view()))?;
             outer.set_cursor_shape(snapshot.cursor)?;
         }
 
@@ -104,48 +92,19 @@ fn run_event_loop(
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
             Event::Key(key) => {
-                if key.kind == KeyEventKind::Press
-                    && console_view.mode == ConsoleViewMode::Selection
-                    && key.code == KeyCode::Char('y')
-                {
-                    copy_requests.push(session.request_copy());
-                    console_view.warning = None;
-                    dirty.store(true, Ordering::Release);
-                } else if route_console_key(
-                    key,
-                    session,
-                    snapshot.buffer.area().height,
-                    console_view,
-                ) {
+                if console.handle_key(key, session, snapshot.buffer.area().height) {
                     dirty.store(true, Ordering::Release);
                 }
             }
             Event::Paste(data) => {
-                match session.send_paste(&data) {
-                    Ok(request) => {
-                        paste_requests.push(request);
-                        console_view.warning = None;
-                    }
-                    Err(_) => console_view.warning = Some(ConsoleWarning::PasteRejected),
-                }
+                console.handle_paste(&data, session);
                 dirty.store(true, Ordering::Release);
             }
             Event::FocusGained => session.send_focus(true),
             Event::FocusLost => session.send_focus(false),
             Event::Mouse(mouse) => {
                 let area = console_area(outer.terminal_mut().size()?.into());
-                if let Some(route) = mouse_router.route(
-                    mouse,
-                    area,
-                    console_view.mode,
-                    snapshot.mouse_tracking,
-                    selection_clock.elapsed(),
-                ) {
-                    console_view.stackhand_mouse_gesture = route.stackhand_gesture_active;
-                    session.send_mouse(route.event);
-                    if route.changes_history_view {
-                        console_view.following = false;
-                    }
+                if console.handle_mouse(mouse, area, snapshot.mouse_tracking, session) {
                     dirty.store(true, Ordering::Release);
                 }
             }
@@ -157,158 +116,6 @@ fn run_event_loop(
             }
         }
     }
-}
-
-fn poll_copy_requests(
-    requests: &mut Vec<CopyRequest>,
-    view: &mut ConsoleViewState,
-    dirty: &AtomicBool,
-) {
-    requests.retain(|request| {
-        let Some(result) = request.poll() else {
-            return true;
-        };
-        apply_copy_result(result, view);
-        dirty.store(true, Ordering::Release);
-        false
-    });
-}
-
-fn apply_copy_result(result: Result<Option<String>, String>, view: &mut ConsoleViewState) {
-    view.warning = copy_warning(result, crate::clipboard::write_text);
-}
-
-fn copy_warning(
-    result: Result<Option<String>, String>,
-    write: impl FnOnce(String) -> Result<()>,
-) -> Option<ConsoleWarning> {
-    match result {
-        Ok(Some(text)) if !text.is_empty() => {
-            write(text).err().map(|_| ConsoleWarning::ClipboardFailed)
-        }
-        Ok(_) => Some(ConsoleWarning::NothingSelected),
-        Err(_) => Some(ConsoleWarning::ClipboardFailed),
-    }
-}
-
-fn poll_paste_requests(
-    requests: &mut Vec<PasteRequest>,
-    view: &mut ConsoleViewState,
-    dirty: &AtomicBool,
-) {
-    let mut failed = false;
-    requests.retain_mut(|request| match request.poll() {
-        Some(PasteCompletion::Delivered) => false,
-        Some(PasteCompletion::Failed(_)) => {
-            failed = true;
-            false
-        }
-        None => true,
-    });
-    if failed {
-        view.warning = Some(ConsoleWarning::PasteDeliveryFailed);
-        dirty.store(true, Ordering::Release);
-    }
-}
-
-fn route_console_key(
-    key: KeyEvent,
-    session: &TerminalSession,
-    page_rows: u16,
-    view: &mut ConsoleViewState,
-) -> bool {
-    if key.kind != KeyEventKind::Press {
-        if view.mode == ConsoleViewMode::ChildInput {
-            session.send_key(key);
-        }
-        return false;
-    }
-
-    match view.mode {
-        ConsoleViewMode::ChildInput if is_command_leader(key) => {
-            view.mode = ConsoleViewMode::AppCommand;
-            true
-        }
-        ConsoleViewMode::ChildInput => {
-            session.send_key(key);
-            false
-        }
-        ConsoleViewMode::AppCommand => match key.code {
-            KeyCode::PageUp => {
-                scroll_page(session, page_rows, -1);
-                view.mode = ConsoleViewMode::Scroll;
-                view.following = false;
-                true
-            }
-            KeyCode::PageDown => {
-                scroll_page(session, page_rows, 1);
-                view.mode = ConsoleViewMode::Scroll;
-                view.following = false;
-                true
-            }
-            KeyCode::Char('f') => {
-                return_to_live_tail(session, view);
-                true
-            }
-            KeyCode::Char('s') => {
-                view.mode = ConsoleViewMode::Selection;
-                true
-            }
-            KeyCode::Esc => {
-                view.mode = ConsoleViewMode::ChildInput;
-                true
-            }
-            _ => false,
-        },
-        ConsoleViewMode::Scroll => match key.code {
-            KeyCode::PageUp => {
-                scroll_page(session, page_rows, -1);
-                true
-            }
-            KeyCode::PageDown => {
-                scroll_page(session, page_rows, 1);
-                true
-            }
-            KeyCode::Char('f') => {
-                return_to_live_tail(session, view);
-                true
-            }
-            KeyCode::Esc => {
-                view.mode = ConsoleViewMode::AppCommand;
-                true
-            }
-            _ => false,
-        },
-        ConsoleViewMode::Selection => match key.code {
-            KeyCode::Char('a') => {
-                session.select_all();
-                view.following = false;
-                true
-            }
-            KeyCode::Esc => {
-                session.clear_selection();
-                view.mode = ConsoleViewMode::AppCommand;
-                true
-            }
-            _ => false,
-        },
-    }
-}
-
-fn is_command_leader(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn scroll_page(session: &TerminalSession, page_rows: u16, direction: isize) {
-    let page = isize::try_from(page_rows.saturating_sub(1).max(1))
-        .expect("u16 page size always fits in isize");
-    session.scroll_lines(direction * page);
-}
-
-fn return_to_live_tail(session: &TerminalSession, view: &mut ConsoleViewState) {
-    session.follow_live();
-    view.following = true;
-    view.mode = ConsoleViewMode::ChildInput;
 }
 
 #[derive(Default)]
@@ -357,11 +164,7 @@ fn empty_snapshot(geometry: TerminalGeometry) -> OwnedTerminalSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::os::unix::net::UnixStream;
-
     use super::*;
-    use crate::runtime::PtyIo;
 
     #[test]
     fn rapid_resize_uses_only_the_last_valid_geometry() {
@@ -389,64 +192,5 @@ mod tests {
             pending.take_ready(started + Duration::from_millis(21)),
             None
         );
-    }
-
-    #[test]
-    fn scroll_navigation_stops_following_and_f_returns_to_live_tail() {
-        let (reader, peer) = UnixStream::pair().unwrap();
-        let session = TerminalSession::spawn(
-            PtyIo {
-                reader: Box::new(reader),
-                writer: Box::new(io::sink()),
-                resizer: Box::new(|_, _| Ok(())),
-            },
-            TerminalGeometry::DEFAULT,
-            || {},
-        )
-        .unwrap();
-        let mut view = ConsoleViewState::default();
-
-        assert!(route_console_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &session,
-            20,
-            &mut view,
-        ));
-        assert!(route_console_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &session,
-            20,
-            &mut view,
-        ));
-        assert_eq!(view.mode, ConsoleViewMode::Scroll);
-        assert!(!view.following);
-
-        assert!(route_console_key(
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-            &session,
-            20,
-            &mut view,
-        ));
-        assert_eq!(view.mode, ConsoleViewMode::ChildInput);
-        assert!(view.following);
-
-        drop(peer);
-        session.shutdown().unwrap();
-    }
-
-    #[test]
-    fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
-        let warning = copy_warning(Ok(Some("selected".to_string())), |_| {
-            Err(anyhow::anyhow!("clipboard unavailable"))
-        });
-
-        assert_eq!(warning, Some(ConsoleWarning::ClipboardFailed));
-    }
-
-    #[test]
-    fn empty_selection_is_visible_without_calling_the_clipboard() {
-        let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
-
-        assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
     }
 }

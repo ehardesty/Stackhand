@@ -88,16 +88,16 @@ fn mouse_event(
     kind: MouseKind,
     col: u16,
     surface_row: i32,
-    application_owned: bool,
+    stackhand_owned: bool,
 ) -> TerminalMouseEvent {
     TerminalMouseEvent {
         kind,
         point: SelectionPoint { col, surface_row },
         modifiers: MouseModifiers {
-            shift: application_owned,
+            shift: stackhand_owned,
             ..MouseModifiers::default()
         },
-        application_owned,
+        stackhand_owned,
         time: Duration::from_millis(10),
     }
 }
@@ -117,7 +117,7 @@ fn wait_for_state(
                 }
                 TerminalEvent::Exited
                 | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated { .. } => {}
+                | TerminalEvent::OutputTruncated => {}
             }
         }
         if session.is_dirty() {

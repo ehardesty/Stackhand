@@ -130,10 +130,10 @@ The pinned macOS arm64 package path passed after the real-program matrix:
 
 | Measurement | Value |
 | --- | ---: |
-| Release binary | 2,282,448 bytes |
+| Release binary | 2,297,408 bytes |
 | Static Ghostty archive | 8,857,784 bytes |
-| Package archive | 951,950 bytes |
-| Package SHA-256 | `66e53f40cd982a0c2f52d1c8b891776725cceb81d00a6a7974d4602659abb88b` |
+| Package archive | 953,727 bytes |
+| Package SHA-256 | `de7ccb78dda1895641de867947546ff3575d1a0c38d0db63daba36deca8d9257` |
 
 The packaged launcher opened a real `/bin/sh` PTY with a clean runtime `PATH`
 that did not contain Zig. It printed `package-post-doc-ok` and completed
