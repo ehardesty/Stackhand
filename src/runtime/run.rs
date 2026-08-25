@@ -15,6 +15,7 @@ use anyhow::Result;
 
 use crate::geometry::TerminalGeometry;
 use crate::runtime::pipe::{PipeRun, RunOutput};
+use crate::runtime::process_tree::{SemanticSignal, SignalError, UnixProcessTree};
 use crate::runtime::{PtyProcess, SpawnCommand};
 use crate::terminal::{
     CopyRequest, OutputHistoryMetrics, OwnedTerminalSnapshot, PasteRejection, PasteRequest,
@@ -28,6 +29,10 @@ pub struct ProcessId(u32);
 impl ProcessId {
     pub fn new(value: u32) -> Self {
         Self(value)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
     }
 }
 
@@ -118,22 +123,32 @@ impl RunRuntime {
                 let spawned = PtyProcess::spawn(request.command, initial_geometry)?;
                 let wake = request.on_output_wake.unwrap_or_else(|| Box::new(|| {}));
                 let session = TerminalSession::spawn(spawned.io, initial_geometry, wake)?;
-                RunInner::Pty {
-                    process: spawned.process,
-                    session,
-                }
+                let tree = spawned.process.process_id().map(UnixProcessTree::from_root);
+                (
+                    tree,
+                    RunInner::Pty {
+                        process: spawned.process,
+                        session,
+                    },
+                )
             }
-            RunMode::Pipe => RunInner::Pipe(PipeRun::spawn(
-                &request.command,
-                request.run_id,
-                request.events.clone(),
-                request.output.clone(),
-            )?),
+            RunMode::Pipe => {
+                let pipe = PipeRun::spawn(
+                    &request.command,
+                    request.run_id,
+                    request.events.clone(),
+                    request.output.clone(),
+                )?;
+                let tree = pipe.root_pid().map(UnixProcessTree::from_root);
+                (tree, RunInner::Pipe(pipe))
+            }
         };
+        let (tree, inner) = inner;
         let run = OwnedRun {
             process_id: request.process_id,
             run_id: request.run_id,
             inner: Some(inner),
+            tree,
             events: request.events,
             cleanup_error: None,
         };
@@ -153,6 +168,10 @@ pub struct OwnedRun {
     process_id: ProcessId,
     run_id: RunId,
     inner: Option<RunInner>,
+    // The owned Process Tree identity. Present when the platform reports a
+    // root PID at spawn time.
+    #[allow(dead_code)]
+    tree: Option<UnixProcessTree>,
     events: mpsc::Sender<RunEvent>,
     cleanup_error: Option<anyhow::Error>,
 }
@@ -166,6 +185,11 @@ enum RunInner {
 }
 
 const RUN_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Bounded wait between terminate and kill during explicit cleanup. The full
+/// configured shutdown ladder is ticket #16.
+const TERMINATE_GRACE: Duration = Duration::from_secs(1);
+/// Bounded wait after kill before containment results are reported.
+const KILL_GRACE: Duration = Duration::from_millis(500);
 const RUN_EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The completion record for a naturally completed Run.
@@ -200,11 +224,12 @@ impl OwnedRun {
         self.run_id
     }
 
-    /// The root operating-system PID when the platform reports one.
+    /// The root operating-system PID when the platform reports one. The
+    /// root doubles as the owned process-group identity on Unix.
     pub fn root_pid(&self) -> Option<ProcessId> {
         match self.inner.as_ref()? {
             RunInner::Pty { process, .. } => process.process_id().map(ProcessId::new),
-            RunInner::Pipe(_) => None,
+            RunInner::Pipe(pipe) => pipe.root_pid().map(ProcessId::new),
         }
     }
 
@@ -239,10 +264,8 @@ impl OwnedRun {
         };
         let exit = match inner {
             RunInner::Pipe(pipe) => {
-                let status = pipe.wait()?;
-                RunExit {
-                    code: status.code(),
-                }
+                let code = pipe.reap_and_join()?;
+                RunExit { code }
             }
             RunInner::Pty { process, session } => {
                 let code = wait_for_pty_exit(process)?;
@@ -253,6 +276,37 @@ impl OwnedRun {
         };
         self.emit(RunEventKind::Exited { code: exit.code });
         Ok(exit)
+    }
+
+    /// Deliver a semantic interrupt to the owned Process Tree. A
+    /// process-already-gone race is harmless and returns success.
+    pub fn interrupt(&self) -> Result<()> {
+        self.signal_tree(SemanticSignal::Interrupt)
+    }
+
+    /// Deliver a semantic terminate to the owned Process Tree.
+    pub fn terminate(&self) -> Result<()> {
+        self.signal_tree(SemanticSignal::Terminate)
+    }
+
+    /// Deliver a semantic kill to the owned Process Tree.
+    pub fn kill(&self) -> Result<()> {
+        self.signal_tree(SemanticSignal::Kill)
+    }
+
+    fn signal_tree(&self, semantic: SemanticSignal) -> Result<()> {
+        let Some(tree) = self.tree.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "Run {} has no observable Process Tree identity",
+                self.run_id.0
+            ));
+        };
+        // A NotFound race means the tree is already gone; that is success.
+        // An Ownership failure fails closed: the caller must not escalate.
+        match tree.signal(semantic) {
+            Ok(()) | Err(SignalError::NotFound) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(error.detail())),
+        }
     }
 
     /// Complete Run cleanup: stop the root process, then finalize the
@@ -266,8 +320,41 @@ impl OwnedRun {
                 Some(RunInner::Pty {
                     mut process,
                     session,
-                }) => process.shutdown().and_then(|()| session.shutdown()),
-                Some(RunInner::Pipe(mut pipe)) => pipe.stop_and_join(),
+                }) => {
+                    let mut failure_notes = Vec::new();
+                    if let Some(tree) = self.tree.as_ref() {
+                        failure_notes = self.escalate_group_shutdown(tree);
+                    }
+                    if failure_notes.is_empty() {
+                        // Escalation is complete, so reaping is safe now:
+                        // no further Process Group signal follows a reap.
+                        process.shutdown().and_then(|()| session.shutdown())
+                    } else {
+                        if let Err(error) = session.shutdown() {
+                            failure_notes.push(error.to_string());
+                        }
+                        failure_notes.extend(process.abandon_nonblocking());
+                        Err(anyhow::anyhow!(
+                            "Run cleanup failed: {}",
+                            failure_notes.join("; ")
+                        ))
+                    }
+                }
+                Some(RunInner::Pipe(mut pipe)) => {
+                    let mut failure_notes = Vec::new();
+                    if let Some(tree) = self.tree.as_ref() {
+                        failure_notes = self.escalate_group_shutdown(tree);
+                    }
+                    if failure_notes.is_empty() {
+                        pipe.reap_and_join().map(|_code| ())
+                    } else {
+                        failure_notes.extend(pipe.abandon_nonblocking());
+                        Err(anyhow::anyhow!(
+                            "Run cleanup failed: {}",
+                            failure_notes.join("; ")
+                        ))
+                    }
+                }
                 None => Ok(()),
             };
             self.cleanup_error = result.err();
@@ -287,6 +374,84 @@ impl OwnedRun {
 
     fn is_cleaned_up(&self) -> bool {
         self.inner.is_none()
+    }
+
+    /// Escalate terminate → kill against the owned Process Tree while its
+    /// identity is intact. The unreaped root keeps the group in existence
+    /// and its PID reserved, so both group signals and direct root signals
+    /// are safe during this function. No signal of any kind follows a reap.
+    ///
+    /// Target selection:
+    /// - Live members other than the root receive group signals.
+    /// - A root that has not exited yet receives direct signals (safe while
+    ///   unreaped).
+    /// - An exited root with no other members needs no signal at all: this
+    ///   avoids the Darwin EPERM quirk for zombie-only setsid groups.
+    ///
+    /// "Settled" means the root has exited AND no other member remains.
+    /// An empty member list alone is not settled: the root may still be
+    /// starting its children.
+    ///
+    /// Fail-closed rules: an Ownership or Failed signal error stops
+    /// escalation immediately; members that remain after kill are reported,
+    /// never hidden; and the caller must not reap until this returns.
+    fn escalate_group_shutdown(&self, tree: &UnixProcessTree) -> Vec<String> {
+        let mut notes = Vec::new();
+        for stage in [SemanticSignal::Terminate, SemanticSignal::Kill] {
+            if Self::tree_settled(tree) {
+                return notes;
+            }
+            let target_group = !Self::tree_is_empty(tree);
+            let result = if target_group {
+                tree.signal(stage)
+            } else {
+                tree.signal_root_unreaped(stage)
+            };
+            match result {
+                Ok(()) | Err(SignalError::NotFound) => {}
+                Err(error) => {
+                    notes.push(format!("escalation stopped: {}", error.detail()));
+                    return notes;
+                }
+            }
+            let budget = match stage {
+                SemanticSignal::Terminate => TERMINATE_GRACE,
+                _ => KILL_GRACE,
+            };
+            let deadline = Instant::now() + budget;
+            while Instant::now() < deadline && !Self::tree_settled(tree) {
+                std::thread::sleep(RUN_EXIT_POLL_INTERVAL);
+            }
+        }
+        if let Ok(members) = tree.remaining_members_excluding_root()
+            && !members.is_empty()
+        {
+            notes.push(format!(
+                "Process Tree members remained after kill: {:?}",
+                members
+            ));
+        }
+        notes
+    }
+
+    fn tree_is_empty(tree: &UnixProcessTree) -> bool {
+        tree.remaining_members_excluding_root()
+            .map(|members| members.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether nothing is left except possibly the root itself, which may be
+    /// alive or an unreaped zombie. Group signals are skipped in this state.
+    fn only_unreaped_root_remains(tree: &UnixProcessTree) -> bool {
+        Self::tree_is_empty(tree) || UnixProcessTree::root_exit_pending(tree.root_pid())
+    }
+
+    /// Whether the Run's Process Tree work is done: the root has exited and
+    /// no other member remains. Both halves are required — an empty member
+    /// list alone cannot distinguish "all clear" from "children not yet
+    /// spawned by a live root".
+    fn tree_settled(tree: &UnixProcessTree) -> bool {
+        UnixProcessTree::root_exit_pending(tree.root_pid()) && Self::tree_is_empty(tree)
     }
 
     fn emit(&self, kind: RunEventKind) {
@@ -369,248 +534,5 @@ impl TerminalHandle<'_> {
 
     pub fn poll_event(&self) -> Option<TerminalEvent> {
         self.session.poll_event()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    const WAIT: Duration = Duration::from_secs(5);
-
-    fn start_marker_run() -> (OwnedRun, mpsc::Receiver<RunEvent>) {
-        let (events, receiver) = mpsc::channel();
-        let command = SpawnCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("printf 'run-ready\\n'; IFS= read -r line; printf 'run-done\\n'");
-        let run = RunRuntime
-            .start(RunStartRequest {
-                process_id: ProcessId::new(7),
-                run_id: RunId::new(42),
-                command,
-                mode: RunMode::Pty {
-                    initial_geometry: TerminalGeometry::DEFAULT,
-                },
-                events,
-                output: mpsc::channel().0,
-                on_output_wake: None,
-            })
-            .expect("fixture run started");
-        (run, receiver)
-    }
-
-    fn wait_for_output(handle: &TerminalHandle<'_>, marker: &str) -> bool {
-        let deadline = Instant::now() + WAIT;
-        while Instant::now() < deadline {
-            if handle.snapshot().text().contains(marker) {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        false
-    }
-
-    #[test]
-    fn run_reports_identity_and_joins_on_explicit_cleanup() {
-        let mut run = RunRuntime
-            .start(RunStartRequest {
-                process_id: ProcessId::new(3),
-                run_id: RunId::new(9),
-                command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 30"),
-                mode: RunMode::Pty {
-                    initial_geometry: TerminalGeometry::DEFAULT,
-                },
-                events: mpsc::channel().0,
-                output: mpsc::channel().0,
-                on_output_wake: None,
-            })
-            .unwrap();
-
-        assert_eq!(run.process_id(), ProcessId::new(3));
-        assert_eq!(run.run_id(), RunId::new(9));
-        assert!(run.root_pid().is_some());
-
-        run.shutdown().expect("run cleaned up");
-        // Repeated shutdown observes the first cleanup instead of repeating.
-        run.shutdown().expect("repeated cleanup stayed successful");
-    }
-
-    #[test]
-    fn natural_exit_and_explicit_cleanup_both_join_terminal_tasks() {
-        let (mut run, receiver) = start_marker_run();
-        assert_eq!(run.run_id(), RunId::new(42));
-
-        let handle = run.terminal().expect("PTY fixture");
-        assert!(
-            wait_for_output(&handle, "run-ready"),
-            "fixture output did not appear"
-        );
-        handle.send_raw(vec![0x04]);
-
-        let spawned = receiver.recv_timeout(WAIT).expect("spawn event arrived");
-        assert_eq!(spawned.run_id, RunId::new(42));
-        assert!(matches!(
-            spawned.kind,
-            RunEventKind::Spawned { root_pid: Some(_) }
-        ));
-
-        assert!(
-            wait_for_output(&handle, "run-done"),
-            "root process did not reach natural exit"
-        );
-        // Cleanup after a natural root exit still finalizes the TerminalSession
-        // and joins every terminal task.
-        run.shutdown().expect("run joined after natural exit");
-
-        let final_event = receiver.recv_timeout(WAIT).expect("final event arrived");
-        assert_eq!(final_event.run_id, RunId::new(42));
-        assert_eq!(final_event.kind, RunEventKind::ShutdownComplete);
-    }
-
-    #[test]
-    fn every_low_volume_event_carries_the_requested_run_id() {
-        let (_run, receiver) = start_marker_run();
-        while let Ok(event) = receiver.try_recv() {
-            assert_eq!(event.run_id, RunId::new(42));
-        }
-    }
-}
-
-#[cfg(test)]
-mod pipe_tests {
-    use super::*;
-    use crate::runtime::pipe::OutputStream;
-    use std::sync::mpsc::{Receiver, TryRecvError};
-    use std::thread;
-
-    const WAIT: Duration = Duration::from_secs(10);
-
-    fn start_pipe(command: SpawnCommand) -> (OwnedRun, Receiver<RunEvent>, Receiver<RunOutput>) {
-        let (events, event_receiver) = mpsc::channel();
-        let (output, output_receiver) = mpsc::channel();
-        let run = RunRuntime
-            .start(RunStartRequest {
-                process_id: ProcessId::new(11),
-                run_id: RunId::new(77),
-                command,
-                mode: RunMode::Pipe,
-                events,
-                output,
-                on_output_wake: None,
-            })
-            .expect("pipe run started");
-        (run, event_receiver, output_receiver)
-    }
-
-    fn drain_output(receiver: &Receiver<RunOutput>) -> Vec<RunOutput> {
-        let mut chunks = Vec::new();
-        while let Ok(chunk) = receiver.try_recv() {
-            chunks.push(chunk);
-        }
-        chunks
-    }
-
-    fn text(chunks: &[RunOutput], stream: OutputStream) -> String {
-        String::from_utf8_lossy(
-            &chunks
-                .iter()
-                .filter(|chunk| chunk.stream == stream)
-                .flat_map(|chunk| chunk.data.clone())
-                .collect::<Vec<u8>>(),
-        )
-        .into_owned()
-    }
-
-    #[test]
-    fn pipe_mode_starts_a_direct_command_and_reaps_natural_exit() {
-        let (mut run, events, output) =
-            start_pipe(SpawnCommand::new("/bin/echo").arg("hello-direct"));
-
-        let exit = run.wait().expect("direct command completed");
-        assert_eq!(exit.code, Some(0));
-
-        let chunks = drain_output(&output);
-        assert_eq!(text(&chunks, OutputStream::Stdout), "hello-direct\n");
-        assert!(chunks.iter().all(|chunk| chunk.run_id == RunId::new(77)));
-
-        let spawned = events.recv_timeout(WAIT).expect("spawn event");
-        assert_eq!(spawned.run_id, RunId::new(77));
-        assert!(matches!(spawned.kind, RunEventKind::Spawned { .. }));
-        let exited = events.recv_timeout(WAIT).expect("exit event");
-        assert_eq!(exited.kind, RunEventKind::Exited { code: Some(0) });
-
-        // The root process was reaped by wait(); cleanup stays successful.
-        run.shutdown().expect("run joined");
-    }
-
-    #[test]
-    fn pipe_mode_preserves_stream_identity_for_shell_commands() {
-        let (mut run, _events, output) = start_pipe(
-            SpawnCommand::new("/bin/sh")
-                .arg("-c")
-                .arg("printf to-out; printf to-err >&2"),
-        );
-
-        run.wait().expect("shell command completed");
-        let chunks = drain_output(&output);
-        assert!(text(&chunks, OutputStream::Stdout).contains("to-out"));
-        assert!(text(&chunks, OutputStream::Stderr).contains("to-err"));
-        assert!(!text(&chunks, OutputStream::Stdout).contains("to-err"));
-        run.shutdown().expect("run joined");
-    }
-
-    #[test]
-    fn pipe_mode_rejects_resize_without_harming_the_run() {
-        let (mut run, _events, _output) =
-            start_pipe(SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 30"));
-
-        let rejection = run.resize(TerminalGeometry::DEFAULT);
-        assert_eq!(rejection, Err(ResizeUnsupported));
-
-        // The Run is still healthy and controllable after the rejection.
-        run.shutdown().expect("run stopped after rejected resize");
-    }
-
-    #[test]
-    fn high_output_pipe_completes_and_keeps_bytes_out_of_the_event_sink() {
-        let lines = 20_000u32;
-        let (mut run, events, output) = start_pipe(
-            SpawnCommand::new("/bin/sh")
-                .arg("-c")
-                .arg(format!(
-                    "i=0; while [ \"$i\" -lt {lines} ]; do printf 'line-%06d\\n' \"$i\"; i=$((i+1)); done"
-                )),
-        );
-
-        let exit = run.wait().expect("high-output run completed");
-        assert_eq!(exit.code, Some(0));
-        thread::sleep(Duration::from_millis(50));
-        let chunks = drain_output(&output);
-        let body = text(&chunks, OutputStream::Stdout);
-        let expected_last = format!("line-{:06}", lines - 1);
-        assert!(
-            body.contains(&expected_last),
-            "final line missing from drained output"
-        );
-        assert_eq!(
-            body.lines().count(),
-            usize::try_from(lines).unwrap(),
-            "every output line must reach the high-volume path"
-        );
-
-        // Only lifecycle events may exist on the low-volume sink.
-        loop {
-            match events.try_recv() {
-                Ok(event) => assert!(matches!(
-                    event.kind,
-                    RunEventKind::Spawned { .. } | RunEventKind::Exited { .. }
-                )),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        run.shutdown().expect("run joined");
     }
 }

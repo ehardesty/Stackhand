@@ -50,7 +50,8 @@ pub(crate) struct PipeRun {
 
 impl PipeRun {
     /// Spawn one direct or shell command with piped stdout and stderr. Two
-    /// reader tasks drain both streams from spawn to EOF.
+    /// reader tasks drain both streams from spawn to EOF. The root process
+    /// becomes a process-group leader, matching PTY-mode containment.
     pub(crate) fn spawn(
         command: &crate::runtime::SpawnCommand,
         run_id: RunId,
@@ -62,6 +63,11 @@ impl PipeRun {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         let mut child = cmd
             .spawn()
@@ -100,16 +106,59 @@ impl PipeRun {
         })
     }
 
-    /// Reap the root process, then join both stream readers at EOF.
-    // Consumed by OwnedRun::wait on the natural-completion path.
-    #[allow(dead_code)]
-    pub(crate) fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        let Some(mut child) = self.child.take() else {
-            return Err(anyhow::anyhow!("pipe Run already completed"));
-        };
-        let status = child.wait()?;
+    /// Root PID of the owned pipe Run when it is not yet reaped.
+    pub(crate) fn root_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
+    }
+
+    /// Reap the root process (blocking), then join both stream readers at
+    /// EOF. Call this only after Process Tree escalation is finished: once
+    /// the root is reaped its PID can be reused, so no further group signal
+    /// may follow. Signal escalation stays with the Process Tree adapter in
+    /// the Run owner; this method only reaps and reports I/O results.
+    pub(crate) fn reap_and_join(&mut self) -> Result<Option<i32>> {
+        let mut code = None;
+        if let Some(mut child) = self.child.take() {
+            code = child.wait()?.code();
+        }
         self.join_readers();
-        Ok(status)
+        let failures = self.io_failures();
+        if failures.is_empty() {
+            Ok(code)
+        } else {
+            Err(anyhow::anyhow!("Run I/O failed: {}", failures.join("; ")))
+        }
+    }
+
+    /// Non-blocking cleanup for failed shutdown paths. Never waits: it
+    /// reaps the root only if it has already exited, detaches unfinished
+    /// reader tasks, and returns diagnostics about what could not be
+    /// confirmed.
+    pub(crate) fn abandon_nonblocking(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => notes.push("root process left unreaped".to_string()),
+                Err(error) => {
+                    notes.push(format!("root process state unobservable: {error}"));
+                }
+            }
+        }
+        for handle in self.readers.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // The reader stays alive but detached; a descendant holding
+                // the pipes keeps it from EOF. This is reported, not hidden.
+                notes.push("an output reader task did not reach EOF".to_string());
+            }
+        }
+        let failures = self.io_failures();
+        if !failures.is_empty() {
+            notes.push(format!("I/O failures: {}", failures.join("; ")));
+        }
+        notes
     }
 
     pub(crate) fn io_failures(&self) -> Vec<String> {
@@ -175,50 +224,4 @@ fn spawn_stream_reader(
             }
         })
         .expect("pipe reader thread spawns with valid configuration")
-}
-
-impl PipeRun {
-    /// Explicit stop for a still-running pipe Run: terminate, bounded wait,
-    /// then kill. Reader tasks always join so no stream stays undrained.
-    /// (The complete semantic shutdown ladder is owned by the Run owner from
-    /// ticket #16; this keeps pipe-mode cleanup correct and bounded until
-    /// then.)
-    pub(crate) fn stop_and_join(&mut self) -> anyhow::Result<()> {
-        const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
-
-        #[cfg(unix)]
-        fn send_signal(child: &Child, signal: libc::c_int) {
-            let pid = child.id() as libc::pid_t;
-            // SAFETY: signaling one owned root process; the call itself
-            // cannot fail unsafely.
-            unsafe {
-                libc::kill(pid, signal);
-            }
-        }
-
-        if let Some(child) = self.child.as_mut() {
-            #[cfg(unix)]
-            if child.try_wait()?.is_none() {
-                send_signal(child, libc::SIGTERM);
-                let deadline = std::time::Instant::now() + TERMINATE_GRACE;
-                while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            #[cfg(unix)]
-            if child.try_wait()?.is_none() {
-                send_signal(&child, libc::SIGKILL);
-            }
-            child.wait()?;
-        }
-        self.join_readers();
-        let failures = self.io_failures();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Run I/O failed: {}", failures.join("; ")))
-        }
-    }
 }

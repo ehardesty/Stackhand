@@ -1,11 +1,14 @@
 mod input_writer;
 mod pipe;
+mod process_tree;
 mod pty;
 // The Run ownership seam is the product interface for Milestone 0B. Some of
 // its public surface (resize, natural-exit waiting) is exercised through
 // callers and tests rather than this crate's non-test code yet.
 #[allow(dead_code)]
 mod run;
+#[cfg(test)]
+mod run_tests;
 #[cfg(test)]
 pub(crate) use run::handle_for_test;
 

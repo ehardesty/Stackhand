@@ -117,6 +117,19 @@ impl PtyProcess {
         self.child.as_ref().and_then(|child| child.process_id())
     }
 
+    /// Non-blocking cleanup for failed shutdown paths. Reaps the root only
+    /// when it has already exited and reports when it cannot be confirmed.
+    pub(crate) fn abandon_nonblocking(&mut self) -> Vec<String> {
+        let Some(child) = self.child.as_mut() else {
+            return Vec::new();
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => Vec::new(),
+            Ok(None) => vec!["root process left unreaped".to_string()],
+            Err(error) => vec![format!("root process state unobservable: {error}")],
+        }
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
