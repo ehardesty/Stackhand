@@ -8,9 +8,11 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -37,15 +39,140 @@ pub struct RunOutput {
 }
 
 type EventSink = Sender<RunEvent>;
-type OutputSink = Sender<RunOutput>;
+/// The caller-provided high-volume output queue is bounded. A full queue is
+/// reported and the reader continues draining the operating-system pipe so a
+/// noisy Run cannot block its own lifecycle or another Run.
+pub const OUTPUT_QUEUE_SLOTS: usize = 65_536;
+/// Maximum process-output bytes retained by one caller-provided queue.
+pub const OUTPUT_QUEUE_BYTES: usize = 16 * 1_024 * 1_024;
+const IO_FAILURE_SLOTS: usize = 64;
 
 const READ_BUFFER_BYTES: usize = 64 * 1_024;
+
+/// A bounded high-volume output sender. Byte reservations are released by
+/// [`RunOutputReceiver`] when a caller consumes a chunk, so many small writes
+/// cannot exhaust the queue's message slots while large writes still respect
+/// the same memory bound.
+#[derive(Clone)]
+pub struct RunOutputSender {
+    sender: SyncSender<RunOutput>,
+    pending_bytes: Arc<AtomicUsize>,
+}
+
+#[allow(dead_code)]
+pub struct RunOutputReceiver {
+    receiver: Receiver<RunOutput>,
+    pending_bytes: Arc<AtomicUsize>,
+}
+
+pub enum OutputSendError {
+    Full(RunOutput),
+    Disconnected,
+}
+
+pub fn output_channel() -> (RunOutputSender, RunOutputReceiver) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(OUTPUT_QUEUE_SLOTS);
+    let pending_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        RunOutputSender {
+            sender,
+            pending_bytes: Arc::clone(&pending_bytes),
+        },
+        RunOutputReceiver {
+            receiver,
+            pending_bytes,
+        },
+    )
+}
+
+impl RunOutputSender {
+    pub(crate) fn try_send(&self, chunk: RunOutput) -> Result<(), OutputSendError> {
+        let amount = chunk.data.len();
+        let mut current = self.pending_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return Err(OutputSendError::Full(chunk));
+            };
+            if next > OUTPUT_QUEUE_BYTES {
+                return Err(OutputSendError::Full(chunk));
+            }
+            match self.pending_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        match self.sender.try_send(chunk) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(chunk)) => {
+                self.pending_bytes.fetch_sub(amount, Ordering::AcqRel);
+                Err(OutputSendError::Full(chunk))
+            }
+            Err(TrySendError::Disconnected(_chunk)) => {
+                self.pending_bytes.fetch_sub(amount, Ordering::AcqRel);
+                Err(OutputSendError::Disconnected)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl RunOutputReceiver {
+    pub fn try_recv(&self) -> Result<RunOutput, TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(chunk) => {
+                self.pending_bytes
+                    .fetch_sub(chunk.data.len(), Ordering::AcqRel);
+                Ok(chunk)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<RunOutput, RecvTimeoutError> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(chunk) => {
+                self.pending_bytes
+                    .fetch_sub(chunk.data.len(), Ordering::AcqRel);
+                Ok(chunk)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+type OutputSink = RunOutputSender;
+
+fn record_io_failure(failures: &Mutex<Vec<String>>, detail: String) -> bool {
+    let mut failures = failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first = failures.is_empty();
+    if failures.len() < IO_FAILURE_SLOTS {
+        failures.push(detail);
+    } else if failures.len() == IO_FAILURE_SLOTS {
+        failures.push("additional pipe I/O diagnostics were suppressed".to_string());
+    }
+    first
+}
 
 /// The owned pipe-mode process and its reader tasks.
 pub(crate) struct PipeRun {
     child: Option<Child>,
     readers: Vec<JoinHandle<()>>,
     io_failures: Arc<Mutex<Vec<String>>>,
+}
+
+pub(crate) struct PipeFinalize {
+    pub exit_code: Option<i32>,
+    pub root_reaped: bool,
+    pub readers_joined: bool,
+    pub io_failures: Vec<String>,
+    pub worker_failures: Vec<String>,
 }
 
 impl PipeRun {
@@ -111,22 +238,61 @@ impl PipeRun {
         self.child.as_ref().map(|child| child.id())
     }
 
-    /// Reap the root process (blocking), then join both stream readers at
-    /// EOF. Call this only after Process Tree escalation is finished: once
-    /// the root is reaped its PID can be reused, so no further group signal
-    /// may follow. Signal escalation stays with the Process Tree adapter in
-    /// the Run owner; this method only reaps and reports I/O results.
-    pub(crate) fn reap_and_join(&mut self) -> Result<Option<i32>> {
-        let mut code = None;
-        if let Some(mut child) = self.child.take() {
-            code = child.wait()?.code();
+    /// Reap and join only while the caller's deadline remains. A reader can
+    /// remain blocked when a descendant holds an inherited pipe open; after
+    /// the deadline its JoinHandle is detached and the failure is retained.
+    pub(crate) fn finalize_bounded(&mut self, deadline: Instant) -> PipeFinalize {
+        let mut exit_code = None;
+        let mut root_reaped = self.child.is_none();
+        let mut worker_failures = Vec::new();
+
+        while let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_code = status.code();
+                    let _ = self.child.take();
+                    root_reaped = true;
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(None) => {
+                    worker_failures
+                        .push("root process was not reaped before the final deadline".to_string());
+                    break;
+                }
+                Err(error) => {
+                    worker_failures.push(format!("root process state was not observable: {error}"));
+                    break;
+                }
+            }
         }
-        self.join_readers();
-        let failures = self.io_failures();
-        if failures.is_empty() {
-            Ok(code)
-        } else {
-            Err(anyhow::anyhow!("Run I/O failed: {}", failures.join("; ")))
+
+        let mut readers_joined = true;
+        for handle in self.readers.drain(..) {
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    worker_failures.push("pipe reader task panicked".to_string());
+                }
+            } else {
+                readers_joined = false;
+                worker_failures
+                    .push("pipe reader did not reach EOF before the final deadline".to_string());
+                // Dropping the handle deliberately detaches a reader whose
+                // inherited pipe endpoint remains owned by a survivor.
+            }
+        }
+
+        PipeFinalize {
+            exit_code,
+            root_reaped,
+            readers_joined,
+            io_failures: self.io_failures(),
+            worker_failures,
         }
     }
 
@@ -161,17 +327,36 @@ impl PipeRun {
         notes
     }
 
+    /// Detach without polling or reaping the root. Use this when Process
+    /// Tree containment or output EOF is still unconfirmed; later PID reuse
+    /// must not follow an incomplete cleanup decision.
+    pub(crate) fn abandon_without_reap(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.child.take().is_some() {
+            notes.push(
+                "root process detached without reaping because containment was unconfirmed"
+                    .to_string(),
+            );
+        }
+        for handle in self.readers.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                notes.push("an output reader task did not reach EOF".to_string());
+            }
+        }
+        let failures = self.io_failures();
+        if !failures.is_empty() {
+            notes.push(format!("I/O failures: {}", failures.join("; ")));
+        }
+        notes
+    }
+
     pub(crate) fn io_failures(&self) -> Vec<String> {
         self.io_failures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-    }
-
-    pub(crate) fn join_readers(&mut self) {
-        for handle in self.readers.drain(..) {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -193,31 +378,60 @@ fn spawn_stream_reader(
         .name(name.to_string())
         .spawn(move || {
             let mut buffer = vec![0u8; READ_BUFFER_BYTES];
+            let emit = |data: Vec<u8>| -> bool {
+                let chunk = RunOutput {
+                    run_id,
+                    stream: stream_kind,
+                    data,
+                };
+                match output.try_send(chunk) {
+                    Ok(()) => true,
+                    Err(OutputSendError::Full(chunk)) => {
+                        let detail = format!(
+                            "{stream_kind:?} output sink is full; dropped {} bytes",
+                            chunk.data.len()
+                        );
+                        if record_io_failure(&io_failures, detail.clone()) {
+                            let _ = events.send(RunEvent {
+                                run_id,
+                                kind: RunEventKind::IoFailed(detail),
+                            });
+                        }
+                        true
+                    }
+                    Err(OutputSendError::Disconnected) => {
+                        let detail = format!(
+                            "{stream_kind:?} output sink was closed; remaining bytes were not retained"
+                        );
+                        if record_io_failure(&io_failures, detail.clone()) {
+                            let _ = events.send(RunEvent {
+                                run_id,
+                                kind: RunEventKind::IoFailed(detail),
+                            });
+                        }
+                        false
+                    }
+                }
+            };
             loop {
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let chunk = RunOutput {
-                            run_id,
-                            stream: stream_kind,
-                            data: buffer[..count].to_vec(),
-                        };
-                        if output.send(chunk).is_err() {
-                            break;
+                        if !emit(buffer[..count].to_vec()) {
+                            return;
                         }
                     }
                     Err(error) => {
                         let detail = format!("{stream_kind:?} read failed: {error}");
-                        io_failures
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .push(detail.clone());
+                        let should_emit = record_io_failure(&io_failures, detail.clone());
                         // I/O failure reaches callers only through the
                         // low-volume path; it carries no output bytes.
-                        let _ = events.send(RunEvent {
-                            run_id,
-                            kind: RunEventKind::IoFailed(detail),
-                        });
+                        if should_emit {
+                            let _ = events.send(RunEvent {
+                                run_id,
+                                kind: RunEventKind::IoFailed(detail),
+                            });
+                        }
                         break;
                     }
                 }

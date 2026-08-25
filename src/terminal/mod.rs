@@ -15,6 +15,6 @@ pub(crate) use history::{OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS};
 pub(crate) use mouse::{MouseButton, MouseKind, MouseModifiers, TerminalMouseEvent};
 pub(crate) use paste::{PASTE_LIMIT_BYTES, PasteCompletion, PasteRejection, PasteRequest};
 pub(crate) use session::{
-    CopyRequest, CursorShape, OwnedCursorState, OwnedTerminalSnapshot, SCROLLBACK_TARGET_BYTES,
-    SelectionPoint, TerminalEvent, TerminalSession,
+    CopyRequest, CursorShape, InputRejection, OwnedCursorState, OwnedTerminalSnapshot,
+    SCROLLBACK_TARGET_BYTES, SelectionPoint, TerminalEvent, TerminalSession,
 };

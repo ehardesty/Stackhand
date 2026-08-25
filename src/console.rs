@@ -71,7 +71,7 @@ impl ConsoleInteraction {
 
         if key.kind != KeyEventKind::Press {
             if self.view.mode == ConsoleViewMode::ChildInput {
-                let _ = session.send_key(key);
+                return self.record_input_result(session.send_key(key));
             }
             return false;
         }
@@ -81,10 +81,7 @@ impl ConsoleInteraction {
                 self.view.mode = ConsoleViewMode::AppCommand;
                 true
             }
-            ConsoleViewMode::ChildInput => {
-                let _ = session.send_key(key);
-                false
-            }
+            ConsoleViewMode::ChildInput => self.record_input_result(session.send_key(key)),
             ConsoleViewMode::AppCommand => self.handle_app_command(key, session, page_rows),
             ConsoleViewMode::Scroll => self.handle_scroll_command(key, session, page_rows),
             ConsoleViewMode::Selection => self.handle_selection_command(key, session),
@@ -121,8 +118,19 @@ impl ConsoleInteraction {
         if route.changes_history_view {
             self.view.following = false;
         }
-        let _ = session.send_mouse(route.event);
+        if self.record_input_result(session.send_mouse(route.event)) {
+            self.view.stackhand_mouse_gesture = false;
+        }
         true
+    }
+
+    fn record_input_result(&mut self, result: Result<(), crate::runtime::InputRejected>) -> bool {
+        if result.is_err() {
+            self.view.warning = Some(ConsoleWarning::InputRejected);
+            true
+        } else {
+            false
+        }
     }
 
     fn poll_paste_requests(&mut self) -> bool {

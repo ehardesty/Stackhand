@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use crate::geometry::TerminalGeometry;
 use anyhow::{Context, Result};
@@ -74,6 +75,32 @@ impl PtyProcess {
         Ok(status.map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX)))
     }
 
+    /// Reap only after the caller has observed root exit without reaping and
+    /// Process Tree work is complete. The poll is bounded and never calls the
+    /// blocking child wait when the deadline has passed.
+    pub(crate) fn reap_bounded(&mut self, deadline: Instant) -> Result<Option<i32>> {
+        loop {
+            let Some(child) = self.child.as_mut() else {
+                return Ok(None);
+            };
+            match child.try_wait()? {
+                Some(status) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
+                    let _ = self.child.take();
+                    return Ok(Some(code));
+                }
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "root process was not reaped before the final deadline"
+                    ));
+                }
+            }
+        }
+    }
+
     pub fn spawn(command: SpawnCommand, geometry: TerminalGeometry) -> Result<SpawnedPty> {
         let pair = native_pty_system()
             .openpty(pty_size(geometry))
@@ -130,16 +157,29 @@ impl PtyProcess {
         }
     }
 
-    pub fn shutdown(&mut self) -> Result<()> {
+    /// Detach the root without probing or reaping it. This is required when
+    /// Process Tree containment is not confirmed before a final deadline.
+    pub(crate) fn abandon_without_reap(&mut self) -> Vec<String> {
+        if self.child.take().is_some() {
+            vec![
+                "root process detached without reaping because containment was unconfirmed"
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn shutdown(&mut self) -> Result<Option<i32>> {
         let Some(mut child) = self.child.take() else {
-            return Ok(());
+            return Ok(None);
         };
 
         if child.try_wait()?.is_none() {
             child.kill().context("could not stop the shell")?;
         }
-        child.wait().context("could not wait for the shell")?;
-        Ok(())
+        let status = child.wait().context("could not wait for the shell")?;
+        Ok(Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)))
     }
 }
 

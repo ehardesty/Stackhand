@@ -28,7 +28,7 @@ mod pty_seam_tests {
                     initial_geometry: TerminalGeometry::DEFAULT,
                 },
                 events,
-                output: mpsc::channel().0,
+                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
@@ -59,7 +59,7 @@ mod pty_seam_tests {
                     initial_geometry: TerminalGeometry::DEFAULT,
                 },
                 events: mpsc::channel().0,
-                output: mpsc::channel().0,
+                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
@@ -129,9 +129,9 @@ mod pipe_tests {
 
     const WAIT: Duration = Duration::from_secs(10);
 
-    fn start_pipe(command: SpawnCommand) -> (OwnedRun, Receiver<RunEvent>, Receiver<RunOutput>) {
+    fn start_pipe(command: SpawnCommand) -> (OwnedRun, Receiver<RunEvent>, RunOutputReceiver) {
         let (events, event_receiver) = mpsc::channel();
-        let (output, output_receiver) = mpsc::channel();
+        let (output, output_receiver) = output_channel();
         let run = RunRuntime
             .start(RunStartRequest {
                 process_id: ProcessId::new(11),
@@ -148,7 +148,7 @@ mod pipe_tests {
         (run, event_receiver, output_receiver)
     }
 
-    fn drain_output(receiver: &Receiver<RunOutput>) -> Vec<RunOutput> {
+    fn drain_output(receiver: &RunOutputReceiver) -> Vec<RunOutput> {
         let mut chunks = Vec::new();
         while let Ok(chunk) = receiver.try_recv() {
             chunks.push(chunk);
@@ -236,7 +236,10 @@ mod pipe_tests {
         let expected_last = format!("line-{:06}", lines - 1);
         assert!(
             body.contains(&expected_last),
-            "final line missing from drained output"
+            "final line missing from drained output: bytes={}, lines={}, chunks={}, outcome={exit:?}",
+            body.len(),
+            body.lines().count(),
+            chunks.len(),
         );
         assert_eq!(
             body.lines().count(),
@@ -249,7 +252,9 @@ mod pipe_tests {
             match events.try_recv() {
                 Ok(event) => assert!(matches!(
                     event.kind,
-                    RunEventKind::Spawned { .. } | RunEventKind::Exited { .. }
+                    RunEventKind::Spawned { .. }
+                        | RunEventKind::Exited { .. }
+                        | RunEventKind::ShutdownComplete
                 )),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
@@ -274,13 +279,13 @@ mod process_tree_tests {
         run: OwnedRun,
         #[allow(dead_code)] // kept for symmetry with other fixtures; read by callers as needed
         events: Receiver<RunEvent>,
-        output: Receiver<crate::runtime::pipe::RunOutput>,
+        output: RunOutputReceiver,
         root_pid: u32,
     }
 
     fn start_pipe(command: SpawnCommand) -> StartedRun {
         let (events, event_receiver) = mpsc::channel();
-        let (output, output_receiver) = mpsc::channel();
+        let (output, output_receiver) = output_channel();
         let run = RunRuntime
             .start(RunStartRequest {
                 process_id: ProcessId::new(21),
@@ -527,6 +532,57 @@ wait";
         started.run.terminate().expect("idempotent terminate");
         started.run.kill().expect("idempotent kill");
         started.run.shutdown().expect("cleanup");
+
+        // A prior ownership failure closes the signal gate. Shutdown must
+        // retain that failure and finalize without running the ladder again.
+        let mut latched = start_pipe(SpawnCommand::new("/bin/sh").arg("-c").arg("true"));
+        let latched_root = latched.root_pid;
+        let deadline = Instant::now() + WAIT;
+        while !UnixProcessTree::root_exit_pending(latched_root) {
+            assert!(Instant::now() < deadline, "latched fixture did not exit");
+            thread::sleep(Duration::from_millis(2));
+        }
+        latched
+            .run
+            .mark_signal_failure_for_test("prior Process Group ownership failure");
+        let outcome = latched.run.shutdown().expect("latched cleanup completed");
+        assert!(
+            outcome
+                .stage_results
+                .iter()
+                .any(|stage| stage.stage == "signal" && !stage.ok),
+            "retained signal failure missing: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .stage_results
+                .iter()
+                .all(|stage| !matches!(stage.stage, "interrupt" | "terminate" | "kill")),
+            "shutdown reran a signal stage: {outcome:?}"
+        );
+
+        // Drop observes the same latch and reports that it skipped numeric
+        // Process Group signaling instead of attempting another kill.
+        let dropped = start_pipe(SpawnCommand::new("/bin/sh").arg("-c").arg("true"));
+        let dropped_root = dropped.root_pid;
+        let deadline = Instant::now() + WAIT;
+        while !UnixProcessTree::root_exit_pending(dropped_root) {
+            assert!(Instant::now() < deadline, "drop fixture did not exit");
+            thread::sleep(Duration::from_millis(2));
+        }
+        dropped
+            .run
+            .mark_signal_failure_for_test("prior Process Group ownership failure");
+        drop(dropped.run);
+        let diagnostics: Vec<_> = dropped.events.try_iter().collect();
+        assert!(
+            diagnostics.iter().any(|event| matches!(
+                &event.kind,
+                RunEventKind::Failed(detail)
+                    if detail.contains("skipped Process Tree signaling")
+            )),
+            "drop latch diagnostic missing: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -542,7 +598,7 @@ wait";
                     initial_geometry: geometry,
                 },
                 events,
-                output: mpsc::channel().0,
+                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,

@@ -25,13 +25,13 @@ fn quick_ladder(graceful_ms: u64, terminate_ms: u64) -> ShutdownLadder {
 
 struct StartedRun {
     run: OwnedRun,
-    output: mpsc::Receiver<crate::runtime::pipe::RunOutput>,
+    output: RunOutputReceiver,
     root_pid: u32,
 }
 
 fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> StartedRun {
     let (events, _event_log) = mpsc::channel();
-    let (output, output_receiver) = mpsc::channel();
+    let (output, output_receiver) = output_channel();
     let run = RunRuntime
         .start(RunStartRequest {
             process_id: ProcessId::new(31),
@@ -220,7 +220,7 @@ fn input_and_resize_are_rejected_after_shutdown_starts() {
                 initial_geometry: geometry,
             },
             events,
-            output: mpsc::channel().0,
+            output: output_channel().0,
             ladder: quick_ladder(100, 100),
             metrics_interval: None,
             on_output_wake: None,

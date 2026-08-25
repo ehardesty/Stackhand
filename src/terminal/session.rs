@@ -8,7 +8,7 @@ use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
 
-use super::command_gate::{CommandEvent, CommandGate, TerminalCommand};
+use super::command_gate::{CommandEvent, CommandGate, CommandRejection, TerminalCommand};
 use super::history::OutputHistoryMetrics;
 use super::mouse::TerminalMouseEvent;
 use super::owner::{OwnerEvent, OwnerHandle};
@@ -54,6 +54,33 @@ pub enum TerminalEvent {
     },
     OutputTruncated,
     StateChanged,
+}
+
+/// Why an interactive input item was not admitted. The caller receives this
+/// result immediately; no key, focus, mouse, or raw item is silently dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputRejection {
+    /// The command owner is stopping or has already stopped.
+    Stopping,
+    /// The bounded command queue cannot admit the complete item.
+    Backpressure {
+        attempted_bytes: usize,
+        pending_bytes: usize,
+        limit_bytes: usize,
+    },
+}
+
+impl From<CommandRejection> for InputRejection {
+    fn from(rejection: CommandRejection) -> Self {
+        match rejection {
+            CommandRejection::Stopping => Self::Stopping,
+            CommandRejection::Backpressure(error) => Self::Backpressure {
+                attempted_bytes: error.attempted_bytes,
+                pending_bytes: error.pending_bytes,
+                limit_bytes: error.limit_bytes,
+            },
+        }
+    }
 }
 
 impl OwnedTerminalSnapshot {
@@ -121,20 +148,28 @@ impl TerminalSession {
         })
     }
 
-    pub fn send_key(&self, event: KeyEvent) {
-        let _ = self.commands.try_send(TerminalCommand::Key(event));
+    pub fn send_key(&self, event: KeyEvent) -> Result<(), InputRejection> {
+        self.commands
+            .try_send(TerminalCommand::Key(event))
+            .map_err(Into::into)
     }
 
-    pub fn send_focus(&self, gained: bool) {
-        let _ = self.commands.try_send(TerminalCommand::Focus(gained));
+    pub fn send_focus(&self, gained: bool) -> Result<(), InputRejection> {
+        self.commands
+            .try_send(TerminalCommand::Focus(gained))
+            .map_err(Into::into)
     }
 
-    pub fn send_mouse(&self, event: TerminalMouseEvent) {
-        let _ = self.commands.try_send(TerminalCommand::Mouse(event));
+    pub fn send_mouse(&self, event: TerminalMouseEvent) -> Result<(), InputRejection> {
+        self.commands
+            .try_send(TerminalCommand::Mouse(event))
+            .map_err(Into::into)
     }
 
-    pub fn send_raw(&self, data: Vec<u8>) {
-        let _ = self.commands.try_send(TerminalCommand::Raw(data));
+    pub fn send_raw(&self, data: Vec<u8>) -> Result<(), InputRejection> {
+        self.commands
+            .try_send(TerminalCommand::Raw(data))
+            .map_err(Into::into)
     }
 
     /// Admit one whole paste to the bounded terminal owner.
@@ -146,21 +181,27 @@ impl TerminalSession {
         paste::validate(data)?;
         let request_id = self.next_paste_request_id.fetch_add(1, Ordering::Relaxed);
         let (completion_tx, completion_rx) = mpsc::channel();
-        self.commands
-            .try_send(TerminalCommand::Paste {
-                data: data.as_bytes().to_vec(),
-                completion: completion_tx,
-            })
-            .map_err(|error| PasteRejection::Busy {
-                attempted_bytes: error.attempted_bytes,
-                pending_bytes: error.pending_bytes,
-                limit_bytes: error.limit_bytes,
-            })?;
+        match self.commands.try_send(TerminalCommand::Paste {
+            data: data.as_bytes().to_vec(),
+            completion: completion_tx,
+        }) {
+            Ok(()) => {}
+            Err(CommandRejection::Stopping) => return Err(PasteRejection::Stopping),
+            Err(CommandRejection::Backpressure(error)) => {
+                return Err(PasteRejection::Busy {
+                    attempted_bytes: error.attempted_bytes,
+                    pending_bytes: error.pending_bytes,
+                    limit_bytes: error.limit_bytes,
+                });
+            }
+        }
         Ok(PasteRequest::new(request_id, completion_rx))
     }
 
-    pub fn resize(&self, geometry: TerminalGeometry) {
-        let _ = self.commands.try_send(TerminalCommand::Resize(geometry));
+    pub fn resize(&self, geometry: TerminalGeometry) -> Result<(), InputRejection> {
+        self.commands
+            .try_send(TerminalCommand::Resize(geometry))
+            .map_err(Into::into)
     }
 
     pub fn scroll_lines(&self, delta: isize) {
@@ -248,6 +289,13 @@ impl TerminalSession {
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        self.shutdown_until(Instant::now() + SESSION_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Stop the terminal owner and writer within an absolute deadline. A
+    /// blocked PTY reader or writer is detached after the deadline and the
+    /// returned error lets the Run outcome report the unconfirmed worker.
+    pub fn shutdown_until(&self, deadline: Instant) -> Result<()> {
         let mut complete = self
             .shutdown_complete
             .lock()
@@ -257,19 +305,54 @@ impl TerminalSession {
         }
         self.commands.close();
         self.owner.request_shutdown();
-        let deadline = Instant::now() + SESSION_SHUTDOWN_TIMEOUT;
         while self.owner.is_alive() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         if self.owner.is_alive() {
-            bail!("terminal owner did not stop within two seconds");
+            let owner_joined = self.owner.abandon_nonblocking();
+            let writer_joined = self.writer.abandon_nonblocking();
+            *complete = true;
+            bail!(
+                "terminal workers did not stop before the deadline (owner_joined={owner_joined}, writer_joined={writer_joined})"
+            );
         }
-        self.owner.join()?;
-        self.writer
-            .join()
-            .context("could not stop the PTY writer")?;
+        if !self
+            .owner
+            .join_until(deadline)
+            .context("could not stop the terminal owner")?
+        {
+            *complete = true;
+            bail!("terminal owner did not join before the deadline");
+        }
+        if !self
+            .writer
+            .join_until(deadline)
+            .context("could not stop the PTY writer")?
+        {
+            *complete = true;
+            bail!("PTY writer did not join before the deadline");
+        }
         *complete = true;
         Ok(())
+    }
+
+    /// Close admission and detach terminal workers without waiting. This is
+    /// used only after a Run's final deadline when a survivor may still own
+    /// the PTY. The caller reports the returned worker state in its outcome.
+    pub fn abandon_nonblocking(&self) -> (bool, bool) {
+        let mut complete = self
+            .shutdown_complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *complete {
+            return (true, true);
+        }
+        self.commands.close();
+        self.owner.request_shutdown();
+        let owner_joined = self.owner.abandon_nonblocking();
+        let writer_joined = self.writer.abandon_nonblocking();
+        *complete = true;
+        (owner_joined, writer_joined)
     }
 }
 
@@ -285,9 +368,12 @@ fn bounded_scroll_delta(delta: isize) -> isize {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use super::super::paste::PasteCompletion;
     use super::*;
 
     #[test]
@@ -306,7 +392,7 @@ mod tests {
             resizer: Box::new(|_, _| Err("fixture resize failure".into())),
         };
         let session = TerminalSession::spawn(io, TerminalGeometry::DEFAULT, || {}).unwrap();
-        session.resize(TerminalGeometry::new(42, 12).unwrap());
+        let _ = session.resize(TerminalGeometry::new(42, 12).unwrap());
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut failure = None;
@@ -358,5 +444,119 @@ mod tests {
         assert_eq!(history.chunks, super::super::OUTPUT_HISTORY_CHUNKS);
         assert_eq!(history.bytes, super::super::OUTPUT_HISTORY_CHUNKS);
         assert_eq!(history.evicted_bytes, 1);
+    }
+
+    struct ActiveOutputReader {
+        chunk: Vec<u8>,
+        stop: Arc<AtomicBool>,
+        produced: Arc<AtomicUsize>,
+    }
+
+    impl Read for ActiveOutputReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+
+            let amount = buffer.len().min(self.chunk.len());
+            buffer[..amount].copy_from_slice(&self.chunk[..amount]);
+            self.produced.fetch_add(amount, Ordering::Release);
+            Ok(amount)
+        }
+    }
+
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn active_output_does_not_delay_an_admitted_terminal_command() {
+        const ACTIVE_OUTPUT_BYTES: usize = 550 * 1_024;
+        const COMMAND_LATENCY_BOUND: Duration = Duration::from_secs(1);
+
+        let mut chunk = vec![0; 4_096];
+        let line = b"active-output-line-0123456789\r\n";
+        for (index, byte) in chunk.iter_mut().enumerate() {
+            *byte = line[index % line.len()];
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let produced = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let io = PtyIo {
+            reader: Box::new(ActiveOutputReader {
+                chunk,
+                stop: Arc::clone(&stop),
+                produced: Arc::clone(&produced),
+            }),
+            writer: Box::new(RecordingWriter {
+                bytes: Arc::clone(&captured),
+            }),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let session = TerminalSession::spawn(io, TerminalGeometry::DEFAULT, || {}).unwrap();
+
+        let produced_deadline = Instant::now() + Duration::from_secs(10);
+        while produced.load(Ordering::Acquire) < ACTIVE_OUTPUT_BYTES {
+            while let Some(event) = session.poll_event() {
+                if let TerminalEvent::Failed(error) = event {
+                    panic!("terminal owner failed during the output burst: {error}");
+                }
+            }
+            assert!(
+                Instant::now() < produced_deadline,
+                "active output fixture did not produce its initial burst"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let output_before_command = {
+            let metrics = session.output_history_metrics();
+            metrics.bytes.saturating_add(metrics.evicted_bytes)
+        };
+        let command_started = Instant::now();
+        let mut request = session.send_paste("fairness-sentinel").unwrap();
+        let completion_deadline = command_started + COMMAND_LATENCY_BOUND;
+        let completion = loop {
+            if let Some(completion) = request.poll() {
+                break completion;
+            }
+            let elapsed = command_started.elapsed();
+            assert!(
+                Instant::now() < completion_deadline,
+                "accepted terminal command exceeded {COMMAND_LATENCY_BOUND:?} while output was active (elapsed {elapsed:?})"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(completion, PasteCompletion::Delivered);
+        let output_after_command = {
+            let metrics = session.output_history_metrics();
+            metrics.bytes.saturating_add(metrics.evicted_bytes)
+        };
+        assert!(
+            output_after_command > output_before_command,
+            "output parsing did not progress while the command was pending"
+        );
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .windows(b"fairness-sentinel".len())
+                .any(|window| window == b"fairness-sentinel"),
+            "accepted terminal command was not delivered to the PTY writer"
+        );
+
+        stop.store(true, Ordering::Release);
+        session.shutdown().unwrap();
     }
 }

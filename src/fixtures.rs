@@ -19,11 +19,14 @@ use crate::terminal::{
 
 static FIXTURE_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Start one fixture Run through the same public seam that the application
-/// and a future Supervisor use.
-fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Result<OwnedRun> {
+/// Start one PTY fixture Run through the same seam that the application uses.
+pub(crate) fn start_fixture_run(
+    command: SpawnCommand,
+    geometry: TerminalGeometry,
+    on_output_wake: Option<Box<dyn Fn() + Send + 'static>>,
+) -> Result<OwnedRun> {
     let (events, _run_event_log) = mpsc::channel();
-    let (output, _output_log) = mpsc::channel();
+    let (output, _output_log) = crate::runtime::output_channel();
     let run_id = FIXTURE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     RunRuntime.start(RunStartRequest {
         process_id: ProcessId::new(u32::try_from(run_id).expect("fixture run id fits u32")),
@@ -36,7 +39,7 @@ fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Resul
         output,
         ladder: Default::default(),
         metrics_interval: None,
-        on_output_wake: None,
+        on_output_wake,
     })
 }
 
@@ -51,7 +54,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
         "printf 'fixture-ready\\r\\n'; IFS= read -r line; printf 'fixture-echo:%s\\r\\n' \"$line\"; set -- $(stty size); printf 'fixture-size:%sx%s\\r\\n' \"$2\" \"$1\"",
     );
-    let mut run = start_fixture_run(command, geometry)?;
+    let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
 
     let resized_geometry =
@@ -95,7 +98,7 @@ pub fn run_fixture_input() -> Result<()> {
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
         "stty raw -echo; printf '\\033[?1linput-normal-ready\\r\\n'; IFS= read -r normal; normal_hex=$(printf '%s' \"$normal\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nnormal-bytes:%s\\r\\n' \"$normal_hex\"; printf '\\033[?1h\\033[?1004h\\033[?1036h\\033[6ninput-ready\\r\\n'; IFS= read -r bytes; hex=$(printf '%s' \"$bytes\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\ninput-bytes:%s\\r\\n' \"$hex\"",
     );
-    let mut run = start_fixture_run(command, geometry)?;
+    let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
@@ -138,7 +141,7 @@ safe=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
 printf 'safe-bytes:%s\r\n' "$safe"
 sleep 3"#,
     );
-    let mut run = start_fixture_run(command, geometry)?;
+    let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
 
     let fixture_result = (|| {
@@ -328,11 +331,11 @@ IFS= read -r _
 printf '\033[2J\033[Habcdefghijklmno'
 IFS= read -r _"#,
     );
-    let mut run = start_fixture_run(command, geometry)?;
+    let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
 
     let fixture_result = (|| {
-        let primary = wait_for_snapshot(&session, |snapshot| {
+        let primary = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.buffer[(0, 0)].symbol() == "R"
                 && snapshot
                     .cursor
@@ -341,7 +344,7 @@ IFS= read -r _"#,
         assert_primary_render(&primary)?;
 
         send_fixture_enter(&session);
-        let alternate = wait_for_snapshot(&session, |snapshot| {
+        let alternate = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.buffer[(0, 0)].symbol() == "A" && snapshot.cursor.is_none()
         })?;
         ensure!(
@@ -350,7 +353,7 @@ IFS= read -r _"#,
         );
 
         send_fixture_enter(&session);
-        let restored = wait_for_snapshot(&session, |snapshot| {
+        let restored = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.buffer[(0, 0)].symbol() == "R" && snapshot.cursor.is_some()
         })?;
         ensure!(
@@ -359,7 +362,7 @@ IFS= read -r _"#,
         );
 
         send_fixture_enter(&session);
-        let unwrapped = wait_for_snapshot(&session, |snapshot| {
+        let unwrapped = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.text().starts_with("abcdefghijklmno")
         })?;
         ensure!(
@@ -369,7 +372,7 @@ IFS= read -r _"#,
 
         let narrow = TerminalGeometry::new(8, 6).expect("fixture geometry is non-zero");
         let _ = session.resize(narrow);
-        let reflowed = wait_for_snapshot(&session, |snapshot| {
+        let reflowed = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.buffer.area().width == 8
                 && snapshot.buffer[(0, 0)].symbol() == "a"
                 && snapshot.buffer[(0, 1)].symbol() == "i"
@@ -383,7 +386,7 @@ IFS= read -r _"#,
         for (cols, rows) in [(2, 1), (120, 40), (7, 5)] {
             let _ = session.resize(TerminalGeometry::new(cols, rows).unwrap());
         }
-        let final_snapshot = wait_for_snapshot(&session, |snapshot| {
+        let final_snapshot = wait_for_snapshot(&session, "render", |snapshot| {
             snapshot.buffer.area().width == 7 && snapshot.buffer.area().height == 5
         })?;
         ensure!(
@@ -451,13 +454,25 @@ fn send_fixture_enter(session: &TerminalHandle<'_>) {
     let _ = session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 }
 
-fn wait_for_snapshot(
+pub(crate) fn wait_for_snapshot(
     session: &TerminalHandle<'_>,
+    fixture: &str,
     ready: impl Fn(&OwnedTerminalSnapshot) -> bool,
 ) -> Result<OwnedTerminalSnapshot> {
     let deadline = Instant::now() + FIXTURE_TIMEOUT;
     let mut snapshot = session.snapshot();
     while Instant::now() < deadline {
+        while let Some(event) = session.poll_event() {
+            match event {
+                TerminalEvent::Failed(error) => bail!("terminal owner failed: {error}"),
+                TerminalEvent::InputBackpressure { .. } => {
+                    bail!("{fixture} fixture filled the child-input queue")
+                }
+                TerminalEvent::Exited
+                | TerminalEvent::StateChanged
+                | TerminalEvent::OutputTruncated => {}
+            }
+        }
         if session.is_dirty() {
             snapshot = session.snapshot();
         }
@@ -467,7 +482,7 @@ fn wait_for_snapshot(
         thread::sleep(Duration::from_millis(5));
     }
     bail!(
-        "render fixture timed out; terminal contained: {:?}",
+        "{fixture} fixture timed out; terminal contained: {:?}",
         snapshot.text()
     )
 }

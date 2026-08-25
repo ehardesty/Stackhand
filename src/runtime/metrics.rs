@@ -107,7 +107,17 @@ impl MetricsSampler {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    std::thread::sleep(interval);
+                    // Poll in short slices so a large configured interval
+                    // cannot make Run finalization wait for a whole sleep.
+                    let sleep_deadline = std::time::Instant::now() + interval;
+                    while std::time::Instant::now() < sleep_deadline {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10).min(
+                            sleep_deadline.saturating_duration_since(std::time::Instant::now()),
+                        ));
+                    }
                     // Check the gate again after sleeping so a stop during
                     // the sleep never produces a late sample.
                     if stop.load(Ordering::Acquire) {

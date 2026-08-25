@@ -65,6 +65,15 @@ pub enum CommandEvent {
     Failed(String),
 }
 
+/// Why a command was not admitted to the terminal owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandRejection {
+    /// The terminal owner is stopping or has already stopped.
+    Stopping,
+    /// The bounded command queue cannot admit this complete command.
+    Backpressure(CommandBackpressure),
+}
+
 #[derive(Default)]
 struct CommandStatus {
     events: Mutex<VecDeque<CommandEvent>>,
@@ -124,7 +133,7 @@ impl CommandGate {
         )
     }
 
-    pub fn try_send(&self, command: TerminalCommand) -> Result<(), CommandBackpressure> {
+    pub fn try_send(&self, command: TerminalCommand) -> Result<(), CommandRejection> {
         let attempted_bytes = command.estimated_bytes();
         let reservation =
             reserve_bytes(&self.pending_bytes, attempted_bytes).map_err(|pending| {
@@ -134,7 +143,7 @@ impl CommandGate {
                     limit_bytes: COMMAND_QUEUE_BYTES,
                 };
                 self.status.record(CommandEvent::Backpressure(error));
-                error
+                CommandRejection::Backpressure(error)
             })?;
 
         let result = self
@@ -154,7 +163,7 @@ impl CommandGate {
                     limit_bytes: COMMAND_QUEUE_BYTES,
                 };
                 self.status.record(CommandEvent::Backpressure(error));
-                Err(error)
+                Err(CommandRejection::Backpressure(error))
             }
             Some(Err(TrySendError::Disconnected(command))) => {
                 self.pending_bytes
@@ -162,11 +171,7 @@ impl CommandGate {
                 self.status.record(CommandEvent::Failed(
                     "terminal command owner is not available".to_string(),
                 ));
-                Err(CommandBackpressure {
-                    attempted_bytes,
-                    pending_bytes: reservation,
-                    limit_bytes: COMMAND_QUEUE_BYTES,
-                })
+                Err(CommandRejection::Stopping)
             }
             None => {
                 self.pending_bytes
@@ -174,11 +179,7 @@ impl CommandGate {
                 self.status.record(CommandEvent::Failed(
                     "terminal command gate is shut down".to_string(),
                 ));
-                Err(CommandBackpressure {
-                    attempted_bytes,
-                    pending_bytes: reservation,
-                    limit_bytes: COMMAND_QUEUE_BYTES,
-                })
+                Err(CommandRejection::Stopping)
             }
         }
     }

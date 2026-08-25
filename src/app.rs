@@ -21,7 +21,7 @@ pub fn run_interactive() -> Result<()> {
     let size = outer.terminal_mut().size()?;
     let geometry = TerminalGeometry::from_pane(console_area(size.into()));
     let (events, _run_event_log) = mpsc::channel();
-    let (output, _output_log) = mpsc::channel();
+    let (output, _output_log) = crate::runtime::output_channel();
     let dirty = Arc::new(AtomicBool::new(true));
     let wake_dirty = Arc::clone(&dirty);
     let mut run = RunRuntime.start(RunStartRequest {
@@ -68,7 +68,9 @@ fn run_event_loop(
             dirty.store(true, Ordering::Release);
         }
         if let Some(geometry) = pending_resize.take_ready(Instant::now()) {
-            let _ = session.resize(geometry);
+            if session.resize(geometry).is_err() {
+                console.warn(ConsoleWarning::InputRejected);
+            }
             dirty.store(true, Ordering::Release);
         }
 
@@ -111,10 +113,16 @@ fn run_event_loop(
                 dirty.store(true, Ordering::Release);
             }
             Event::FocusGained => {
-                let _ = session.send_focus(true);
+                if session.send_focus(true).is_err() {
+                    console.warn(ConsoleWarning::InputRejected);
+                    dirty.store(true, Ordering::Release);
+                }
             }
             Event::FocusLost => {
-                let _ = session.send_focus(false);
+                if session.send_focus(false).is_err() {
+                    console.warn(ConsoleWarning::InputRejected);
+                    dirty.store(true, Ordering::Release);
+                }
             }
             Event::Mouse(mouse) => {
                 let area = console_area(outer.terminal_mut().size()?.into());

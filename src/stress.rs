@@ -12,34 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
-use std::sync::mpsc;
-
+use crate::fixtures::start_fixture_run;
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{
-    OwnedRun, ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand,
-};
-
-fn start_stress_run(
-    command: SpawnCommand,
-    geometry: TerminalGeometry,
-    wake: Box<dyn Fn() + Send>,
-) -> anyhow::Result<OwnedRun> {
-    let (events, _run_event_log) = mpsc::channel();
-    let (output, _output_log) = mpsc::channel();
-    RunRuntime.start(RunStartRequest {
-        process_id: ProcessId::new(1),
-        run_id: RunId::new(1),
-        command,
-        mode: RunMode::Pty {
-            initial_geometry: geometry,
-        },
-        events,
-        output,
-        ladder: Default::default(),
-        metrics_interval: None,
-        on_output_wake: Some(wake),
-    })
-}
+use crate::runtime::SpawnCommand;
 use crate::terminal::{
     OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS, PASTE_LIMIT_BYTES, PasteCompletion,
     PasteRejection, TerminalEvent,
@@ -160,12 +135,12 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
     let baseline_rss = resident_set_kib(std::process::id());
     let redraw = Arc::new(RedrawGate::default());
     let wake_count = Arc::clone(&redraw);
-    let mut run = start_stress_run(
+    let mut run = start_fixture_run(
         command,
         geometry,
-        Box::new(move || {
+        Some(Box::new(move || {
             wake_count.request();
-        }),
+        })),
     )?;
     let session = run.terminal().expect("stress fixture is PTY-mode");
     let mut peak_rss_kib = baseline_rss;
@@ -331,12 +306,12 @@ sleep 5"#,
     );
     let redraw = Arc::new(RedrawGate::default());
     let wake_count = Arc::clone(&redraw);
-    let mut run = start_stress_run(
+    let mut run = start_fixture_run(
         command,
         geometry,
-        Box::new(move || {
+        Some(Box::new(move || {
             wake_count.request();
-        }),
+        })),
     )?;
     let session = run.terminal().expect("stress fixture is PTY-mode");
     let fixture_result = (|| {
@@ -373,32 +348,45 @@ sleep 5"#,
         let before = session.output_history_metrics();
         let output_bytes_before = before.bytes + before.evicted_bytes;
         let wakes_before = redraw.requests();
-        let progress_deadline = Instant::now() + Duration::from_millis(350);
+        let accepted_pastes = requests.len();
+        let progress_deadline = Instant::now() + Duration::from_secs(2);
+        let mut pending_pastes_during_flood = requests.len();
+        let mut output_bytes_after = output_bytes_before;
+        let mut wakes_after = wakes_before;
         while Instant::now() < progress_deadline {
             while let Some(event) = session.poll_event() {
                 if let TerminalEvent::Failed(error) = event {
                     bail!("terminal owner failed during blocked input: {error}");
                 }
             }
+            requests.retain_mut(|request| request.poll().is_none());
+            pending_pastes_during_flood = requests.len();
+            let after = session.output_history_metrics();
+            output_bytes_after = after.bytes + after.evicted_bytes;
+            wakes_after = redraw.requests();
+            if pending_pastes_during_flood > 0
+                && output_bytes_after > output_bytes_before
+                && wakes_after > wakes_before
+            {
+                break;
+            }
+            ensure!(
+                pending_pastes_during_flood > 0,
+                "all paste requests completed before progress was observed: output bytes {output_bytes_before}->{output_bytes_after}, wakes {wakes_before}->{wakes_after}"
+            );
             thread::sleep(Duration::from_millis(1));
         }
-        let accepted_pastes = requests.len();
-        requests.retain_mut(|request| request.poll().is_none());
-        let pending_pastes_during_flood = requests.len();
-        let after = session.output_history_metrics();
-        let output_bytes_after = after.bytes + after.evicted_bytes;
-        let wakes_after = redraw.requests();
         ensure!(
             pending_pastes_during_flood > 0,
-            "all paste requests completed before blocked-input observation"
+            "all paste requests completed before blocked-input observation: output bytes {output_bytes_before}->{output_bytes_after}, wakes {wakes_before}->{wakes_after}"
         );
         ensure!(
             output_bytes_after > output_bytes_before,
-            "PTY output history stopped while accepted paste was pending"
+            "PTY output history did not advance while an accepted paste was pending: bytes {output_bytes_before}->{output_bytes_after}, pending {pending_pastes_during_flood}"
         );
         ensure!(
             wakes_after > wakes_before,
-            "terminal wakes stopped while accepted paste was pending"
+            "terminal wakes did not advance while an accepted paste was pending: wakes {wakes_before}->{wakes_after}, pending {pending_pastes_during_flood}"
         );
 
         Ok::<_, anyhow::Error>((

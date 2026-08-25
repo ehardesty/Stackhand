@@ -25,6 +25,7 @@ use crate::runtime::{BoundedPtyWriter, PtyResizer};
 pub const OUTPUT_QUEUE_SLOTS: usize = 64;
 pub const OUTPUT_READ_BUFFER_BYTES: usize = 4_096;
 pub const OUTPUT_WORK_BUDGET: usize = 32;
+const OUTPUT_SLICE_WORK_BUDGET: usize = 2;
 const EFFECT_BUFFER_BYTES: usize = 256 * 1_024;
 const OWNER_EVENT_SLOTS: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -208,6 +209,47 @@ impl OwnerHandle {
             .join()
             .map_err(|_| anyhow!("terminal owner thread panicked"))
     }
+
+    /// Join the owner thread only while the supplied deadline remains. The
+    /// owner can be blocked in its PTY reader when a survivor keeps the
+    /// terminal open; after the deadline the thread is detached and the
+    /// caller retains a structured worker failure.
+    pub fn join_until(&self, deadline: Instant) -> Result<bool> {
+        loop {
+            let finished = self
+                .thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_none_or(|handle| handle.is_finished());
+            if finished {
+                self.join()?;
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(self.abandon_nonblocking());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Detach an owner thread that is still blocked. Returns whether it
+    /// joined cleanly.
+    pub fn abandon_nonblocking(&self) -> bool {
+        let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return true;
+        };
+        if thread.is_finished() {
+            thread.join().is_ok()
+        } else {
+            false
+        }
+    }
 }
 
 struct Effects {
@@ -272,25 +314,16 @@ fn run_owner(
     while !shared.shutdown.load(Ordering::Acquire) {
         let mut did_work = false;
 
-        if let Some(data) = pending_effect.take() {
-            match writer.try_enqueue(&data) {
-                Ok(()) => did_work = true,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    pending_effect = Some(data);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if pending_effect.is_none() {
-            pending_effect = effects.borrow_mut().pop();
-        }
+        did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
         if effects.borrow().overflowed {
             bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
         }
 
-        // Output always gets one bounded turn. A blocked accepted input item
-        // stays owned for retry, but it cannot stop PTY draining. Effects can
-        // accumulate only up to their separate byte bound.
+        // Output gets one bounded turn. Service the input gate between small
+        // output slices so a busy PTY cannot monopolise the owner. A blocked
+        // accepted input item stays owned for retry, but it cannot stop PTY
+        // draining. Effects can accumulate only up to their separate bound.
+        let mut output_slice_work = 0;
         for _ in 0..OUTPUT_WORK_BUDGET {
             let data = match output_rx.try_recv() {
                 Ok(data) => data,
@@ -309,39 +342,30 @@ fn run_owner(
             }
             state.write_output(&data);
             did_work = true;
+            output_slice_work += 1;
             if effects.borrow().overflowed {
                 break;
             }
+
+            if output_slice_work == OUTPUT_SLICE_WORK_BUDGET {
+                did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
+                if effects.borrow().overflowed {
+                    bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
+                }
+                if pending_effect.is_none() {
+                    did_work |= service_input(&mut state, &writer, &commands, &mut pending_input)?;
+                }
+                output_slice_work = 0;
+            }
         }
 
-        if pending_effect.is_none() {
-            pending_effect = effects.borrow_mut().pop();
-        }
+        did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
         if effects.borrow().overflowed {
             bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
         }
 
         if pending_effect.is_none() {
-            if let Some(pending) = pending_input.take() {
-                match writer.try_enqueue_with_completion(&pending.data, pending.completion.as_ref())
-                {
-                    Ok(()) => {
-                        commands.complete(pending.command_bytes);
-                        did_work = true;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        pending_input = Some(pending);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            } else if let Ok(command) = commands.try_recv() {
-                let command_bytes = command.estimated_bytes();
-                pending_input = state.apply_command(command, command_bytes)?;
-                if pending_input.is_none() {
-                    commands.complete(command_bytes);
-                }
-                did_work = true;
-            }
+            did_work |= service_input(&mut state, &writer, &commands, &mut pending_input)?;
         }
 
         let now = Instant::now();
@@ -366,6 +390,58 @@ fn run_owner(
         .join()
         .map_err(|_| anyhow!("PTY reader thread panicked"))?;
     Ok(())
+}
+
+fn service_effect(
+    writer: &BoundedPtyWriter,
+    effects: &Rc<RefCell<Effects>>,
+    pending_effect: &mut Option<Vec<u8>>,
+) -> Result<bool> {
+    if pending_effect.is_none() {
+        *pending_effect = effects.borrow_mut().pop();
+    }
+    let Some(data) = pending_effect.take() else {
+        return Ok(false);
+    };
+    match writer.try_enqueue(&data) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            *pending_effect = Some(data);
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn service_input(
+    state: &mut TerminalState,
+    writer: &BoundedPtyWriter,
+    commands: &CommandReceiver,
+    pending_input: &mut Option<PendingInput>,
+) -> Result<bool> {
+    if let Some(pending) = pending_input.take() {
+        match writer.try_enqueue_with_completion(&pending.data, pending.completion.as_ref()) {
+            Ok(()) => {
+                commands.complete(pending.command_bytes);
+                return Ok(true);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                *pending_input = Some(pending);
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let Ok(command) = commands.try_recv() else {
+        return Ok(false);
+    };
+    let command_bytes = command.estimated_bytes();
+    *pending_input = state.apply_command(command, command_bytes)?;
+    if pending_input.is_none() {
+        commands.complete(command_bytes);
+    }
+    Ok(true)
 }
 
 fn deny_child_clipboard(

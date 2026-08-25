@@ -12,6 +12,12 @@ pub enum ResizeRejected {
     Unsupported,
     /// The Run is shutting down; resize requests are no longer admitted.
     Stopping,
+    /// The bounded terminal command queue cannot admit the resize.
+    Backpressure {
+        attempted_bytes: usize,
+        pending_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 /// The configured semantic shutdown ladder for one Run.
@@ -89,7 +95,7 @@ pub struct RunOutcome {
     /// worker threads joined cleanly.
     pub cleanup_confirmed: bool,
     /// Known members whose exit could not be confirmed.
-    pub remaining_pids: Vec<u32>,
+    pub remaining_pids: Vec<crate::runtime::OsPid>,
     pub io_failures: Vec<String>,
     pub terminal_failure: Option<String>,
     pub worker_join_failures: Vec<String>,

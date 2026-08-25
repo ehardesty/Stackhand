@@ -18,6 +18,7 @@ pub enum ConsoleViewMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleWarning {
     PasteRejected,
+    InputRejected,
     InputBackpressure,
     OutputTruncated,
     PasteDeliveryFailed,
@@ -90,6 +91,9 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
         let warning = match warning {
             ConsoleWarning::PasteRejected => {
                 "WARNING: paste rejected; no partial bytes sent · Ctrl-A: commands"
+            }
+            ConsoleWarning::InputRejected => {
+                "WARNING: terminal input was rejected; Run is stopping or its queue is full · Ctrl-A: commands"
             }
             ConsoleWarning::InputBackpressure => {
                 "WARNING: child input queue is saturated; delivery is bounded · Ctrl-A: commands"

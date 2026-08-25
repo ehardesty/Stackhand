@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::Instant;
 
 pub const WRITER_QUEUE_SLOTS: usize = 1_024;
 pub const WRITER_EVENT_SLOTS: usize = 64;
@@ -79,6 +80,45 @@ impl PtyWriterOwner {
         thread
             .join()
             .map_err(|_| io::Error::other("PTY writer thread panicked"))
+    }
+
+    /// Join the writer only while the supplied deadline remains. A blocked
+    /// operating-system write is detached after the deadline and reported by
+    /// the caller instead of extending Run shutdown indefinitely.
+    pub fn join_until(&self, deadline: Instant) -> io::Result<bool> {
+        loop {
+            let finished = self
+                .thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished);
+            if finished {
+                self.join()?;
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(self.abandon_nonblocking());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Detach a writer that is still blocked. Returns whether it joined.
+    pub fn abandon_nonblocking(&self) -> bool {
+        let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return true;
+        };
+        if thread.is_finished() {
+            thread.join().is_ok()
+        } else {
+            false
+        }
     }
 }
 
