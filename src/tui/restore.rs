@@ -3,8 +3,8 @@ use std::io::{self, Stdout};
 use anyhow::{Context, Result};
 use crossterm::cursor::{self, SetCursorStyle};
 use crossterm::event::{
-    DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -30,6 +30,7 @@ impl OuterTerminal {
             stdout,
             EnterAlternateScreen,
             EnableFocusChange,
+            EnableMouseCapture,
             cursor::Hide
         ) {
             let _ = terminal::disable_raw_mode();
@@ -47,6 +48,7 @@ impl OuterTerminal {
             let _ = execute!(
                 stdout,
                 DisableFocusChange,
+                DisableMouseCapture,
                 LeaveAlternateScreen,
                 cursor::Show
             );
@@ -68,6 +70,7 @@ impl OuterTerminal {
                 let _ = execute!(
                     stdout,
                     DisableFocusChange,
+                    DisableMouseCapture,
                     LeaveAlternateScreen,
                     cursor::Show
                 );
@@ -108,6 +111,7 @@ impl Drop for OuterTerminal {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableFocusChange,
+            DisableMouseCapture,
             LeaveAlternateScreen,
             cursor::Show,
             SetCursorStyle::DefaultUserShape

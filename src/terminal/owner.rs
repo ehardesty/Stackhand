@@ -3,24 +3,26 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender as CompletionSender;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::TryRecvError;
 use libghostty_vt::key;
 use libghostty_vt::render::RenderState;
-use libghostty_vt::terminal::{Options as TerminalOptions, ScrollViewport, Terminal};
+use libghostty_vt::terminal::{
+    ClipboardWrite, ClipboardWriteError, Options as TerminalOptions, Terminal,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
-use ratatui_ghostty::input::{self, IntoKeyInput};
-use ratatui_ghostty::widget::{CursorState, TerminalWidget};
 
-use super::command_gate::{CommandReceiver, TerminalCommand};
+use super::command_gate::CommandReceiver;
+use super::commands::{PendingInput, apply_command};
 use super::history::{BoundedOutputHistory, OutputHistoryMetrics};
+use super::render;
+use super::selection::SelectionController;
+use super::session::OwnedCursorState;
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{BoundedPtyWriter, PtyResizer};
 
@@ -29,6 +31,7 @@ pub const OUTPUT_READ_BUFFER_BYTES: usize = 4_096;
 pub const OUTPUT_WORK_BUDGET: usize = 32;
 const EFFECT_BUFFER_BYTES: usize = 256 * 1_024;
 const OWNER_EVENT_SLOTS: usize = 64;
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug)]
 pub enum OwnerEvent {
@@ -41,7 +44,7 @@ pub enum OwnerEvent {
 #[derive(Clone)]
 pub struct OwnedRender {
     pub buffer: Buffer,
-    pub cursor: CursorState,
+    pub cursor: Option<OwnedCursorState>,
 }
 
 struct SharedOwner {
@@ -122,7 +125,7 @@ impl OwnerHandle {
         let shared = Arc::new(SharedOwner {
             render: Mutex::new(OwnedRender {
                 buffer: Buffer::empty(Rect::new(0, 0, geometry.cols(), geometry.rows())),
-                cursor: CursorState::default(),
+                cursor: None,
             }),
             dirty: AtomicBool::new(true),
             alive: AtomicBool::new(true),
@@ -240,12 +243,6 @@ impl Effects {
     }
 }
 
-struct PendingInput {
-    data: Vec<u8>,
-    command_bytes: usize,
-    completion: Option<CompletionSender<Result<(), String>>>,
-}
-
 fn run_owner(
     reader: Box<dyn Read + Send>,
     mut resizer: PtyResizer,
@@ -267,14 +264,17 @@ fn run_owner(
         let effects = Rc::clone(&effects);
         move |_, data| effects.borrow_mut().push(data)
     })?;
+    terminal.on_clipboard_write(deny_child_clipboard)?;
     let mut render_state = RenderState::new()?;
     let mut key_encoder = key::Encoder::new()?;
+    let mut selection = SelectionController::new()?;
     let mut history = BoundedOutputHistory::new();
     let mut focused = true;
     let mut cols = geometry.cols();
     let mut rows = geometry.rows();
     let mut pending_input: Option<PendingInput> = None;
     let mut pending_effect: Option<Vec<u8>> = None;
+    let mut next_selection_tick = Instant::now() + SELECTION_AUTOSCROLL_INTERVAL;
 
     while !shared.shutdown.load(Ordering::Acquire) {
         let mut did_work = false;
@@ -352,12 +352,21 @@ fn run_owner(
                     &mut focused,
                     &mut cols,
                     &mut rows,
+                    &mut selection,
                 )?;
                 if pending_input.is_none() {
                     commands.complete(command_bytes);
                 }
                 did_work = true;
             }
+        }
+
+        let now = Instant::now();
+        if now >= next_selection_tick {
+            if selection.tick_autoscroll(&mut terminal)? {
+                did_work = true;
+            }
+            next_selection_tick = now + SELECTION_AUTOSCROLL_INTERVAL;
         }
 
         if did_work {
@@ -383,6 +392,13 @@ fn run_owner(
     Ok(())
 }
 
+fn deny_child_clipboard(
+    _terminal: &Terminal<'_, '_>,
+    _write: ClipboardWrite<'_>,
+) -> std::result::Result<(), ClipboardWriteError> {
+    Err(ClipboardWriteError::Denied)
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     sender: crossbeam_channel::Sender<Vec<u8>>,
@@ -402,62 +418,6 @@ fn spawn_reader(
         .context("could not start the PTY reader")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_command(
-    command: TerminalCommand,
-    command_bytes: usize,
-    terminal: &mut Terminal<'static, 'static>,
-    key_encoder: &mut key::Encoder<'static>,
-    resizer: &mut crate::runtime::PtyResizer,
-    focused: &mut bool,
-    cols: &mut u16,
-    rows: &mut u16,
-) -> Result<Option<PendingInput>> {
-    let data = match command {
-        TerminalCommand::Key(event) => {
-            input::encode_key(key_encoder, &event.into_key_input(), terminal)?
-        }
-        TerminalCommand::Focus(gained) => {
-            *focused = gained;
-            input::encode_focus(gained).to_vec()
-        }
-        TerminalCommand::Raw(data) => data,
-        TerminalCommand::Paste { data, completion } => {
-            return Ok(Some(PendingInput {
-                data: input::encode_paste(&data, terminal),
-                command_bytes,
-                completion: Some(completion),
-            }));
-        }
-        TerminalCommand::Resize(geometry) => {
-            terminal.resize(geometry.cols(), geometry.rows(), 0, 0)?;
-            resizer(geometry.cols(), geometry.rows()).map_err(|error| {
-                anyhow!(
-                    "PTY resize to {}x{} failed: {error}",
-                    geometry.cols(),
-                    geometry.rows()
-                )
-            })?;
-            *cols = geometry.cols();
-            *rows = geometry.rows();
-            return Ok(None);
-        }
-        TerminalCommand::Scroll(delta) => {
-            terminal.scroll_viewport(ScrollViewport::Delta(delta));
-            return Ok(None);
-        }
-    };
-    if data.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(PendingInput {
-            data,
-            command_bytes,
-            completion: None,
-        }))
-    }
-}
-
 fn render(
     terminal: &mut Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
@@ -475,14 +435,15 @@ fn render(
         owned.buffer = Buffer::empty(area);
     }
     owned.buffer.reset();
-    let mut widget = TerminalWidget::new(terminal, render_state).focused(focused);
-    (&mut widget).render(area, &mut owned.buffer);
-    owned.cursor = widget.cursor().clone();
+    owned.cursor =
+        render::render(terminal, render_state, &mut owned.buffer, focused, area).unwrap_or(None);
     shared.dirty.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -494,5 +455,27 @@ mod tests {
         assert_eq!(effects.bytes, EFFECT_BUFFER_BYTES);
         assert_eq!(effects.queue.len(), 1);
         assert!(effects.overflowed);
+    }
+
+    #[test]
+    fn child_clipboard_reads_are_ignored_and_writes_reach_the_denial_boundary() {
+        let writes = Cell::new(0_u8);
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 2,
+            max_scrollback: 1024,
+        })
+        .unwrap();
+        terminal
+            .on_clipboard_write(|_, _| {
+                writes.set(writes.get() + 1);
+                Err(ClipboardWriteError::Denied)
+            })
+            .unwrap();
+
+        terminal.vt_write(b"\x1b]52;c;?\x07");
+        assert_eq!(writes.get(), 0);
+        terminal.vt_write(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(writes.get(), 1);
     }
 }

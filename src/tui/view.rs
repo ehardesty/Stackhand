@@ -12,6 +12,7 @@ pub enum ConsoleViewMode {
     ChildInput,
     AppCommand,
     Scroll,
+    Selection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub enum ConsoleWarning {
     InputBackpressure,
     OutputTruncated,
     PasteDeliveryFailed,
+    ClipboardFailed,
+    NothingSelected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,15 +97,26 @@ fn footer_text(view: ConsoleViewState) -> &'static str {
             ConsoleWarning::PasteDeliveryFailed => {
                 "WARNING: an admitted paste did not reach the child · Ctrl-A: commands"
             }
+            ConsoleWarning::ClipboardFailed => {
+                "WARNING: clipboard write failed; terminal session continues · Esc: selection"
+            }
+            ConsoleWarning::NothingSelected => {
+                "WARNING: no terminal text is selected · Esc: selection"
+            }
         };
     }
 
     match (view.mode, view.following) {
         (ConsoleViewMode::ChildInput, true) => "Ctrl-A: commands · Ctrl-Q: quit · LIVE",
         (ConsoleViewMode::ChildInput, false) => "Ctrl-A: commands · history view · NOT FOLLOWING",
-        (ConsoleViewMode::AppCommand, _) => "PageUp: history · f: live tail · Esc: child input",
+        (ConsoleViewMode::AppCommand, _) => {
+            "PageUp: history · s: selection · f: live tail · Esc: child input"
+        }
         (ConsoleViewMode::Scroll, _) => {
             "PageUp/Down: move · f: live tail · history target 64 KiB; page rounding and truncation signal unavailable"
+        }
+        (ConsoleViewMode::Selection, _) => {
+            "Drag: cells · double: word · triple: line · a: all · y: copy · Esc: commands"
         }
     }
 }
@@ -152,5 +166,17 @@ mod tests {
             warning: Some(ConsoleWarning::PasteDeliveryFailed),
         });
         assert!(text.contains("admitted paste did not reach the child"));
+    }
+
+    #[test]
+    fn footer_makes_clipboard_failure_visible_and_keeps_selection_controls() {
+        let text = footer_text(ConsoleViewState {
+            mode: ConsoleViewMode::Selection,
+            following: false,
+            warning: Some(ConsoleWarning::ClipboardFailed),
+        });
+
+        assert!(text.contains("clipboard write failed"));
+        assert!(text.contains("session continues"));
     }
 }

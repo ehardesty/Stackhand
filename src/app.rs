@@ -3,12 +3,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyProcess, SpawnCommand};
 use crate::terminal::{
-    OwnedTerminalSnapshot, PasteCompletion, PasteRequest, TerminalEvent, TerminalSession,
+    CopyRequest, OwnedTerminalSnapshot, PasteCompletion, PasteRequest, SelectionPoint,
+    TerminalEvent, TerminalSession,
 };
 use crate::tui::{
     ConsoleViewMode, ConsoleViewState, ConsoleWarning, OuterTerminal, console_area, render,
@@ -61,8 +65,11 @@ fn run_event_loop(
     console_view: &mut ConsoleViewState,
 ) -> Result<()> {
     let mut paste_requests = Vec::new();
+    let mut copy_requests = Vec::new();
+    let selection_clock = Instant::now();
     loop {
         poll_paste_requests(&mut paste_requests, console_view, dirty);
+        poll_copy_requests(&mut copy_requests, console_view, dirty);
         if let Some(geometry) = pending_resize.take_ready(Instant::now()) {
             session.resize(geometry);
             dirty.store(true, Ordering::Release);
@@ -98,7 +105,19 @@ fn run_event_loop(
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
             Event::Key(key) => {
-                if route_console_key(key, session, snapshot.buffer.area().height, console_view) {
+                if key.kind == KeyEventKind::Press
+                    && console_view.mode == ConsoleViewMode::Selection
+                    && key.code == KeyCode::Char('y')
+                {
+                    copy_requests.push(session.request_copy());
+                    console_view.warning = None;
+                    dirty.store(true, Ordering::Release);
+                } else if route_console_key(
+                    key,
+                    session,
+                    snapshot.buffer.area().height,
+                    console_view,
+                ) {
                     dirty.store(true, Ordering::Release);
                 }
             }
@@ -114,14 +133,51 @@ fn run_event_loop(
             }
             Event::FocusGained => session.send_focus(true),
             Event::FocusLost => session.send_focus(false),
+            Event::Mouse(mouse) => {
+                let area = console_area(outer.terminal_mut().size()?.into());
+                if route_selection_mouse(mouse, area, selection_clock, session, console_view) {
+                    dirty.store(true, Ordering::Release);
+                }
+            }
             Event::Resize(cols, rows) => {
                 let geometry = TerminalGeometry::from_pane(console_area(
                     ratatui::layout::Rect::new(0, 0, cols, rows),
                 ));
                 pending_resize.update(geometry, Instant::now());
             }
-            _ => {}
         }
+    }
+}
+
+fn poll_copy_requests(
+    requests: &mut Vec<CopyRequest>,
+    view: &mut ConsoleViewState,
+    dirty: &AtomicBool,
+) {
+    requests.retain(|request| {
+        let Some(result) = request.poll() else {
+            return true;
+        };
+        apply_copy_result(result, view);
+        dirty.store(true, Ordering::Release);
+        false
+    });
+}
+
+fn apply_copy_result(result: Result<Option<String>, String>, view: &mut ConsoleViewState) {
+    view.warning = copy_warning(result, crate::clipboard::write_text);
+}
+
+fn copy_warning(
+    result: Result<Option<String>, String>,
+    write: impl FnOnce(String) -> Result<()>,
+) -> Option<ConsoleWarning> {
+    match result {
+        Ok(Some(text)) if !text.is_empty() => {
+            write(text).err().map(|_| ConsoleWarning::ClipboardFailed)
+        }
+        Ok(_) => Some(ConsoleWarning::NothingSelected),
+        Err(_) => Some(ConsoleWarning::ClipboardFailed),
     }
 }
 
@@ -184,6 +240,10 @@ fn route_console_key(
                 return_to_live_tail(session, view);
                 true
             }
+            KeyCode::Char('s') => {
+                view.mode = ConsoleViewMode::Selection;
+                true
+            }
             KeyCode::Esc => {
                 view.mode = ConsoleViewMode::ChildInput;
                 true
@@ -209,6 +269,72 @@ fn route_console_key(
             }
             _ => false,
         },
+        ConsoleViewMode::Selection => match key.code {
+            KeyCode::Char('a') => {
+                session.select_all();
+                view.following = false;
+                true
+            }
+            KeyCode::Esc => {
+                session.clear_selection();
+                view.mode = ConsoleViewMode::AppCommand;
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+fn route_selection_mouse(
+    mouse: MouseEvent,
+    area: ratatui::layout::Rect,
+    clock: Instant,
+    session: &TerminalSession,
+    view: &mut ConsoleViewState,
+) -> bool {
+    let Some(route) = selection_mouse_route(mouse, area, view.mode) else {
+        return false;
+    };
+    match route {
+        SelectionMouseRoute::Press(point) => {
+            session.selection_press(point, clock.elapsed());
+        }
+        SelectionMouseRoute::Drag(point) => session.selection_drag(point),
+        SelectionMouseRoute::Release(point) => session.selection_release(point),
+    }
+    view.following = false;
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMouseRoute {
+    Press(SelectionPoint),
+    Drag(SelectionPoint),
+    Release(SelectionPoint),
+}
+
+fn selection_mouse_route(
+    mouse: MouseEvent,
+    area: ratatui::layout::Rect,
+    mode: ConsoleViewMode,
+) -> Option<SelectionMouseRoute> {
+    if mode != ConsoleViewMode::Selection || area.width == 0 {
+        return None;
+    }
+    let inside = mouse.column >= area.x && mouse.column < area.right();
+    if !inside && !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+        return None;
+    }
+    let col = mouse.column.saturating_sub(area.x).min(area.width - 1);
+    let point = SelectionPoint {
+        col,
+        surface_row: i32::from(mouse.row) - i32::from(area.y),
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(SelectionMouseRoute::Press(point)),
+        MouseEventKind::Drag(MouseButton::Left) => Some(SelectionMouseRoute::Drag(point)),
+        MouseEventKind::Up(MouseButton::Left) => Some(SelectionMouseRoute::Release(point)),
+        _ => None,
     }
 }
 
@@ -348,5 +474,40 @@ mod tests {
 
         drop(peer);
         session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
+        let warning = copy_warning(Ok(Some("selected".to_string())), |_| {
+            Err(anyhow::anyhow!("clipboard unavailable"))
+        });
+
+        assert_eq!(warning, Some(ConsoleWarning::ClipboardFailed));
+    }
+
+    #[test]
+    fn empty_selection_is_visible_without_calling_the_clipboard() {
+        let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
+
+        assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
+    }
+
+    #[test]
+    fn release_outside_the_pane_still_ends_selection_routing() {
+        let area = ratatui::layout::Rect::new(10, 5, 20, 4);
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            selection_mouse_route(release, area, ConsoleViewMode::Selection),
+            Some(SelectionMouseRoute::Release(SelectionPoint {
+                col: 19,
+                surface_row: -1,
+            }))
+        );
     }
 }

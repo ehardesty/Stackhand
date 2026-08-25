@@ -11,12 +11,11 @@ The repository pins the contributor Rust toolchain in
 
 - Rust `1.93.0`;
 - Zig `0.15.2`;
-- Ghostty commit `bebca84668947bfc92b9a30ed58712e1c34eee1d`;
-- `libghostty-vt` and `libghostty-vt-sys` crate `0.1.1`, from upstream revision
-  `86338c17d1926c7e863f3c94d70202d3d1d60172`;
-- `ratatui-ghostty` crate `0.2.0`, from upstream revision
-  `be6d2d89105ca8cb867e7963888f82ba58b52316`;
-- native option `-Demit-lib-vt`;
+- Ghostty commit `a887df42c56f6de86c0fe6da9c4eeca37931e083`;
+- `libghostty-vt` and `libghostty-vt-sys` crate `0.2.1`, from upstream revision
+  `46a9d2ac941ed600cf43c5e6299c8dfd1d3a1ef0`;
+- native options `-Demit-lib-vt=true`, `-Demit-xcframework=false`, and
+  `-Dapp-runtime=none`;
 - the release profile uses `strip = true` and `lto = "thin"`.
 
 `Cargo.lock` pins the complete Rust dependency graph. The native build script
@@ -31,20 +30,20 @@ Use the pinned Zig toolchain first on `PATH`:
 PATH="$(brew --prefix zig@0.15)/bin:$PATH" ./scripts/package.sh
 ```
 
-The script runs `cargo build --locked --release`, copies the binary and the
-native library into one archive, and writes a launcher that sets the platform
-library path to that bundled library. The launcher does not call Zig. It does
-not search for a separately installed Ghostty library.
+The script runs `cargo build --locked --release` and copies the binary into one
+archive. The 0.2.1 binding links the vendored Ghostty static library into that
+binary. The launcher does not call Zig and does not search for a separately
+installed Ghostty library.
 
 The package contains a SHA-256 manifest. The script also writes platform
 metrics next to the archive. The metrics include native build time, binary
-size, native library size, archive size, and archive hash.
+size, static native archive size, package archive size, and package hash.
 
 ## Current platform evidence
 
 | Target | Result | Evidence boundary |
 | --- | --- | --- |
-| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with the pinned Rust `1.93.0` and Zig `0.15.2`. | First native build: 28 s; incremental package build: 3 s; binary: 1,055,200 bytes; native library: 5,378,440 bytes; final archive: 3,846,181 bytes; archive SHA-256: `762c4f01430a1de15e9f632e884b86833acf1221b9fe401c3c0f094274cd9b68`. Launch-to-quit PTY smoke timing: 2.05 s (three identical runs). This timing includes PTY setup, first frame, and Ctrl-Q shutdown. |
+| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with pinned Rust `1.93.0`, Zig `0.15.2`, and `libghostty-vt` `0.2.1`. | First native upgrade build: 36 s; binary: 2,265,136 bytes; static native archive: 8,857,784 bytes; final package archive: 941,695 bytes; archive SHA-256: `c0f70d268dff23406fc554a826ae2bb23421177defe9132c78fe024ba707d84b`. Two consecutive package runs had the same payload hash. A clean-`PATH` real-PTY fixture passed, and `otool -L` reported no Ghostty shared library. |
 | Linux x86-64 (`x86_64-unknown-linux-gnu`) | Not verified on this macOS arm64 host. | A Linux x86-64 clean-checkout build must run in Linux CI or a Linux machine before this target can be called supported. The script accepts the target through `STACKHAND_TARGET`. |
 | macOS x86-64 (`x86_64-apple-darwin`) | Not verified. | Requires a cross-target toolchain and a separate runtime smoke test. Do not describe it as supported. |
 | Linux arm64 (`aarch64-unknown-linux-gnu`) | Not verified. | Requires a Linux arm64 runtime smoke test. Do not describe it as supported. |
@@ -60,8 +59,8 @@ it does not replace a clean-checkout build on another machine.
 ## Runtime dependency check
 
 The packaged artifact is a directory and a `.tar.gz` archive. The archive
-contains `bin/stackhand-bin`, the matching `libghostty-vt` library, and a
-launcher in `bin/stackhand`. A runtime smoke test should use a clean `PATH`
+contains `bin/stackhand-bin` and a launcher in `bin/stackhand`. A runtime smoke
+test should use a clean `PATH`
 without `zig` and without `GHOSTTY_SOURCE_DIR`:
 
 ```sh
@@ -69,9 +68,9 @@ env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm-256color \
   SHELL=/bin/sh ./dist/stackhand-aarch64-apple-darwin/bin/stackhand
 ```
 
-Press `Ctrl-Q` to leave the prototype. If the bundled library is absent, the
-smoke test must fail. With the package present, no Zig or external Ghostty
-library is used.
+Press `Ctrl-Q` to leave the prototype. `otool -L` on macOS or `ldd` on Linux
+must not report a Ghostty shared library. No Zig or external Ghostty library is
+used at runtime.
 
 ## Known friction and remaining proof
 

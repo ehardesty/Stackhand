@@ -29,6 +29,11 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run
 
 Stackhand opens the shell from `SHELL`, or `/bin/sh` when `SHELL` is not set. Type in the bordered pane. Press `Ctrl-Q` to leave the prototype. Stackhand then stops the shell and restores the outer terminal.
 
+Press `Ctrl-A`, then `s`, to enter selection mode. Drag to select cells. A
+double click selects a word. A triple click selects a logical line. Press `a`
+to select all retained terminal text, `y` to copy, or `Esc` to return to
+application commands. Child clipboard reads and writes are denied.
+
 Run the automated checks with the pinned Zig version on `PATH`:
 
 ```sh

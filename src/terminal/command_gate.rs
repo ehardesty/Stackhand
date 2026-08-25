@@ -2,10 +2,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as CompletionSender;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossterm::event::KeyEvent;
 
+use super::selection::SelectionPoint;
 use crate::geometry::TerminalGeometry;
 
 pub const COMMAND_QUEUE_SLOTS: usize = 256;
@@ -23,6 +25,15 @@ pub enum TerminalCommand {
     },
     Resize(TerminalGeometry),
     Scroll(isize),
+    SelectionPress {
+        point: SelectionPoint,
+        time: Duration,
+    },
+    SelectionDrag(SelectionPoint),
+    SelectionRelease(SelectionPoint),
+    SelectionAll,
+    SelectionClear,
+    SelectionText(CompletionSender<Result<Option<String>, String>>),
 }
 
 impl TerminalCommand {
@@ -36,6 +47,9 @@ impl TerminalCommand {
             Self::Paste { data, .. } => data.len().saturating_add(12),
             Self::Resize(_) => 4,
             Self::Scroll(_) => std::mem::size_of::<isize>(),
+            Self::SelectionPress { .. } | Self::SelectionDrag(_) | Self::SelectionRelease(_) => 32,
+            Self::SelectionAll | Self::SelectionClear => 1,
+            Self::SelectionText(_) => 64,
         }
     }
 }

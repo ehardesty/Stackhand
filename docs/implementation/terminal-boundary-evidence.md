@@ -11,13 +11,13 @@ Stackhand can open one real shell in a PTY-backed Ratatui pane. Basic text and E
 - Ratatui owns the outer application pane.
 - Crossterm supplies basic host events and outer terminal control.
 - `portable-pty` owns PTY transport for this slice.
-- `ratatui-ghostty` owns the serialized Ghostty terminal thread and converts its render state to a Ratatui buffer.
-- Stackhand's terminal adapter is the only module that uses `ratatui-ghostty` input and render helpers during normal terminal operation. The application does not use the wrapper session type.
+- Stackhand owns the serialized Ghostty terminal thread and the small Crossterm input and Ratatui render adapters.
+- Stackhand uses `libghostty-vt` directly only inside `terminal/`. No borrowed Ghostty value leaves the terminal owner.
 - Render data returned by the adapter is an owned buffer with owned cursor data. No borrowed Ghostty value leaves the adapter.
 - Stackhand owns the shell handle separately from PTY transport. On exit, it stops and waits for the shell before it stops the terminal owner.
-- Stackhand owns the terminal session loop instead of using the wrapper's session type. It uses the wrapper's public input and Ratatui render helpers. A bounded command gate, effect collector, PTY output queue, and PTY writer are all inside the Stackhand-owned boundary.
+- Stackhand owns the terminal session loop, input adapter, and Ratatui render adapter. A bounded command gate, effect collector, PTY output queue, and PTY writer are all inside the Stackhand-owned boundary.
 
-The current `Cargo.lock` pins `ratatui-ghostty` 0.2.0, `libghostty-vt` 0.1.1, and the Ghostty source revision selected by that binding. That Ghostty revision requires Zig 0.15.2. Zig 0.16.0 does not build it because Ghostty rejects that version and uses an API removed from Zig 0.16.
+The current `Cargo.lock` pins `libghostty-vt` 0.2.1 and Ghostty commit `a887df42c56f6de86c0fe6da9c4eeca37931e083`. This binding version is required because 0.1.1 did not expose public selection gestures, tracked grid references, selection formatting, or clipboard policy callbacks. The pinned Ghostty revision requires Zig 0.15.2. Zig 0.16.0 does not build it.
 
 ## Automated evidence
 
@@ -60,9 +60,9 @@ The current Stackhand adapter exposes line-delta scrolling but not Ghostty's dir
 
 A fifth executable fixture (`--fixture-paste`) sends normal and bracketed paste through a real PTY child. Stackhand validates each paste with Ghostty's `paste::is_safe` check before it queues the paste. The prototype accepts at most 64 KiB of paste text. Ghostty input encoding adds `ESC [200~` and `ESC [201~` only when the child has enabled bracketed-paste mode. A paste larger than the limit is rejected before any bytes are queued. A partial-write unit fixture limits each underlying writer call to two bytes and proves that the bounded writer retries until normal and bracketed paste bytes remain complete and ordered. A blocked-child phase fills the bounded path. All admitted paste requests remain owned for retry. The first saturated call rejects the complete paste before admission and produces a visible warning.
 
-Neither the pinned Rust wrapper, the pinned Rust binding, nor this Ghostty terminal source revision exposes caller-driven scrollback compression. The source keeps scrollback in bounded terminal pages. Stackhand does not schedule a compression job for this binding because there is no callable compression operation. A later binding must add an incremental idle scheduler if its scrollback implementation requires caller-driven compression.
+The 0.2.1 binding exposes caller-driven scrollback compression. Stackhand does not yet schedule its incremental operation. This remains separate prototype work.
 
-The interactive outer terminal requests Crossterm focus events. When the outer terminal reports Kitty keyboard enhancement support, Stackhand requests unambiguous Escape codes plus press, repeat, and release event types. The wrapper's public input helper maps those host event types and common modifiers to Ghostty input. Ghostty then applies the child-selected Kitty keyboard flags during key encoding.
+The interactive outer terminal requests Crossterm focus events. When the outer terminal reports Kitty keyboard enhancement support, Stackhand requests unambiguous Escape codes plus press, repeat, and release event types. Stackhand's owned input adapter maps those host event types and common modifiers to Ghostty input. Ghostty then applies the child-selected Kitty keyboard flags during key encoding.
 
 The Stackhand command gate has a 256 KiB byte limit and 256 message slots. The downstream PTY writer has the same byte limit and 1,024 message slots. A command keeps its gate byte reservation until its complete encoded item enters the writer. If the writer is full, the terminal owner keeps the one complete encoded item and retries it. `send_paste` returns a request token after bounded command admission. This is not a synchronous delivery acknowledgement. The application polls the token for a request-specific `Delivered` or `Failed` completion without blocking the UI. A saturated gate rejects a complete paste before admission. Queue saturation and PTY writer failures remain visible. The writer thread retries partial operating-system writes until the admitted item is complete, a terminal failure is reported, or explicit Process shutdown cancels remaining input because the child is stopped first.
 
@@ -77,7 +77,10 @@ The Stackhand command gate has a 256 KiB byte limit and 256 message slots. The d
 - Cursor shape is best effort because an outer terminal can ignore the Crossterm shape command. The automated fixture proves the Ghostty-to-Stackhand cursor state and the mapping code, not each outer terminal's display.
 - The current shutdown operation stops one shell root. Process Tree containment and the interrupt, terminate, and kill ladder belong to the separate process-ownership spike.
 - Stackhand owns and joins the PTY reader, terminal owner, and PTY writer. Shutdown still requires the Process to stop first so the blocking PTY read reaches end-of-file.
-- The Ghostty build fetches its pinned source during the first build. `scripts/package.sh` bundles the resulting native library for runtime use; an offline contributor build still needs a local checkout supplied through `GHOSTTY_SOURCE_DIR`. See [packaging evidence](./packaging-evidence.md).
-- Selection and mouse ownership remain outside this slice. Full key encoding and broader sustained-output validation remain separate concerns. Paste validation, bounded delivery, and saturation evidence are now included.
+- The Ghostty build fetches its pinned source during the first build. The current binding links the vendored static library into the application binary. An offline contributor build still needs a local checkout supplied through `GHOSTTY_SOURCE_DIR`. See [packaging evidence](./packaging-evidence.md).
+- Selection uses Ghostty press, drag, release, repeat-click, and autoscroll gesture APIs. Ghostty owns the active selection and its tracked endpoints across output and resize/reflow. The Ratatui adapter reads Ghostty's per-cell selected state for the visible highlight.
+- User copy uses Ghostty's plain selection formatter with soft-wrap unwrapping and trailing-padding trimming. Tests assert copied logical text for Unicode, hard and soft line breaks, scrollback autoscroll, live output, and reflow. The UI writes owned text to the system clipboard after a user action. A failure produces a warning and does not stop the terminal session.
+- The 0.2.1 callback boundary ignores child OSC 52 reads. Stackhand registers a callback that denies all child clipboard writes. Clipboard contents are not logged.
+- Mouse arbitration with child mouse tracking remains in the next slice. Selection mode currently gives the application explicit mouse ownership.
 
 No evidence from this slice conflicts with the accepted separation between Ratatui application UI and Ghostty terminal semantics.

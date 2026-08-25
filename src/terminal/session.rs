@@ -7,12 +7,12 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
-use ratatui_ghostty::widget::{CursorState, CursorStyle};
 
 use super::command_gate::{CommandEvent, CommandGate, TerminalCommand};
 use super::history::OutputHistoryMetrics;
 use super::owner::{OwnerEvent, OwnerHandle};
 use super::paste::{self, PasteRejection, PasteRequest};
+pub use super::selection::SelectionPoint;
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyIo, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer};
 
@@ -77,6 +77,22 @@ pub struct TerminalSession {
     commands: CommandGate,
     next_paste_request_id: AtomicU64,
     shutdown_complete: Mutex<bool>,
+}
+
+pub struct CopyRequest {
+    receiver: mpsc::Receiver<Result<Option<String>, String>>,
+}
+
+impl CopyRequest {
+    pub fn poll(&self) -> Option<Result<Option<String>, String>> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                "terminal owner stopped before copy completed".to_string(),
+            )),
+        }
+    }
 }
 
 impl TerminalSession {
@@ -155,11 +171,49 @@ impl TerminalSession {
             .try_send(TerminalCommand::Scroll(MAX_SAFE_SCROLL_DELTA));
     }
 
+    pub fn selection_press(&self, point: SelectionPoint, time: Duration) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionPress { point, time });
+    }
+
+    pub fn selection_drag(&self, point: SelectionPoint) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionDrag(point));
+    }
+
+    pub fn selection_release(&self, point: SelectionPoint) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionRelease(point));
+    }
+
+    pub fn select_all(&self) {
+        let _ = self.commands.try_send(TerminalCommand::SelectionAll);
+    }
+
+    pub fn clear_selection(&self) {
+        let _ = self.commands.try_send(TerminalCommand::SelectionClear);
+    }
+
+    pub fn request_copy(&self) -> CopyRequest {
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .commands
+            .try_send(TerminalCommand::SelectionText(sender.clone()))
+            .is_err()
+        {
+            let _ = sender.send(Err("terminal command queue is full".to_string()));
+        }
+        CopyRequest { receiver }
+    }
+
     pub fn snapshot(&self) -> OwnedTerminalSnapshot {
         let render = self.owner.render();
         OwnedTerminalSnapshot {
             buffer: render.buffer,
-            cursor: owned_cursor(render.cursor),
+            cursor: render.cursor,
         }
     }
 
@@ -242,18 +296,6 @@ impl Drop for TerminalSession {
 
 fn bounded_scroll_delta(delta: isize) -> isize {
     delta.clamp(-MAX_SAFE_SCROLL_DELTA, MAX_SAFE_SCROLL_DELTA)
-}
-
-fn owned_cursor(cursor: CursorState) -> Option<OwnedCursorState> {
-    Some(OwnedCursorState {
-        position: cursor.position?,
-        shape: match cursor.style {
-            CursorStyle::Block => CursorShape::Block,
-            CursorStyle::Bar => CursorShape::Bar,
-            CursorStyle::Underline => CursorShape::Underline,
-        },
-        blinking: cursor.blinking,
-    })
 }
 
 #[cfg(test)]

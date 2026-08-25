@@ -60,8 +60,7 @@ case "$target_dir" in
 esac
 
 case "$target" in
-  *-apple-darwin) native_glob='libghostty-vt*.dylib' ;;
-  *-linux-*) native_glob='libghostty-vt.so*' ;;
+  *-apple-darwin | *-linux-*) native_glob='libghostty-vt.a' ;;
   *)
     echo "unsupported packaging target: $target" >&2
     echo "Supported prototype targets are *-apple-darwin and *-linux-*." >&2
@@ -110,24 +109,9 @@ mkdir -p "$out_dir"
 package_name="stackhand-$target"
 package_root="$out_dir/$package_name"
 rm -rf "$package_root"
-mkdir -p "$package_root/bin" "$package_root/lib" "$package_root/share/licenses"
+mkdir -p "$package_root/bin" "$package_root/share/licenses"
 
 cp "$binary" "$package_root/bin/stackhand-bin"
-cp "$native_lib" "$package_root/lib/$(basename "$native_lib")"
-
-# The sys crate's macOS library has an @rpath install name without the
-# versioned filename. Keep both names in the bundle. Linux gets the common
-# SONAME aliases as plain files so the bundle does not depend on symlink
-# preservation by an archive or file transfer tool.
-case "$target" in
-  *-apple-darwin)
-    cp "$native_lib" "$package_root/lib/libghostty-vt.dylib"
-    ;;
-  *-linux-*)
-    cp "$native_lib" "$package_root/lib/libghostty-vt.so"
-    cp "$native_lib" "$package_root/lib/libghostty-vt.so.0"
-    ;;
-esac
 
 cp "$repo_root/packaging/build-metadata.toml" "$package_root/share/build-metadata.toml"
 cp "$repo_root/docs/implementation/native-dependency-licenses.md" \
@@ -137,25 +121,6 @@ cat > "$package_root/bin/stackhand" <<'LAUNCHER'
 #!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-case "$(uname -s)" in
-  Darwin)
-    if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
-      DYLD_LIBRARY_PATH="$root/lib:$DYLD_LIBRARY_PATH"
-    else
-      DYLD_LIBRARY_PATH="$root/lib"
-    fi
-    export DYLD_LIBRARY_PATH
-    ;;
-  Linux)
-    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
-      LD_LIBRARY_PATH="$root/lib:$LD_LIBRARY_PATH"
-    else
-      LD_LIBRARY_PATH="$root/lib"
-    fi
-    export LD_LIBRARY_PATH
-    ;;
-  *) echo "unsupported packaged host: $(uname -s)" >&2; exit 1 ;;
-esac
 exec "$root/bin/stackhand-bin" "$@"
 LAUNCHER
 chmod 755 "$package_root/bin/stackhand"
