@@ -8,6 +8,7 @@
 //! shutdown, and they never receive raw child, pipe, PTY, reader, writer, or
 //! sampler handles.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -56,11 +57,36 @@ pub enum RunMode {
     Pipe,
 }
 
-/// Why a PTY-only operation could not run in pipe mode. Non-fatal: the Run
-/// stays healthy.
+/// Why a resize request was rejected. Non-fatal: the Run stays healthy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Part of the semantic Run interface consumed by callers.
-pub struct ResizeUnsupported;
+pub enum ResizeRejected {
+    /// Pipe mode has no terminal to resize.
+    Unsupported,
+    /// The Run is shutting down; resize requests are no longer admitted.
+    Stopping,
+}
+
+/// The configured semantic shutdown ladder for one Run.
+///
+/// interrupt → wait `graceful_timeout` → terminate → wait
+/// `terminate_timeout` → kill remaining members → wait up to
+/// `final_deadline` for Process Tree exit.
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownLadder {
+    pub graceful_timeout: Duration,
+    pub terminate_timeout: Duration,
+    pub final_deadline: Duration,
+}
+
+impl Default for ShutdownLadder {
+    fn default() -> Self {
+        Self {
+            graceful_timeout: Duration::from_secs(5),
+            terminate_timeout: Duration::from_secs(3),
+            final_deadline: Duration::from_secs(10),
+        }
+    }
+}
 
 /// Everything needed to start one Run.
 pub struct RunStartRequest {
@@ -74,6 +100,8 @@ pub struct RunStartRequest {
     /// High-volume sink for pipe-mode process output. PTY-mode Runs deliver
     /// output into their TerminalSession instead.
     pub output: mpsc::Sender<RunOutput>,
+    /// The configured semantic shutdown ladder timeouts for this Run.
+    pub ladder: ShutdownLadder,
     /// Optional wake called when terminal output arrives. This is the
     /// redraw-notification path for interactive hosts; it never carries
     /// output bytes.
@@ -103,6 +131,65 @@ pub enum RunEventKind {
     },
     /// One owned I/O task failed. Carries no output bytes.
     IoFailed(String),
+}
+
+/// How one completed Run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunExitDisposition {
+    /// The Run finished with exit code 0 and no stop request.
+    NaturalCompletion,
+    /// The Run exited without a stop request and not with exit code 0.
+    UnexpectedExit,
+    /// A shutdown request was recorded, even if the process exited first.
+    IntentionalStop,
+}
+
+/// One recorded stage of the shutdown ladder or finalization sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageResult {
+    pub stage: &'static str,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+impl StageResult {
+    fn ok(stage: &'static str) -> Self {
+        Self {
+            stage,
+            ok: true,
+            detail: None,
+        }
+    }
+
+    fn failed(stage: &'static str, detail: String) -> Self {
+        Self {
+            stage,
+            ok: false,
+            detail: Some(detail),
+        }
+    }
+}
+
+/// One structured result for a completed Run. Callers never assemble
+/// cleanup results from pieces; every completion path produces exactly one
+/// of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub run_id: RunId,
+    pub disposition: RunExitDisposition,
+    /// Whether a shutdown request was recorded for this Run.
+    pub intentional_stop: bool,
+    pub exit_code: Option<i32>,
+    /// Every executed or skipped ladder/cleanup stage, in order.
+    pub stage_results: Vec<StageResult>,
+    /// True only when the owned Process Tree is confirmed empty and all
+    /// tasks joined cleanly.
+    pub cleanup_confirmed: bool,
+    /// Known members whose exit could not be confirmed.
+    pub remaining_pids: Vec<u32>,
+    pub io_failures: Vec<String>,
+    pub terminal_failure: Option<String>,
+    pub task_join_failures: Vec<String>,
 }
 
 impl RunEvent {
@@ -149,8 +236,11 @@ impl RunRuntime {
             run_id: request.run_id,
             inner: Some(inner),
             tree,
+            ladder: request.ladder,
+            stopping: AtomicBool::new(false),
+            retired_pty: None,
             events: request.events,
-            cleanup_error: None,
+            outcome: None,
         };
         run.emit(RunEventKind::Spawned {
             root_pid: run.root_pid(),
@@ -172,8 +262,15 @@ pub struct OwnedRun {
     // root PID at spawn time.
     #[allow(dead_code)]
     tree: Option<UnixProcessTree>,
+    ladder: ShutdownLadder,
+    /// Set before any cleanup work starts. Input and resize admission gates
+    /// read this flag.
+    stopping: AtomicBool,
+    /// A finalized PTY session kept only so input/resize admission gates
+    /// stay observable after completion.
+    retired_pty: Option<TerminalSession>,
     events: mpsc::Sender<RunEvent>,
-    cleanup_error: Option<anyhow::Error>,
+    outcome: Option<RunOutcome>,
 }
 
 enum RunInner {
@@ -185,19 +282,8 @@ enum RunInner {
 }
 
 const RUN_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// Bounded wait between terminate and kill during explicit cleanup. The full
-/// configured shutdown ladder is ticket #16.
-const TERMINATE_GRACE: Duration = Duration::from_secs(1);
-/// Bounded wait after kill before containment results are reported.
-const KILL_GRACE: Duration = Duration::from_millis(500);
+/// Upper bound for observing natural root exit through `wait()`.
 const RUN_EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The completion record for a naturally completed Run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RunExit {
-    /// The root process exit code when the platform reports one.
-    pub code: Option<i32>,
-}
 
 fn wait_for_pty_exit(process: &mut PtyProcess) -> Result<Option<i32>> {
     let deadline = Instant::now() + RUN_EXIT_WAIT_TIMEOUT;
@@ -210,6 +296,43 @@ fn wait_for_pty_exit(process: &mut PtyProcess) -> Result<Option<i32>> {
     Err(anyhow::anyhow!(
         "root process did not exit within its wait deadline"
     ))
+}
+
+/// Collected results of one shutdown-ladder execution.
+struct LadderTrace {
+    stages: Vec<StageResult>,
+    remaining_pids: Vec<u32>,
+    /// Set when a signal-stage error makes further Process Group signaling
+    /// unsafe. Finalization still runs; only further signals are skipped.
+    signals_stopped: bool,
+}
+
+impl LadderTrace {
+    fn new() -> Self {
+        Self {
+            stages: Vec::new(),
+            remaining_pids: Vec::new(),
+            signals_stopped: false,
+        }
+    }
+
+    fn record_remaining(&mut self, tree: &UnixProcessTree) {
+        if let Ok(members) = tree.remaining_members_excluding_root() {
+            self.remaining_pids = members.into_iter().collect();
+        }
+    }
+}
+
+fn stage_result(name: &'static str, sent: bool) -> StageResult {
+    if sent {
+        StageResult::ok(name)
+    } else {
+        StageResult {
+            stage: name,
+            ok: true,
+            detail: Some("already settled; no signal needed".to_string()),
+        }
+    }
 }
 
 impl OwnedRun {
@@ -238,44 +361,106 @@ impl OwnedRun {
     /// terminal shutdown action and cannot detach the TerminalSession from
     /// its Run.
     pub fn terminal(&self) -> Option<TerminalHandle<'_>> {
-        match self.inner.as_ref()? {
-            RunInner::Pty { session, .. } => Some(TerminalHandle { session }),
-            RunInner::Pipe(_) => None,
-        }
+        let session = match self.inner.as_ref() {
+            Some(RunInner::Pty { session, .. }) => session,
+            Some(RunInner::Pipe(_)) | None => self.retired_pty.as_ref()?,
+        };
+        Some(TerminalHandle {
+            session,
+            stopping: &self.stopping,
+        })
+    }
+
+    /// Whether this Run still admits user input and resize requests.
+    pub fn accepts_input(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
     }
 
     /// Request a PTY geometry change. Pipe mode has no terminal to resize;
-    /// the request is rejected without affecting Run health.
-    pub fn resize(&self, geometry: TerminalGeometry) -> Result<(), ResizeUnsupported> {
+    /// both rejections are non-fatal and leave the Run healthy.
+    pub fn resize(&self, geometry: TerminalGeometry) -> Result<(), ResizeRejected> {
+        if !self.accepts_input() {
+            return Err(ResizeRejected::Stopping);
+        }
         match self.inner.as_ref() {
             Some(RunInner::Pty { session, .. }) => {
                 session.resize(geometry);
                 Ok(())
             }
-            _ => Err(ResizeUnsupported),
+            _ => Err(ResizeRejected::Unsupported),
         }
     }
 
-    /// Wait for natural completion: reap the root process and drain all
-    /// output to EOF before returning. The exit event carries the `RunId`.
-    pub fn wait(&mut self) -> Result<RunExit> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Err(anyhow::anyhow!("Run {} already completed", self.run_id.0));
-        };
-        let exit = match inner {
-            RunInner::Pipe(pipe) => {
-                let code = pipe.reap_and_join()?;
-                RunExit { code }
+    /// Wait for natural completion: observe root exit, reap the root
+    /// process, drain all output to EOF, finalize the optional
+    /// TerminalSession, and join every Run task. No stop request is
+    /// recorded, so the disposition is natural or unexpected.
+    pub fn wait(&mut self) -> Result<RunOutcome> {
+        if let Some(outcome) = &self.outcome {
+            return Ok(outcome.clone());
+        }
+        self.stopping.store(false, Ordering::Release);
+        let mut stages = Vec::new();
+        let mut io_failures = Vec::new();
+        let mut terminal_failure = None;
+
+        let exit_code = match self.inner.as_mut() {
+            None => return Err(anyhow::anyhow!("Run {} already completed", self.run_id.0)),
+            Some(RunInner::Pipe(pipe)) => {
+                let code = match pipe.reap_and_join() {
+                    Ok(code) => code,
+                    Err(error) => {
+                        io_failures.push(error.to_string());
+                        None
+                    }
+                };
+                stages.push(StageResult::ok("reap"));
+                stages.push(StageResult::ok("drain"));
+                code
             }
-            RunInner::Pty { process, session } => {
+            Some(RunInner::Pty { process, .. }) => {
                 let code = wait_for_pty_exit(process)?;
-                // Finalize terminal tasks after root exit.
-                session.shutdown()?;
-                RunExit { code }
+                // Finalize terminal tasks after root exit; readers drain
+                // final PTY bytes inside the session owner before it stops.
+                if let Some(RunInner::Pty {
+                    process: mut owned_process,
+                    session,
+                }) = self.inner.take()
+                {
+                    if let Err(error) = session.shutdown() {
+                        terminal_failure = Some(error.to_string());
+                    }
+                    self.retired_pty = Some(session);
+                    match owned_process.shutdown() {
+                        Ok(()) => stages.push(StageResult::ok("reap")),
+                        Err(error) => stages.push(StageResult::failed("reap", error.to_string())),
+                    }
+                }
+                stages.push(StageResult::ok("drain"));
+                code
             }
         };
-        self.emit(RunEventKind::Exited { code: exit.code });
-        Ok(exit)
+
+        let disposition = if exit_code == Some(0) {
+            RunExitDisposition::NaturalCompletion
+        } else {
+            RunExitDisposition::UnexpectedExit
+        };
+        let outcome = RunOutcome {
+            run_id: self.run_id,
+            disposition,
+            intentional_stop: false,
+            exit_code,
+            stage_results: stages,
+            cleanup_confirmed: io_failures.is_empty() && terminal_failure.is_none(),
+            remaining_pids: Vec::new(),
+            io_failures,
+            terminal_failure,
+            task_join_failures: Vec::new(),
+        };
+        self.emit(RunEventKind::Exited { code: exit_code });
+        self.outcome = Some(outcome.clone());
+        Ok(outcome)
     }
 
     /// Deliver a semantic interrupt to the owned Process Tree. A
@@ -309,141 +494,215 @@ impl OwnedRun {
         }
     }
 
-    /// Complete Run cleanup: stop the root process, then finalize the
-    /// TerminalSession (PTY mode) or join both stream readers (pipe mode).
-    /// Natural root exit followed by cleanup uses the same path. Repeated
-    /// calls observe the first cleanup instead of repeating it.
-    pub fn shutdown(&mut self) -> Result<()> {
-        if !self.is_cleaned_up() {
-            let inner = self.inner.take();
-            let result = match inner {
-                Some(RunInner::Pty {
+    /// Own the complete semantic shutdown ladder and produce one structured
+    /// outcome:
+    ///
+    /// record intentional stop → interrupt → wait `graceful_timeout` →
+    /// terminate remaining members → wait `terminate_timeout` → kill
+    /// remaining members → wait up to `final_deadline` → confirm containment
+    /// → reap the root → drain final output → finalize the optional
+    /// TerminalSession → join all Run tasks.
+    ///
+    /// Repeated calls observe the first shutdown instead of repeating it.
+    pub fn shutdown(&mut self) -> Result<RunOutcome> {
+        if let Some(outcome) = &self.outcome {
+            return Ok(outcome.clone());
+        }
+        // One shutdown request records intentional stop before cleanup.
+        self.stopping.store(true, Ordering::Release);
+
+        let ladder = self.ladder;
+        let mut trace = match self.tree.as_ref() {
+            Some(tree) => Self::run_ladder(tree, ladder),
+            None => LadderTrace {
+                stages: vec![StageResult::failed(
+                    "identity",
+                    "no observable Process Tree identity".to_string(),
+                )],
+                remaining_pids: Vec::new(),
+                signals_stopped: true,
+            },
+        };
+
+        // Finalization always follows the ladder, even when a signal stage
+        // failed: reaping, draining, terminal finalization, and task joins
+        // are never skipped by an earlier failure.
+        let mut io_failures = Vec::new();
+        let mut terminal_failure = None;
+        let mut task_join_failures = Vec::new();
+        let mut exit_code = None;
+
+        if let Some(inner) = self.inner.take() {
+            match inner {
+                RunInner::Pipe(mut pipe) => {
+                    if trace.signals_stopped {
+                        task_join_failures.extend(pipe.abandon_nonblocking());
+                        trace.stages.push(StageResult::failed(
+                            "reap",
+                            "signal escalation failed; root state unconfirmed".to_string(),
+                        ));
+                    } else {
+                        match pipe.reap_and_join() {
+                            Ok(code) => {
+                                exit_code = code;
+                                trace.stages.push(StageResult::ok("reap"));
+                                trace.stages.push(StageResult::ok("drain"));
+                            }
+                            Err(error) => {
+                                trace
+                                    .stages
+                                    .push(StageResult::failed("drain", error.to_string()));
+                                io_failures.push(error.to_string());
+                                task_join_failures
+                                    .push("pipe readers did not reach EOF".to_string());
+                            }
+                        }
+                    }
+                }
+                RunInner::Pty {
                     mut process,
                     session,
-                }) => {
-                    let mut failure_notes = Vec::new();
-                    if let Some(tree) = self.tree.as_ref() {
-                        failure_notes = self.escalate_group_shutdown(tree);
+                } => {
+                    // TerminalSession finalization happens only after
+                    // Process Tree shutdown made further child output
+                    // impossible.
+                    if let Err(error) = session.shutdown() {
+                        terminal_failure = Some(error.to_string());
                     }
-                    if failure_notes.is_empty() {
-                        // Escalation is complete, so reaping is safe now:
-                        // no further Process Group signal follows a reap.
-                        process.shutdown().and_then(|()| session.shutdown())
+                    self.retired_pty = Some(session);
+                    trace.stages.push(StageResult::ok("drain"));
+                    if trace.signals_stopped {
+                        task_join_failures.extend(process.abandon_nonblocking());
                     } else {
-                        if let Err(error) = session.shutdown() {
-                            failure_notes.push(error.to_string());
+                        match process.shutdown() {
+                            Ok(()) => trace.stages.push(StageResult::ok("reap")),
+                            Err(error) => trace
+                                .stages
+                                .push(StageResult::failed("reap", error.to_string())),
                         }
-                        failure_notes.extend(process.abandon_nonblocking());
-                        Err(anyhow::anyhow!(
-                            "Run cleanup failed: {}",
-                            failure_notes.join("; ")
-                        ))
                     }
                 }
-                Some(RunInner::Pipe(mut pipe)) => {
-                    let mut failure_notes = Vec::new();
-                    if let Some(tree) = self.tree.as_ref() {
-                        failure_notes = self.escalate_group_shutdown(tree);
-                    }
-                    if failure_notes.is_empty() {
-                        pipe.reap_and_join().map(|_code| ())
-                    } else {
-                        failure_notes.extend(pipe.abandon_nonblocking());
-                        Err(anyhow::anyhow!(
-                            "Run cleanup failed: {}",
-                            failure_notes.join("; ")
-                        ))
-                    }
-                }
-                None => Ok(()),
-            };
-            self.cleanup_error = result.err();
-            self.emit(match &self.cleanup_error {
-                None => RunEventKind::ShutdownComplete,
-                Some(error) => RunEventKind::Failed(error.to_string()),
-            });
+            }
         }
-        match &self.cleanup_error {
-            None => Ok(()),
-            Some(error) => Err(anyhow::anyhow!(
-                "Run {} did not clean up completely: {error}",
-                self.run_id.0
-            )),
+
+        let cleanup_confirmed = !trace.signals_stopped
+            && trace.remaining_pids.is_empty()
+            && io_failures.is_empty()
+            && terminal_failure.is_none()
+            && task_join_failures.is_empty()
+            && trace.stages.iter().all(|stage| stage.ok);
+        let outcome = RunOutcome {
+            run_id: self.run_id,
+            disposition: RunExitDisposition::IntentionalStop,
+            intentional_stop: true,
+            exit_code,
+            stage_results: trace.stages,
+            cleanup_confirmed,
+            remaining_pids: trace.remaining_pids,
+            io_failures,
+            terminal_failure,
+            task_join_failures,
+        };
+        self.emit(match cleanup_confirmed {
+            true => RunEventKind::ShutdownComplete,
+            false => RunEventKind::Failed("Run cleanup did not fully confirm".to_string()),
+        });
+        self.outcome = Some(outcome.clone());
+        Ok(outcome)
+    }
+
+    /// Execute interrupt → wait → terminate → wait → kill → wait against
+    /// the owned Process Tree while its identity is intact. The unreaped
+    /// root keeps the group in existence and its PID reserved, so group
+    /// signals and direct unreaped-root signals are both safe here. No
+    /// signal of any kind follows a reap.
+    fn run_ladder(tree: &UnixProcessTree, ladder: ShutdownLadder) -> LadderTrace {
+        let mut trace = LadderTrace::new();
+
+        // Stage: interrupt.
+        match Self::send_stage(tree, SemanticSignal::Interrupt) {
+            Ok(sent) => trace.stages.push(stage_result("interrupt", sent)),
+            Err(error) => {
+                trace
+                    .stages
+                    .push(StageResult::failed("interrupt", error.detail()));
+                trace.signals_stopped = true;
+                trace.record_remaining(tree);
+                return trace;
+            }
+        }
+        Self::wait_settled(tree, ladder.graceful_timeout);
+
+        // Stage: terminate remaining members.
+        match Self::send_stage(tree, SemanticSignal::Terminate) {
+            Ok(sent) => trace.stages.push(stage_result("terminate", sent)),
+            Err(error) => {
+                trace
+                    .stages
+                    .push(StageResult::failed("terminate", error.detail()));
+                trace.signals_stopped = true;
+                trace.record_remaining(tree);
+                return trace;
+            }
+        }
+        Self::wait_settled(tree, ladder.terminate_timeout);
+
+        // Stage: kill whatever remains.
+        match Self::send_stage(tree, SemanticSignal::Kill) {
+            Ok(sent) => trace.stages.push(stage_result("kill", sent)),
+            Err(error) => {
+                trace
+                    .stages
+                    .push(StageResult::failed("kill", error.detail()));
+                trace.signals_stopped = true;
+            }
+        }
+        Self::wait_settled(tree, ladder.final_deadline);
+        trace.record_remaining(tree);
+        trace
+    }
+
+    /// Deliver one ladder stage. Kill applies only to members that remain:
+    /// dead processes leave the group, and a settled tree needs no signal.
+    /// Returns whether a signal was actually sent.
+    fn send_stage(
+        tree: &UnixProcessTree,
+        semantic: SemanticSignal,
+    ) -> std::result::Result<bool, SignalError> {
+        if Self::tree_settled(tree) {
+            return Ok(false);
+        }
+        let target_group = !Self::tree_is_empty(tree);
+        let result = if target_group {
+            tree.signal(semantic)
+        } else {
+            tree.signal_root_unreaped(semantic)
+        };
+        match result {
+            Ok(()) => Ok(true),
+            // An exit race is harmless and means there is nothing left.
+            Err(SignalError::NotFound) => Ok(false),
+            // Ownership/permission failures fail closed: no further signals
+            // against this numeric PGID. Finalization still proceeds.
+            Err(error) => Err(error),
         }
     }
 
-    fn is_cleaned_up(&self) -> bool {
-        self.inner.is_none()
-    }
-
-    /// Escalate terminate → kill against the owned Process Tree while its
-    /// identity is intact. The unreaped root keeps the group in existence
-    /// and its PID reserved, so both group signals and direct root signals
-    /// are safe during this function. No signal of any kind follows a reap.
-    ///
-    /// Target selection:
-    /// - Live members other than the root receive group signals.
-    /// - A root that has not exited yet receives direct signals (safe while
-    ///   unreaped).
-    /// - An exited root with no other members needs no signal at all: this
-    ///   avoids the Darwin EPERM quirk for zombie-only setsid groups.
-    ///
-    /// "Settled" means the root has exited AND no other member remains.
-    /// An empty member list alone is not settled: the root may still be
-    /// starting its children.
-    ///
-    /// Fail-closed rules: an Ownership or Failed signal error stops
-    /// escalation immediately; members that remain after kill are reported,
-    /// never hidden; and the caller must not reap until this returns.
-    fn escalate_group_shutdown(&self, tree: &UnixProcessTree) -> Vec<String> {
-        let mut notes = Vec::new();
-        for stage in [SemanticSignal::Terminate, SemanticSignal::Kill] {
+    fn wait_settled(tree: &UnixProcessTree, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
             if Self::tree_settled(tree) {
-                return notes;
+                return true;
             }
-            let target_group = !Self::tree_is_empty(tree);
-            let result = if target_group {
-                tree.signal(stage)
-            } else {
-                tree.signal_root_unreaped(stage)
-            };
-            match result {
-                Ok(()) | Err(SignalError::NotFound) => {}
-                Err(error) => {
-                    notes.push(format!("escalation stopped: {}", error.detail()));
-                    return notes;
-                }
-            }
-            let budget = match stage {
-                SemanticSignal::Terminate => TERMINATE_GRACE,
-                _ => KILL_GRACE,
-            };
-            let deadline = Instant::now() + budget;
-            while Instant::now() < deadline && !Self::tree_settled(tree) {
-                std::thread::sleep(RUN_EXIT_POLL_INTERVAL);
-            }
+            std::thread::sleep(RUN_EXIT_POLL_INTERVAL);
         }
-        if let Ok(members) = tree.remaining_members_excluding_root()
-            && !members.is_empty()
-        {
-            notes.push(format!(
-                "Process Tree members remained after kill: {:?}",
-                members
-            ));
-        }
-        notes
+        Self::tree_settled(tree)
     }
 
     fn tree_is_empty(tree: &UnixProcessTree) -> bool {
         tree.remaining_members_excluding_root()
             .map(|members| members.is_empty())
             .unwrap_or(false)
-    }
-
-    /// Whether nothing is left except possibly the root itself, which may be
-    /// alive or an unreaped zombie. Group signals are skipped in this state.
-    fn only_unreaped_root_remains(tree: &UnixProcessTree) -> bool {
-        Self::tree_is_empty(tree) || UnixProcessTree::root_exit_pending(tree.root_pid())
     }
 
     /// Whether the Run's Process Tree work is done: the root has exited and
@@ -466,38 +725,72 @@ impl OwnedRun {
 /// containment and shutdown policy stay inside the Run owner.
 pub struct TerminalHandle<'a> {
     session: &'a TerminalSession,
+    /// Shared admission gate: once shutdown starts, input is rejected.
+    stopping: &'a AtomicBool,
 }
 
 /// Internal constructor for crate tests that already own a session.
 #[cfg(test)]
-pub(crate) fn handle_for_test<'a>(session: &'a TerminalSession) -> TerminalHandle<'a> {
-    TerminalHandle { session }
+pub(crate) fn handle_for_test<'s>(
+    session: &'s TerminalSession,
+    stopping: &'s AtomicBool,
+) -> TerminalHandle<'s> {
+    TerminalHandle { session, stopping }
 }
 
 impl TerminalHandle<'_> {
+    fn admits_input(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Send one key event. Rejected (dropped) once shutdown has started.
     pub fn send_key(&self, event: crossterm::event::KeyEvent) {
+        if !self.admits_input() {
+            return;
+        }
         self.session.send_key(event);
     }
 
+    /// Send a focus change. Rejected (dropped) once shutdown has started.
     pub fn send_focus(&self, gained: bool) {
+        if !self.admits_input() {
+            return;
+        }
         self.session.send_focus(gained);
     }
 
+    /// Send a mouse event. Rejected (dropped) once shutdown has started.
     pub fn send_mouse(&self, event: TerminalMouseEvent) {
+        if !self.admits_input() {
+            return;
+        }
         self.session.send_mouse(event);
     }
 
+    /// Send raw bytes. Rejected (dropped) once shutdown has started.
     pub fn send_raw(&self, data: Vec<u8>) {
+        if !self.admits_input() {
+            return;
+        }
         self.session.send_raw(data);
     }
 
-    /// See [`TerminalSession::send_paste`].
+    /// Admit one whole paste. Rejected with `PasteRejection::Stopping`
+    /// once shutdown has started. See [`TerminalSession::send_paste`].
     pub fn send_paste(&self, data: &str) -> Result<PasteRequest, PasteRejection> {
+        if !self.admits_input() {
+            return Err(PasteRejection::Stopping);
+        }
         self.session.send_paste(data)
     }
 
-    pub fn resize(&self, geometry: TerminalGeometry) {
+    /// Resize the terminal. Rejected once shutdown has started.
+    pub fn resize(&self, geometry: TerminalGeometry) -> Result<(), ResizeRejected> {
+        if !self.admits_input() {
+            return Err(ResizeRejected::Stopping);
+        }
         self.session.resize(geometry);
+        Ok(())
     }
 
     pub fn scroll_lines(&self, delta: isize) {

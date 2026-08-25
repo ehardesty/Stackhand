@@ -60,6 +60,8 @@ impl PasteRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasteRejection {
     Unsafe,
+    /// The Run is shutting down; input is no longer admitted.
+    Stopping,
     TooLarge {
         bytes: usize,
         limit: usize,
@@ -76,6 +78,9 @@ impl std::fmt::Display for PasteRejection {
         match self {
             Self::Unsafe => formatter.write_str(
                 "paste was rejected by Ghostty safety validation (it contains a newline or bracketed-paste terminator)",
+            ),
+            Self::Stopping => formatter.write_str(
+                "paste was rejected because the Run is shutting down",
             ),
             Self::TooLarge { bytes, limit } => write!(
                 formatter,

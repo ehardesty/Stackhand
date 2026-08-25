@@ -33,6 +33,7 @@ pub fn run_interactive() -> Result<()> {
         },
         events,
         output,
+        ladder: Default::default(),
         on_output_wake: Some(Box::new(move || {
             wake_dirty.store(true, Ordering::Release);
         })),
@@ -50,7 +51,7 @@ pub fn run_interactive() -> Result<()> {
         &mut console,
     );
     run_result?;
-    run.shutdown()
+    run.shutdown().map(|_outcome| ())
 }
 
 fn run_event_loop(
@@ -66,7 +67,7 @@ fn run_event_loop(
             dirty.store(true, Ordering::Release);
         }
         if let Some(geometry) = pending_resize.take_ready(Instant::now()) {
-            session.resize(geometry);
+            let _ = session.resize(geometry);
             dirty.store(true, Ordering::Release);
         }
 

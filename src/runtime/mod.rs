@@ -10,6 +10,8 @@ mod run;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
+mod shutdown_tests;
+#[cfg(test)]
 pub(crate) use run::handle_for_test;
 
 pub(crate) use input_writer::{
@@ -20,6 +22,6 @@ pub(crate) use pty::{PtyIo, PtyProcess, PtyResizer, SpawnCommand};
 // callers outside this module tree today.
 #[allow(unused_imports)]
 pub use run::{
-    OwnedRun, ProcessId, ResizeUnsupported, RunEvent, RunEventKind, RunExit, RunId, RunMode,
-    RunRuntime, RunStartRequest, TerminalHandle,
+    OwnedRun, ProcessId, ResizeRejected, RunEvent, RunEventKind, RunExitDisposition, RunId,
+    RunMode, RunOutcome, RunRuntime, RunStartRequest, ShutdownLadder, StageResult, TerminalHandle,
 };

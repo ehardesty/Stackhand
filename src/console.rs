@@ -285,7 +285,8 @@ mod tests {
     #[test]
     fn scroll_navigation_stops_following_and_f_returns_to_live_tail() {
         let (session, peer) = session();
-        let handle = crate::runtime::handle_for_test(&session);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let handle = crate::runtime::handle_for_test(&session, &stopped);
         let mut interaction = ConsoleInteraction::default();
 
         assert!(interaction.handle_key(

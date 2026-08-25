@@ -34,6 +34,7 @@ fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Resul
         },
         events,
         output,
+        ladder: Default::default(),
         on_output_wake: None,
     })
 }
@@ -54,7 +55,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 
     let resized_geometry =
         TerminalGeometry::new(42, 12).expect("fixture geometry is always non-zero");
-    session.resize(resized_geometry);
+    let _ = session.resize(resized_geometry);
 
     for character in text.chars() {
         session.send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -366,7 +367,7 @@ IFS= read -r _"#,
         );
 
         let narrow = TerminalGeometry::new(8, 6).expect("fixture geometry is non-zero");
-        session.resize(narrow);
+        let _ = session.resize(narrow);
         let reflowed = wait_for_snapshot(&session, |snapshot| {
             snapshot.buffer.area().width == 8
                 && snapshot.buffer[(0, 0)].symbol() == "a"
@@ -379,7 +380,7 @@ IFS= read -r _"#,
         );
 
         for (cols, rows) in [(2, 1), (120, 40), (7, 5)] {
-            session.resize(TerminalGeometry::new(cols, rows).unwrap());
+            let _ = session.resize(TerminalGeometry::new(cols, rows).unwrap());
         }
         let final_snapshot = wait_for_snapshot(&session, |snapshot| {
             snapshot.buffer.area().width == 7 && snapshot.buffer.area().height == 5

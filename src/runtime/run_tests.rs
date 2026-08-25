@@ -29,6 +29,7 @@ mod pty_seam_tests {
                 },
                 events,
                 output: mpsc::channel().0,
+                ladder: Default::default(),
                 on_output_wake: None,
             })
             .expect("fixture run started");
@@ -58,6 +59,7 @@ mod pty_seam_tests {
                 },
                 events: mpsc::channel().0,
                 output: mpsc::channel().0,
+                ladder: Default::default(),
                 on_output_wake: None,
             })
             .unwrap();
@@ -132,6 +134,7 @@ mod pipe_tests {
                 mode: RunMode::Pipe,
                 events,
                 output,
+                ladder: Default::default(),
                 on_output_wake: None,
             })
             .expect("pipe run started");
@@ -163,7 +166,7 @@ mod pipe_tests {
             start_pipe(SpawnCommand::new("/bin/echo").arg("hello-direct"));
 
         let exit = run.wait().expect("direct command completed");
-        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.exit_code, Some(0));
 
         let chunks = drain_output(&output);
         assert_eq!(text(&chunks, OutputStream::Stdout), "hello-direct\n");
@@ -201,7 +204,7 @@ mod pipe_tests {
             start_pipe(SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 30"));
 
         let rejection = run.resize(TerminalGeometry::DEFAULT);
-        assert_eq!(rejection, Err(ResizeUnsupported));
+        assert_eq!(rejection, Err(ResizeRejected::Unsupported));
 
         // The Run is still healthy and controllable after the rejection.
         run.shutdown().expect("run stopped after rejected resize");
@@ -219,7 +222,7 @@ mod pipe_tests {
         );
 
         let exit = run.wait().expect("high-output run completed");
-        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.exit_code, Some(0));
         thread::sleep(Duration::from_millis(50));
         let chunks = drain_output(&output);
         let body = text(&chunks, OutputStream::Stdout);
@@ -279,6 +282,7 @@ mod process_tree_tests {
                 mode: RunMode::Pipe,
                 events,
                 output,
+                ladder: Default::default(),
                 on_output_wake: None,
             })
             .expect("pipe run started");
@@ -354,7 +358,7 @@ mod process_tree_tests {
             }
 
             let exit = started.run.wait().expect("exit observed");
-            assert_eq!(exit.code, Some(code), "{semantic:?} was not delivered");
+            assert_eq!(exit.exit_code, Some(code), "{semantic:?} was not delivered");
             let output = drain_stdout(&mut started);
             assert!(
                 output.contains(marker),
@@ -415,7 +419,11 @@ wait";
 
         started.run.terminate().expect("terminate delivered");
         let exit = started.run.wait().expect("exec'd root exited");
-        assert_ne!(exit.code, Some(0), "SIGTERM should have ended the sleep");
+        assert_ne!(
+            exit.exit_code,
+            Some(0),
+            "SIGTERM should have ended the sleep"
+        );
         started.run.shutdown().expect("cleanup");
         assert!(pids_alive(&[root]).is_empty(), "root survived cleanup");
     }
@@ -522,6 +530,7 @@ wait";
                 },
                 events,
                 output: mpsc::channel().0,
+                ladder: Default::default(),
                 on_output_wake: None,
             })
             .expect("pty run started");
@@ -529,7 +538,7 @@ wait";
 
         run.interrupt().expect("tree interrupt through PTY seam");
         let exit = run.wait().expect("PTY root exited after interrupt");
-        assert_ne!(exit.code, None);
+        assert_ne!(exit.exit_code, None);
         run.shutdown().expect("cleanup joins terminal tasks");
         assert!(pids_alive(&[root.get()]).is_empty());
     }
