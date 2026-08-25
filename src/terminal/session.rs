@@ -1,19 +1,25 @@
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect};
-use ratatui_ghostty::session::{SessionConfig, SessionEvent, SessionHandle, SessionIo};
+use ratatui::layout::Position;
 use ratatui_ghostty::widget::{CursorState, CursorStyle};
 
+use super::command_gate::{CommandEvent, CommandGate, TerminalCommand};
+use super::history::OutputHistoryMetrics;
+use super::owner::{OwnerEvent, OwnerHandle};
+use super::paste::{self, PasteRejection, PasteRequest};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyIo, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer};
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const INPUT_QUEUE_LIMIT_BYTES: usize = 256 * 1_024;
+pub const INPUT_QUEUE_LIMIT_BYTES: usize = 256 * 1_024;
+pub const SCROLLBACK_TARGET_BYTES: usize = 64 * 1_024;
+const MAX_SAFE_SCROLL_DELTA: isize = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct OwnedTerminalSnapshot {
@@ -44,6 +50,9 @@ pub enum TerminalEvent {
         pending_bytes: usize,
         limit_bytes: usize,
     },
+    OutputTruncated {
+        evicted_bytes: usize,
+    },
     StateChanged,
 }
 
@@ -63,9 +72,11 @@ impl OwnedTerminalSnapshot {
 }
 
 pub struct TerminalSession {
-    inner: SessionHandle,
+    owner: OwnerHandle,
     writer: PtyWriterOwner,
-    resize_failure: Arc<ResizeFailure>,
+    commands: CommandGate,
+    next_paste_request_id: AtomicU64,
+    shutdown_complete: Mutex<bool>,
 }
 
 impl TerminalSession {
@@ -74,61 +85,103 @@ impl TerminalSession {
         geometry: TerminalGeometry,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self> {
-        let config = SessionConfig {
-            scrollback: 1_000,
-            ..SessionConfig::default()
-        };
         let (writer, writer_owner) = spawn_bounded_pty_writer(io.writer, INPUT_QUEUE_LIMIT_BYTES)
             .context("could not start the bounded PTY writer")?;
-        let resize_failure = Arc::new(ResizeFailure::default());
-        let resize_failure_callback = Arc::clone(&resize_failure);
-        let mut pty_resizer = io.resizer;
-        let io = SessionIo {
-            reader: io.reader,
+        let (commands, command_receiver) = CommandGate::new();
+        let owner = OwnerHandle::spawn(
+            io.reader,
+            io.resizer,
             writer,
-            resizer: Box::new(move |cols, rows| {
-                let result = pty_resizer(cols, rows);
-                if let Err(error) = &result {
-                    resize_failure_callback
-                        .record(format!("PTY resize to {cols}x{rows} failed: {error}"));
-                }
-                result
-            }),
-        };
-        let inner = SessionHandle::spawn(config, io, geometry.cols(), geometry.rows(), wake)
-            .context("could not start the Ghostty terminal owner")?;
+            command_receiver,
+            geometry,
+            wake,
+        )?;
         Ok(Self {
-            inner,
+            owner,
             writer: writer_owner,
-            resize_failure,
+            commands,
+            next_paste_request_id: AtomicU64::new(1),
+            shutdown_complete: Mutex::new(false),
         })
     }
 
     pub fn send_key(&self, event: KeyEvent) {
-        self.inner.send_key(event);
+        let _ = self.commands.try_send(TerminalCommand::Key(event));
     }
 
     pub fn send_focus(&self, gained: bool) {
-        self.inner.send_focus(gained);
+        let _ = self.commands.try_send(TerminalCommand::Focus(gained));
     }
 
     pub fn send_raw(&self, data: Vec<u8>) {
-        self.inner.send_raw(data);
+        let _ = self.commands.try_send(TerminalCommand::Raw(data));
+    }
+
+    /// Admit one whole paste to the bounded terminal owner.
+    ///
+    /// The returned token acknowledges bounded command admission only. Poll
+    /// it for request-specific PTY delivery or failure. Saturation rejects the
+    /// complete paste before admission. This call does not wait for delivery.
+    pub fn send_paste(&self, data: &str) -> Result<PasteRequest, PasteRejection> {
+        paste::validate(data)?;
+        let request_id = self.next_paste_request_id.fetch_add(1, Ordering::Relaxed);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        self.commands
+            .try_send(TerminalCommand::Paste {
+                data: data.as_bytes().to_vec(),
+                completion: completion_tx,
+            })
+            .map_err(|error| PasteRejection::Busy {
+                attempted_bytes: error.attempted_bytes,
+                pending_bytes: error.pending_bytes,
+                limit_bytes: error.limit_bytes,
+            })?;
+        Ok(PasteRequest::new(request_id, completion_rx))
     }
 
     pub fn resize(&self, geometry: TerminalGeometry) {
-        self.inner.send_resize(geometry.cols(), geometry.rows());
+        let _ = self.commands.try_send(TerminalCommand::Resize(geometry));
+    }
+
+    pub fn scroll_lines(&self, delta: isize) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::Scroll(bounded_scroll_delta(delta)));
+    }
+
+    pub fn follow_live(&self) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::Scroll(MAX_SAFE_SCROLL_DELTA));
     }
 
     pub fn snapshot(&self) -> OwnedTerminalSnapshot {
-        snapshot_from(&self.inner)
+        let render = self.owner.render();
+        OwnedTerminalSnapshot {
+            buffer: render.buffer,
+            cursor: owned_cursor(render.cursor),
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.inner.is_dirty()
+        self.owner.is_dirty()
+    }
+
+    pub fn output_history_metrics(&self) -> OutputHistoryMetrics {
+        self.owner.history_metrics()
     }
 
     pub fn poll_event(&self) -> Option<TerminalEvent> {
+        if let Some(event) = self.commands.poll_event() {
+            return Some(match event {
+                CommandEvent::Backpressure(error) => TerminalEvent::InputBackpressure {
+                    attempted_bytes: error.attempted_bytes,
+                    pending_bytes: error.pending_bytes,
+                    limit_bytes: error.limit_bytes,
+                },
+                CommandEvent::Failed(error) => TerminalEvent::Failed(error),
+            });
+        }
         if let Some(event) = self.writer.poll_event() {
             return Some(match event {
                 PtyWriterEvent::Backpressure {
@@ -145,92 +198,53 @@ impl TerminalSession {
                 }
             });
         }
-        if let Some(error) = self.resize_failure.take() {
-            return Some(TerminalEvent::Failed(error));
-        }
-        self.inner.poll_event().map(|event| match event {
-            SessionEvent::Exited => TerminalEvent::Exited,
-            SessionEvent::Error(error) => TerminalEvent::Failed(error.to_string()),
-            _ => TerminalEvent::StateChanged,
+        self.owner.poll_event().map(|event| match event {
+            OwnerEvent::Exited => TerminalEvent::Exited,
+            OwnerEvent::Failed(error) => TerminalEvent::Failed(error),
+            OwnerEvent::StateChanged => TerminalEvent::StateChanged,
+            OwnerEvent::OutputTruncated { evicted_bytes } => {
+                TerminalEvent::OutputTruncated { evicted_bytes }
+            }
         })
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        self.inner.send_shutdown();
+        let mut complete = self
+            .shutdown_complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *complete {
+            return Ok(());
+        }
+        self.commands.close();
+        self.owner.request_shutdown();
         let deadline = Instant::now() + SESSION_SHUTDOWN_TIMEOUT;
-        while self.inner.is_alive() && Instant::now() < deadline {
+        while self.owner.is_alive() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        if self.inner.is_alive() {
+        if self.owner.is_alive() {
             bail!("terminal owner did not stop within two seconds");
         }
+        self.owner.join()?;
         self.writer
             .join()
             .context("could not stop the PTY writer")?;
+        *complete = true;
         Ok(())
     }
 }
 
-#[derive(Default)]
-struct ResizeFailure {
-    latest: Mutex<Option<String>>,
-}
-
-impl ResizeFailure {
-    fn record(&self, error: String) {
-        *self
-            .latest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
-    }
-
-    fn take(&self) -> Option<String> {
-        self.latest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
-trait SnapshotSource {
-    fn size(&self) -> (u16, u16);
-    fn blit_to(&self, buffer: &mut Buffer, area: Rect);
-    fn cursor_state(&self) -> CursorState;
-    fn mark_clean(&self);
+fn bounded_scroll_delta(delta: isize) -> isize {
+    delta.clamp(-MAX_SAFE_SCROLL_DELTA, MAX_SAFE_SCROLL_DELTA)
 }
 
-impl SnapshotSource for SessionHandle {
-    fn size(&self) -> (u16, u16) {
-        self.size()
-    }
-
-    fn blit_to(&self, buffer: &mut Buffer, area: Rect) {
-        self.blit_to(buffer, area);
-    }
-
-    fn cursor_state(&self) -> CursorState {
-        self.cursor_state()
-    }
-
-    fn mark_clean(&self) {
-        self.mark_clean();
-    }
-}
-
-fn snapshot_from(source: &impl SnapshotSource) -> OwnedTerminalSnapshot {
-    // Clear the signal before the copy. Output that arrives after this point
-    // sets it again and forces a later snapshot instead of being acknowledged
-    // without being observed.
-    source.mark_clean();
-    let (cols, rows) = source.size();
-    let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
-    let area = buffer.area;
-    source.blit_to(&mut buffer, area);
-    let cursor = owned_cursor(source.cursor_state());
-    OwnedTerminalSnapshot { buffer, cursor }
-}
-
-fn owned_cursor(cursor: ratatui_ghostty::widget::CursorState) -> Option<OwnedCursorState> {
+fn owned_cursor(cursor: CursorState) -> Option<OwnedCursorState> {
     Some(OwnedCursorState {
         position: cursor.position?,
         shape: match cursor.style {
@@ -244,44 +258,16 @@ fn owned_cursor(cursor: ratatui_ghostty::widget::CursorState) -> Option<OwnedCur
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::io;
+    use std::io::{self, Read};
     use std::os::unix::net::UnixStream;
 
     use super::*;
 
-    struct OutputDuringCopy {
-        dirty: Cell<bool>,
-    }
-
-    impl SnapshotSource for OutputDuringCopy {
-        fn size(&self) -> (u16, u16) {
-            (1, 1)
-        }
-
-        fn blit_to(&self, buffer: &mut Buffer, _area: Rect) {
-            buffer[(0, 0)].set_symbol("old");
-            self.dirty.set(true);
-        }
-
-        fn cursor_state(&self) -> CursorState {
-            CursorState::default()
-        }
-
-        fn mark_clean(&self) {
-            self.dirty.set(false);
-        }
-    }
-
     #[test]
-    fn output_that_arrives_during_snapshot_copy_stays_dirty() {
-        let source = OutputDuringCopy {
-            dirty: Cell::new(true),
-        };
-
-        let _ = snapshot_from(&source);
-
-        assert!(source.dirty.get());
+    fn extreme_scroll_deltas_are_bounded_before_the_ghostty_call() {
+        assert_eq!(bounded_scroll_delta(isize::MIN), -1_000_000);
+        assert_eq!(bounded_scroll_delta(isize::MAX), 1_000_000);
+        assert_eq!(bounded_scroll_delta(-5), -5);
     }
 
     #[test]
@@ -307,7 +293,43 @@ mod tests {
 
         drop(peer);
         session.shutdown().unwrap();
-        let failure = failure.expect("PTY resize failure must become a terminal event");
-        assert!(failure.contains("PTY resize to 42x12 failed: fixture resize failure"));
+        assert!(failure.unwrap().contains("PTY resize to 42x12 failed"));
+    }
+
+    struct OneByteChunks {
+        remaining: usize,
+    }
+
+    impl Read for OneByteChunks {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            buffer[0] = b'x';
+            self.remaining -= 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn each_real_reader_chunk_enters_the_bounded_output_history() {
+        let io = PtyIo {
+            reader: Box::new(OneByteChunks {
+                remaining: super::super::OUTPUT_HISTORY_CHUNKS + 1,
+            }),
+            writer: Box::new(io::sink()),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let session = TerminalSession::spawn(io, TerminalGeometry::DEFAULT, || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.output_history_metrics().evicted_bytes == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let history = session.output_history_metrics();
+        session.shutdown().unwrap();
+        assert_eq!(history.chunks, super::super::OUTPUT_HISTORY_CHUNKS);
+        assert_eq!(history.bytes, super::super::OUTPUT_HISTORY_CHUNKS);
+        assert_eq!(history.evicted_bytes, 1);
     }
 }

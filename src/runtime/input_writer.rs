@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-const WRITER_QUEUE_SLOTS: usize = 1_024;
-const WRITER_EVENT_SLOTS: usize = 64;
+pub const WRITER_QUEUE_SLOTS: usize = 1_024;
+pub const WRITER_EVENT_SLOTS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PtyWriterEvent {
@@ -81,17 +82,44 @@ impl PtyWriterOwner {
     }
 }
 
-struct QueuedPtyWriter {
-    sender: SyncSender<Vec<u8>>,
+impl Drop for PtyWriterOwner {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
+pub(crate) struct BoundedPtyWriter {
+    sender: SyncSender<WriterItem>,
     pending_bytes: Arc<AtomicUsize>,
     limit_bytes: usize,
     status: Arc<WriterStatus>,
 }
 
-impl Write for QueuedPtyWriter {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+struct WriterItem {
+    data: Vec<u8>,
+    completion: Option<CompletionSender<Result<(), String>>>,
+}
+
+impl BoundedPtyWriter {
+    /// Admit one complete encoded input or effect item.
+    ///
+    /// `Ok` is a durable acknowledgement. The writer owner will retry partial
+    /// operating-system writes until this full item is delivered or it emits
+    /// a terminal failure. `WouldBlock` means that no byte was admitted.
+    pub(crate) fn try_enqueue(&self, data: &[u8]) -> io::Result<()> {
+        self.try_enqueue_with_completion(data, None)
+    }
+
+    pub(crate) fn try_enqueue_with_completion(
+        &self,
+        data: &[u8],
+        completion: Option<&CompletionSender<Result<(), String>>>,
+    ) -> io::Result<()> {
         if data.is_empty() {
-            return Ok(0);
+            if let Some(completion) = completion {
+                let _ = completion.send(Ok(()));
+            }
+            return Ok(());
         }
 
         let pending = reserve_bytes(&self.pending_bytes, data.len(), self.limit_bytes).map_err(
@@ -105,8 +133,12 @@ impl Write for QueuedPtyWriter {
             },
         )?;
 
-        match self.sender.try_send(data.to_vec()) {
-            Ok(()) => Ok(data.len()),
+        let item = WriterItem {
+            data: data.to_vec(),
+            completion: completion.cloned(),
+        };
+        match self.sender.try_send(item) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.pending_bytes.fetch_sub(data.len(), Ordering::AcqRel);
                 self.status.record(PtyWriterEvent::Backpressure {
@@ -119,8 +151,11 @@ impl Write for QueuedPtyWriter {
                     "PTY input queue has no free message slot",
                 ))
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Disconnected(item)) => {
                 self.pending_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                if let Some(completion) = item.completion {
+                    let _ = completion.send(Err("PTY writer is not available".to_string()));
+                }
                 self.status.record(PtyWriterEvent::Failed(
                     "PTY writer is not available".to_string(),
                 ));
@@ -131,16 +166,23 @@ impl Write for QueuedPtyWriter {
             }
         }
     }
+}
+
+impl Write for BoundedPtyWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.try_enqueue(data)?;
+        Ok(data.len())
+    }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-pub fn spawn_bounded_pty_writer(
+pub(crate) fn spawn_bounded_pty_writer(
     writer: Box<dyn Write + Send>,
     limit_bytes: usize,
-) -> io::Result<(Box<dyn Write + Send>, PtyWriterOwner)> {
+) -> io::Result<(BoundedPtyWriter, PtyWriterOwner)> {
     if limit_bytes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -148,26 +190,39 @@ pub fn spawn_bounded_pty_writer(
         ));
     }
 
-    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE_SLOTS);
+    let (sender, receiver) = mpsc::sync_channel::<WriterItem>(WRITER_QUEUE_SLOTS);
     let pending_bytes = Arc::new(AtomicUsize::new(0));
     let status = Arc::new(WriterStatus::default());
     let thread_pending = Arc::clone(&pending_bytes);
     let thread_status = Arc::clone(&status);
+    let thread_limit = limit_bytes;
     let thread = thread::Builder::new()
         .name("pty-writer".to_string())
         .spawn(move || {
             let mut writer = writer;
-            while let Ok(data) = receiver.recv() {
-                let result = writer.write_all(&data).and_then(|()| writer.flush());
-                thread_pending.fetch_sub(data.len(), Ordering::AcqRel);
+            while let Ok(item) = receiver.recv() {
+                let result = write_with_retry(
+                    &mut writer,
+                    &item.data,
+                    &thread_status,
+                    &thread_pending,
+                    thread_limit,
+                );
+                thread_pending.fetch_sub(item.data.len(), Ordering::AcqRel);
                 if let Err(error) = result {
+                    if let Some(completion) = item.completion {
+                        let _ = completion.send(Err(error.to_string()));
+                    }
                     thread_status.record(PtyWriterEvent::Failed(error.to_string()));
                     break;
+                }
+                if let Some(completion) = item.completion {
+                    let _ = completion.send(Ok(()));
                 }
             }
         })?;
 
-    let queued_writer = QueuedPtyWriter {
+    let queued_writer = BoundedPtyWriter {
         sender,
         pending_bytes,
         limit_bytes,
@@ -177,7 +232,59 @@ pub fn spawn_bounded_pty_writer(
         status,
         thread: Mutex::new(Some(thread)),
     };
-    Ok((Box::new(queued_writer), owner))
+    Ok((queued_writer, owner))
+}
+
+fn write_with_retry(
+    writer: &mut Box<dyn Write + Send>,
+    data: &[u8],
+    status: &WriterStatus,
+    pending_bytes: &AtomicUsize,
+    limit_bytes: usize,
+) -> io::Result<()> {
+    let mut offset = 0;
+    let mut reported_backpressure = false;
+    while offset < data.len() {
+        match writer.write(&data[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PTY writer made no progress",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !reported_backpressure {
+                    status.record(PtyWriterEvent::Backpressure {
+                        attempted_bytes: data.len(),
+                        pending_bytes: pending_bytes.load(Ordering::Acquire),
+                        limit_bytes,
+                    });
+                    reported_backpressure = true;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !reported_backpressure {
+                    status.record(PtyWriterEvent::Backpressure {
+                        attempted_bytes: data.len(),
+                        pending_bytes: pending_bytes.load(Ordering::Acquire),
+                        limit_bytes,
+                    });
+                    reported_backpressure = true;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn reserve_bytes(pending: &AtomicUsize, amount: usize, limit: usize) -> Result<usize, usize> {
@@ -233,6 +340,105 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
             b"user-query-focus"
+        );
+    }
+
+    #[test]
+    fn writer_retries_partial_writes_until_the_full_paste_is_delivered() {
+        #[derive(Clone)]
+        struct PartialWriter {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            maximum: usize,
+        }
+
+        impl Write for PartialWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                let count = self.maximum.min(data.len());
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&data[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let read_bytes = Arc::clone(&bytes);
+        let writer = PartialWriter { bytes, maximum: 2 };
+        let (mut queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
+
+        queued.write_all(b"normal-paste").unwrap();
+        queued.write_all(b"-bracketed-paste").unwrap();
+        drop(queued);
+        owner.join().unwrap();
+
+        assert_eq!(
+            read_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            b"normal-paste-bracketed-paste"
+        );
+    }
+
+    #[test]
+    fn writer_retries_temporary_os_backpressure_without_losing_paste_bytes() {
+        #[derive(Clone)]
+        struct TemporarilyBlockedWriter {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            blocked: Arc<AtomicUsize>,
+        }
+
+        impl Write for TemporarilyBlockedWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                if self.blocked.load(Ordering::Acquire) > 0 {
+                    self.blocked.fetch_sub(1, Ordering::AcqRel);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "fixture backpressure",
+                    ));
+                }
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let read_bytes = Arc::clone(&bytes);
+        let writer = TemporarilyBlockedWriter {
+            bytes,
+            blocked: Arc::new(AtomicUsize::new(1)),
+        };
+        let (mut queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
+
+        queued.write_all(b"retry-this-paste").unwrap();
+        drop(queued);
+        owner.join().unwrap();
+        assert_eq!(
+            owner.poll_event(),
+            Some(PtyWriterEvent::Backpressure {
+                attempted_bytes: 16,
+                pending_bytes: 16,
+                limit_bytes: 64,
+            })
+        );
+        assert_eq!(
+            read_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            b"retry-this-paste"
         );
     }
 

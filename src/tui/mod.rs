@@ -2,4 +2,4 @@ mod restore;
 mod view;
 
 pub use restore::OuterTerminal;
-pub use view::{console_area, render};
+pub use view::{ConsoleViewMode, ConsoleViewState, ConsoleWarning, console_area, render};

@@ -7,12 +7,44 @@ use crate::terminal::OwnedTerminalSnapshot;
 
 const FOOTER_HEIGHT: u16 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleViewMode {
+    ChildInput,
+    AppCommand,
+    Scroll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleWarning {
+    PasteRejected,
+    InputBackpressure,
+    OutputTruncated,
+    PasteDeliveryFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsoleViewState {
+    pub mode: ConsoleViewMode,
+    pub following: bool,
+    pub warning: Option<ConsoleWarning>,
+}
+
+impl Default for ConsoleViewState {
+    fn default() -> Self {
+        Self {
+            mode: ConsoleViewMode::ChildInput,
+            following: true,
+            warning: None,
+        }
+    }
+}
+
 pub fn console_area(area: Rect) -> Rect {
     let content_height = area.height.saturating_sub(FOOTER_HEIGHT);
     Block::bordered().inner(Rect::new(area.x, area.y, area.width, content_height))
 }
 
-pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot) {
+pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, view: ConsoleViewState) {
     let area = frame.area();
     let pane = Rect::new(
         area.x,
@@ -34,8 +66,7 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot) {
     }
 
     frame.render_widget(
-        Paragraph::new("Ctrl-Q: quit · keys go to the shell")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer_text(view)).style(Style::default().fg(Color::DarkGray)),
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
     );
 
@@ -44,6 +75,34 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot) {
         let y = console.y.saturating_add(cursor.position.y);
         if x < console.right() && y < console.bottom() {
             frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+fn footer_text(view: ConsoleViewState) -> &'static str {
+    if let Some(warning) = view.warning {
+        return match warning {
+            ConsoleWarning::PasteRejected => {
+                "WARNING: paste rejected; no partial bytes sent · Ctrl-A: commands"
+            }
+            ConsoleWarning::InputBackpressure => {
+                "WARNING: child input queue is saturated; delivery is bounded · Ctrl-A: commands"
+            }
+            ConsoleWarning::OutputTruncated => {
+                "WARNING: oldest Process output was removed at the history bound · Ctrl-A: commands"
+            }
+            ConsoleWarning::PasteDeliveryFailed => {
+                "WARNING: an admitted paste did not reach the child · Ctrl-A: commands"
+            }
+        };
+    }
+
+    match (view.mode, view.following) {
+        (ConsoleViewMode::ChildInput, true) => "Ctrl-A: commands · Ctrl-Q: quit · LIVE",
+        (ConsoleViewMode::ChildInput, false) => "Ctrl-A: commands · history view · NOT FOLLOWING",
+        (ConsoleViewMode::AppCommand, _) => "PageUp: history · f: live tail · Esc: child input",
+        (ConsoleViewMode::Scroll, _) => {
+            "PageUp/Down: move · f: live tail · history target 64 KiB; page rounding and truncation signal unavailable"
         }
     }
 }
@@ -58,5 +117,40 @@ mod tests {
 
         assert_eq!(area.width, 0);
         assert_eq!(area.height, 0);
+    }
+
+    #[test]
+    fn scroll_footer_reports_the_bound_and_missing_truncation_signal() {
+        let text = footer_text(ConsoleViewState {
+            mode: ConsoleViewMode::Scroll,
+            following: false,
+            warning: None,
+        });
+
+        assert!(text.contains("target 64 KiB"));
+        assert!(text.contains("page rounding"));
+        assert!(text.contains("truncation signal unavailable"));
+    }
+
+    #[test]
+    fn footer_makes_paste_rejection_visible() {
+        let text = footer_text(ConsoleViewState {
+            mode: ConsoleViewMode::ChildInput,
+            following: true,
+            warning: Some(ConsoleWarning::PasteRejected),
+        });
+
+        assert!(text.contains("WARNING: paste rejected"));
+        assert!(text.contains("no partial bytes sent"));
+    }
+
+    #[test]
+    fn footer_makes_admitted_paste_delivery_failure_visible() {
+        let text = footer_text(ConsoleViewState {
+            mode: ConsoleViewMode::ChildInput,
+            following: true,
+            warning: Some(ConsoleWarning::PasteDeliveryFailed),
+        });
+        assert!(text.contains("admitted paste did not reach the child"));
     }
 }

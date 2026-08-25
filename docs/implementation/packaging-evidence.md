@@ -44,7 +44,7 @@ size, native library size, archive size, and archive hash.
 
 | Target | Result | Evidence boundary |
 | --- | --- | --- |
-| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with the pinned Rust `1.93.0` and Zig `0.15.2`. | First native build: 28 s; incremental package build: 3 s; binary: 1,106,736 bytes; native library: 5,378,440 bytes; final archive: 3,868,182 bytes; archive SHA-256: `e7284255b0b5bee021d8ec4d855db65cf882022d7582638e5db7cd5546d4a392`. Launch-to-quit PTY smoke timing: 2.05 s (three identical runs). This timing includes PTY setup, first frame, and Ctrl-Q shutdown. |
+| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with the pinned Rust `1.93.0` and Zig `0.15.2`. | First native build: 28 s; incremental package build: 3 s; binary: 1,055,200 bytes; native library: 5,378,440 bytes; final archive: 3,846,181 bytes; archive SHA-256: `762c4f01430a1de15e9f632e884b86833acf1221b9fe401c3c0f094274cd9b68`. Launch-to-quit PTY smoke timing: 2.05 s (three identical runs). This timing includes PTY setup, first frame, and Ctrl-Q shutdown. |
 | Linux x86-64 (`x86_64-unknown-linux-gnu`) | Not verified on this macOS arm64 host. | A Linux x86-64 clean-checkout build must run in Linux CI or a Linux machine before this target can be called supported. The script accepts the target through `STACKHAND_TARGET`. |
 | macOS x86-64 (`x86_64-apple-darwin`) | Not verified. | Requires a cross-target toolchain and a separate runtime smoke test. Do not describe it as supported. |
 | Linux arm64 (`aarch64-unknown-linux-gnu`) | Not verified. | Requires a Linux arm64 runtime smoke test. Do not describe it as supported. |

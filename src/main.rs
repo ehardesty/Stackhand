@@ -7,7 +7,9 @@ fn main() -> Result<()> {
         Mode::Interactive => stackhand::app::run_interactive(),
         Mode::FixtureRoundTrip(text) => stackhand::app::run_fixture_round_trip(&text),
         Mode::FixtureInput => stackhand::app::run_fixture_input(),
+        Mode::FixturePaste => stackhand::app::run_fixture_paste(),
         Mode::FixtureRendering => stackhand::app::run_fixture_rendering(),
+        Mode::FixtureScrollback => stackhand::scrollback_fixture::run(),
     }
 }
 
@@ -15,7 +17,9 @@ enum Mode {
     Interactive,
     FixtureRoundTrip(String),
     FixtureInput,
+    FixturePaste,
     FixtureRendering,
+    FixtureScrollback,
 }
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
@@ -35,6 +39,20 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
             bail!("--fixture-input does not accept arguments");
         }
         return Ok(Mode::FixtureInput);
+    }
+
+    if first == "--fixture-paste" {
+        if args.next().is_some() {
+            bail!("--fixture-paste does not accept arguments");
+        }
+        return Ok(Mode::FixturePaste);
+    }
+
+    if first == "--fixture-scrollback" {
+        if args.next().is_some() {
+            bail!("--fixture-scrollback does not accept arguments");
+        }
+        return Ok(Mode::FixtureScrollback);
     }
 
     if first != "--fixture-round-trip" {
