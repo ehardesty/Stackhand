@@ -1,5 +1,7 @@
 mod input_writer;
+mod ladder;
 mod metrics;
+mod outcome;
 mod pipe;
 mod process_tree;
 mod pty;
@@ -28,7 +30,9 @@ pub(crate) use pty::{PtyIo, PtyProcess, PtyResizer, SpawnCommand};
 #[allow(unused_imports)]
 pub use metrics::RunMetrics;
 #[allow(unused_imports)]
+pub use outcome::{ResizeRejected, RunExitDisposition, RunOutcome, ShutdownLadder, StageResult};
+#[allow(unused_imports)]
 pub use run::{
-    OwnedRun, ProcessId, ResizeRejected, RunEvent, RunEventKind, RunExitDisposition, RunId,
-    RunMode, RunOutcome, RunRuntime, RunStartRequest, ShutdownLadder, StageResult, TerminalHandle,
+    InputRejected, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunMode, RunRuntime,
+    RunStartRequest, TerminalHandle,
 };

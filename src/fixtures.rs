@@ -59,9 +59,9 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
     let _ = session.resize(resized_geometry);
 
     for character in text.chars() {
-        session.send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        let _ = session.send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
-    session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let _ = session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     let expected = format!("fixture-echo:{text}");
     let expected_size = "fixture-size:42x12";
@@ -99,8 +99,8 @@ pub fn run_fixture_input() -> Result<()> {
     let session = run.terminal().expect("PTY fixture");
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
-    session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-    session.send_raw(vec![b'\n']);
+    let _ = session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let _ = session.send_raw(vec![b'\n']);
     let second_phase = wait_for_fixture_text(&session, "input-ready")?;
     ensure!(
         second_phase
@@ -109,11 +109,11 @@ pub fn run_fixture_input() -> Result<()> {
         "normal cursor mode did not produce CSI A: {second_phase:?}"
     );
     for event in events {
-        session.send_key(event);
+        let _ = session.send_key(event);
     }
-    session.send_focus(true);
-    session.send_focus(false);
-    session.send_raw(vec![b'\n']);
+    let _ = session.send_focus(true);
+    let _ = session.send_focus(false);
+    let _ = session.send_raw(vec![b'\n']);
 
     let marker = format!("input-bytes:{expected_hex}");
     let output = wait_for_fixture_text(&session, &marker)?;
@@ -174,7 +174,7 @@ sleep 3"#,
             ),
             "oversized paste was accepted"
         );
-        session.send_raw(b"SAFE".to_vec());
+        let _ = session.send_raw(b"SAFE".to_vec());
         let safe = wait_for_fixture_text(&session, "safe-bytes:")?;
         ensure!(
             safe.contains("safe-bytes:53414645"),
@@ -448,7 +448,7 @@ fn assert_primary_render(snapshot: &OwnedTerminalSnapshot) -> Result<()> {
 }
 
 fn send_fixture_enter(session: &TerminalHandle<'_>) {
-    session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let _ = session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 }
 
 fn wait_for_snapshot(

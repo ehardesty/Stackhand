@@ -214,7 +214,7 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
                 scrolled = true;
             }
             if !unfocused && elapsed >= Duration::from_millis(500) {
-                session.send_focus(false);
+                let _ = session.send_focus(false);
                 output_callbacks_before_unfocused = redraw.requests();
                 unfocused_at = Some(Instant::now());
                 unfocused = true;
@@ -222,7 +222,7 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
             if !sent_probe && saw_query_ready && elapsed >= Duration::from_millis(750) {
                 // The child already emitted CSI 6 n. This line is accepted
                 // after Ghostty's response in the same serialized writer.
-                session.send_raw(b"probe\n".to_vec());
+                let _ = session.send_raw(b"probe\n".to_vec());
                 session.follow_live();
                 sent_probe = true;
             }

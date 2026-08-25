@@ -71,7 +71,7 @@ impl ConsoleInteraction {
 
         if key.kind != KeyEventKind::Press {
             if self.view.mode == ConsoleViewMode::ChildInput {
-                session.send_key(key);
+                let _ = session.send_key(key);
             }
             return false;
         }
@@ -82,7 +82,7 @@ impl ConsoleInteraction {
                 true
             }
             ConsoleViewMode::ChildInput => {
-                session.send_key(key);
+                let _ = session.send_key(key);
                 false
             }
             ConsoleViewMode::AppCommand => self.handle_app_command(key, session, page_rows),
@@ -121,7 +121,7 @@ impl ConsoleInteraction {
         if route.changes_history_view {
             self.view.following = false;
         }
-        session.send_mouse(route.event);
+        let _ = session.send_mouse(route.event);
         true
     }
 

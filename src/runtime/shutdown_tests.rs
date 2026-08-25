@@ -277,7 +277,10 @@ fn outcome_distinguishes_natural_unexpected_and_intentional_ends() {
 fn final_output_is_processed_before_the_output_owner_closes() {
     // A writer that produces a fixed, known output while the ladder runs:
     // every line it emitted must be visible through the high-volume sink.
-    let script = "trap '' INT; echo flood-start; i=0; while [ \"$i\" -lt 5000 ]; do printf 'line-%06d\\n' \"$i\"; i=$((i+1)); done; while :; do sleep 3600; done";
+    // TERM exits cleanly so bash flushes its stdio buffer: a signal-killed
+    // shell would lose whatever remained unflushed, which says nothing about
+    // the Run's draining behavior.
+    let script = "trap '' INT; trap 'exit 0' TERM; echo flood-start; i=0; while [ \"$i\" -lt 5000 ]; do printf 'line-%06d\\n' \"$i\"; i=$((i+1)); done; while :; do sleep 3600; done";
     let mut started = start_pipe(
         SpawnCommand::new("/bin/sh").arg("-c").arg(script),
         quick_ladder(100, 100),

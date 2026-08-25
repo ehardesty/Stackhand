@@ -110,8 +110,12 @@ fn run_event_loop(
                 console.handle_paste(&data, &session);
                 dirty.store(true, Ordering::Release);
             }
-            Event::FocusGained => session.send_focus(true),
-            Event::FocusLost => session.send_focus(false),
+            Event::FocusGained => {
+                let _ = session.send_focus(true);
+            }
+            Event::FocusLost => {
+                let _ = session.send_focus(false);
+            }
             Event::Mouse(mouse) => {
                 let area = console_area(outer.terminal_mut().size()?.into());
                 if console.handle_mouse(mouse, area, snapshot.mouse_tracking, &session) {

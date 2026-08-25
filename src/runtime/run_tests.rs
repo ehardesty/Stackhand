@@ -85,7 +85,7 @@ mod pty_seam_tests {
             wait_for_output(&handle, "run-ready"),
             "fixture output did not appear"
         );
-        handle.send_raw(vec![0x04]);
+        let _ = handle.send_raw(vec![0x04]);
 
         let spawned = receiver.recv_timeout(WAIT).expect("spawn event arrived");
         assert_eq!(spawned.run_id, RunId::new(42));
@@ -99,9 +99,13 @@ mod pty_seam_tests {
             "root process did not reach natural exit"
         );
         // Cleanup after a natural root exit still finalizes the TerminalSession
-        // and joins every terminal task.
+        // and joins every terminal worker thread. Exit is reported through the
+        // low-volume path before shutdown completion.
         run.shutdown().expect("run joined after natural exit");
 
+        let exit_event = receiver.recv_timeout(WAIT).expect("exit event arrived");
+        assert_eq!(exit_event.run_id, RunId::new(42));
+        assert_eq!(exit_event.kind, RunEventKind::Exited { code: Some(0) });
         let final_event = receiver.recv_timeout(WAIT).expect("final event arrived");
         assert_eq!(final_event.run_id, RunId::new(42));
         assert_eq!(final_event.kind, RunEventKind::ShutdownComplete);

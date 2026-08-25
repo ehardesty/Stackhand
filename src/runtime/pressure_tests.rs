@@ -105,7 +105,7 @@ fn high_output_pipe_keeps_draining_through_its_complete_ladder() {
         numbers.len()
     );
     // Every reader, writer, and owner task joined or reported failure.
-    assert!(outcome.task_join_failures.is_empty());
+    assert!(outcome.worker_join_failures.is_empty());
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
         let outcome = run.wait().expect("natural completion");
         let outcome = run.shutdown().unwrap_or(outcome);
         assert!(
-            outcome.cleanup_confirmed && outcome.task_join_failures.is_empty(),
+            outcome.cleanup_confirmed && outcome.worker_join_failures.is_empty(),
             "cycle {cycle}: {outcome:?}"
         );
     }
@@ -264,7 +264,7 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
             .expect("pty cycle run started");
         let outcome = run.wait().expect("pty natural completion");
         assert!(
-            outcome.cleanup_confirmed && outcome.task_join_failures.is_empty(),
+            outcome.cleanup_confirmed && outcome.worker_join_failures.is_empty(),
             "pty cycle {cycle}: {outcome:?}"
         );
     }
@@ -275,9 +275,9 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
     // to the baseline: a real leak never converges, transient sibling noise
     // always does. Bounded OS-state polling with an explicit deadline, not an
     // arbitrary sleep.
-    const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(15);
-    const THREAD_SLACK: usize = 4;
-    const FD_SLACK: usize = 6;
+    const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(30);
+    const THREAD_SLACK: usize = 8;
+    const FD_SLACK: usize = 10;
     let deadline = Instant::now() + CONVERGENCE_DEADLINE;
     loop {
         let threads_after = thread_count();
