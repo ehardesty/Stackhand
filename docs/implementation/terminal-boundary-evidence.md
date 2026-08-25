@@ -84,3 +84,6 @@ The Stackhand command gate has a 256 KiB byte limit and 256 message slots. The d
 - Mouse arbitration now uses Ghostty's current tracking state, with Shift as the Stackhand selection override. See [mouse ownership evidence](./mouse-ownership-evidence.md).
 
 No evidence from this slice conflicts with the accepted separation between Ratatui application UI and Ghostty terminal semantics.
+
+The completed real-program matrix and final **go** recommendation are in
+[terminal prototype validation](./terminal-prototype-validation.md).
