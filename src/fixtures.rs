@@ -6,11 +6,35 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier};
 
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{PtyProcess, SpawnCommand};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+
+use crate::runtime::{
+    OwnedRun, ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
+};
 use crate::terminal::{
     OwnedTerminalSnapshot, PASTE_LIMIT_BYTES, PasteCompletion, PasteRejection, PasteRequest,
-    TerminalEvent, TerminalSession,
+    TerminalEvent,
 };
+
+static FIXTURE_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Start one fixture Run through the same public seam that the application
+/// and a future Supervisor use.
+fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Result<OwnedRun> {
+    let (events, _run_event_log) = mpsc::channel();
+    let run_id = FIXTURE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    RunRuntime.start(RunStartRequest {
+        process_id: ProcessId::new(u32::try_from(run_id).expect("fixture run id fits u32")),
+        run_id: RunId::new(run_id),
+        command,
+        mode: RunMode::Pty {
+            initial_geometry: geometry,
+        },
+        events,
+        on_output_wake: None,
+    })
+}
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -23,9 +47,8 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
         "printf 'fixture-ready\\r\\n'; IFS= read -r line; printf 'fixture-echo:%s\\r\\n' \"$line\"; set -- $(stty size); printf 'fixture-size:%sx%s\\r\\n' \"$2\" \"$1\"",
     );
-    let spawned = PtyProcess::spawn(command, geometry)?;
-    let session = TerminalSession::spawn(spawned.io, geometry, || {})?;
-    let mut process = spawned.process;
+    let mut run = start_fixture_run(command, geometry)?;
+    let session = run.terminal();
 
     let resized_geometry =
         TerminalGeometry::new(42, 12).expect("fixture geometry is always non-zero");
@@ -50,10 +73,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(5));
     }
 
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
-    process_result?;
-    session_result?;
+    run.shutdown()?;
 
     if !output.contains(&expected) || !output.contains(expected_size) {
         bail!("fixture did not produce the expected output; terminal contained: {output:?}");
@@ -71,9 +91,8 @@ pub fn run_fixture_input() -> Result<()> {
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
         "stty raw -echo; printf '\\033[?1linput-normal-ready\\r\\n'; IFS= read -r normal; normal_hex=$(printf '%s' \"$normal\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nnormal-bytes:%s\\r\\n' \"$normal_hex\"; printf '\\033[?1h\\033[?1004h\\033[?1036h\\033[6ninput-ready\\r\\n'; IFS= read -r bytes; hex=$(printf '%s' \"$bytes\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\ninput-bytes:%s\\r\\n' \"$hex\"",
     );
-    let spawned = PtyProcess::spawn(command, geometry)?;
-    let session = TerminalSession::spawn(spawned.io, geometry, || {})?;
-    let mut process = spawned.process;
+    let mut run = start_fixture_run(command, geometry)?;
+    let session = run.terminal();
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
     session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -93,12 +112,8 @@ pub fn run_fixture_input() -> Result<()> {
     session.send_raw(vec![b'\n']);
 
     let marker = format!("input-bytes:{expected_hex}");
-    let output_result = wait_for_fixture_text(&session, &marker);
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
-    let output = output_result?;
-    process_result?;
-    session_result?;
+    let output = wait_for_fixture_text(&session, &marker)?;
+    run.shutdown()?;
 
     println!("{output}");
     Ok(())
@@ -119,9 +134,8 @@ safe=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
 printf 'safe-bytes:%s\r\n' "$safe"
 sleep 3"#,
     );
-    let spawned = PtyProcess::spawn(command, geometry)?;
-    let session = TerminalSession::spawn(spawned.io, geometry, || {})?;
-    let mut process = spawned.process;
+    let mut run = start_fixture_run(command, geometry)?;
+    let session = run.terminal();
 
     let fixture_result = (|| {
         wait_for_fixture_text(&session, "fixture-normal-ready")?;
@@ -184,11 +198,8 @@ sleep 3"#,
         Ok::<_, anyhow::Error>(())
     })();
 
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
     fixture_result?;
-    process_result?;
-    session_result?;
+    run.shutdown()?;
     Ok(())
 }
 
@@ -221,7 +232,7 @@ fn input_fixture_events() -> Vec<KeyEvent> {
     .collect()
 }
 
-fn wait_for_fixture_text(session: &TerminalSession, expected: &str) -> Result<String> {
+fn wait_for_fixture_text(session: &TerminalHandle<'_>, expected: &str) -> Result<String> {
     let deadline = Instant::now() + FIXTURE_TIMEOUT;
     let mut output = session.snapshot().text();
     if output.contains(expected) || output.replace('\n', "").contains(expected) {
@@ -250,7 +261,7 @@ fn wait_for_fixture_text(session: &TerminalSession, expected: &str) -> Result<St
     bail!("fixture did not contain {expected:?}; terminal contained: {output:?}")
 }
 
-fn wait_for_input_backpressure(session: &TerminalSession) -> Result<String> {
+fn wait_for_input_backpressure(session: &TerminalHandle<'_>) -> Result<String> {
     let deadline = Instant::now() + FIXTURE_TIMEOUT;
     while Instant::now() < deadline {
         while let Some(event) = session.poll_event() {
@@ -313,9 +324,8 @@ IFS= read -r _
 printf '\033[2J\033[Habcdefghijklmno'
 IFS= read -r _"#,
     );
-    let spawned = PtyProcess::spawn(command, geometry)?;
-    let session = TerminalSession::spawn(spawned.io, geometry, || {})?;
-    let mut process = spawned.process;
+    let mut run = start_fixture_run(command, geometry)?;
+    let session = run.terminal();
 
     let fixture_result = (|| {
         let primary = wait_for_snapshot(&session, |snapshot| {
@@ -379,11 +389,8 @@ IFS= read -r _"#,
         Ok::<_, anyhow::Error>(())
     })();
 
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
     fixture_result?;
-    process_result?;
-    session_result?;
+    run.shutdown()?;
     println!("render-fixture: colors styles unicode cursor alternate-screen reflow resize ok");
     Ok(())
 }
@@ -436,12 +443,12 @@ fn assert_primary_render(snapshot: &OwnedTerminalSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn send_fixture_enter(session: &TerminalSession) {
+fn send_fixture_enter(session: &TerminalHandle<'_>) {
     session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 }
 
 fn wait_for_snapshot(
-    session: &TerminalSession,
+    session: &TerminalHandle<'_>,
     ready: impl Fn(&OwnedTerminalSnapshot) -> bool,
 ) -> Result<OwnedTerminalSnapshot> {
     let deadline = Instant::now() + FIXTURE_TIMEOUT;

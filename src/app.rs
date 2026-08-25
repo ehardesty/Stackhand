@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -7,8 +7,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::console::ConsoleInteraction;
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{PtyProcess, SpawnCommand};
-use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent, TerminalSession};
+use crate::runtime::{
+    ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
+};
+use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{ConsoleWarning, OuterTerminal, console_area, render};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -18,36 +20,40 @@ pub fn run_interactive() -> Result<()> {
     let mut outer = OuterTerminal::enter()?;
     let size = outer.terminal_mut().size()?;
     let geometry = TerminalGeometry::from_pane(console_area(size.into()));
-    let spawned = PtyProcess::spawn(SpawnCommand::shell(), geometry)?;
+    let (events, _run_event_log) = mpsc::channel();
     let dirty = Arc::new(AtomicBool::new(true));
     let wake_dirty = Arc::clone(&dirty);
-    let session = TerminalSession::spawn(spawned.io, geometry, move || {
-        wake_dirty.store(true, Ordering::Release);
+    let mut run = RunRuntime.start(RunStartRequest {
+        process_id: ProcessId::new(1),
+        run_id: RunId::new(1),
+        command: SpawnCommand::shell(),
+        mode: RunMode::Pty {
+            initial_geometry: geometry,
+        },
+        events,
+        on_output_wake: Some(Box::new(move || {
+            wake_dirty.store(true, Ordering::Release);
+        })),
     })?;
-    let mut process = spawned.process;
     let mut snapshot = empty_snapshot(geometry);
     let mut pending_resize = PendingResize::default();
     let mut console = ConsoleInteraction::default();
 
     let run_result = run_event_loop(
         &mut outer,
-        &session,
+        run.terminal(),
         &dirty,
         &mut snapshot,
         &mut pending_resize,
         &mut console,
     );
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
-
     run_result?;
-    process_result?;
-    session_result
+    run.shutdown()
 }
 
 fn run_event_loop(
     outer: &mut OuterTerminal,
-    session: &TerminalSession,
+    session: TerminalHandle<'_>,
     dirty: &AtomicBool,
     snapshot: &mut OwnedTerminalSnapshot,
     pending_resize: &mut PendingResize,
@@ -92,19 +98,19 @@ fn run_event_loop(
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
             Event::Key(key) => {
-                if console.handle_key(key, session, snapshot.buffer.area().height) {
+                if console.handle_key(key, &session, snapshot.buffer.area().height) {
                     dirty.store(true, Ordering::Release);
                 }
             }
             Event::Paste(data) => {
-                console.handle_paste(&data, session);
+                console.handle_paste(&data, &session);
                 dirty.store(true, Ordering::Release);
             }
             Event::FocusGained => session.send_focus(true),
             Event::FocusLost => session.send_focus(false),
             Event::Mouse(mouse) => {
                 let area = console_area(outer.terminal_mut().size()?.into());
-                if console.handle_mouse(mouse, area, snapshot.mouse_tracking, session) {
+                if console.handle_mouse(mouse, area, snapshot.mouse_tracking, &session) {
                     dirty.store(true, Ordering::Release);
                 }
             }

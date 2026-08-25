@@ -9,6 +9,8 @@ mod selection;
 mod session;
 mod state;
 
+#[allow(unused_imports)]
+pub(crate) use history::OutputHistoryMetrics;
 pub(crate) use history::{OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS};
 pub(crate) use mouse::{MouseButton, MouseKind, MouseModifiers, TerminalMouseEvent};
 pub(crate) use paste::{PASTE_LIMIT_BYTES, PasteCompletion, PasteRejection, PasteRequest};

@@ -12,11 +12,33 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
+use std::sync::mpsc;
+
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{PtyProcess, SpawnCommand};
+use crate::runtime::{
+    OwnedRun, ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand,
+};
+
+fn start_stress_run(
+    command: SpawnCommand,
+    geometry: TerminalGeometry,
+    wake: Box<dyn Fn() + Send>,
+) -> anyhow::Result<OwnedRun> {
+    let (events, _run_event_log) = mpsc::channel();
+    RunRuntime.start(RunStartRequest {
+        process_id: ProcessId::new(1),
+        run_id: RunId::new(1),
+        command,
+        mode: RunMode::Pty {
+            initial_geometry: geometry,
+        },
+        events,
+        on_output_wake: Some(wake),
+    })
+}
 use crate::terminal::{
     OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS, PASTE_LIMIT_BYTES, PasteCompletion,
-    PasteRejection, TerminalEvent, TerminalSession,
+    PasteRejection, TerminalEvent,
 };
 
 /// A redraw request gate. Many output chunks can set the gate, but only the
@@ -132,13 +154,16 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
     );
 
     let baseline_rss = resident_set_kib(std::process::id());
-    let spawned = PtyProcess::spawn(command, geometry)?;
     let redraw = Arc::new(RedrawGate::default());
     let wake_count = Arc::clone(&redraw);
-    let session = TerminalSession::spawn(spawned.io, geometry, move || {
-        wake_count.request();
-    })?;
-    let mut process = spawned.process;
+    let mut run = start_stress_run(
+        command,
+        geometry,
+        Box::new(move || {
+            wake_count.request();
+        }),
+    )?;
+    let session = run.terminal();
     let mut peak_rss_kib = baseline_rss;
     let mut snapshots = 0;
     let mut active_snapshots = 0;
@@ -257,11 +282,9 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
         Ok::<_, anyhow::Error>(())
     })();
 
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
+    let history = session.output_history_metrics();
     fixture_result?;
-    process_result?;
-    session_result?;
+    run.shutdown()?;
 
     let peak_rss_delta_kib = peak_rss_kib
         .zip(baseline_rss)
@@ -273,7 +296,6 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
         );
     }
 
-    let history = session.output_history_metrics();
     Ok(StressReport {
         wake_requests: redraw.requests(),
         redraw_notifications: redraw.notifications(),
@@ -303,13 +325,16 @@ while [ "$i" -lt 200000 ]; do
 done
 sleep 5"#,
     );
-    let spawned = PtyProcess::spawn(command, geometry)?;
     let redraw = Arc::new(RedrawGate::default());
     let wake_count = Arc::clone(&redraw);
-    let session = TerminalSession::spawn(spawned.io, geometry, move || {
-        wake_count.request();
-    })?;
-    let mut process = spawned.process;
+    let mut run = start_stress_run(
+        command,
+        geometry,
+        Box::new(move || {
+            wake_count.request();
+        }),
+    )?;
+    let session = run.terminal();
     let fixture_result = (|| {
         let start_deadline = Instant::now() + Duration::from_secs(2);
         while session.output_history_metrics().bytes == 0 && Instant::now() < start_deadline {
@@ -385,11 +410,8 @@ sleep 5"#,
         ))
     })();
 
-    let process_result = process.shutdown();
-    let session_result = session.shutdown();
     let (report, mut requests) = fixture_result?;
-    process_result?;
-    session_result?;
+    run.shutdown()?;
     for request in &mut requests {
         ensure!(
             matches!(

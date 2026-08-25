@@ -90,6 +90,11 @@ impl PtyProcess {
         Ok(SpawnedPty { process, io })
     }
 
+    /// The root operating-system PID when the platform reports one.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.process_id())
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let Some(mut child) = self.child.take() else {
             return Ok(());

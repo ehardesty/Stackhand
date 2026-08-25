@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
 
-use crate::terminal::{CopyRequest, PasteCompletion, PasteRequest, TerminalSession};
+use crate::runtime::TerminalHandle;
+use crate::terminal::{CopyRequest, PasteCompletion, PasteRequest};
 use crate::tui::{ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
 
 pub(crate) struct ConsoleInteraction {
@@ -53,7 +54,12 @@ impl ConsoleInteraction {
         changed
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, session: &TerminalSession, page_rows: u16) -> bool {
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        session: &TerminalHandle<'_>,
+        page_rows: u16,
+    ) -> bool {
         if key.kind == KeyEventKind::Press
             && self.view.mode == ConsoleViewMode::Selection
             && key.code == KeyCode::Char('y')
@@ -85,7 +91,7 @@ impl ConsoleInteraction {
         }
     }
 
-    pub fn handle_paste(&mut self, data: &str, session: &TerminalSession) {
+    pub fn handle_paste(&mut self, data: &str, session: &TerminalHandle<'_>) {
         match session.send_paste(data) {
             Ok(request) => {
                 self.paste_requests.push(request);
@@ -100,7 +106,7 @@ impl ConsoleInteraction {
         mouse: MouseEvent,
         area: Rect,
         child_tracking: bool,
-        session: &TerminalSession,
+        session: &TerminalHandle<'_>,
     ) -> bool {
         let Some(route) = self.mouse.route(
             mouse,
@@ -139,7 +145,7 @@ impl ConsoleInteraction {
     fn handle_app_command(
         &mut self,
         key: KeyEvent,
-        session: &TerminalSession,
+        session: &TerminalHandle<'_>,
         page_rows: u16,
     ) -> bool {
         match key.code {
@@ -174,7 +180,7 @@ impl ConsoleInteraction {
     fn handle_scroll_command(
         &mut self,
         key: KeyEvent,
-        session: &TerminalSession,
+        session: &TerminalHandle<'_>,
         page_rows: u16,
     ) -> bool {
         match key.code {
@@ -198,7 +204,7 @@ impl ConsoleInteraction {
         }
     }
 
-    fn handle_selection_command(&mut self, key: KeyEvent, session: &TerminalSession) -> bool {
+    fn handle_selection_command(&mut self, key: KeyEvent, session: &TerminalHandle<'_>) -> bool {
         match key.code {
             KeyCode::Char('a') => {
                 session.select_all();
@@ -214,7 +220,7 @@ impl ConsoleInteraction {
         }
     }
 
-    fn return_to_live_tail(&mut self, session: &TerminalSession) {
+    fn return_to_live_tail(&mut self, session: &TerminalHandle<'_>) {
         session.follow_live();
         self.view.following = true;
         self.view.mode = ConsoleViewMode::ChildInput;
@@ -225,7 +231,7 @@ fn is_command_leader(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-fn scroll_page(session: &TerminalSession, page_rows: u16, direction: isize) {
+fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {
     let page = isize::try_from(page_rows.saturating_sub(1).max(1))
         .expect("u16 page size always fits in isize");
     session.scroll_lines(direction * page);
@@ -259,6 +265,7 @@ mod tests {
     use super::*;
     use crate::geometry::TerminalGeometry;
     use crate::runtime::PtyIo;
+    use crate::terminal::TerminalSession;
 
     fn session() -> (TerminalSession, UnixStream) {
         let (reader, peer) = UnixStream::pair().unwrap();
@@ -278,16 +285,17 @@ mod tests {
     #[test]
     fn scroll_navigation_stops_following_and_f_returns_to_live_tail() {
         let (session, peer) = session();
+        let handle = crate::runtime::handle_for_test(&session);
         let mut interaction = ConsoleInteraction::default();
 
         assert!(interaction.handle_key(
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &session,
+            &handle,
             20,
         ));
         assert!(interaction.handle_key(
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &session,
+            &handle,
             20,
         ));
         assert_eq!(interaction.view().mode, ConsoleViewMode::Scroll);
@@ -295,7 +303,7 @@ mod tests {
 
         assert!(interaction.handle_key(
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-            &session,
+            &handle,
             20,
         ));
         assert_eq!(interaction.view().mode, ConsoleViewMode::ChildInput);
