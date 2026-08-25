@@ -61,3 +61,16 @@ fn executable_drains_output_while_scrolled_and_unfocused() {
             "scrollback-fixture: bounded history continued draining while scrolled and unfocused",
         ));
 }
+
+#[test]
+fn executable_arbitrates_sgr_mouse_bytes_and_selection_override() {
+    let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary must build");
+
+    command
+        .arg("--fixture-mouse")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "mouse-fixture: SGR press, release, motion, drag, and four wheel directions reached the child; Shift override bytes did not",
+        ));
+}

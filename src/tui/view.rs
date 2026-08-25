@@ -30,6 +30,7 @@ pub struct ConsoleViewState {
     pub mode: ConsoleViewMode,
     pub following: bool,
     pub warning: Option<ConsoleWarning>,
+    pub stackhand_mouse_gesture: bool,
 }
 
 impl Default for ConsoleViewState {
@@ -38,6 +39,7 @@ impl Default for ConsoleViewState {
             mode: ConsoleViewMode::ChildInput,
             following: true,
             warning: None,
+            stackhand_mouse_gesture: false,
         }
     }
 }
@@ -69,7 +71,8 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, view: Con
     }
 
     frame.render_widget(
-        Paragraph::new(footer_text(view)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer_text(view, snapshot.mouse_tracking))
+            .style(Style::default().fg(Color::DarkGray)),
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
     );
 
@@ -82,9 +85,9 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, view: Con
     }
 }
 
-fn footer_text(view: ConsoleViewState) -> &'static str {
+fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
     if let Some(warning) = view.warning {
-        return match warning {
+        let warning = match warning {
             ConsoleWarning::PasteRejected => {
                 "WARNING: paste rejected; no partial bytes sent · Ctrl-A: commands"
             }
@@ -104,9 +107,13 @@ fn footer_text(view: ConsoleViewState) -> &'static str {
                 "WARNING: no terminal text is selected · Esc: selection"
             }
         };
+        return format!(
+            "{} · {warning}",
+            mouse_owner_text(view, child_mouse_tracking)
+        );
     }
 
-    match (view.mode, view.following) {
+    let controls = match (view.mode, view.following) {
         (ConsoleViewMode::ChildInput, true) => "Ctrl-A: commands · Ctrl-Q: quit · LIVE",
         (ConsoleViewMode::ChildInput, false) => "Ctrl-A: commands · history view · NOT FOLLOWING",
         (ConsoleViewMode::AppCommand, _) => {
@@ -118,6 +125,20 @@ fn footer_text(view: ConsoleViewState) -> &'static str {
         (ConsoleViewMode::Selection, _) => {
             "Drag: cells · double: word · triple: line · a: all · y: copy · Esc: commands"
         }
+    };
+    format!(
+        "{} · {controls}",
+        mouse_owner_text(view, child_mouse_tracking)
+    )
+}
+
+fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'static str {
+    if view.stackhand_mouse_gesture {
+        "MOUSE: STACKHAND · active gesture"
+    } else if view.mode == ConsoleViewMode::ChildInput && child_mouse_tracking {
+        "MOUSE: CHILD · Shift+mouse: Stackhand"
+    } else {
+        "MOUSE: STACKHAND"
     }
 }
 
@@ -135,11 +156,15 @@ mod tests {
 
     #[test]
     fn scroll_footer_reports_the_bound_and_missing_truncation_signal() {
-        let text = footer_text(ConsoleViewState {
-            mode: ConsoleViewMode::Scroll,
-            following: false,
-            warning: None,
-        });
+        let text = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::Scroll,
+                following: false,
+                warning: None,
+                stackhand_mouse_gesture: false,
+            },
+            false,
+        );
 
         assert!(text.contains("target 64 KiB"));
         assert!(text.contains("page rounding"));
@@ -148,11 +173,15 @@ mod tests {
 
     #[test]
     fn footer_makes_paste_rejection_visible() {
-        let text = footer_text(ConsoleViewState {
-            mode: ConsoleViewMode::ChildInput,
-            following: true,
-            warning: Some(ConsoleWarning::PasteRejected),
-        });
+        let text = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::ChildInput,
+                following: true,
+                warning: Some(ConsoleWarning::PasteRejected),
+                stackhand_mouse_gesture: false,
+            },
+            false,
+        );
 
         assert!(text.contains("WARNING: paste rejected"));
         assert!(text.contains("no partial bytes sent"));
@@ -160,23 +189,53 @@ mod tests {
 
     #[test]
     fn footer_makes_admitted_paste_delivery_failure_visible() {
-        let text = footer_text(ConsoleViewState {
-            mode: ConsoleViewMode::ChildInput,
-            following: true,
-            warning: Some(ConsoleWarning::PasteDeliveryFailed),
-        });
+        let text = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::ChildInput,
+                following: true,
+                warning: Some(ConsoleWarning::PasteDeliveryFailed),
+                stackhand_mouse_gesture: false,
+            },
+            false,
+        );
         assert!(text.contains("admitted paste did not reach the child"));
     }
 
     #[test]
     fn footer_makes_clipboard_failure_visible_and_keeps_selection_controls() {
-        let text = footer_text(ConsoleViewState {
-            mode: ConsoleViewMode::Selection,
-            following: false,
-            warning: Some(ConsoleWarning::ClipboardFailed),
-        });
+        let text = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::Selection,
+                following: false,
+                warning: Some(ConsoleWarning::ClipboardFailed),
+                stackhand_mouse_gesture: false,
+            },
+            true,
+        );
 
         assert!(text.contains("clipboard write failed"));
         assert!(text.contains("session continues"));
+        assert!(text.contains("MOUSE: STACKHAND"));
+    }
+
+    #[test]
+    fn footer_shows_child_mouse_ownership_and_the_override() {
+        let text = footer_text(ConsoleViewState::default(), true);
+
+        assert!(text.contains("MOUSE: CHILD"));
+        assert!(text.contains("Shift+mouse: Stackhand"));
+    }
+
+    #[test]
+    fn footer_shows_a_captured_stackhand_gesture() {
+        let text = footer_text(
+            ConsoleViewState {
+                stackhand_mouse_gesture: true,
+                ..ConsoleViewState::default()
+            },
+            true,
+        );
+
+        assert!(text.starts_with("MOUSE: STACKHAND · active gesture"));
     }
 }

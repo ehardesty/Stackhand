@@ -10,6 +10,7 @@ use ratatui::layout::Position;
 
 use super::command_gate::{CommandEvent, CommandGate, TerminalCommand};
 use super::history::OutputHistoryMetrics;
+use super::mouse::TerminalMouseEvent;
 use super::owner::{OwnerEvent, OwnerHandle};
 use super::paste::{self, PasteRejection, PasteRequest};
 pub use super::selection::SelectionPoint;
@@ -25,6 +26,7 @@ const MAX_SAFE_SCROLL_DELTA: isize = 1_000_000;
 pub struct OwnedTerminalSnapshot {
     pub buffer: Buffer,
     pub cursor: Option<OwnedCursorState>,
+    pub mouse_tracking: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +131,10 @@ impl TerminalSession {
         let _ = self.commands.try_send(TerminalCommand::Focus(gained));
     }
 
+    pub fn send_mouse(&self, event: TerminalMouseEvent) {
+        let _ = self.commands.try_send(TerminalCommand::Mouse(event));
+    }
+
     pub fn send_raw(&self, data: Vec<u8>) {
         let _ = self.commands.try_send(TerminalCommand::Raw(data));
     }
@@ -214,6 +220,7 @@ impl TerminalSession {
         OwnedTerminalSnapshot {
             buffer: render.buffer,
             cursor: render.cursor,
+            mouse_tracking: render.mouse_tracking,
         }
     }
 

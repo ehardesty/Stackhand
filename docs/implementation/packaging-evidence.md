@@ -43,7 +43,7 @@ size, static native archive size, package archive size, and package hash.
 
 | Target | Result | Evidence boundary |
 | --- | --- | --- |
-| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with pinned Rust `1.93.0`, Zig `0.15.2`, and `libghostty-vt` `0.2.1`. | First native upgrade build: 36 s; binary: 2,265,136 bytes; static native archive: 8,857,784 bytes; final package archive: 941,695 bytes; archive SHA-256: `c0f70d268dff23406fc554a826ae2bb23421177defe9132c78fe024ba707d84b`. Two consecutive package runs had the same payload hash. A clean-`PATH` real-PTY fixture passed, and `otool -L` reported no Ghostty shared library. |
+| macOS arm64 (`aarch64-apple-darwin`) | Build and package path passed on 2026-08-24 with pinned Rust `1.93.0`, Zig `0.15.2`, and `libghostty-vt` `0.2.1`. | First native upgrade build: 36 s; binary: 2,282,448 bytes; static native archive: 8,857,784 bytes; final package archive: 951,950 bytes; archive SHA-256: `66e53f40cd982a0c2f52d1c8b891776725cceb81d00a6a7974d4602659abb88b`. Two consecutive package runs had the same payload hash. A clean-`PATH` real-PTY mouse fixture passed, and `otool -L` reported no Ghostty shared library. |
 | Linux x86-64 (`x86_64-unknown-linux-gnu`) | Not verified on this macOS arm64 host. | A Linux x86-64 clean-checkout build must run in Linux CI or a Linux machine before this target can be called supported. The script accepts the target through `STACKHAND_TARGET`. |
 | macOS x86-64 (`x86_64-apple-darwin`) | Not verified. | Requires a cross-target toolchain and a separate runtime smoke test. Do not describe it as supported. |
 | Linux arm64 (`aarch64-unknown-linux-gnu`) | Not verified. | Requires a Linux arm64 runtime smoke test. Do not describe it as supported. |

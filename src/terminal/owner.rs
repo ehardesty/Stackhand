@@ -20,6 +20,7 @@ use ratatui::layout::Rect;
 use super::command_gate::CommandReceiver;
 use super::commands::{PendingInput, apply_command};
 use super::history::{BoundedOutputHistory, OutputHistoryMetrics};
+use super::mouse::MouseController;
 use super::render;
 use super::selection::SelectionController;
 use super::session::OwnedCursorState;
@@ -45,6 +46,7 @@ pub enum OwnerEvent {
 pub struct OwnedRender {
     pub buffer: Buffer,
     pub cursor: Option<OwnedCursorState>,
+    pub mouse_tracking: bool,
 }
 
 struct SharedOwner {
@@ -126,6 +128,7 @@ impl OwnerHandle {
             render: Mutex::new(OwnedRender {
                 buffer: Buffer::empty(Rect::new(0, 0, geometry.cols(), geometry.rows())),
                 cursor: None,
+                mouse_tracking: false,
             }),
             dirty: AtomicBool::new(true),
             alive: AtomicBool::new(true),
@@ -267,6 +270,7 @@ fn run_owner(
     terminal.on_clipboard_write(deny_child_clipboard)?;
     let mut render_state = RenderState::new()?;
     let mut key_encoder = key::Encoder::new()?;
+    let mut mouse_controller = MouseController::new()?;
     let mut selection = SelectionController::new()?;
     let mut history = BoundedOutputHistory::new();
     let mut focused = true;
@@ -348,6 +352,7 @@ fn run_owner(
                     command_bytes,
                     &mut terminal,
                     &mut key_encoder,
+                    &mut mouse_controller,
                     &mut resizer,
                     &mut focused,
                     &mut cols,
@@ -437,6 +442,7 @@ fn render(
     owned.buffer.reset();
     owned.cursor =
         render::render(terminal, render_state, &mut owned.buffer, focused, area).unwrap_or(None);
+    owned.mouse_tracking = terminal.is_mouse_tracking().unwrap_or(false);
     shared.dirty.store(true, Ordering::Release);
 }
 

@@ -10,6 +10,7 @@ fn main() -> Result<()> {
         Mode::FixturePaste => stackhand::app::run_fixture_paste(),
         Mode::FixtureRendering => stackhand::app::run_fixture_rendering(),
         Mode::FixtureScrollback => stackhand::scrollback_fixture::run(),
+        Mode::FixtureMouse => stackhand::mouse_fixture::run(),
     }
 }
 
@@ -20,6 +21,7 @@ enum Mode {
     FixturePaste,
     FixtureRendering,
     FixtureScrollback,
+    FixtureMouse,
 }
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
@@ -53,6 +55,13 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
             bail!("--fixture-scrollback does not accept arguments");
         }
         return Ok(Mode::FixtureScrollback);
+    }
+
+    if first == "--fixture-mouse" {
+        if args.next().is_some() {
+            bail!("--fixture-mouse does not accept arguments");
+        }
+        return Ok(Mode::FixtureMouse);
     }
 
     if first != "--fixture-round-trip" {

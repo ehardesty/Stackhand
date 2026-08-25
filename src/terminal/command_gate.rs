@@ -7,6 +7,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossterm::event::KeyEvent;
 
+use super::mouse::TerminalMouseEvent;
 use super::selection::SelectionPoint;
 use crate::geometry::TerminalGeometry;
 
@@ -18,6 +19,7 @@ const COMMAND_EVENT_SLOTS: usize = 64;
 pub enum TerminalCommand {
     Key(KeyEvent),
     Focus(bool),
+    Mouse(TerminalMouseEvent),
     Raw(Vec<u8>),
     Paste {
         data: Vec<u8>,
@@ -43,6 +45,7 @@ impl TerminalCommand {
             // command value. This keeps the byte bound true after encoding.
             Self::Key(_) => 64,
             Self::Focus(_) => input_focus_bytes(),
+            Self::Mouse(_) => 64,
             Self::Raw(data) => data.len(),
             Self::Paste { data, .. } => data.len().saturating_add(12),
             Self::Resize(_) => 4,

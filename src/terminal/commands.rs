@@ -6,6 +6,7 @@ use libghostty_vt::terminal::{ScrollViewport, Terminal};
 
 use super::command_gate::TerminalCommand;
 use super::input;
+use super::mouse::MouseController;
 use super::selection::SelectionController;
 use crate::runtime::PtyResizer;
 
@@ -21,6 +22,7 @@ pub fn apply_command(
     command_bytes: usize,
     terminal: &mut Terminal<'static, 'static>,
     key_encoder: &mut key::Encoder<'static>,
+    mouse_controller: &mut MouseController,
     resizer: &mut PtyResizer,
     focused: &mut bool,
     cols: &mut u16,
@@ -33,6 +35,7 @@ pub fn apply_command(
             *focused = gained;
             input::encode_focus(gained).to_vec()
         }
+        TerminalCommand::Mouse(event) => mouse_controller.apply(terminal, selection, event)?,
         TerminalCommand::Raw(data) => data,
         TerminalCommand::Paste { data, completion } => {
             return Ok(Some(PendingInput {

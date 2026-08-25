@@ -81,6 +81,6 @@ The Stackhand command gate has a 256 KiB byte limit and 256 message slots. The d
 - Selection uses Ghostty press, drag, release, repeat-click, and autoscroll gesture APIs. Ghostty owns the active selection and its tracked endpoints across output and resize/reflow. The Ratatui adapter reads Ghostty's per-cell selected state for the visible highlight.
 - User copy uses Ghostty's plain selection formatter with soft-wrap unwrapping and trailing-padding trimming. Tests assert copied logical text for Unicode, hard and soft line breaks, scrollback autoscroll, live output, and reflow. The UI writes owned text to the system clipboard after a user action. A failure produces a warning and does not stop the terminal session.
 - The 0.2.1 callback boundary ignores child OSC 52 reads. Stackhand registers a callback that denies all child clipboard writes. Clipboard contents are not logged.
-- Mouse arbitration with child mouse tracking remains in the next slice. Selection mode currently gives the application explicit mouse ownership.
+- Mouse arbitration now uses Ghostty's current tracking state, with Shift as the Stackhand selection override. See [mouse ownership evidence](./mouse-ownership-evidence.md).
 
 No evidence from this slice conflicts with the accepted separation between Ratatui application UI and Ghostty terminal semantics.

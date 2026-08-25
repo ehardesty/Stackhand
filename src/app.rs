@@ -3,19 +3,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyProcess, SpawnCommand};
 use crate::terminal::{
-    CopyRequest, OwnedTerminalSnapshot, PasteCompletion, PasteRequest, SelectionPoint,
-    TerminalEvent, TerminalSession,
+    CopyRequest, OwnedTerminalSnapshot, PasteCompletion, PasteRequest, TerminalEvent,
+    TerminalSession,
 };
 use crate::tui::{
-    ConsoleViewMode, ConsoleViewState, ConsoleWarning, OuterTerminal, console_area, render,
+    ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter, OuterTerminal, console_area,
+    render,
 };
 
 pub use crate::fixtures::{
@@ -67,6 +65,7 @@ fn run_event_loop(
     let mut paste_requests = Vec::new();
     let mut copy_requests = Vec::new();
     let selection_clock = Instant::now();
+    let mut mouse_router = MouseRouter::default();
     loop {
         poll_paste_requests(&mut paste_requests, console_view, dirty);
         poll_copy_requests(&mut copy_requests, console_view, dirty);
@@ -135,7 +134,18 @@ fn run_event_loop(
             Event::FocusLost => session.send_focus(false),
             Event::Mouse(mouse) => {
                 let area = console_area(outer.terminal_mut().size()?.into());
-                if route_selection_mouse(mouse, area, selection_clock, session, console_view) {
+                if let Some(route) = mouse_router.route(
+                    mouse,
+                    area,
+                    console_view.mode,
+                    snapshot.mouse_tracking,
+                    selection_clock.elapsed(),
+                ) {
+                    console_view.stackhand_mouse_gesture = route.stackhand_gesture_active;
+                    session.send_mouse(route.event);
+                    if route.changes_history_view {
+                        console_view.following = false;
+                    }
                     dirty.store(true, Ordering::Release);
                 }
             }
@@ -285,59 +295,6 @@ fn route_console_key(
     }
 }
 
-fn route_selection_mouse(
-    mouse: MouseEvent,
-    area: ratatui::layout::Rect,
-    clock: Instant,
-    session: &TerminalSession,
-    view: &mut ConsoleViewState,
-) -> bool {
-    let Some(route) = selection_mouse_route(mouse, area, view.mode) else {
-        return false;
-    };
-    match route {
-        SelectionMouseRoute::Press(point) => {
-            session.selection_press(point, clock.elapsed());
-        }
-        SelectionMouseRoute::Drag(point) => session.selection_drag(point),
-        SelectionMouseRoute::Release(point) => session.selection_release(point),
-    }
-    view.following = false;
-    true
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelectionMouseRoute {
-    Press(SelectionPoint),
-    Drag(SelectionPoint),
-    Release(SelectionPoint),
-}
-
-fn selection_mouse_route(
-    mouse: MouseEvent,
-    area: ratatui::layout::Rect,
-    mode: ConsoleViewMode,
-) -> Option<SelectionMouseRoute> {
-    if mode != ConsoleViewMode::Selection || area.width == 0 {
-        return None;
-    }
-    let inside = mouse.column >= area.x && mouse.column < area.right();
-    if !inside && !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-        return None;
-    }
-    let col = mouse.column.saturating_sub(area.x).min(area.width - 1);
-    let point = SelectionPoint {
-        col,
-        surface_row: i32::from(mouse.row) - i32::from(area.y),
-    };
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => Some(SelectionMouseRoute::Press(point)),
-        MouseEventKind::Drag(MouseButton::Left) => Some(SelectionMouseRoute::Drag(point)),
-        MouseEventKind::Up(MouseButton::Left) => Some(SelectionMouseRoute::Release(point)),
-        _ => None,
-    }
-}
-
 fn is_command_leader(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -394,6 +351,7 @@ fn empty_snapshot(geometry: TerminalGeometry) -> OwnedTerminalSnapshot {
             geometry.rows(),
         )),
         cursor: None,
+        mouse_tracking: false,
     }
 }
 
@@ -490,24 +448,5 @@ mod tests {
         let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
 
         assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
-    }
-
-    #[test]
-    fn release_outside_the_pane_still_ends_selection_routing() {
-        let area = ratatui::layout::Rect::new(10, 5, 20, 4);
-        let release = MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: 40,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-
-        assert_eq!(
-            selection_mouse_route(release, area, ConsoleViewMode::Selection),
-            Some(SelectionMouseRoute::Release(SelectionPoint {
-                col: 19,
-                surface_row: -1,
-            }))
-        );
     }
 }
