@@ -8,6 +8,8 @@ mod pty;
 // callers and tests rather than this crate's non-test code yet.
 #[cfg(test)]
 mod metrics_tests;
+#[cfg(test)]
+mod pressure_tests;
 #[allow(dead_code)]
 mod run;
 #[cfg(test)]

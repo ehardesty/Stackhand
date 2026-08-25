@@ -311,7 +311,10 @@ enum RunInner {
     Pipe(PipeRun),
 }
 
-const RUN_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const RUN_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(15);
+/// Upper bound for Process Tree enumeration polls while waiting for
+/// containment confirmation; keeps `ps` pressure low under parallel load.
+const SETTLED_POLL_CEILING: Duration = Duration::from_millis(75);
 /// Upper bound for observing natural root exit through `wait()`.
 const RUN_EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -429,7 +432,9 @@ impl OwnedRun {
         if let Some(outcome) = &self.outcome {
             return Ok(outcome.clone());
         }
-        self.stopping.store(false, Ordering::Release);
+        // Natural completion still closes admission and stops the sampler:
+        // the Run is over either way.
+        self.stopping.store(true, Ordering::Release);
         let mut stages = Vec::new();
         let mut io_failures = Vec::new();
         let mut terminal_failure = None;
@@ -687,7 +692,7 @@ impl OwnedRun {
                 return trace;
             }
         }
-        Self::wait_settled(tree, ladder.graceful_timeout);
+        Self::wait_settled_retransmitting(tree, SemanticSignal::Interrupt, ladder.graceful_timeout);
 
         // Stage: terminate remaining members.
         match Self::send_stage(tree, SemanticSignal::Terminate) {
@@ -701,7 +706,11 @@ impl OwnedRun {
                 return trace;
             }
         }
-        Self::wait_settled(tree, ladder.terminate_timeout);
+        Self::wait_settled_retransmitting(
+            tree,
+            SemanticSignal::Terminate,
+            ladder.terminate_timeout,
+        );
 
         // Stage: kill whatever remains.
         match Self::send_stage(tree, SemanticSignal::Kill) {
@@ -713,7 +722,7 @@ impl OwnedRun {
                 trace.signals_stopped = true;
             }
         }
-        Self::wait_settled(tree, ladder.final_deadline);
+        Self::wait_settled_retransmitting(tree, SemanticSignal::Kill, ladder.final_deadline);
         trace.record_remaining(tree);
         trace
     }
@@ -725,7 +734,8 @@ impl OwnedRun {
         tree: &UnixProcessTree,
         semantic: SemanticSignal,
     ) -> std::result::Result<bool, SignalError> {
-        if Self::tree_settled(tree) {
+        // Cheap probe first; enumeration runs only when needed.
+        if UnixProcessTree::root_exit_pending(tree.root_pid()) && Self::tree_is_empty(tree) {
             return Ok(false);
         }
         let target_group = !Self::tree_is_empty(tree);
@@ -746,13 +756,54 @@ impl OwnedRun {
 
     fn wait_settled(tree: &UnixProcessTree, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
+        let mut cadence = RUN_EXIT_POLL_INTERVAL;
+        loop {
+            // Cheap probe first: waitid observes root exit without touching
+            // the process table. Enumeration runs only after root exit.
+            if UnixProcessTree::root_exit_pending(tree.root_pid()) && Self::tree_is_empty(tree) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return Self::tree_settled(tree);
+            }
+            std::thread::sleep(cadence);
+            cadence = (cadence * 2).min(SETTLED_POLL_CEILING);
+        }
+    }
+
+    /// Wait for the tree to settle while re-transmitting the stage signal
+    /// periodically. Single-shot group signals are occasionally ineffective
+    /// on macOS under heavy process churn (observed as kill() returning 0
+    /// with no effect); real supervisors re-send during escalation windows,
+    /// and so do we.
+    fn wait_settled_retransmitting(
+        tree: &UnixProcessTree,
+        stage: SemanticSignal,
+        budget: Duration,
+    ) -> bool {
+        const RETRANSMIT_INTERVAL: Duration = Duration::from_millis(250);
+        let started = Instant::now();
+        let mut next_send = started + RETRANSMIT_INTERVAL;
+        loop {
             if Self::tree_settled(tree) {
                 return true;
             }
-            std::thread::sleep(RUN_EXIT_POLL_INTERVAL);
+            if Instant::now() >= started + budget {
+                return Self::tree_settled(tree);
+            }
+            if Instant::now() >= next_send {
+                let result = if Self::tree_is_empty(tree) {
+                    tree.signal_root_unreaped(stage)
+                } else {
+                    tree.signal(stage)
+                };
+                // A failed re-transmit does not change the recorded stage
+                // result; the budget still bounds this phase either way.
+                let _ = result;
+                next_send = Instant::now() + RETRANSMIT_INTERVAL;
+            }
+            std::thread::sleep(RUN_EXIT_POLL_INTERVAL.min(SETTLED_POLL_CEILING));
         }
-        Self::tree_settled(tree)
     }
 
     fn tree_is_empty(tree: &UnixProcessTree) -> bool {
