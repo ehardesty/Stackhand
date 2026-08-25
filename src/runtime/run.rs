@@ -9,12 +9,13 @@
 //! sampler handles.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::geometry::TerminalGeometry;
+use crate::runtime::metrics::{MetricsSampler, RunMetrics};
 use crate::runtime::pipe::{PipeRun, RunOutput};
 use crate::runtime::process_tree::{SemanticSignal, SignalError, UnixProcessTree};
 use crate::runtime::{PtyProcess, SpawnCommand};
@@ -102,6 +103,8 @@ pub struct RunStartRequest {
     pub output: mpsc::Sender<RunOutput>,
     /// The configured semantic shutdown ladder timeouts for this Run.
     pub ladder: ShutdownLadder,
+    /// Aggregate Process Tree sampling interval. `None` disables sampling.
+    pub metrics_interval: Option<Duration>,
     /// Optional wake called when terminal output arrives. This is the
     /// redraw-notification path for interactive hosts; it never carries
     /// output bytes.
@@ -109,13 +112,13 @@ pub struct RunStartRequest {
 }
 
 /// A low-volume Run lifecycle event. Every event carries the `RunId`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunEvent {
     pub run_id: RunId,
     pub kind: RunEventKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RunEventKind {
     /// The root process spawned. Carries the root PID when the platform
     /// reports one.
@@ -131,6 +134,9 @@ pub enum RunEventKind {
     },
     /// One owned I/O task failed. Carries no output bytes.
     IoFailed(String),
+    /// One bounded aggregate Process Tree sample. At most one is emitted
+    /// per configured interval.
+    Metrics(RunMetrics),
 }
 
 /// How one completed Run ended.
@@ -173,7 +179,7 @@ impl StageResult {
 /// One structured result for a completed Run. Callers never assemble
 /// cleanup results from pieces; every completion path produces exactly one
 /// of these.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunOutcome {
     pub run_id: RunId,
     pub disposition: RunExitDisposition,
@@ -190,6 +196,9 @@ pub struct RunOutcome {
     pub io_failures: Vec<String>,
     pub terminal_failure: Option<String>,
     pub task_join_failures: Vec<String>,
+    /// The last valid sample retained when the sampler stopped with the
+    /// Run, if sampling was enabled and produced at least one snapshot.
+    pub final_metrics: Option<RunMetrics>,
 }
 
 impl RunEvent {
@@ -231,13 +240,31 @@ impl RunRuntime {
             }
         };
         let (tree, inner) = inner;
+        let root_pid = match &inner {
+            RunInner::Pty { process, .. } => process.process_id(),
+            RunInner::Pipe(pipe) => pipe.root_pid(),
+        };
+        let stopping = Arc::new(AtomicBool::new(false));
+        let metrics = root_pid.and_then(|root_pid| {
+            request.metrics_interval.map(|interval| {
+                MetricsSampler::spawn(
+                    root_pid,
+                    request.process_id,
+                    request.run_id,
+                    interval,
+                    Arc::clone(&stopping),
+                    request.events.clone(),
+                )
+            })
+        });
         let run = OwnedRun {
             process_id: request.process_id,
             run_id: request.run_id,
             inner: Some(inner),
             tree,
             ladder: request.ladder,
-            stopping: AtomicBool::new(false),
+            stopping,
+            metrics,
             retired_pty: None,
             events: request.events,
             outcome: None,
@@ -264,8 +291,11 @@ pub struct OwnedRun {
     tree: Option<UnixProcessTree>,
     ladder: ShutdownLadder,
     /// Set before any cleanup work starts. Input and resize admission gates
-    /// read this flag.
-    stopping: AtomicBool,
+    /// read this flag. Shared with the metrics sampler so it stops with the
+    /// Run.
+    stopping: Arc<AtomicBool>,
+    /// Aggregate Process Tree sampler, present when sampling is enabled.
+    metrics: Option<MetricsSampler>,
     /// A finalized PTY session kept only so input/resize admission gates
     /// stay observable after completion.
     retired_pty: Option<TerminalSession>,
@@ -367,7 +397,7 @@ impl OwnedRun {
         };
         Some(TerminalHandle {
             session,
-            stopping: &self.stopping,
+            stopping: self.stopping.as_ref(),
         })
     }
 
@@ -441,6 +471,17 @@ impl OwnedRun {
             }
         };
 
+        // The sampler stops and joins with the Run; a stopped sampler can
+        // never emit a later sample for this Run.
+        let mut task_join_failures = Vec::new();
+        let (final_metrics, sampler_joined) = match self.metrics.take() {
+            Some(sampler) => sampler.stop_and_join(),
+            None => (None, true),
+        };
+        if !sampler_joined {
+            task_join_failures.push("metrics sampler did not join".to_string());
+        }
+
         let disposition = if exit_code == Some(0) {
             RunExitDisposition::NaturalCompletion
         } else {
@@ -452,11 +493,14 @@ impl OwnedRun {
             intentional_stop: false,
             exit_code,
             stage_results: stages,
-            cleanup_confirmed: io_failures.is_empty() && terminal_failure.is_none(),
+            cleanup_confirmed: io_failures.is_empty()
+                && terminal_failure.is_none()
+                && task_join_failures.is_empty(),
             remaining_pids: Vec::new(),
             io_failures,
             terminal_failure,
-            task_join_failures: Vec::new(),
+            final_metrics,
+            task_join_failures,
         };
         self.emit(RunEventKind::Exited { code: exit_code });
         self.outcome = Some(outcome.clone());
@@ -591,6 +635,17 @@ impl OwnedRun {
             && terminal_failure.is_none()
             && task_join_failures.is_empty()
             && trace.stages.iter().all(|stage| stage.ok);
+
+        // The sampler stops and joins with the Run; a stopped sampler can
+        // never emit a later sample for this Run.
+        let (final_metrics, sampler_joined) = match self.metrics.take() {
+            Some(sampler) => sampler.stop_and_join(),
+            None => (None, true),
+        };
+        if !sampler_joined {
+            task_join_failures.push("metrics sampler did not join".to_string());
+        }
+        let cleanup_confirmed = cleanup_confirmed && sampler_joined;
         let outcome = RunOutcome {
             run_id: self.run_id,
             disposition: RunExitDisposition::IntentionalStop,
@@ -601,6 +656,7 @@ impl OwnedRun {
             remaining_pids: trace.remaining_pids,
             io_failures,
             terminal_failure,
+            final_metrics,
             task_join_failures,
         };
         self.emit(match cleanup_confirmed {

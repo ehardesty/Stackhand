@@ -34,6 +34,7 @@ pub fn run_interactive() -> Result<()> {
         events,
         output,
         ladder: Default::default(),
+        metrics_interval: None,
         on_output_wake: Some(Box::new(move || {
             wake_dirty.store(true, Ordering::Release);
         })),

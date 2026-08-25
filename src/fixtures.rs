@@ -35,6 +35,7 @@ fn start_fixture_run(command: SpawnCommand, geometry: TerminalGeometry) -> Resul
         events,
         output,
         ladder: Default::default(),
+        metrics_interval: None,
         on_output_wake: None,
     })
 }

@@ -41,6 +41,7 @@ fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> StartedRun {
             events,
             output,
             ladder,
+            metrics_interval: None,
             on_output_wake: None,
         })
         .expect("pipe run started");
@@ -221,6 +222,7 @@ fn input_and_resize_are_rejected_after_shutdown_starts() {
             events,
             output: mpsc::channel().0,
             ladder: quick_ladder(100, 100),
+            metrics_interval: None,
             on_output_wake: None,
         })
         .expect("pty run started");

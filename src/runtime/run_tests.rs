@@ -30,6 +30,7 @@ mod pty_seam_tests {
                 events,
                 output: mpsc::channel().0,
                 ladder: Default::default(),
+                metrics_interval: None,
                 on_output_wake: None,
             })
             .expect("fixture run started");
@@ -60,6 +61,7 @@ mod pty_seam_tests {
                 events: mpsc::channel().0,
                 output: mpsc::channel().0,
                 ladder: Default::default(),
+                metrics_interval: None,
                 on_output_wake: None,
             })
             .unwrap();
@@ -135,6 +137,7 @@ mod pipe_tests {
                 events,
                 output,
                 ladder: Default::default(),
+                metrics_interval: None,
                 on_output_wake: None,
             })
             .expect("pipe run started");
@@ -283,6 +286,7 @@ mod process_tree_tests {
                 events,
                 output,
                 ladder: Default::default(),
+                metrics_interval: None,
                 on_output_wake: None,
             })
             .expect("pipe run started");
@@ -531,6 +535,7 @@ wait";
                 events,
                 output: mpsc::channel().0,
                 ladder: Default::default(),
+                metrics_interval: None,
                 on_output_wake: None,
             })
             .expect("pty run started");

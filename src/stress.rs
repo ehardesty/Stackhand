@@ -36,6 +36,7 @@ fn start_stress_run(
         events,
         output,
         ladder: Default::default(),
+        metrics_interval: None,
         on_output_wake: Some(wake),
     })
 }
