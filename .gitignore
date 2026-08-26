@@ -36,8 +36,8 @@ lcov.info
 *.log
 *.pid
 *.pid.lock
-core
-core.*
+/core
+/core.*
 /.cache/
 /tmp/
 
