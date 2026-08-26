@@ -122,6 +122,12 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
         }
         None => base_dir.to_path_buf(),
     };
+    if !working_dir.is_dir() {
+        return fail(format!(
+            "Process '{name}': working directory '{}' does not exist",
+            working_dir.display()
+        ));
+    }
     let terminal_mode = match process.terminal.as_deref() {
         None | Some("pipe") => TerminalMode::Pipe,
         Some("pty") => TerminalMode::Pty,
@@ -222,15 +228,32 @@ mod tests {
 
     #[test]
     fn relative_working_directories_resolve_from_the_config_directory() {
-        let project = write_and_load(
-            "cwd",
-            "version: 1\nprocesses:\n  - name: web\n    working_dir: ./web\n    command:\n      program: /bin/true\n",
-        )
-        .expect("valid config");
+        let dir = std::env::temp_dir().join("stackhand-config-cwd");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("web")).expect("working directory creates");
+        let path = dir.join("stackhand.yaml");
+        fs::write(&path, "version: 1\nprocesses:\n  - name: web\n    working_dir: ./web\n    command:\n      program: /bin/true\n")
+            .expect("config writes");
+        let project = load(&path).expect("valid config");
+        let _ = fs::remove_dir_all(&dir);
         let expected = std::env::temp_dir()
             .join("stackhand-config-cwd")
             .join("web");
         assert_eq!(project.processes()[0].working_dir, expected);
+    }
+
+    #[test]
+    fn missing_working_directories_are_rejected_with_the_process_name() {
+        let error = write_and_load(
+            "missing-cwd",
+            "version: 1\nprocesses:\n  - name: web\n    working_dir: ./nope\n    command:\n      program: /bin/true\n",
+        )
+        .expect_err("a missing working directory must fail");
+        assert!(
+            error.message.contains("Process 'web'") && error.message.contains("working directory"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

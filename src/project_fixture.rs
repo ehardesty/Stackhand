@@ -14,6 +14,27 @@ const STARTUP_WAIT: Duration = Duration::from_secs(15);
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
+/// Console text that proves inline environment reached the child. The
+/// fixture configuration in `tests/project_fixture.rs` prints it from
+/// `$FIXTURE_TOKEN`.
+const ENV_PROOF: &str = "fixture-token-stackhand-env-ok";
+
+/// Console text that proves a shell pipeline ran end to end: the first
+/// stage's output only appears after the second stage transforms it.
+const PIPELINE_PROOF: &str = "FIXTURE-PIPELINE-LOWER";
+
+/// One expected console proof per configured Process. This harness and the
+/// integration-test configurations in `tests/project_fixture.rs` form one
+/// contract.
+const CONSOLE_PROOFS: &[(&str, &str)] = &[
+    // A direct command reaches the child with its documented meaning.
+    ("hello", "fixture-marker"),
+    // Inline environment reaches the child.
+    ("hello", ENV_PROOF),
+    // Shell command text runs through the user's shell as one pipeline.
+    ("shelled", PIPELINE_PROOF),
+];
+
 pub fn run(config_path: &Path) -> Result<()> {
     let project = crate::config::load(config_path)
         .map_err(|error| anyhow!("configuration error: {error}"))?;
@@ -52,37 +73,40 @@ fn prove_slice(
     }
     println!("fixture-started-ok");
 
-    // Output flows to the selected Process console without entering the
-    // control plane.
-    let marker_process = snapshot
-        .processes
-        .iter()
-        .find(|process| process.current_run.is_some())
-        .ok_or_else(|| anyhow!("no active Process to inspect"))?;
-    let view = consoles
-        .view(
-            snapshot
-                .processes
-                .iter()
-                .position(|p| p.name == marker_process.name)
-                .expect("selected Process exists") as u32,
-            marker_process.current_run.expect("active Run"),
-        )
-        .ok_or_else(|| anyhow!("no live console view"))?;
+    // Output flows to each Process console without entering the control
+    // plane; every proof must appear in its own Process's console.
+    for (name, needle) in CONSOLE_PROOFS {
+        let index = snapshot
+            .processes
+            .iter()
+            .position(|process| process.name == *name)
+            .unwrap_or_else(|| panic!("Process {name} is part of the fixture contract"));
+        let run_id = snapshot.processes[index]
+            .current_run
+            .unwrap_or_else(|| panic!("Process {name} has an active Run"));
+        let view = consoles
+            .view(index as u32, run_id)
+            .ok_or_else(|| anyhow!("no live console view for {name}"))?;
+        wait_for_console_text(view, needle)?;
+    }
+    println!("fixture-output-ok");
+    Ok(())
+}
+
+fn wait_for_console_text(view: crate::supervisor::ConsoleView, needle: &str) -> Result<()> {
     let deadline = Instant::now() + OUTPUT_WAIT;
     loop {
         if view
             .snapshot()
-            .is_some_and(|snapshot| buffer_text(&snapshot).contains("fixture-marker"))
+            .is_some_and(|snapshot| buffer_text(&snapshot).contains(needle))
         {
             break;
         }
         if Instant::now() >= deadline {
-            bail!("the fixture marker never reached the console");
+            bail!("the fixture proof '{needle}' never reached the console");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    println!("fixture-output-ok");
     Ok(())
 }
 

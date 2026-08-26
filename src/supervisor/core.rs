@@ -4,6 +4,8 @@
 //! reach it through semantic commands, typed seam events, and immutable
 //! snapshots — the same surface the serializing task wrapper drives.
 
+use std::ffi::{OsStr, OsString};
+
 use crate::geometry::TerminalGeometry;
 use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
@@ -158,17 +160,14 @@ impl Core {
 
     fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
         let spec = &self.project.processes()[index];
-        // Shell command forms become concrete programs in configuration
-        // support (Issue #23); until then both forms resolve to a direct
-        // program here.
+        // Shell command text reaches the child through the user's own shell
+        // so its syntax means what configuration promised; direct commands
+        // never gain shell parsing.
         let (program, args) = match &spec.command {
             crate::model::CommandForm::Direct { program, args } => (program.clone(), args.clone()),
             crate::model::CommandForm::Shell { text } => (
-                std::ffi::OsString::from("/bin/sh"),
-                vec![
-                    std::ffi::OsString::from("-c"),
-                    std::ffi::OsString::from(text),
-                ],
+                shell_program(std::env::var_os("SHELL").as_deref()),
+                vec![OsString::from("-c"), OsString::from(text)],
             ),
         };
         StartIntent {
@@ -297,6 +296,12 @@ impl Core {
     }
 }
 
+/// The program that interprets shell command text: `$SHELL` from the
+/// environment when present, otherwise `/bin/sh`.
+fn shell_program(shell_env: Option<&OsStr>) -> OsString {
+    shell_env.map_or_else(|| OsString::from("/bin/sh"), OsString::from)
+}
+
 /// Semantic commands. Callers never mutate Supervisor state directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -336,4 +341,18 @@ pub struct ProcessSnapshot {
     pub current_run: Option<u64>,
     pub failure: Option<FailureSummary>,
     pub metrics: Option<MetricsMetadata>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_resolution_prefers_the_environment_and_falls_back() {
+        assert_eq!(
+            shell_program(Some(OsStr::new("/bin/zsh"))),
+            OsString::from("/bin/zsh")
+        );
+        assert_eq!(shell_program(None), OsString::from("/bin/sh"));
+    }
 }
