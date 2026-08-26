@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 
 use crate::runtime::TerminalHandle;
 use crate::terminal::{CopyRequest, PasteCompletion, PasteRequest};
-use crate::tui::{ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
+use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
 
 /// One requested move of the Process-list selection. Command modes carry
 /// only this request; the app event loop owns the selection itself, so a
@@ -16,6 +16,8 @@ pub enum SelectionMove {
     Up,
     Down,
 }
+
+pub use crate::pipe_scroll::PipeScroll;
 
 pub(crate) struct ConsoleInteraction {
     view: ConsoleViewState,
@@ -48,6 +50,39 @@ impl ConsoleInteraction {
         self.view.warning = Some(warning);
     }
 
+    /// Set which console pane the view renders; the footer shows the pane's
+    /// controls and the pane-aware input gating reads it. A pane change
+    /// invalidates the pane-scoped routing warnings.
+    pub fn set_pane(&mut self, pane: ConsolePaneKind) {
+        if self.view.pane != pane {
+            Self::clear_pane_warnings(&mut self.view);
+        }
+        self.view.pane = pane;
+    }
+
+    /// Clear the warnings that describe the selected pane's input routing.
+    /// Call when the selected Process changes; use before asserting a
+    /// fresh rejection so the asserted warning is the new one.
+    pub fn clear_pane_warning(&mut self) {
+        Self::clear_pane_warnings(&mut self.view);
+    }
+
+    /// The routing warnings belong to the selected pane and Process: a
+    /// pane or selection change makes them stale.
+    fn clear_pane_warnings(view: &mut ConsoleViewState) {
+        if matches!(
+            view.warning,
+            Some(
+                ConsoleWarning::InputDisabled
+                    | ConsoleWarning::PipeReadOnly
+                    | ConsoleWarning::SelectionUnavailable
+                    | ConsoleWarning::PasteRejected
+            )
+        ) {
+            view.warning = None;
+        }
+    }
+
     /// Drain every Process-selection move queued by command modes.
     pub fn take_selection_moves(&mut self) -> Vec<SelectionMove> {
         std::mem::take(&mut self.selection_requests)
@@ -68,6 +103,38 @@ impl ConsoleInteraction {
             changed = true;
         }
         changed
+    }
+
+    /// Route one key event for the selected pane through the input
+    /// policy: the production boundary that decides whether the event
+    /// reaches a terminal session. A terminal pane delivers only while
+    /// its Process's focused input is enabled; pipe and empty panes
+    /// reject child input visibly while command mode keeps working.
+    pub fn route_pane_key(
+        &mut self,
+        pane: ConsolePaneKind,
+        input_focused: bool,
+        key: KeyEvent,
+        session: Option<&TerminalHandle<'_>>,
+        pipe_scroll: &mut Option<PipeScroll>,
+        page_rows: u16,
+    ) -> bool {
+        // Routing a key into a pane makes that pane the current one; a
+        // pane change drops the stale pane-scoped warning.
+        self.set_pane(pane);
+        match pane {
+            ConsolePaneKind::Terminal => {
+                let session = session.expect("a terminal pane owns a live session");
+                if child_input_rejected(self.view(), input_focused, &key) {
+                    self.warn(ConsoleWarning::InputDisabled);
+                    return true;
+                }
+                self.handle_key(key, session, page_rows)
+            }
+            ConsolePaneKind::Pipe | ConsolePaneKind::Empty => {
+                self.handle_key_read_only(key, pipe_scroll, page_rows)
+            }
+        }
     }
 
     pub fn handle_key(
@@ -101,6 +168,96 @@ impl ConsoleInteraction {
             ConsoleViewMode::AppCommand => self.handle_app_command(key, session, page_rows),
             ConsoleViewMode::Scroll => self.handle_scroll_command(key, session, page_rows),
             ConsoleViewMode::Selection => self.handle_selection_command(key, session),
+        }
+    }
+
+    /// Route one key when the selected pane has no terminal session: the
+    /// pipe output pane, or a Process without an active Run. The command
+    /// leader still enters command mode and plain child input is rejected
+    /// visibly; selection moves and pipe scrolling work without a session.
+    /// Route one key into a read-only pane (pipe output or no active
+    /// Run). Child input is a Press event; repeat and release events
+    /// carry no input of their own and are consumed here. The Press
+    /// rejection warning they would trigger is already visible from the
+    /// original press until the pane or selection changes.
+    pub fn handle_key_read_only(
+        &mut self,
+        key: KeyEvent,
+        scroll: &mut Option<PipeScroll>,
+        page_rows: u16,
+    ) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        match self.view.mode {
+            ConsoleViewMode::ChildInput => {
+                if is_command_leader(key) {
+                    self.view.mode = ConsoleViewMode::AppCommand;
+                    return true;
+                }
+                self.view.warning = Some(ConsoleWarning::PipeReadOnly);
+                true
+            }
+            ConsoleViewMode::AppCommand => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selection_requests.push(SelectionMove::Up);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.selection_requests.push(SelectionMove::Down);
+                    true
+                }
+                KeyCode::PageUp => {
+                    scroll.get_or_insert_default().scroll_page(page_rows, -1);
+                    self.view.mode = ConsoleViewMode::Scroll;
+                    true
+                }
+                KeyCode::PageDown => {
+                    scroll.get_or_insert_default().scroll_page(page_rows, 1);
+                    self.view.mode = ConsoleViewMode::Scroll;
+                    true
+                }
+                KeyCode::Char('f') => {
+                    scroll.get_or_insert_default().follow();
+                    self.view.mode = ConsoleViewMode::ChildInput;
+                    true
+                }
+                KeyCode::Char('s') => {
+                    self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
+                    true
+                }
+                KeyCode::Esc => {
+                    self.view.mode = ConsoleViewMode::ChildInput;
+                    true
+                }
+                _ => false,
+            },
+            ConsoleViewMode::Scroll => match key.code {
+                KeyCode::PageUp => {
+                    scroll.get_or_insert_default().scroll_page(page_rows, -1);
+                    true
+                }
+                KeyCode::PageDown => {
+                    scroll.get_or_insert_default().scroll_page(page_rows, 1);
+                    true
+                }
+                KeyCode::Char('f') => {
+                    scroll.get_or_insert_default().follow();
+                    self.view.mode = ConsoleViewMode::ChildInput;
+                    true
+                }
+                KeyCode::Esc => {
+                    self.view.mode = ConsoleViewMode::AppCommand;
+                    true
+                }
+                _ => false,
+            },
+            ConsoleViewMode::Selection => {
+                // 's' is rejected in read-only panes, so this mode is
+                // unreachable; Esc is kept for a future path that enters it.
+                self.view.mode = ConsoleViewMode::AppCommand;
+                key.code == KeyCode::Esc
+            }
         }
     }
 
@@ -259,8 +416,25 @@ impl ConsoleInteraction {
     }
 }
 
-fn is_command_leader(key: KeyEvent) -> bool {
+pub(crate) fn is_command_leader(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// The application's child-input gate for the selected terminal pane. True
+/// when this key attempt is rejected visibly instead of delivered: the
+/// Process's focused input is disabled and the key is plain child input.
+/// The command leader is never rejected, so the Process list stays
+/// reachable from a disabled pane.
+/// Whether the event is child input the selected PTY Process must never
+/// receive: its focused input is disabled, and the event is a plain child
+/// key of any kind in child-input mode. The leader's Press is the only
+/// exception: it moves the user into the command UI, where nothing
+/// reaches the child. Repeat and release events are gated too, so no
+/// byte of any kind reaches a disabled Process.
+fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEvent) -> bool {
+    !input_focused
+        && view.mode == ConsoleViewMode::ChildInput
+        && !(key.kind == KeyEventKind::Press && is_command_leader(*key))
 }
 
 fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {
@@ -390,6 +564,168 @@ mod tests {
 
         drop(peer);
         session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn child_input_gate_rejects_only_disabled_terminal_child_input() {
+        let plain = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let repeat = KeyEvent {
+            kind: KeyEventKind::Repeat,
+            ..plain
+        };
+        let release = KeyEvent {
+            kind: KeyEventKind::Release,
+            ..plain
+        };
+        let leader = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let leader_repeat = KeyEvent {
+            kind: KeyEventKind::Repeat,
+            ..leader
+        };
+        let default = ConsoleViewState::default();
+
+        // Disabled input in child-input mode rejects keys of every kind.
+        assert!(child_input_rejected(default, false, &plain));
+        assert!(child_input_rejected(default, false, &repeat));
+        assert!(child_input_rejected(default, false, &release));
+        // Enabled focused input delivers everything on the terminal path.
+        assert!(!child_input_rejected(default, true, &plain));
+        assert!(!child_input_rejected(default, true, &repeat));
+        // The leader's press is never rejected; it enters the list.
+        assert!(!child_input_rejected(default, false, &leader));
+        // A leader repeat or release is still child input.
+        assert!(child_input_rejected(default, false, &leader_repeat));
+        // Command modes are not child input; keys route as commands.
+        let commands = ConsoleViewState {
+            mode: ConsoleViewMode::AppCommand,
+            ..ConsoleViewState::default()
+        };
+        assert!(!child_input_rejected(commands, false, &plain));
+    }
+
+    #[test]
+    fn pane_key_seam_rejects_disabled_terminal_input_and_keeps_read_only_keys() {
+        let mut interaction = ConsoleInteraction::default();
+        let mut scroll: Option<PipeScroll> = None;
+        let key = |code: KeyCode| -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) };
+
+        // A disabled terminal pane rejects child input visibly and keeps
+        // the leader available; no session write happens without one. The
+        // pane still owns a live session: a disabled-input PTY is a live
+        // PTY whose keys are gated.
+        let (session, _peer) = session();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let handle = crate::runtime::handle_for_test(&session, &stopped);
+        assert!(interaction.route_pane_key(
+            ConsolePaneKind::Terminal,
+            false,
+            key(KeyCode::Char('x')),
+            Some(&handle),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.view().warning,
+            Some(ConsoleWarning::InputDisabled)
+        );
+        // The read-only pane rejects child input and keeps commands.
+        assert!(interaction.route_pane_key(
+            ConsolePaneKind::Pipe,
+            false,
+            key(KeyCode::Char('x')),
+            None,
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.view().warning,
+            Some(ConsoleWarning::PipeReadOnly)
+        );
+        assert!(interaction.route_pane_key(
+            ConsolePaneKind::Pipe,
+            false,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            None,
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
+
+        // A pane change drops the pane-scoped warning.
+        interaction.set_pane(ConsolePaneKind::Terminal);
+        assert_eq!(interaction.view().warning, None);
+        // The explicit clear does the same from the app selection path.
+        interaction.clear_pane_warning();
+        assert_eq!(interaction.view().warning, None);
+    }
+
+    #[test]
+    fn read_only_pane_keys_reject_child_input_and_keep_commands_working() {
+        let mut interaction = ConsoleInteraction::default();
+        let mut scroll: Option<PipeScroll> = None;
+
+        // Plain child input is rejected visibly and consumed.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.view().warning,
+            Some(ConsoleWarning::PipeReadOnly)
+        );
+        interaction.clear_pane_warning();
+
+        // The leader enters command mode without a session.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
+
+        // Selection moves queue without a session.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.take_selection_moves(),
+            vec![SelectionMove::Down]
+        );
+
+        // Pipe scrolling and re-following work without a session.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(scroll.unwrap().offset(), 19);
+        assert!(!scroll.unwrap().following());
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert!(scroll.unwrap().following());
+        assert_eq!(interaction.view().mode, ConsoleViewMode::ChildInput);
+
+        // Text selection is unavailable in a read-only pane.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut scroll,
+            20,
+        ));
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.view().warning,
+            Some(ConsoleWarning::SelectionUnavailable)
+        );
     }
 
     #[test]

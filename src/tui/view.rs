@@ -24,6 +24,20 @@ pub enum ConsoleWarning {
     PasteDeliveryFailed,
     ClipboardFailed,
     NothingSelected,
+    InputDisabled,
+    PipeReadOnly,
+    SelectionUnavailable,
+}
+
+/// Which console pane the selected Process currently renders. The footer
+/// and the key routing distinguish the pane kinds: only a terminal pane
+/// can receive child input, mouse tracking, and text selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConsolePaneKind {
+    #[default]
+    Terminal,
+    Pipe,
+    Empty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +46,7 @@ pub struct ConsoleViewState {
     pub following: bool,
     pub warning: Option<ConsoleWarning>,
     pub stackhand_mouse_gesture: bool,
+    pub pane: ConsolePaneKind,
 }
 
 impl Default for ConsoleViewState {
@@ -41,6 +56,7 @@ impl Default for ConsoleViewState {
             following: true,
             warning: None,
             stackhand_mouse_gesture: false,
+            pane: ConsolePaneKind::default(),
         }
     }
 }
@@ -84,6 +100,7 @@ pub fn pane_inner(pane: Rect) -> Rect {
 
 /// One line of retained pipe output for rendering. The marker flag keeps
 /// Run-marker identity that flattening to plain strings would lose.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipeLine {
     pub text: String,
     pub marker: bool,
@@ -200,6 +217,13 @@ fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console
 }
 
 fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
+    // Scroll mode operates on the console's history, not the Process
+    // list; only command mode owns list movement.
+    let focus = match view.mode {
+        ConsoleViewMode::ChildInput | ConsoleViewMode::Scroll => "FOCUS: CONSOLE",
+        ConsoleViewMode::AppCommand => "FOCUS: LIST",
+        ConsoleViewMode::Selection => "FOCUS: SELECT",
+    };
     if let Some(warning) = view.warning {
         let warning = match warning {
             ConsoleWarning::PasteRejected => {
@@ -223,28 +247,69 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             ConsoleWarning::NothingSelected => {
                 "WARNING: no terminal text is selected · Esc: selection"
             }
+            ConsoleWarning::InputDisabled => {
+                "WARNING: input is not enabled for this Process · Ctrl-A: commands"
+            }
+            ConsoleWarning::PipeReadOnly => {
+                "WARNING: pipe output is read-only; no child input · Ctrl-A: commands"
+            }
+            ConsoleWarning::SelectionUnavailable => {
+                "WARNING: text selection is unavailable in pipe output · Esc: commands"
+            }
         };
         return format!(
-            "{} · {warning}",
+            "{} · {focus} · {warning}",
             mouse_owner_text(view, child_mouse_tracking)
         );
     }
 
-    let controls = match (view.mode, view.following) {
-        (ConsoleViewMode::ChildInput, true) => "Ctrl-A: commands · Ctrl-Q: quit · LIVE",
-        (ConsoleViewMode::ChildInput, false) => "Ctrl-A: commands · history view · NOT FOLLOWING",
-        (ConsoleViewMode::AppCommand, _) => {
-            "PageUp: history · s: selection · j/k or ↑↓: select Process · f: live tail · Esc: child input"
+    let (controls, note) = if view.pane == ConsolePaneKind::Terminal {
+        match (view.mode, view.following) {
+            (ConsoleViewMode::ChildInput, true) => ("Ctrl-A: commands · Ctrl-Q: quit", "LIVE"),
+            (ConsoleViewMode::ChildInput, false) => {
+                ("Ctrl-A: commands · Ctrl-Q: quit", "NOT FOLLOWING")
+            }
+            (ConsoleViewMode::AppCommand, _) => (
+                "PageUp: history · s: selection · j/k or ↑↓: select Process · f: live tail · Esc: console",
+                "",
+            ),
+            (ConsoleViewMode::Scroll, _) => (
+                "PageUp/Down: move · f: live tail",
+                "history target 64 KiB; page rounding and truncation signal unavailable",
+            ),
+            (ConsoleViewMode::Selection, _) => (
+                "Drag: cells · double: word · triple: line · a: all · y: copy · Esc: commands",
+                "",
+            ),
         }
-        (ConsoleViewMode::Scroll, _) => {
-            "PageUp/Down: move · f: live tail · history target 64 KiB; page rounding and truncation signal unavailable"
-        }
-        (ConsoleViewMode::Selection, _) => {
-            "Drag: cells · double: word · triple: line · a: all · y: copy · Esc: commands"
+    } else {
+        match view.mode {
+            ConsoleViewMode::ChildInput => (
+                "Ctrl-A: commands · Ctrl-Q: quit",
+                if view.pane == ConsolePaneKind::Pipe {
+                    "read-only output"
+                } else {
+                    "no active Run"
+                },
+            ),
+            ConsoleViewMode::AppCommand => (
+                "j/k or ↑↓: select Process · PageUp/Down: scroll · f: live tail · s: selection · Esc: console",
+                "",
+            ),
+            ConsoleViewMode::Scroll => ("PageUp/Down: scroll · f: live tail · Esc: commands", ""),
+            ConsoleViewMode::Selection => (
+                "a: all · y: copy · Esc: commands",
+                "unavailable in pipe output",
+            ),
         }
     };
+    let note = if note.is_empty() {
+        String::new()
+    } else {
+        format!(" · {note}")
+    };
     format!(
-        "{} · {controls}",
+        "{} · {focus} · {controls}{note}",
         mouse_owner_text(view, child_mouse_tracking)
     )
 }
@@ -359,6 +424,7 @@ mod tests {
                 following: false,
                 warning: None,
                 stackhand_mouse_gesture: false,
+                pane: ConsolePaneKind::default(),
             },
             false,
         );
@@ -366,6 +432,9 @@ mod tests {
         assert!(text.contains("target 64 KiB"));
         assert!(text.contains("page rounding"));
         assert!(text.contains("truncation signal unavailable"));
+        // Scrolling the history is console focus, not list focus.
+        assert!(text.contains("FOCUS: CONSOLE"), "{text}");
+        assert!(!text.contains("FOCUS: LIST"), "{text}");
     }
 
     #[test]
@@ -376,6 +445,7 @@ mod tests {
                 following: true,
                 warning: Some(ConsoleWarning::PasteRejected),
                 stackhand_mouse_gesture: false,
+                pane: ConsolePaneKind::default(),
             },
             false,
         );
@@ -392,6 +462,7 @@ mod tests {
                 following: true,
                 warning: Some(ConsoleWarning::PasteDeliveryFailed),
                 stackhand_mouse_gesture: false,
+                pane: ConsolePaneKind::default(),
             },
             false,
         );
@@ -406,6 +477,7 @@ mod tests {
                 following: false,
                 warning: Some(ConsoleWarning::ClipboardFailed),
                 stackhand_mouse_gesture: false,
+                pane: ConsolePaneKind::default(),
             },
             true,
         );
@@ -434,5 +506,62 @@ mod tests {
         );
 
         assert!(text.starts_with("MOUSE: STACKHAND · active gesture"));
+    }
+
+    #[test]
+    fn footer_labels_the_focus_and_the_pane() {
+        let console_footer = footer_text(ConsoleViewState::default(), false);
+        assert!(
+            console_footer.contains("FOCUS: CONSOLE"),
+            "{console_footer}"
+        );
+        assert!(console_footer.contains("LIVE"), "{console_footer}");
+
+        let list_footer = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::AppCommand,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(list_footer.contains("FOCUS: LIST"), "{list_footer}");
+
+        let pipe_footer = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(pipe_footer.contains("read-only output"), "{pipe_footer}");
+
+        let empty_footer = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Empty,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(empty_footer.contains("no active Run"), "{empty_footer}");
+    }
+
+    #[test]
+    fn footer_makes_input_rejections_visible() {
+        for (warning, needle) in [
+            (ConsoleWarning::InputDisabled, "input is not enabled"),
+            (ConsoleWarning::PipeReadOnly, "pipe output is read-only"),
+            (
+                ConsoleWarning::SelectionUnavailable,
+                "text selection is unavailable",
+            ),
+        ] {
+            let state = ConsoleViewState {
+                warning: Some(warning),
+                ..ConsoleViewState::default()
+            };
+            let text = footer_text(state, false);
+            assert!(text.contains("WARNING:"), "{text}");
+            assert!(text.contains(needle), "{text}");
+        }
     }
 }

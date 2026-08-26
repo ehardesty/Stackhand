@@ -4,17 +4,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
-use crate::console::{ConsoleInteraction, SelectionMove};
+use crate::console::{ConsoleInteraction, PipeScroll, SelectionMove};
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
-use crate::runtime::OutputStream;
 use crate::supervisor::Lifecycle;
 use crate::supervisor::{
     Command, ConsoleView, Consoles, ProcessSnapshot, ProjectSnapshot, SupervisorHandle,
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
-    ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout, render_project,
+    ConsolePaneKind, ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout,
+    render_project,
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -79,6 +79,9 @@ fn run_event_loop(
     let mut pipe_truncation: Option<(usize, bool)> = None;
     let mut pipe_generation: u64 = 0;
     let mut pipe_generation_known = false;
+    // One scroll view per Process, so scrolling or re-following one pane
+    // never changes another Process's view. Resized with the snapshot.
+    let mut pipe_scroll: Vec<Option<PipeScroll>> = Vec::new();
     let mut dirty = true;
 
     loop {
@@ -92,6 +95,7 @@ fn run_event_loop(
             bail!("this Project has no Processes");
         }
         selected = selected.min(snapshot.processes.len() - 1);
+        pipe_scroll.resize(snapshot.processes.len(), None);
         for request in console.take_selection_moves() {
             // Selection is UI state only: movement clamps at the list ends
             // and never sends a command to the Supervisor.
@@ -99,6 +103,8 @@ fn run_event_loop(
                 SelectionMove::Up => selected.saturating_sub(1),
                 SelectionMove::Down => (selected + 1).min(snapshot.processes.len() - 1),
             };
+            // The warning describes the previously selected Process.
+            console.clear_pane_warning();
             dirty = true;
         }
         let selected_process = &snapshot.processes[selected];
@@ -132,16 +138,26 @@ fn run_event_loop(
             dirty = true;
         }
 
+        let mut pipe_window: Vec<crate::tui::PipeLine> = Vec::new();
         let (terminal_snapshot, pipe_lines) = match &pane {
             SelectedPane::Terminal(view) => {
+                console.set_pane(ConsolePaneKind::Terminal);
                 console_snapshot = view.snapshot();
                 (console_snapshot.as_ref(), None)
             }
             SelectedPane::Pipe(retained) => {
-                let tail_limit = console_pane.height.saturating_sub(2).max(1) as usize;
-                (None, Some(pipe_lines(retained, tail_limit)))
+                console.set_pane(ConsolePaneKind::Pipe);
+                let pane_rows = console_pane.height.saturating_sub(2).max(1) as usize;
+                let scroll = &pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
+                pipe_window.clear();
+                pipe_window
+                    .extend(retained.display_lines(pane_rows.saturating_add(scroll.offset())));
+                (None, Some(scroll.window(&pipe_window, pane_rows)))
             }
-            SelectedPane::Empty => (None, None),
+            SelectedPane::Empty => {
+                console.set_pane(ConsolePaneKind::Empty);
+                (None, None)
+            }
         };
         if dirty
             || matches!(
@@ -151,13 +167,7 @@ fn run_event_loop(
         {
             dirty = false;
             let rows = process_rows(&snapshot, selected);
-            let pane = render_frame(
-                outer,
-                &rows,
-                terminal_snapshot,
-                pipe_lines.as_deref(),
-                console.view(),
-            )?;
+            let pane = render_frame(outer, &rows, terminal_snapshot, pipe_lines, console.view())?;
             console_pane = pane;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
             outer.set_cursor_shape(cursor)?;
@@ -169,38 +179,95 @@ fn run_event_loop(
         let input_event = event::read()?;
         match input_event {
             Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
-            Event::Key(key) => {
-                if let SelectedPane::Terminal(view) = &pane {
-                    route_key(&mut console, view, key, console_pane.height, &mut dirty);
+            Event::Key(key) => match &pane {
+                SelectedPane::Terminal(view) => {
+                    // The pane key seam is the one production boundary that
+                    // decides whether the event reaches the PTY child:
+                    // focused input enabled, or it is rejected visibly.
+                    let changed = view.with(|session| {
+                        console.route_pane_key(
+                            ConsolePaneKind::Terminal,
+                            selected_process.input_focused,
+                            key,
+                            Some(session),
+                            &mut pipe_scroll[selected],
+                            console_pane.height.saturating_sub(2).max(1),
+                        )
+                    });
+                    if changed.unwrap_or(false) {
+                        dirty = true;
+                    }
                 }
-            }
-            Event::Paste(data) => {
-                if let SelectedPane::Terminal(view) = &pane {
-                    view.with(|session| console.handle_paste(&data, session));
+                SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                    let kind = match &pane {
+                        SelectedPane::Pipe(_) => ConsolePaneKind::Pipe,
+                        _ => ConsolePaneKind::Empty,
+                    };
+                    let changed = console.route_pane_key(
+                        kind,
+                        selected_process.input_focused,
+                        key,
+                        None,
+                        &mut pipe_scroll[selected],
+                        console_pane.height.saturating_sub(2).max(1),
+                    );
+                    if changed {
+                        dirty = true;
+                    }
+                }
+            },
+            Event::Paste(data) => match &pane {
+                SelectedPane::Terminal(view) => {
+                    // Paste is child input: it follows the same policy as
+                    // typed keys and is rejected visibly when disabled.
+                    if selected_process.input_focused {
+                        view.with(|session| console.handle_paste(&data, session));
+                    } else {
+                        console.warn(ConsoleWarning::InputDisabled);
+                    }
                     dirty = true;
                 }
-            }
+                // A read-only pane rejects paste visibly instead of
+                // dropping it silently.
+                SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                    console.warn(ConsoleWarning::PasteRejected);
+                    dirty = true;
+                }
+            },
             Event::FocusGained | Event::FocusLost => {
                 if let SelectedPane::Terminal(view) = &pane {
                     let gained = matches!(input_event, Event::FocusGained);
-                    let delivered = view.with(|session| session.send_focus(gained).is_ok());
-                    if delivered != Some(true) {
+                    // Focus reports are child-bound, so they follow the
+                    // input policy like typed keys.
+                    let delivered = if selected_process.input_focused {
+                        view.with(|session| session.send_focus(gained).is_ok())
+                            .unwrap_or(false)
+                    } else {
+                        console.warn(ConsoleWarning::InputDisabled);
+                        false
+                    };
+                    // A failed delivery with focused input enabled is the
+                    // rejected-input case; a disabled pane keeps the more
+                    // specific disabled warning above.
+                    if !delivered && selected_process.input_focused {
                         console.warn(ConsoleWarning::InputRejected);
+                        dirty = true;
+                    } else if !delivered {
                         dirty = true;
                     }
                 }
             }
             Event::Mouse(mouse) => {
                 if let SelectedPane::Terminal(view) = &pane {
+                    // Child mouse tracking is child input: a disabled
+                    // Process keeps Stackhand's selection and scroll
+                    // gestures but receives no mouse events.
+                    let child_tracking = selected_process.input_focused
+                        && console_snapshot
+                            .as_ref()
+                            .is_some_and(|snap| snap.mouse_tracking);
                     let changed = view.with(|session| {
-                        console.handle_mouse(
-                            mouse,
-                            console_pane,
-                            console_snapshot
-                                .as_ref()
-                                .is_some_and(|snap| snap.mouse_tracking),
-                            session,
-                        )
+                        console.handle_mouse(mouse, console_pane, child_tracking, session)
                     });
                     if changed.unwrap_or(false) {
                         dirty = true;
@@ -253,69 +320,6 @@ fn selected_pane(
     }
 }
 
-/// Flatten one Process's retained output into the newest display lines.
-/// Only `tail_limit` lines of work happen: older lines stay in the module.
-/// Run markers keep their marker identity; pipe chunks keep their stream
-/// identity in a prefix on the first line of each chunk.
-fn pipe_lines(
-    retained: &crate::output::RetainedOutput,
-    tail_limit: usize,
-) -> Vec<crate::tui::PipeLine> {
-    use crate::output::RetainedChunk;
-    use crate::tui::PipeLine;
-    let mut lines: Vec<PipeLine> = Vec::new();
-    for chunk in retained.chunks.iter().rev() {
-        match chunk {
-            RetainedChunk::Marker { label, .. } => {
-                lines.push(PipeLine {
-                    text: label.clone(),
-                    marker: true,
-                });
-                if lines.len() >= tail_limit {
-                    break;
-                }
-            }
-            RetainedChunk::Data { stream, text, .. } => {
-                let prefix = match stream {
-                    OutputStream::Stdout => "out: ",
-                    OutputStream::Stderr => "err: ",
-                };
-                let split: Vec<&str> = text.split('\n').collect();
-                let mut chunk_lines: Vec<PipeLine> = Vec::new();
-                for (index, line) in split.iter().enumerate().rev() {
-                    // The final empty split is the chunk's trailing newline,
-                    // not a line of its own.
-                    if index + 1 == split.len() && line.is_empty() {
-                        continue;
-                    }
-                    if index == 0 && !line.is_empty() {
-                        chunk_lines.push(PipeLine {
-                            text: format!("{prefix}{line}"),
-                            marker: false,
-                        });
-                    } else {
-                        chunk_lines.push(PipeLine {
-                            text: (*line).to_string(),
-                            marker: false,
-                        });
-                    }
-                }
-                for line in chunk_lines.into_iter().rev() {
-                    lines.push(line);
-                    if lines.len() >= tail_limit {
-                        break;
-                    }
-                }
-                if lines.len() >= tail_limit {
-                    break;
-                }
-            }
-        }
-    }
-    lines.reverse();
-    lines
-}
-
 fn drain_console_events(console: &mut ConsoleInteraction, view: &ConsoleView, dirty: &mut bool) {
     while let Some(session_event) = view.poll_event() {
         match session_event {
@@ -334,18 +338,6 @@ fn drain_console_events(console: &mut ConsoleInteraction, view: &ConsoleView, di
             // the structured exit state visible.
             TerminalEvent::Exited | TerminalEvent::StateChanged => *dirty = true,
         }
-    }
-}
-
-fn route_key(
-    console: &mut ConsoleInteraction,
-    view: &ConsoleView,
-    key: KeyEvent,
-    page_rows: u16,
-    dirty: &mut bool,
-) {
-    if view.with(|session| console.handle_key(key, session, page_rows)) == Some(true) {
-        *dirty = true;
     }
 }
 

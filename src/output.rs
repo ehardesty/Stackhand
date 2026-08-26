@@ -48,6 +48,72 @@ pub struct RetainedOutput {
     pub generation: u64,
 }
 
+impl RetainedOutput {
+    /// Flatten the newest retained chunks into display lines in order.
+    /// Run markers keep their marker identity; a data chunk prefixes its
+    /// stream identity on the first line. Only `tail_limit` lines of work
+    /// happen: older lines stay in the module. A zero limit shows
+    /// nothing; one data chunk is the only fully materialized slice, and
+    /// it is bounded by the reader's read buffer.
+    pub fn display_lines(&self, tail_limit: usize) -> Vec<crate::tui::PipeLine> {
+        use crate::tui::PipeLine;
+        if tail_limit == 0 {
+            return Vec::new();
+        }
+        let mut lines: Vec<PipeLine> = Vec::new();
+        for chunk in self.chunks.iter().rev() {
+            match chunk {
+                RetainedChunk::Marker { label, .. } => {
+                    lines.push(PipeLine {
+                        text: label.clone(),
+                        marker: true,
+                    });
+                    if lines.len() >= tail_limit {
+                        break;
+                    }
+                }
+                RetainedChunk::Data { stream, text, .. } => {
+                    let prefix = match stream {
+                        OutputStream::Stdout => "out: ",
+                        OutputStream::Stderr => "err: ",
+                    };
+                    let split: Vec<&str> = text.split('\n').collect();
+                    let mut chunk_lines: Vec<PipeLine> = Vec::new();
+                    for (index, line) in split.iter().enumerate().rev() {
+                        // The final empty split is the chunk's trailing
+                        // newline, not a line of its own.
+                        if index + 1 == split.len() && line.is_empty() {
+                            continue;
+                        }
+                        if index == 0 && !line.is_empty() {
+                            chunk_lines.push(PipeLine {
+                                text: format!("{prefix}{line}"),
+                                marker: false,
+                            });
+                        } else {
+                            chunk_lines.push(PipeLine {
+                                text: (*line).to_string(),
+                                marker: false,
+                            });
+                        }
+                    }
+                    for line in chunk_lines {
+                        lines.push(line);
+                        if lines.len() >= tail_limit {
+                            break;
+                        }
+                    }
+                    if lines.len() >= tail_limit {
+                        break;
+                    }
+                }
+            }
+        }
+        lines.reverse();
+        lines
+    }
+}
+
 /// The retained output of one Process across its Runs.
 pub struct ProcessOutput {
     inner: Mutex<Inner>,
@@ -303,5 +369,96 @@ mod tests {
             }]
         );
         assert_eq!(snapshot.latest_run, Some(2));
+    }
+
+    #[test]
+    fn display_lines_keep_line_order_within_and_between_chunks() {
+        let lines = RetainedOutput {
+            chunks: vec![
+                RetainedChunk::Data {
+                    run_id: 1,
+                    stream: OutputStream::Stdout,
+                    text: "a\nb\n".to_string(),
+                },
+                RetainedChunk::Data {
+                    run_id: 2,
+                    stream: OutputStream::Stderr,
+                    text: "c\nd\n".to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+        .display_lines(10);
+        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+
+        assert_eq!(text, vec!["out: a", "b", "err: c", "d"]);
+    }
+
+    #[test]
+    fn display_lines_zero_limit_shows_nothing() {
+        let output = RetainedOutput {
+            chunks: vec![RetainedChunk::Data {
+                run_id: 1,
+                stream: OutputStream::Stdout,
+                text: "a\nb\n".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        assert!(output.display_lines(0).is_empty());
+    }
+
+    #[test]
+    fn display_lines_tail_limit_keeps_the_newest_lines() {
+        let lines = RetainedOutput {
+            chunks: vec![
+                RetainedChunk::Data {
+                    run_id: 1,
+                    stream: OutputStream::Stdout,
+                    text: "a\nb\n".to_string(),
+                },
+                RetainedChunk::Data {
+                    run_id: 2,
+                    stream: OutputStream::Stdout,
+                    text: "c\nd\n".to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+        .display_lines(2);
+        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+
+        // The kept tail starts inside the second chunk: its first line
+        // keeps the stream label, and the older chunk drops out.
+        assert_eq!(text, vec!["out: c", "d"]);
+    }
+
+    #[test]
+    fn display_lines_keeps_markers_and_handles_chunks_without_trailing_newline() {
+        let lines = RetainedOutput {
+            chunks: vec![
+                RetainedChunk::Data {
+                    run_id: 1,
+                    stream: OutputStream::Stdout,
+                    text: "a\nb".to_string(),
+                },
+                RetainedChunk::Marker {
+                    run_id: 2,
+                    label: "── Run 2 started ──".to_string(),
+                },
+                RetainedChunk::Data {
+                    run_id: 2,
+                    stream: OutputStream::Stderr,
+                    text: "c".to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+        .display_lines(10);
+        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+        let markers: Vec<bool> = lines.iter().map(|line| line.marker).collect();
+
+        assert_eq!(text, vec!["out: a", "b", "── Run 2 started ──", "err: c"]);
+        assert_eq!(markers, vec![false, false, true, false]);
     }
 }

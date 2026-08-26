@@ -153,9 +153,8 @@ pub struct ProcessSpec {
     pub working_dir: PathBuf,
     pub env: Vec<(String, String)>,
     pub terminal_mode: TerminalMode,
-    /// Consumed by TUI input routing (Issue #30); configuration validation
-    /// covers it in Issue #23.
-    #[allow(dead_code)]
+    /// Consumed by TUI input routing through ProcessSnapshot.input_focused;
+    /// configuration validation covers it in Issue #23.
     pub input_policy: InputPolicy,
     /// Startup Dependencies. A Dependency is a startup relationship only;
     /// it never couples lifetimes after the dependent starts.

@@ -551,8 +551,6 @@ pub struct ProcessSnapshot {
     pub enabled: bool,
     pub autostart: bool,
     /// Whether this Process accepts focused child input when selected.
-    /// Consumed by input routing across selection (Issue #30).
-    #[allow(dead_code)]
     pub input_focused: bool,
     pub desired: DesiredState,
     pub lifecycle: Lifecycle,
