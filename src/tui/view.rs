@@ -82,6 +82,38 @@ pub fn pane_inner(pane: Rect) -> Rect {
     ratatui::widgets::Block::bordered().inner(pane)
 }
 
+/// One line of retained pipe output for rendering. The marker flag keeps
+/// Run-marker identity that flattening to plain strings would lose.
+pub struct PipeLine {
+    pub text: String,
+    pub marker: bool,
+}
+
+/// The selected pipe-mode Process's retained output, tail-following: the
+/// newest lines fill the pane and older lines stay in the module, not in
+/// render state. Run markers render dimmed so attempts stay distinguishable.
+fn render_pipe_console(frame: &mut Frame<'_>, lines: &[PipeLine], pane: Rect) {
+    if pane.height == 0 {
+        return;
+    }
+    let start = lines.len().saturating_sub(pane.height as usize);
+    let tail = &lines[start..];
+    let rows: Vec<ratatui::text::Line<'_>> = tail
+        .iter()
+        .map(|line| {
+            if line.marker {
+                ratatui::text::Line::styled(
+                    line.text.as_str(),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                ratatui::text::Line::from(line.text.as_str())
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), pane);
+}
+
 /// The PTY geometry matching the console pane for a Project with this many
 /// Process rows, using the current terminal size.
 pub fn project_console_geometry(process_rows: usize) -> crate::geometry::TerminalGeometry {
@@ -94,6 +126,7 @@ pub fn render_project(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
     console_snapshot: Option<&OwnedTerminalSnapshot>,
+    pipe_lines: Option<&[PipeLine]>,
     view: ConsoleViewState,
 ) -> Rect {
     let area = frame.area();
@@ -119,17 +152,25 @@ pub fn render_project(
     frame.render_widget(Block::bordered().title(" Console "), console_pane);
 
     let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
-    blit_console(
-        frame,
-        console_snapshot.unwrap_or(&EMPTY_CONSOLE),
-        console_inner,
-    );
+    if let Some(lines) = pipe_lines {
+        render_pipe_console(frame, lines, console_inner);
+    } else {
+        blit_console(
+            frame,
+            console_snapshot.unwrap_or(&EMPTY_CONSOLE),
+            console_inner,
+        );
+    }
     frame.render_widget(
         Paragraph::new(footer_text(view, mouse_tracking))
             .style(Style::default().fg(Color::DarkGray)),
         footer,
     );
-    if let Some(cursor) = console_snapshot.and_then(|snap| snap.cursor) {
+    // A pipe console has no terminal cursor; only a live terminal snapshot
+    // positions the cursor for the child.
+    if pipe_lines.is_none()
+        && let Some(cursor) = console_snapshot.and_then(|snap| snap.cursor)
+    {
         let x = console_inner.x.saturating_add(cursor.position.x);
         let y = console_inner.y.saturating_add(cursor.position.y);
         if x < console_inner.right() && y < console_inner.bottom() {
@@ -237,7 +278,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_project(frame, rows, None, ConsoleViewState::default());
+                render_project(frame, rows, None, None, ConsoleViewState::default());
             })
             .unwrap();
         terminal.backend().buffer().clone()

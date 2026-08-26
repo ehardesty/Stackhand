@@ -491,6 +491,7 @@ impl Core {
                 input_focused: matches!(spec.input_policy, crate::model::InputPolicy::Focused),
                 desired: entry.desired,
                 lifecycle: entry.lifecycle,
+                terminal_mode: spec.terminal_mode,
                 current_run: entry.current_run.map(RunId::get),
                 failure: entry.failure.clone(),
                 metrics: entry.metrics,
@@ -555,6 +556,9 @@ pub struct ProcessSnapshot {
     pub input_focused: bool,
     pub desired: DesiredState,
     pub lifecycle: Lifecycle,
+    /// The terminal transport of the Process; the TUI routes the selected
+    /// view to the terminal session or the retained output accordingly.
+    pub terminal_mode: crate::model::TerminalMode,
     /// The numeric identity of the current Run, when one exists.
     pub current_run: Option<u64>,
     pub failure: Option<FailureSummary>,

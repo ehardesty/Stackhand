@@ -52,8 +52,14 @@ const MARKER_SCRIPT: &str = "printf 'fixture-marker-12345\\n'; printf 'fixture-t
 /// Run stays alive as a Service.
 const SHELL_SCRIPT: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep 60";
 
+/// A pipe-mode Service that proves stdout and stderr keep their identity in
+/// the retained output module, then stays alive.
+const PIPED_SCRIPT: &str =
+    "printf 'fixture-pipe-out\\n'; printf 'fixture-pipe-err\\n' 1>&2; exec sleep 60";
+
 fn fixture_config(tcp_port: u16, http_port: u16) -> String {
     let marker = MARKER_SCRIPT.replace('"', "\\\"");
+    let piped = PIPED_SCRIPT.replace('"', "\\\"");
     format!(
         "version: 1\n\
          processes:\n\
@@ -73,6 +79,12 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
          \x20   input: focused\n\
          \x20   command:\n\
          \x20     shell: {SHELL_SCRIPT}\n\
+         \x20 - name: piped\n\
+         \x20   kind: service\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sh\n\
+         \x20     args: [\"-c\", \"{piped}\"]\n\
          \x20 - name: manual\n\
          \x20   kind: service\n\
          \x20   autostart: false\n\
@@ -145,6 +157,9 @@ fn one_configured_service_runs_end_to_end() {
     // marker, the inline-environment token, and the shell pipeline's
     // transformed output all reached their consoles.
     assert!(stdout.contains("fixture-output-ok"), "{stdout}");
+    // Pipe output stayed out of the control plane and landed in the
+    // bounded per-Process module with stream identity and the Run marker.
+    assert!(stdout.contains("fixture-pipe-output-ok"), "{stdout}");
     // The One-shot completed through natural exit observation and its
     // dependent started only after `completed_successfully` held.
     assert!(stdout.contains("fixture-one-shot-ok"), "{stdout}");

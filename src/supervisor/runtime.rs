@@ -10,9 +10,11 @@ use std::thread;
 use std::time::Duration;
 
 use crate::geometry::TerminalGeometry;
+use crate::output::OutputViews;
 use crate::runtime::{
-    OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId, RunMode, RunRuntime,
-    RunStartRequest, SpawnCommand, TerminalHandle, root_exit_pending,
+    OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId, RunMode,
+    RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
+    root_exit_pending,
 };
 use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender, StartIntent};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
@@ -22,6 +24,9 @@ type RunKey = (u32, u64);
 
 /// How often a Run's owner loop polls its root child for natural exit.
 const NATURAL_EXIT_POLL: Duration = Duration::from_millis(50);
+/// How often a retained-output drain polls for the Run's output channel
+/// closing; output chunks themselves arrive without waiting for this.
+const OUTPUT_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 /// One map slot for a Run between the start request and the finished
 /// spawn. The reservation exists synchronously before the spawn worker
@@ -39,16 +44,26 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(2);
 /// root exiting on its own — a One-shot completing or a Service dying — and
 /// reports `Exited` plus `ShutdownComplete` without user action. All results
 /// return as typed [`SeamEvent`]s.
-#[derive(Default)]
 pub(crate) struct RealRunSeam {
     runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
     /// Run keys whose bounded cleanup a worker already claimed. A stop for a
     /// tombstoned key is a harmless no-op: the in-flight natural completion
     /// already reports this Run's ShutdownComplete.
     completed: Arc<Mutex<std::collections::HashSet<RunKey>>>,
+    /// The one retained-output module per Process. Pipe bytes drain into
+    /// it off the control task; PTY bytes stay in each Run's terminal.
+    outputs: Arc<OutputViews>,
 }
 
 impl RealRunSeam {
+    pub(crate) fn new(outputs: Arc<OutputViews>) -> Self {
+        Self {
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            outputs,
+        }
+    }
+
     pub(crate) fn consoles(&self) -> Consoles {
         Consoles {
             runs: Arc::clone(&self.runs),
@@ -61,6 +76,7 @@ impl RunSeam for RealRunSeam {
         let events = events.clone();
         let runs = Arc::clone(&self.runs);
         let completed = Arc::clone(&self.completed);
+        let outputs = Arc::clone(&self.outputs);
         // Reserve the Run identity synchronously so no stop can fall into
         // the window before the spawn worker registers the OwnedRun.
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -77,7 +93,9 @@ impl RunSeam for RealRunSeam {
         thread::spawn(move || {
             let key = (intent.process_id.get(), intent.run_id.get());
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
-            let (output_tx, _output_rx) = crate::runtime::output_channel();
+            // The retained-output receiver lives for this Run only; its
+            // sender drops with the Run, which ends the drain thread.
+            let (output_tx, output_rx) = crate::runtime::output_channel();
             let request = RunStartRequest {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
@@ -108,10 +126,22 @@ impl RunSeam for RealRunSeam {
                         );
                         return;
                     }
+                    // Record this attempt in the Process's retained output
+                    // before any drain, so the marker orders ahead of this
+                    // Run's output. PTY Runs keep their bytes in the fresh
+                    // terminal session; the marker still divides attempts.
+                    outputs
+                        .for_process(intent.process_id.get())
+                        .expect("the registry covers every configured Process")
+                        .mark_run(intent.run_id.get());
                     let root_pid = run.root_pid();
                     runs.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .insert(key, RunSlot::Active(run));
+                    // Retained pipe output drains on its own thread, never
+                    // on the Supervisor control task, and ends when this
+                    // Run's sender drops.
+                    drain_retained_output(output_rx, outputs, intent.process_id);
                     // This worker becomes the Run's single owner: it
                     // forwards Run events and observes natural root exit in
                     // one serialized loop, so the Supervisor always sees
@@ -174,6 +204,29 @@ impl RunSeam for RealRunSeam {
             }),
         }
     }
+}
+
+/// One retained-output drain thread for one Run. It moves the Run's
+/// high-volume pipe bytes into the Process's bounded output module and
+/// ends when this Run's sender drops, so an ended attempt's drain never
+/// lingers into a later attempt.
+fn drain_retained_output(
+    output_rx: RunOutputReceiver,
+    outputs: Arc<OutputViews>,
+    process_id: ProcessId,
+) {
+    let Some(module) = outputs.for_process(process_id.get()) else {
+        return;
+    };
+    thread::spawn(move || {
+        loop {
+            match output_rx.recv_timeout(OUTPUT_DRAIN_POLL) {
+                Ok(chunk) => module.append(chunk.run_id.get(), chunk.stream, chunk.data),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
 }
 
 /// Own one active Run until it ends: forward low-volume Run events into the
@@ -265,11 +318,17 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
         // Completion is reported by the Run's owning worker so it can carry
         // structured cleanup results.
         RunEventKind::ShutdownComplete => return,
-        RunEventKind::Failed(detail) | RunEventKind::IoFailed(detail) => SeamEvent::Failed {
+        RunEventKind::Failed(detail) => SeamEvent::Failed {
             process_id,
             run_id,
             detail,
         },
+        // A bounded output drop is not a Run failure. The Run keeps draining
+        // the operating-system pipe; what is lost is already observable in
+        // the retained module's truncation metadata. Turning a queue-full
+        // drop into a fatal control-plane event would make a noisy Process
+        // kill itself.
+        RunEventKind::IoFailed(_) => return,
         RunEventKind::Metrics(metrics) => SeamEvent::Metrics {
             process_id,
             run_id,

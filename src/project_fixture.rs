@@ -44,13 +44,29 @@ const CONSOLE_PROOFS: &[(&str, &str)] = &[
     ("shelled", PIPELINE_PROOF),
 ];
 
+/// Retained pipe-mode proofs: the Process's bytes never enter the control
+/// plane, so each needle must land in the bounded per-Process output module
+/// with its stream identity intact.
+const PIPE_PROOFS: &[(&str, &str, crate::runtime::OutputStream)] = &[
+    (
+        "piped",
+        "fixture-pipe-out",
+        crate::runtime::OutputStream::Stdout,
+    ),
+    (
+        "piped",
+        "fixture-pipe-err",
+        crate::runtime::OutputStream::Stderr,
+    ),
+];
+
 pub fn run(config_path: &Path) -> Result<()> {
     let project = crate::config::load(config_path)
         .map_err(|error| anyhow!("configuration error: {error}"))?;
-    let (supervisor, consoles) = crate::supervisor::start(project)?;
+    let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
     supervisor.command(Command::StartAutostart);
 
-    let result = prove_slice(&supervisor, &consoles);
+    let result = prove_slice(&supervisor, &consoles, &outputs);
     let shutdown_result = shutdown(supervisor);
     result?;
     shutdown_result?;
@@ -61,6 +77,7 @@ pub fn run(config_path: &Path) -> Result<()> {
 fn prove_slice(
     supervisor: &crate::supervisor::SupervisorHandle,
     consoles: &crate::supervisor::Consoles,
+    outputs: &crate::output::OutputViews,
 ) -> Result<()> {
     // Every enabled autostart Process reaches its terminal-for-now state:
     // Services run, One-shots complete. Starting becomes Running on the
@@ -162,7 +179,60 @@ fn prove_slice(
         wait_for_console_text(view, needle)?;
     }
     println!("fixture-output-ok");
+
+    // Pipe output stays out of the terminal sessions: it lands in the
+    // bounded per-Process module with stream identity, under the Run
+    // marker that divides attempts.
+    for (name, needle, stream) in PIPE_PROOFS {
+        let index = snapshot
+            .processes
+            .iter()
+            .position(|process| process.name == *name)
+            .unwrap_or_else(|| panic!("Process {name} is part of the fixture contract"));
+        let module = outputs
+            .for_process(index as u32)
+            .ok_or_else(|| anyhow!("no retained output module for {name}"))?;
+        let run_id = snapshot.processes[index]
+            .current_run
+            .unwrap_or_else(|| panic!("Process {name} has an active Run"));
+        wait_for_retained_text(&module, *stream, needle, Some(run_id))?;
+    }
+    println!("fixture-pipe-output-ok");
     Ok(())
+}
+
+fn wait_for_retained_text(
+    module: &crate::output::ProcessOutput,
+    stream: crate::runtime::OutputStream,
+    needle: &str,
+    run_id: Option<u64>,
+) -> Result<()> {
+    use crate::output::RetainedChunk;
+    let deadline = Instant::now() + OUTPUT_WAIT;
+    loop {
+        let snapshot = module.snapshot();
+        let marker_present = run_id.is_some_and(|run| {
+            snapshot.chunks.iter().any(|chunk| {
+                matches!(chunk, RetainedChunk::Marker { run_id: marked, .. } if *marked == run)
+            })
+        });
+        let proof_present = snapshot.chunks.iter().any(|chunk| {
+            matches!(
+                chunk,
+                RetainedChunk::Data { run_id: _, stream: chunk_stream, text, .. }
+                    if *chunk_stream == stream && text.contains(needle)
+            )
+        });
+        if marker_present && proof_present {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the retained proof '{needle}' never reached the module (marker: {marker_present})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_console_text(view: crate::supervisor::ConsoleView, needle: &str) -> Result<()> {

@@ -40,6 +40,11 @@ pub use core::{
     ProjectSnapshot, ReadinessStatus,
 };
 pub use runtime::{ConsoleView, Consoles};
+// The data-plane retained-output view is built alongside the Supervisor, so
+// its public types are reachable through this entry point.
+pub use crate::output::{
+    OutputViews, ProcessOutput, RETAINED_BYTES, RETAINED_CHUNKS, RetainedChunk, RetainedOutput,
+};
 
 /// How long a snapshot request waits for the control task before giving up.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
@@ -50,14 +55,16 @@ enum Inbox {
 }
 
 /// Starts a Supervisor for one validated effective Project using the real
-/// Run interface and system clock. The returned [`Consoles`] registry is
-/// the data-plane view of each Process's current terminal; it carries no
-/// lifecycle authority.
-pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles)> {
+/// Run interface and system clock. The returned [`Consoles`] registry is the
+/// data-plane view of each Process's current terminal, and the returned
+/// [`OutputViews`] registry is the data-plane view of each Process's
+/// retained output; neither carries lifecycle authority.
+pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, Arc<OutputViews>)> {
     // Size each first PTY like the pane that will render it, so children
     // never observe a stale default size.
     let initial_geometry = crate::tui::project_console_geometry(project.processes().len());
-    let seam = RealRunSeam::default();
+    let outputs = Arc::new(OutputViews::new(project.processes().len()));
+    let seam = RealRunSeam::new(Arc::clone(&outputs));
     let consoles = seam.consoles();
     Ok((
         start_with(
@@ -68,6 +75,7 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles)> 
             initial_geometry,
         ),
         consoles,
+        outputs,
     ))
 }
 
