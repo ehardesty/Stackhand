@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// How a Process expects to run. A Process is exactly one of these kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +86,9 @@ pub enum InputPolicy {
 pub enum DependencyCondition {
     /// The dependency Process has an active Run that is Starting or Running.
     Started,
+    /// The dependency Service has an active Run whose readiness probe has
+    /// passed. Valid only when the dependency Process is a Service.
+    Ready,
     /// The dependency One-shot's latest completed Run exited with code zero.
     /// Valid only when the dependency Process is a One-shot.
     CompletedSuccessfully,
@@ -95,9 +99,38 @@ impl DependencyCondition {
     pub fn label(self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::Ready => "ready",
             Self::CompletedSuccessfully => "completed_successfully",
         }
     }
+}
+
+/// One bounded network check that decides when a Service's current Run
+/// becomes available. Exactly one form per Process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadinessProbe {
+    /// A TCP connection must succeed against this endpoint.
+    Tcp { host: String, port: u16 },
+    /// An HTTP GET must return a successful 2xx status from this endpoint,
+    /// parsed from the configured URL at configuration time. Redirects are
+    /// never followed.
+    Http {
+        host: String,
+        port: u16,
+        /// The request path and any query, always starting with `/`.
+        path: String,
+    },
+}
+
+/// The readiness policy of one Service: which probe decides availability,
+/// how often failing attempts repeat, and how long one attempt may take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessConfig {
+    pub probe: ReadinessProbe,
+    /// How long after a failed attempt the next one may run.
+    pub interval: Duration,
+    /// How long one attempt may take before it fails as timed out.
+    pub timeout: Duration,
 }
 
 /// One startup Dependency of one Process.
@@ -127,6 +160,9 @@ pub struct ProcessSpec {
     /// Startup Dependencies. A Dependency is a startup relationship only;
     /// it never couples lifetimes after the dependent starts.
     pub dependencies: Vec<DependencySpec>,
+    /// When set, the Service stays Starting until this probe passes. Valid
+    /// on Services only; configuration validation rejects it on One-shots.
+    pub readiness: Option<ReadinessConfig>,
 }
 
 /// Why one effective Project could not be built.
@@ -139,11 +175,17 @@ pub enum ProjectError {
         dependency: String,
     },
     /// A Dependency condition is not valid for the dependency Process's
-    /// kind; only One-shot dependencies support `completed_successfully`.
+    /// kind; only One-shot dependencies support `completed_successfully`
+    /// and only Service dependencies support `ready`.
     InvalidCondition {
         process: String,
         dependency: String,
         condition: String,
+    },
+    /// A readiness probe was configured on a One-shot; only Services wait
+    /// for readiness.
+    ReadinessOnOneShot {
+        process: String,
     },
     /// The Dependency graph has a cycle; the path repeats its first name.
     DependencyCycle(Vec<String>),
@@ -179,15 +221,27 @@ impl EffectiveProject {
                         dependency: dependency.name.clone(),
                     });
                 };
-                if dependency.condition == DependencyCondition::CompletedSuccessfully
-                    && processes[dependency_index].kind == ProcessKind::Service
-                {
+                let condition_kind_mismatch = match dependency.condition {
+                    DependencyCondition::CompletedSuccessfully => {
+                        processes[dependency_index].kind == ProcessKind::Service
+                    }
+                    DependencyCondition::Ready => {
+                        processes[dependency_index].kind == ProcessKind::OneShot
+                    }
+                    DependencyCondition::Started => false,
+                };
+                if condition_kind_mismatch {
                     return Err(ProjectError::InvalidCondition {
                         process: spec.name.clone(),
                         dependency: dependency.name.clone(),
                         condition: dependency.condition.label().to_string(),
                     });
                 }
+            }
+            if spec.readiness.is_some() && spec.kind == ProcessKind::OneShot {
+                return Err(ProjectError::ReadinessOnOneShot {
+                    process: spec.name.clone(),
+                });
             }
         }
         find_dependency_cycle(&processes, &positions).map_or(Ok(Self { processes }), |path| {
@@ -275,6 +329,7 @@ mod tests {
             terminal_mode: TerminalMode::Pipe,
             input_policy: InputPolicy::Disabled,
             dependencies: Vec::new(),
+            readiness: None,
         }
     }
 

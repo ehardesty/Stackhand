@@ -4,6 +4,8 @@
 //! Profiles, overlays, environment files, and interpolation are deferred;
 //! Milestone 1 supports one base configuration.
 
+mod readiness;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -49,8 +51,13 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
             dependency,
             condition,
         } => config_error(anyhow::anyhow!(
-            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': it is valid only when the dependency Process is a One-shot"
+            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'completed_successfully' is valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
         )),
+        crate::model::ProjectError::ReadinessOnOneShot { process } => config_error(
+            anyhow::anyhow!(
+                "Process '{process}': readiness is valid only on Services; a One-shot completes instead of becoming ready"
+            ),
+        ),
         crate::model::ProjectError::DependencyCycle(path) => {
             config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
@@ -170,6 +177,10 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
             .map(|(index, entry)| build_dependency(&name, index, entry))
             .collect::<Result<Vec<_>, ConfigError>>()?,
     };
+    let readiness = match &process.readiness {
+        None => None,
+        Some(file) => Some(readiness::build_readiness(&name, file)?),
+    };
     Ok(ProcessSpec {
         name,
         kind,
@@ -185,6 +196,7 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
         terminal_mode,
         input_policy,
         dependencies,
+        readiness,
     })
 }
 
@@ -237,13 +249,14 @@ fn build_dependency(
     let condition = match condition.as_deref() {
         None => DependencyCondition::Started,
         Some("started") => DependencyCondition::Started,
+        Some("ready") => DependencyCondition::Ready,
         // Kind honesty is enforced later against the full Process list: a
         // One-shot dependency supports `completed_successfully`, a Service
-        // dependency does not.
+        // dependency supports `ready`.
         Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
         Some(other) => {
             return fail(format!(
-                "unsupported condition '{other}' (this Stackhand supports 'started' and 'completed_successfully' for One-shot dependencies)"
+                "unsupported condition '{other}' (this Stackhand supports 'started', 'ready', and 'completed_successfully')"
             ));
         }
     };
@@ -270,6 +283,7 @@ struct ProcessFile {
     terminal: Option<String>,
     input: Option<String>,
     depends_on: Option<Vec<serde_yaml::Value>>,
+    readiness: Option<readiness::ReadinessFile>,
     command: CommandFile,
 }
 
@@ -531,17 +545,23 @@ processes:
     }
 
     #[test]
-    fn ready_stays_rejected() {
-        let error = write_and_load(
-            "deps-ready",
+    fn ready_condition_is_valid_only_on_service_dependencies() {
+        let accepted = write_and_load(
+            "deps-ready-ok",
             "version: 1\nprocesses:\n  - name: web\n    depends_on: [{name: db, condition: ready}]\n    command: {program: /bin/true}\n  - name: db\n    command: {program: /bin/true}\n",
         )
-        .expect_err("an unimplemented condition must fail");
-        assert!(
-            error.message.contains("unsupported condition"),
-            "{}",
-            error.message
+        .expect("a Service dependency accepts ready");
+        assert_eq!(
+            accepted.processes()[0].dependencies[0].condition,
+            crate::model::DependencyCondition::Ready
         );
+
+        let error = write_and_load(
+            "deps-ready-one-shot",
+            "version: 1\nprocesses:\n  - name: web\n    depends_on: [{name: setup, condition: ready}]\n    command: {program: /bin/true}\n  - name: setup\n    kind: one-shot\n    command: {program: /bin/true}\n",
+        )
+        .expect_err("a One-shot dependency must reject ready");
+        assert!(error.message.contains("'ready'"), "{}", error.message);
     }
 
     #[test]

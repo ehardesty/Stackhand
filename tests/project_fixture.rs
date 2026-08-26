@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,36 @@ fn unique_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Host one real TCP listener for the fixture's readiness probe. The
+/// listener lives in this test process; Stackhand's production TCP probe
+/// adapter connects to it over a real loopback socket. Each connection is
+/// accepted and closed; nothing is served.
+fn host_tcp_listener() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+    let port = listener.local_addr().expect("local address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            drop(stream);
+        }
+    });
+    port
+}
+
+/// Host one real HTTP health endpoint for the fixture's HTTP readiness
+/// probe. The hand-rolled response proves the production adapter speaks a
+/// plain HTTP/1.0 GET against a real loopback socket.
+fn host_http_health_endpoint() -> u16 {
+    use std::io::Write;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+    let port = listener.local_addr().expect("local address").port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    });
+    port
+}
+
 /// Prints the direct-command marker, then proves inline environment reached
 /// the child through `$FIXTURE_TOKEN`, then stays alive as a Service.
 const MARKER_SCRIPT: &str = "printf 'fixture-marker-12345\\n'; printf 'fixture-token-%s\\n' \"$FIXTURE_TOKEN\"; exec sleep 60";
@@ -21,7 +52,7 @@ const MARKER_SCRIPT: &str = "printf 'fixture-marker-12345\\n'; printf 'fixture-t
 /// Run stays alive as a Service.
 const SHELL_SCRIPT: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep 60";
 
-fn fixture_config() -> String {
+fn fixture_config(tcp_port: u16, http_port: u16) -> String {
     let marker = MARKER_SCRIPT.replace('"', "\\\"");
     format!(
         "version: 1\n\
@@ -62,6 +93,25 @@ fn fixture_config() -> String {
          \x20   terminal: pipe\n\
          \x20   command:\n\
          \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n\
+         \x20 - name: tcp-ready\n\
+         \x20   kind: service\n\
+         \x20   readiness:\n\
+         \x20     tcp:\n\
+         \x20       host: 127.0.0.1\n\
+         \x20       port: {tcp_port}\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n\
+         \x20 - name: http-ready\n\
+         \x20   kind: service\n\
+         \x20   readiness:\n\
+         \x20     http:\n\
+         \x20       url: \"http://127.0.0.1:{http_port}/healthz\"\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
          \x20     args: [\"60\"]\n",
     )
 }
@@ -71,8 +121,12 @@ fn one_configured_service_runs_end_to_end() {
     let dir = unique_dir("project");
     let nested = dir.join("web");
     fs::create_dir_all(&nested).expect("working directory creates");
+    // The readiness target is a real socket in this process; the probed
+    // supervised Process itself only sleeps.
+    let tcp_port = host_tcp_listener();
+    let http_port = host_http_health_endpoint();
     let config_path = dir.join("stackhand.yaml");
-    fs::write(&config_path, fixture_config()).expect("config writes");
+    fs::write(&config_path, fixture_config(tcp_port, http_port)).expect("config writes");
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
         .arg("--fixture-project")

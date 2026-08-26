@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
-use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender, StartIntent};
+use crate::supervisor::seam::{
+    ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+};
 
 /// One observable runtime action the Supervisor requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,10 +98,8 @@ impl RunSeam for FakeRuntime {
 }
 
 /// A controllable clock. Tests advance it explicitly; nothing in a test
-/// depends on wall-clock sleeps. Interval scheduling consumes it from
-/// Issue #27 on.
+/// depends on wall-clock sleeps. Readiness interval scheduling consumes it.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct FakeClock {
     now: Arc<Mutex<Instant>>,
 }
@@ -111,7 +111,6 @@ impl FakeClock {
         }
     }
 
-    #[allow(dead_code)] // Readiness interval tests consume this from Issue #27 on.
     pub(crate) fn advance(&self, by: Duration) {
         let mut now = self
             .now
@@ -139,5 +138,42 @@ impl RunSeam for Arc<FakeRuntime> {
 
     fn stop(&self, process_id: ProcessId, run_id: RunId, events: &SeamSender) {
         (**self).stop(process_id, run_id, events);
+    }
+}
+
+/// A scripted probe runner. It records every dispatched attempt so tests
+/// assert readiness scheduling; results arrive as scripted `Readiness`
+/// events through [`Harness`](super::tests)'s event path.
+#[derive(Default)]
+pub(crate) struct FakeProbes {
+    attempts: Mutex<Vec<(ProcessId, RunId)>>,
+}
+
+impl FakeProbes {
+    pub(crate) fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The (process, run) identities of every dispatched attempt in order.
+    pub(crate) fn attempts(&self) -> Vec<(ProcessId, RunId)> {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl ProbeSeam for FakeProbes {
+    fn probe(&self, intent: ProbeIntent, _events: &SeamSender) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((intent.process_id, intent.run_id));
+    }
+}
+
+impl ProbeSeam for Arc<FakeProbes> {
+    fn probe(&self, intent: ProbeIntent, events: &SeamSender) {
+        (**self).probe(intent, events);
     }
 }

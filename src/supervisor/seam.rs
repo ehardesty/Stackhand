@@ -7,9 +7,10 @@
 //! widens the external Supervisor interface.
 
 use crossbeam_channel::Sender;
+use std::time::Duration;
 
 use crate::geometry::TerminalGeometry;
-
+use crate::model::ReadinessProbe;
 use crate::runtime::{OsPid, ProcessId, RunId};
 
 /// Where adapters deliver typed events back to the Supervisor. Every
@@ -69,6 +70,15 @@ pub enum SeamEvent {
         cpu_percent: f64,
         rss_kib: u64,
     },
+    /// One bounded readiness attempt finished for the current Run. `passing`
+    /// is true only when the probe succeeded; a failure carries one bounded
+    /// diagnostic.
+    Readiness {
+        process_id: ProcessId,
+        run_id: RunId,
+        passing: bool,
+        diagnostic: Option<String>,
+    },
 }
 
 impl SeamEvent {
@@ -78,7 +88,8 @@ impl SeamEvent {
             | Self::Exited { process_id, .. }
             | Self::ShutdownComplete { process_id, .. }
             | Self::Failed { process_id, .. }
-            | Self::Metrics { process_id, .. } => *process_id,
+            | Self::Metrics { process_id, .. }
+            | Self::Readiness { process_id, .. } => *process_id,
         }
     }
 
@@ -88,7 +99,8 @@ impl SeamEvent {
             | Self::Exited { run_id, .. }
             | Self::ShutdownComplete { run_id, .. }
             | Self::Failed { run_id, .. }
-            | Self::Metrics { run_id, .. } => *run_id,
+            | Self::Metrics { run_id, .. }
+            | Self::Readiness { run_id, .. } => *run_id,
         }
     }
 }
@@ -119,4 +131,22 @@ pub(crate) trait RunSeam: Send {
     /// Perform the complete bounded shutdown for one active Run off the
     /// control task, then report one [`SeamEvent::ShutdownComplete`].
     fn stop(&self, process_id: ProcessId, run_id: RunId, events: &SeamSender);
+}
+
+/// One request for exactly one bounded readiness attempt. The Supervisor
+/// dispatches attempts one at a time per Run; the adapter performs each one
+/// off the control task and reports exactly one
+/// [`SeamEvent::Readiness`] for these identities.
+#[derive(Clone, Debug)]
+pub struct ProbeIntent {
+    pub process_id: ProcessId,
+    pub run_id: RunId,
+    pub probe: ReadinessProbe,
+    pub timeout: Duration,
+}
+
+/// The readiness seam. Implementations own network waits so they never run
+/// on the Supervisor control task.
+pub(crate) trait ProbeSeam: Send {
+    fn probe(&self, intent: ProbeIntent, events: &SeamSender);
 }

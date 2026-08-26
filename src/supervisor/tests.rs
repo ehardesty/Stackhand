@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::ProjectSnapshot;
-use super::support::{FakeClock, FakeRuntime, Intent};
+use super::support::{FakeClock, FakeProbes, FakeRuntime, Intent};
 use super::{Command, Core, DesiredState, Lifecycle, ProcessSnapshot, SeamEvent, SeamSender};
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
-    ProcessKind, ProcessSpec, TerminalMode,
+    ProcessKind, ProcessSpec, ReadinessConfig, ReadinessProbe, TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
+use crate::supervisor::clock::Clock;
 
 fn service(name: &str) -> ProcessSpec {
     simple(name, ProcessKind::Service, Enabled::Yes, Autostart::Yes)
@@ -33,7 +34,24 @@ fn simple(name: &str, kind: ProcessKind, enabled: Enabled, autostart: Autostart)
         terminal_mode: TerminalMode::Pipe,
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
+        readiness: None,
     }
+}
+
+/// A Service gated on a TCP probe against a port nothing listens on; the
+/// scripted probes never succeed unless a test reports a passing event.
+fn probed_service(name: &str) -> ProcessSpec {
+    let mut spec = service(name);
+    spec.autostart = Autostart::No;
+    spec.readiness = Some(ReadinessConfig {
+        probe: ReadinessProbe::Tcp {
+            host: "127.0.0.1".into(),
+            port: 1,
+        },
+        interval: Duration::from_secs(1),
+        timeout: Duration::from_millis(100),
+    });
+    spec
 }
 
 /// A Process that starts only after each named Dependency satisfies its
@@ -50,6 +68,16 @@ fn depending_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
     spec
 }
 
+/// A Process that starts only after each named Service Dependency's
+/// readiness probe has passed.
+fn depending_ready_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
+    let mut spec = depending_on(name, dependencies);
+    for dependency in &mut spec.dependencies {
+        dependency.condition = DependencyCondition::Ready;
+    }
+    spec
+}
+
 /// A Service that starts only after each named One-shot Dependency reports
 /// `completed_successfully`.
 fn depending_completed_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
@@ -63,27 +91,36 @@ fn depending_completed_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
 struct Harness {
     core: Core,
     runtime: Arc<FakeRuntime>,
+    probes: Arc<FakeProbes>,
+    clock: Arc<FakeClock>,
     emitted: crossbeam_channel::Receiver<SeamEvent>,
 }
 
 impl Harness {
     fn new(project: EffectiveProject) -> Self {
-        Self::with(project, Arc::new(FakeRuntime::default()))
+        Self::with(project, FakeRuntime::shared())
     }
 
     fn with(project: EffectiveProject, runtime: Arc<FakeRuntime>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let clock = Box::new(FakeClock::new());
+        let clock = Arc::new(FakeClock::new());
+        let probes = FakeProbes::shared();
+        // The core and the harness share one fake timeline through the
+        // clock's interior shared `Instant`.
+        let core_clock: Arc<dyn Clock> = Arc::new(clock.as_ref().clone());
         let core = Core::new(
             project,
             Box::new(Arc::clone(&runtime)),
-            clock,
+            Box::new(Arc::clone(&probes)),
+            core_clock,
             SeamSender::new(tx),
             crate::geometry::TerminalGeometry::DEFAULT,
         );
         Self {
             core,
             runtime,
+            probes,
+            clock,
             emitted: rx,
         }
     }
@@ -103,6 +140,13 @@ impl Harness {
 
     fn event(&mut self, event: SeamEvent) {
         self.core.event(event);
+    }
+
+    /// Advance the fake clock, then dispatch every attempt that became due.
+    fn advance_and_poll(&mut self, by: Duration) {
+        self.clock.advance(by);
+        self.core.poll_timers(self.clock.now());
+        self.drain();
     }
 
     fn snapshot(&self) -> ProjectSnapshot {
@@ -130,6 +174,15 @@ fn exited(process: &str, run: u64, code: Option<i32>) -> SeamEvent {
         process_id: ProcessId::new(process_index(process)),
         run_id: RunId::new(run),
         code,
+    }
+}
+
+fn readiness(process: &str, run: u64, passing: bool, diagnostic: Option<String>) -> SeamEvent {
+    SeamEvent::Readiness {
+        process_id: ProcessId::new(process_index(process)),
+        run_id: RunId::new(run),
+        passing,
+        diagnostic,
     }
 }
 
@@ -467,6 +520,9 @@ fn unknown_commands_are_ignored() {
     assert!(h.runtime.intents().is_empty());
 }
 
+#[cfg(test)]
+mod readiness;
+
 mod one_shot_lifecycle;
 
 #[cfg(test)]
@@ -653,7 +709,8 @@ mod threaded {
         let handle = start_with(
             four_process_project(),
             Box::new(FakeRuntime::default()),
-            Box::new(FakeClock::new()),
+            Box::new(FakeProbes::default()),
+            Arc::new(FakeClock::new()),
             crate::geometry::TerminalGeometry::DEFAULT,
         );
         // Wait for the initial snapshot through the bounded public request.

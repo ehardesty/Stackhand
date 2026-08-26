@@ -123,6 +123,28 @@ fn prove_slice(
     assert_eq!(gated.failure, None);
     println!("fixture-one-shot-ok");
 
+    // The TCP-probed Service reached Running only through a real probe pass
+    // against the listener this test process hosts; per-Run readiness
+    // bookkeeping ends once the Run passed.
+    let tcp_ready = snapshot
+        .named("tcp-ready")
+        .expect("the fixture defines 'tcp-ready'");
+    assert_eq!(tcp_ready.lifecycle, Lifecycle::Running);
+    assert!(tcp_ready.current_run.is_some());
+    assert_eq!(tcp_ready.readiness, None, "a passed Run keeps no tracking");
+    assert_eq!(tcp_ready.failure, None);
+
+    // The same holds for the HTTP-probed Service against the real local
+    // health endpoint this process hosts.
+    let http_ready = snapshot
+        .named("http-ready")
+        .expect("the fixture defines 'http-ready'");
+    assert_eq!(http_ready.lifecycle, Lifecycle::Running);
+    assert!(http_ready.current_run.is_some());
+    assert_eq!(http_ready.readiness, None);
+    assert_eq!(http_ready.failure, None);
+    println!("fixture-tcp-ready-ok");
+
     // Output flows to each Process console without entering the control
     // plane; every proof must appear in its own Process's console.
     for (name, needle) in CONSOLE_PROOFS {

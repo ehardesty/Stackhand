@@ -109,6 +109,7 @@ impl Core {
     fn condition_satisfied(&self, index: usize, condition: DependencyCondition) -> bool {
         match condition {
             DependencyCondition::Started => self.started_condition_satisfied(index),
+            DependencyCondition::Ready => self.ready_condition_satisfied(index),
             DependencyCondition::CompletedSuccessfully => self.completed_condition_satisfied(index),
         }
     }
@@ -119,6 +120,15 @@ impl Core {
         let entry = &self.entries[index];
         entry.current_run.is_some()
             && matches!(entry.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+    }
+
+    /// `ready` holds only while the dependency has an active Running Run. A
+    /// probed Service reaches Running only when its readiness probe passed,
+    /// so Running implies availability; readiness passes at most once per
+    /// Run, so each Run releases its dependents exactly once.
+    fn ready_condition_satisfied(&self, index: usize) -> bool {
+        let entry = &self.entries[index];
+        entry.current_run.is_some() && entry.lifecycle == Lifecycle::Running
     }
 
     /// `completed_successfully` holds once the dependency's latest completed

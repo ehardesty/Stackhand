@@ -11,20 +11,22 @@
 //! The primary test seam is this interface plus the private scripted fake
 //! runtime and fake clock (`support`), never internal state-machine fields.
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Select, Sender};
+use crossbeam_channel::{Receiver, Select, SelectTimeoutError, Sender};
 
 use crate::model::EffectiveProject;
 use crate::supervisor::clock::{Clock, SystemClock};
 use crate::supervisor::core::Core;
+use crate::supervisor::probe::RealProbes;
 use crate::supervisor::runtime::RealRunSeam;
-use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender};
+use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamEvent, SeamSender};
 
 mod clock;
 mod core;
+mod probe;
 mod runtime;
 mod schedule;
 mod seam;
@@ -35,7 +37,7 @@ mod tests;
 
 pub use core::{
     Command, DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ProcessSnapshot,
-    ProjectSnapshot,
+    ProjectSnapshot, ReadinessStatus,
 };
 pub use runtime::{ConsoleView, Consoles};
 
@@ -61,7 +63,8 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles)> 
         start_with(
             project,
             Box::new(seam),
-            Box::new(SystemClock),
+            Box::new(RealProbes),
+            Arc::new(SystemClock),
             initial_geometry,
         ),
         consoles,
@@ -69,12 +72,13 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles)> 
 }
 
 /// The full seam, shared by production and tests. Tests install the private
-/// scripted fake runtime and fake clock here; neither widens the external
-/// interface.
+/// scripted fake runtime, fake probes, and fake clock here; neither adapter
+/// widens the external interface.
 pub(crate) fn start_with(
     project: EffectiveProject,
     seam: Box<dyn RunSeam>,
-    clock: Box<dyn Clock>,
+    probes: Box<dyn ProbeSeam>,
+    clock: Arc<dyn Clock>,
     initial_geometry: crate::geometry::TerminalGeometry,
 ) -> SupervisorHandle {
     let (inbox_tx, inbox_rx) = crossbeam_channel::unbounded::<Inbox>();
@@ -82,13 +86,14 @@ pub(crate) fn start_with(
     let mut core = Core::new(
         project,
         seam,
-        clock,
+        probes,
+        Arc::clone(&clock),
         SeamSender::new(event_tx.clone()),
         initial_geometry,
     );
     let worker = std::thread::Builder::new()
         .name("stackhand-supervisor".to_string())
-        .spawn(move || run_task(&mut core, &inbox_rx, &event_rx))
+        .spawn(move || run_task(&mut core, &inbox_rx, &event_rx, clock))
         .expect("supervisor task spawns");
     SupervisorHandle {
         inbox: inbox_tx,
@@ -100,12 +105,30 @@ pub(crate) fn start_with(
 /// Serialize commands and control-plane events onto one task. The core owns
 /// a `SeamSender`, so the event channel stays connected for the whole loop;
 /// the task ends when every caller drops its handle.
-fn run_task(core: &mut Core, inbox: &Receiver<Inbox>, events: &Receiver<SeamEvent>) {
+///
+/// Between messages the loop waits at most until the next readiness attempt
+/// becomes due, then polls the core's timers. Readiness work itself always
+/// runs on probe-adapter threads, never here.
+fn run_task(
+    core: &mut Core,
+    inbox: &Receiver<Inbox>,
+    events: &Receiver<SeamEvent>,
+    clock: Arc<dyn Clock>,
+) {
     loop {
         let mut select = Select::new();
         let inbox_index = select.recv(inbox);
         let _event_index = select.recv(events);
-        let oper = select.select();
+        let oper = match core.time_until_next_probe() {
+            Some(wait) => match select.select_timeout(wait) {
+                Ok(oper) => oper,
+                Err(SelectTimeoutError) => {
+                    core.poll_timers(clock.now());
+                    continue;
+                }
+            },
+            None => select.select(),
+        };
         if oper.index() == inbox_index {
             match oper.recv(inbox) {
                 Ok(Inbox::Command(command)) => core.command(command),
@@ -143,7 +166,9 @@ impl SupervisorHandle {
         reply_rx.recv_timeout(SNAPSHOT_WAIT).ok()
     }
 
-    #[allow(dead_code)] // Probe and runtime adapters deliver events from Issue #27 on.
+    /// Deliver one typed seam event from an adapter thread; exercised by
+    /// the threaded wrapper test.
+    #[allow(dead_code)]
     pub(crate) fn deliver_event(&self, event: SeamEvent) {
         let _ = self.events.send(event);
     }

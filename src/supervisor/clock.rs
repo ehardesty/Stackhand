@@ -3,10 +3,7 @@
 
 use std::time::Instant;
 
-pub(crate) trait Clock: Send {
-    // Consumed by readiness interval scheduling (Issue #27) and shutdown
-    // deadlines (Issue #34).
-    #[allow(dead_code)]
+pub(crate) trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
