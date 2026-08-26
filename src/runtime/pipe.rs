@@ -190,6 +190,12 @@ impl PipeRun {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(dir) = command.current_dir() {
+            cmd.current_dir(dir);
+        }
+        for (key, value) in command.envs() {
+            cmd.env(key, value);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;

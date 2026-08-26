@@ -8,6 +8,8 @@
 
 use crossbeam_channel::Sender;
 
+use crate::geometry::TerminalGeometry;
+
 use crate::runtime::{OsPid, ProcessId, RunId};
 
 /// Where adapters deliver typed events back to the Supervisor. Every
@@ -101,10 +103,10 @@ pub struct StartIntent {
     pub args: Vec<std::ffi::OsString>,
     /// Absolute working directory. Consumed by the production adapter once
     /// the Run interface accepts it (Issue #22).
-    #[allow(dead_code)]
     pub working_dir: std::path::PathBuf,
-    #[allow(dead_code)]
     pub env: Vec<(String, String)>,
+    /// The PTY geometry of the rendered console pane at request time.
+    pub initial_geometry: TerminalGeometry,
     pub pty: bool,
 }
 

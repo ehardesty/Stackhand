@@ -4,6 +4,7 @@
 //! reach it through semantic commands, typed seam events, and immutable
 //! snapshots — the same surface the serializing task wrapper drives.
 
+use crate::geometry::TerminalGeometry;
 use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
@@ -49,6 +50,9 @@ pub struct FailureSummary {
 pub(crate) struct Core {
     project: EffectiveProject,
     entries: Vec<Entry>,
+    /// The console pane geometry at startup time; each Run's PTY opens with
+    /// it so children never see a stale default size.
+    initial_geometry: TerminalGeometry,
     seam: Box<dyn RunSeam>,
     #[allow(dead_code)] // Readiness intervals consume this from Issue #27 on.
     clock: Box<dyn Clock>,
@@ -66,11 +70,13 @@ struct Entry {
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         project: EffectiveProject,
         seam: Box<dyn RunSeam>,
         clock: Box<dyn Clock>,
         events: SeamSender,
+        initial_geometry: TerminalGeometry,
     ) -> Self {
         let entries = project
             .processes()
@@ -89,6 +95,7 @@ impl Core {
         Self {
             project,
             entries,
+            initial_geometry,
             seam,
             clock,
             events,
@@ -171,6 +178,7 @@ impl Core {
             args,
             working_dir: spec.working_dir.clone(),
             env: spec.env.clone(),
+            initial_geometry: self.initial_geometry,
             pty: matches!(spec.terminal_mode, crate::model::TerminalMode::Pty),
         }
     }
@@ -277,6 +285,7 @@ impl Core {
                 kind: spec.kind,
                 enabled: matches!(spec.enabled, Enabled::Yes),
                 autostart: matches!(spec.autostart, Autostart::Yes),
+                input_focused: matches!(spec.input_policy, crate::model::InputPolicy::Focused),
                 desired: entry.desired,
                 lifecycle: entry.lifecycle,
                 current_run: entry.current_run.map(RunId::get),
@@ -317,6 +326,10 @@ pub struct ProcessSnapshot {
     pub kind: ProcessKind,
     pub enabled: bool,
     pub autostart: bool,
+    /// Whether this Process accepts focused child input when selected.
+    /// Consumed by input routing across selection (Issue #30).
+    #[allow(dead_code)]
+    pub input_focused: bool,
     pub desired: DesiredState,
     pub lifecycle: Lifecycle,
     /// The numeric identity of the current Run, when one exists.

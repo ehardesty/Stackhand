@@ -1,143 +1,289 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use anyhow::{Result, anyhow, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::console::ConsoleInteraction;
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{
-    ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
+use crate::supervisor::Lifecycle;
+use crate::supervisor::{
+    Command, ConsoleView, Consoles, DesiredState, ProcessSnapshot, ProjectSnapshot,
+    SupervisorHandle,
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
-use crate::tui::{ConsoleWarning, OuterTerminal, console_area, render};
+use crate::tui::{
+    ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout, render_project,
+};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
+/// One shared bound for waiting out every Run's existing shutdown ladder.
+const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
-pub fn run_interactive() -> Result<()> {
-    let mut outer = OuterTerminal::enter()?;
-    let size = outer.terminal_mut().size()?;
-    let geometry = TerminalGeometry::from_pane(console_area(size.into()));
-    let (events, _run_event_log) = mpsc::channel();
-    let (output, _output_log) = crate::runtime::output_channel();
-    let dirty = Arc::new(AtomicBool::new(true));
-    let wake_dirty = Arc::clone(&dirty);
-    let mut run = RunRuntime.start(RunStartRequest {
-        process_id: ProcessId::new(1),
-        run_id: RunId::new(1),
-        command: SpawnCommand::shell(),
-        mode: RunMode::Pty {
-            initial_geometry: geometry,
-        },
-        events,
-        output,
-        ladder: Default::default(),
-        metrics_interval: None,
-        on_output_wake: Some(Box::new(move || {
-            wake_dirty.store(true, Ordering::Release);
-        })),
-    })?;
-    let mut snapshot = empty_snapshot(geometry);
-    let mut pending_resize = PendingResize::default();
-    let mut console = ConsoleInteraction::default();
+/// Load the Project, start enabled autostart Processes, and supervise them
+/// interactively until the user quits with a controlled Project shutdown.
+pub fn run_project(config_path: &Path) -> Result<()> {
+    // Invalid configuration starts no Processes and never enters the TUI.
+    let project = crate::config::load(config_path)
+        .map_err(|error| anyhow!("configuration error: {error}"))?;
+    let (supervisor, consoles) = crate::supervisor::start(project)?;
+    supervisor.command(Command::StartAutostart);
 
-    let run_result = run_event_loop(
-        &mut outer,
-        run.terminal().expect("interactive Run is PTY-mode"),
-        &dirty,
-        &mut snapshot,
-        &mut pending_resize,
-        &mut console,
-    );
-    run_result?;
-    run.shutdown().map(|_outcome| ())
+    // The terminal restores when this scope ends, before the bounded
+    // shutdown wait, so the user sees shutdown progress instead of a frozen
+    // screen.
+    let loop_result = {
+        let mut outer = OuterTerminal::enter()?;
+        run_event_loop(&mut outer, &supervisor, &consoles)
+    };
+    loop_result?;
+    shutdown_project(supervisor)
+}
+
+/// Stop every desired-Running Process and wait, within one shared deadline,
+/// for all current Runs to finish their existing bounded shutdown.
+fn shutdown_project(supervisor: SupervisorHandle) -> Result<()> {
+    supervisor.command(Command::StopAll);
+    let deadline = Instant::now() + PROJECT_SHUTDOWN_WAIT;
+    loop {
+        match supervisor.snapshot() {
+            None => break,
+            Some(snapshot) => {
+                if snapshot.processes.iter().all(|p| p.current_run.is_none()) {
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Project shutdown did not finish within its shared deadline");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    supervisor.stop_task();
+    Ok(())
 }
 
 fn run_event_loop(
     outer: &mut OuterTerminal,
-    session: TerminalHandle<'_>,
-    dirty: &AtomicBool,
-    snapshot: &mut OwnedTerminalSnapshot,
-    pending_resize: &mut PendingResize,
-    console: &mut ConsoleInteraction,
+    supervisor: &SupervisorHandle,
+    consoles: &Consoles,
 ) -> Result<()> {
+    let mut console = ConsoleInteraction::default();
+    let mut selected: usize = 0;
+    let mut pending_resize = PendingResize::default();
+    let mut console_snapshot: Option<OwnedTerminalSnapshot> = None;
+    let mut console_pane = project_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1).1;
+    let mut dirty = true;
+
     loop {
         if console.poll_requests() {
-            dirty.store(true, Ordering::Release);
+            dirty = true;
         }
+        let snapshot: ProjectSnapshot = supervisor
+            .snapshot()
+            .ok_or_else(|| anyhow!("the Supervisor stopped"))?;
+        if snapshot.processes.is_empty() {
+            bail!("this Project has no Processes");
+        }
+        selected = selected.min(snapshot.processes.len() - 1);
+        let selected_process = &snapshot.processes[selected];
+        let view = current_view(consoles, selected, selected_process);
+        drain_console_events(&mut console, view.as_ref(), &mut dirty);
+
         if let Some(geometry) = pending_resize.take_ready(Instant::now()) {
-            if session.resize(geometry).is_err() {
+            if view.as_ref().is_some_and(|view| !view.resize(geometry)) {
                 console.warn(ConsoleWarning::InputRejected);
             }
-            dirty.store(true, Ordering::Release);
+            dirty = true;
         }
 
-        while let Some(session_event) = session.poll_event() {
-            match session_event {
-                TerminalEvent::Failed(error) => bail!("terminal owner failed: {error}"),
-                TerminalEvent::InputBackpressure { .. } => {
-                    console.warn(ConsoleWarning::InputBackpressure);
-                    dirty.store(true, Ordering::Release);
-                }
-                TerminalEvent::OutputTruncated => {
-                    console.warn(ConsoleWarning::OutputTruncated);
-                    dirty.store(true, Ordering::Release);
-                }
-                TerminalEvent::Exited => return Ok(()),
-                TerminalEvent::StateChanged => {}
-            }
-        }
-
-        if dirty.swap(false, Ordering::AcqRel) || session.is_dirty() {
-            *snapshot = session.snapshot();
-            outer
-                .terminal_mut()
-                .draw(|frame| render(frame, snapshot, console.view()))?;
-            outer.set_cursor_shape(snapshot.cursor)?;
+        if dirty || view.as_ref().is_some_and(|view| view.is_dirty()) {
+            dirty = false;
+            console_snapshot = view.as_ref().and_then(|view| view.snapshot());
+            let rows = process_rows(&snapshot, selected);
+            let pane = render_frame(outer, &rows, console_snapshot.as_ref(), console.view())?;
+            console_pane = pane;
+            let cursor = console_snapshot.as_ref().and_then(|snap| snap.cursor);
+            outer.set_cursor_shape(cursor)?;
         }
 
         if !event::poll(pending_resize.poll_interval(Instant::now()))? {
             continue;
         }
-        match event::read()? {
+        let input_event = event::read()?;
+        match input_event {
             Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
             Event::Key(key) => {
-                if console.handle_key(key, &session, snapshot.buffer.area().height) {
-                    dirty.store(true, Ordering::Release);
-                }
+                route_key(
+                    &mut console,
+                    view.as_ref(),
+                    key,
+                    console_pane.height,
+                    &mut dirty,
+                );
             }
             Event::Paste(data) => {
-                console.handle_paste(&data, &session);
-                dirty.store(true, Ordering::Release);
-            }
-            Event::FocusGained => {
-                if session.send_focus(true).is_err() {
-                    console.warn(ConsoleWarning::InputRejected);
-                    dirty.store(true, Ordering::Release);
+                if let Some(view) = view.as_ref() {
+                    view.with(|session| console.handle_paste(&data, session));
+                    dirty = true;
                 }
             }
-            Event::FocusLost => {
-                if session.send_focus(false).is_err() {
-                    console.warn(ConsoleWarning::InputRejected);
-                    dirty.store(true, Ordering::Release);
+            Event::FocusGained | Event::FocusLost => {
+                if let Some(view) = view.as_ref() {
+                    let gained = matches!(input_event, Event::FocusGained);
+                    let delivered = view.with(|session| session.send_focus(gained).is_ok());
+                    if delivered != Some(true) {
+                        console.warn(ConsoleWarning::InputRejected);
+                        dirty = true;
+                    }
                 }
             }
             Event::Mouse(mouse) => {
-                let area = console_area(outer.terminal_mut().size()?.into());
-                if console.handle_mouse(mouse, area, snapshot.mouse_tracking, &session) {
-                    dirty.store(true, Ordering::Release);
+                if let Some(view) = view.as_ref() {
+                    let changed = view.with(|session| {
+                        console.handle_mouse(
+                            mouse,
+                            console_pane,
+                            console_snapshot
+                                .as_ref()
+                                .is_some_and(|snap| snap.mouse_tracking),
+                            session,
+                        )
+                    });
+                    if changed.unwrap_or(false) {
+                        dirty = true;
+                    }
                 }
             }
             Event::Resize(cols, rows) => {
-                let geometry = TerminalGeometry::from_pane(console_area(
-                    ratatui::layout::Rect::new(0, 0, cols, rows),
-                ));
-                pending_resize.update(geometry, Instant::now());
+                // The child sees exactly the rendered console pane.
+                let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+                let (_, pane, _) = project_layout(area, snapshot.processes.len());
+                pending_resize.update(
+                    TerminalGeometry::from_pane(pane_inner(pane)),
+                    Instant::now(),
+                );
             }
         }
     }
+}
+
+/// The live console of the selected Process's current Run. Process
+/// identities are stable Project positions.
+fn current_view(
+    consoles: &Consoles,
+    selected: usize,
+    process: &ProcessSnapshot,
+) -> Option<ConsoleView> {
+    let run_id = process.current_run?;
+    consoles.view(selected as u32, run_id)
+}
+
+fn drain_console_events(
+    console: &mut ConsoleInteraction,
+    view: Option<&ConsoleView>,
+    dirty: &mut bool,
+) {
+    let Some(view) = view else {
+        return;
+    };
+    while let Some(session_event) = view.poll_event() {
+        match session_event {
+            // One failed console must not kill Stackhand or garble the
+            // screen; the warning channel carries the visible signal.
+            TerminalEvent::Failed(_) => console.warn(ConsoleWarning::InputRejected),
+            TerminalEvent::InputBackpressure { .. } => {
+                console.warn(ConsoleWarning::InputBackpressure);
+                *dirty = true;
+            }
+            TerminalEvent::OutputTruncated => {
+                console.warn(ConsoleWarning::OutputTruncated);
+                *dirty = true;
+            }
+            // A child exiting does not end Stackhand; the Supervisor keeps
+            // the structured exit state visible.
+            TerminalEvent::Exited | TerminalEvent::StateChanged => *dirty = true,
+        }
+    }
+}
+
+fn route_key(
+    console: &mut ConsoleInteraction,
+    view: Option<&ConsoleView>,
+    key: KeyEvent,
+    page_rows: u16,
+    dirty: &mut bool,
+) {
+    let Some(view) = view else {
+        return;
+    };
+    if view.with(|session| console.handle_key(key, session, page_rows)) == Some(true) {
+        *dirty = true;
+    }
+}
+
+fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
+    snapshot
+        .processes
+        .iter()
+        .enumerate()
+        .map(|(index, process)| ProcessRowView {
+            name: process.name.clone(),
+            status: status_label(process),
+            selected: index == selected,
+        })
+        .collect()
+}
+
+/// Project structured lifecycle state into the concise row label. The label
+/// is a projection; the snapshot remains the authority.
+fn status_label(process: &ProcessSnapshot) -> String {
+    if !process.enabled {
+        return "Disabled".to_string();
+    }
+    if process.desired == DesiredState::Running
+        && let Some(failure) = &process.failure
+    {
+        return format!("Failed ({})", short_reason(&failure.detail));
+    }
+    match process.lifecycle {
+        Lifecycle::Idle | Lifecycle::Stopped => "Stopped".to_string(),
+        Lifecycle::Starting => "Starting".to_string(),
+        Lifecycle::Running => "Ready".to_string(),
+        Lifecycle::Stopping => {
+            if let Some(failure) = &process.failure {
+                format!("Stopping ({})", short_reason(&failure.detail))
+            } else {
+                "Stopping".to_string()
+            }
+        }
+    }
+}
+
+/// A bounded, character-safe reason for one row.
+fn short_reason(detail: &str) -> String {
+    let mut truncated: String = detail.chars().take(40).collect();
+    if detail.chars().count() > 40 {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn render_frame(
+    outer: &mut OuterTerminal,
+    rows: &[ProcessRowView],
+    console_snapshot: Option<&OwnedTerminalSnapshot>,
+    view: crate::tui::ConsoleViewState,
+) -> Result<ratatui::layout::Rect> {
+    let mut pane = None;
+    outer
+        .terminal_mut()
+        .draw(|frame| {
+            pane = Some(render_project(frame, rows, console_snapshot, view));
+        })
+        .map_err(|error| anyhow!("render failed: {error}"))?;
+    pane.ok_or_else(|| anyhow!("the frame did not render"))
 }
 
 #[derive(Default)]
@@ -168,20 +314,10 @@ impl PendingResize {
 }
 
 fn is_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn empty_snapshot(geometry: TerminalGeometry) -> OwnedTerminalSnapshot {
-    OwnedTerminalSnapshot {
-        buffer: ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
-            0,
-            0,
-            geometry.cols(),
-            geometry.rows(),
-        )),
-        cursor: None,
-        mouse_tracking: false,
-    }
+    key.code == KeyCode::Char('q')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
 }
 
 #[cfg(test)]

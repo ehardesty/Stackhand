@@ -25,12 +25,24 @@ pub enum Autostart {
     No,
 }
 
+impl Autostart {
+    pub fn flag(value: bool) -> Self {
+        if value { Self::Yes } else { Self::No }
+    }
+}
+
 /// Whether configuration enables a Process at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enabled {
     Yes,
     /// The Process stays visible but cannot start.
     No,
+}
+
+impl Enabled {
+    pub fn flag(value: bool) -> Self {
+        if value { Self::Yes } else { Self::No }
+    }
 }
 
 /// Exactly one command form for one Process. The two forms are mutually

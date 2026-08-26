@@ -19,27 +19,18 @@ pub struct PtyIo {
 pub struct SpawnCommand {
     program: OsString,
     args: Vec<OsString>,
+    current_dir: Option<std::path::PathBuf>,
+    envs: Vec<(OsString, OsString)>,
 }
 
 impl SpawnCommand {
-    pub fn shell() -> Self {
-        let program = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-        Self {
-            program,
-            args: Vec::new(),
-        }
-    }
-
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
+            current_dir: None,
+            envs: Vec::new(),
         }
-    }
-
-    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
-        self.args.push(arg.into());
-        self
     }
 
     pub(crate) fn program(&self) -> &OsStr {
@@ -48,6 +39,29 @@ impl SpawnCommand {
 
     pub(crate) fn args(&self) -> &[OsString] {
         &self.args
+    }
+
+    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn with_current_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
+    pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.envs.push((key.into(), value.into()));
+        self
+    }
+
+    pub(crate) fn current_dir(&self) -> Option<&std::path::Path> {
+        self.current_dir.as_deref()
+    }
+
+    pub(crate) fn envs(&self) -> &[(OsString, OsString)] {
+        &self.envs
     }
 }
 
@@ -109,6 +123,12 @@ impl PtyProcess {
         let mut builder = CommandBuilder::new(&command.program);
         for arg in command.args {
             builder.arg(arg);
+        }
+        if let Some(dir) = &command.current_dir {
+            builder.cwd(dir);
+        }
+        for (key, value) in command.envs {
+            builder.env(key, value);
         }
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");

@@ -1,10 +1,12 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
 fn main() -> Result<()> {
     match parse_mode(std::env::args_os().skip(1))? {
-        Mode::Interactive => stackhand::run_interactive(),
+        Mode::Project(path) => stackhand::run_project(&path),
+        Mode::FixtureProject(path) => stackhand::project_fixture::run(&path),
         Mode::FixtureRoundTrip(text) => stackhand::prototype::run_fixture_round_trip(&text),
         Mode::FixtureInput => stackhand::prototype::run_fixture_input(),
         Mode::FixturePaste => stackhand::prototype::run_fixture_paste(),
@@ -15,7 +17,8 @@ fn main() -> Result<()> {
 }
 
 enum Mode {
-    Interactive,
+    Project(PathBuf),
+    FixtureProject(PathBuf),
     FixtureRoundTrip(String),
     FixtureInput,
     FixturePaste,
@@ -26,8 +29,15 @@ enum Mode {
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
     let Some(first) = args.next() else {
-        return Ok(Mode::Interactive);
+        bail!("usage: stackhand <project.yaml> (or --fixture-* modes)");
     };
+
+    if first == "--fixture-project" {
+        let path = args
+            .next()
+            .context("--fixture-project requires a YAML path")?;
+        return Ok(Mode::FixtureProject(PathBuf::from(path)));
+    }
 
     if first == "--fixture-rendering" {
         if args.next().is_some() {
@@ -64,19 +74,24 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
         return Ok(Mode::FixtureMouse);
     }
 
-    if first != "--fixture-round-trip" {
+    if first == "--fixture-round-trip" {
+        let text = args
+            .next()
+            .context("--fixture-round-trip requires one text argument")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("fixture text must be valid UTF-8"))?;
+        if args.next().is_some() {
+            bail!("--fixture-round-trip accepts only one text argument");
+        }
+        return Ok(Mode::FixtureRoundTrip(text));
+    }
+
+    if first.to_string_lossy().starts_with('-') {
         bail!("unknown argument: {}", first.to_string_lossy());
     }
-
-    let text = args
-        .next()
-        .context("--fixture-round-trip requires one text argument")?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("fixture text must be valid UTF-8"))?;
-
     if args.next().is_some() {
-        bail!("--fixture-round-trip accepts only one text argument");
+        bail!("only one Project file is accepted");
     }
 
-    Ok(Mode::FixtureRoundTrip(text))
+    Ok(Mode::Project(PathBuf::from(first)))
 }

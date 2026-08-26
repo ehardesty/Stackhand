@@ -54,6 +54,7 @@ impl Harness {
             Box::new(Arc::clone(&runtime)),
             clock,
             SeamSender::new(tx),
+            crate::geometry::TerminalGeometry::DEFAULT,
         );
         Self {
             core,
@@ -402,6 +403,7 @@ mod threaded {
             four_process_project(),
             Box::new(FakeRuntime::default()),
             Box::new(FakeClock::new()),
+            crate::geometry::TerminalGeometry::DEFAULT,
         );
         // Wait for the initial snapshot through the bounded public request.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

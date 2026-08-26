@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::OwnedTerminalSnapshot;
@@ -45,22 +45,108 @@ impl Default for ConsoleViewState {
     }
 }
 
-pub fn console_area(area: Rect) -> Rect {
-    let content_height = area.height.saturating_sub(FOOTER_HEIGHT);
-    Block::bordered().inner(Rect::new(area.x, area.y, area.width, content_height))
+/// One projected Process list row. Labels are projections of structured
+/// snapshot state, never stored authoritative strings.
+pub struct ProcessRowView {
+    pub name: String,
+    pub status: String,
+    pub selected: bool,
 }
 
-pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, view: ConsoleViewState) {
-    let area = frame.area();
-    let pane = Rect::new(
+/// The one owner of the Project layout rule: a Process list above the
+/// selected console pane, one footer line below. Rendering and interaction
+/// geometry both derive from this.
+pub fn project_layout(area: Rect, process_rows: usize) -> (Rect, Rect, Rect) {
+    let list_height = (process_rows as u16 + 2)
+        .max(3)
+        .min(area.height / 3)
+        .min(area.height);
+    let list = Rect::new(area.x, area.y, area.width, list_height);
+    let console_height = area
+        .height
+        .saturating_sub(list.height)
+        .saturating_sub(FOOTER_HEIGHT)
+        .max(1);
+    let console_outer = Rect::new(area.x, area.y + list.height, area.width, console_height);
+    let footer = Rect::new(
         area.x,
-        area.y,
+        area.bottom().saturating_sub(1),
         area.width,
-        area.height.saturating_sub(FOOTER_HEIGHT),
+        FOOTER_HEIGHT,
     );
-    frame.render_widget(Block::new().borders(Borders::ALL).title(" Shell "), pane);
+    (list, console_outer, footer)
+}
 
-    let console = console_area(area);
+/// The inner area of one bordered pane.
+pub fn pane_inner(pane: Rect) -> Rect {
+    ratatui::widgets::Block::bordered().inner(pane)
+}
+
+/// The PTY geometry matching the console pane for a Project with this many
+/// Process rows, using the current terminal size.
+pub fn project_console_geometry(process_rows: usize) -> crate::geometry::TerminalGeometry {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (_, pane, _) = project_layout(Rect::new(0, 0, cols, rows), process_rows);
+    crate::geometry::TerminalGeometry::from_pane(pane_inner(pane))
+}
+
+pub fn render_project(
+    frame: &mut Frame<'_>,
+    rows: &[ProcessRowView],
+    console_snapshot: Option<&OwnedTerminalSnapshot>,
+    view: ConsoleViewState,
+) -> Rect {
+    let area = frame.area();
+    let (list, console_pane, footer) = project_layout(area, rows.len());
+    let console_inner = pane_inner(console_pane);
+
+    let list_rows: Vec<ratatui::text::Line<'_>> = rows
+        .iter()
+        .map(|row| {
+            let style = if row.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ratatui::text::Line::styled(format!(" {} · {} ", row.name, row.status), style)
+        })
+        .collect();
+    frame.render_widget(
+        ratatui::widgets::List::new(list_rows)
+            .block(Block::new().borders(Borders::ALL).title(" Processes ")),
+        list,
+    );
+    frame.render_widget(Block::bordered().title(" Console "), console_pane);
+
+    let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
+    blit_console(
+        frame,
+        console_snapshot.unwrap_or(&EMPTY_CONSOLE),
+        console_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(footer_text(view, mouse_tracking))
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+    if let Some(cursor) = console_snapshot.and_then(|snap| snap.cursor) {
+        let x = console_inner.x.saturating_add(cursor.position.x);
+        let y = console_inner.y.saturating_add(cursor.position.y);
+        if x < console_inner.right() && y < console_inner.bottom() {
+            frame.set_cursor_position((x, y));
+        }
+    }
+    console_inner
+}
+
+static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
+    std::sync::LazyLock::new(|| OwnedTerminalSnapshot {
+        buffer: ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1)),
+        cursor: None,
+        mouse_tracking: false,
+    });
+
+fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
     let source = snapshot.buffer.area();
     let width = source.width.min(console.width);
     let height = source.height.min(console.height);
@@ -68,20 +154,6 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, view: Con
         for x in 0..width {
             frame.buffer_mut()[(console.x + x, console.y + y)] =
                 snapshot.buffer[(source.x + x, source.y + y)].clone();
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(footer_text(view, snapshot.mouse_tracking))
-            .style(Style::default().fg(Color::DarkGray)),
-        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-    );
-
-    if let Some(cursor) = snapshot.cursor {
-        let x = console.x.saturating_add(cursor.position.x);
-        let y = console.y.saturating_add(cursor.position.y);
-        if x < console.right() && y < console.bottom() {
-            frame.set_cursor_position((x, y));
         }
     }
 }
@@ -151,11 +223,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tiny_screen_has_safe_console_area() {
-        let area = console_area(Rect::new(0, 0, 0, 0));
+    fn the_console_pane_stays_visible_on_small_screens() {
+        let (_, console, footer) = project_layout(Rect::new(0, 0, 20, 6), 8);
 
-        assert_eq!(area.width, 0);
-        assert_eq!(area.height, 0);
+        // The list is capped at a third of the height; what remains stays
+        // visible above the footer.
+        assert!(console.height >= 1);
+        assert_eq!(console.height + footer.height + 2, 6);
+        assert_eq!(footer.height, FOOTER_HEIGHT);
+    }
+
+    #[test]
+    fn resize_geometry_uses_the_console_pane_not_the_full_screen() {
+        let area = Rect::new(0, 0, 100, 30);
+        let (_, pane, _) = project_layout(area, 4);
+        let geometry = crate::geometry::TerminalGeometry::from_pane(pane_inner(pane));
+
+        // The list band is excluded from what the child believes its size
+        // to be.
+        assert!(geometry.rows() < 30);
+        assert_eq!(geometry.cols(), 98);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub use core::{
     Command, DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ProcessSnapshot,
     ProjectSnapshot,
 };
+pub use runtime::{ConsoleView, Consoles};
 
 /// How long a snapshot request waits for the control task before giving up.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
@@ -46,12 +47,23 @@ enum Inbox {
 }
 
 /// Starts a Supervisor for one validated effective Project using the real
-/// Run interface and system clock.
-pub fn start(project: EffectiveProject) -> Result<SupervisorHandle> {
-    Ok(start_with(
-        project,
-        Box::new(RealRunSeam::default()),
-        Box::new(SystemClock),
+/// Run interface and system clock. The returned [`Consoles`] registry is
+/// the data-plane view of each Process's current terminal; it carries no
+/// lifecycle authority.
+pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles)> {
+    // Size each first PTY like the pane that will render it, so children
+    // never observe a stale default size.
+    let initial_geometry = crate::tui::project_console_geometry(project.processes().len());
+    let seam = RealRunSeam::default();
+    let consoles = seam.consoles();
+    Ok((
+        start_with(
+            project,
+            Box::new(seam),
+            Box::new(SystemClock),
+            initial_geometry,
+        ),
+        consoles,
     ))
 }
 
@@ -62,10 +74,17 @@ pub(crate) fn start_with(
     project: EffectiveProject,
     seam: Box<dyn RunSeam>,
     clock: Box<dyn Clock>,
+    initial_geometry: crate::geometry::TerminalGeometry,
 ) -> SupervisorHandle {
     let (inbox_tx, inbox_rx) = crossbeam_channel::unbounded::<Inbox>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<SeamEvent>();
-    let mut core = Core::new(project, seam, clock, SeamSender::new(event_tx.clone()));
+    let mut core = Core::new(
+        project,
+        seam,
+        clock,
+        SeamSender::new(event_tx.clone()),
+        initial_geometry,
+    );
     let worker = std::thread::Builder::new()
         .name("stackhand-supervisor".to_string())
         .spawn(move || run_task(&mut core, &inbox_rx, &event_rx))
