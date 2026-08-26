@@ -37,6 +37,9 @@ pub enum Lifecycle {
     Stopping,
     /// No current Run remains after a stop or exit.
     Stopped,
+    /// A One-shot Run completed with exit code zero. Done survives like a
+    /// satisfied Dependency condition until a new Run completes.
+    Done,
 }
 
 /// One bounded metrics sample from the current Run.
@@ -76,6 +79,11 @@ pub(super) struct Entry {
     /// Why Desired State Running has not produced a Run yet, as a bounded
     /// "dependency: condition" reason.
     pub(super) blocked: Option<String>,
+    /// Whether this Process's latest completed Run exited with code zero.
+    /// The latch persists across evaluations and while a new Run is active;
+    /// only a later Run completion replaces it (rerun semantics are Issue
+    /// #32's work).
+    pub(super) completed: bool,
 }
 
 impl Entry {
@@ -89,6 +97,7 @@ impl Entry {
             failure: None,
             metrics: None,
             blocked: None,
+            completed: false,
         }
     }
 }
@@ -218,18 +227,15 @@ impl Core {
                 self.evaluate();
             }
             SeamEvent::Exited { code, .. } => {
-                let entry = &mut self.entries[index];
-                // Milestone 1 boundary: a Run identity stays occupied until
-                // bounded shutdown reports completion, so an unexpected exit
-                // is recovered by a manual stop then start. Automatic restart
-                // policies are later milestone work.
-                if entry.desired == DesiredState::Running {
-                    entry.failure = Some(FailureSummary {
-                        detail: match code {
-                            Some(code) => format!("exited unexpectedly with code {code}"),
-                            None => "exited unexpectedly".to_string(),
-                        },
-                    });
+                // An in-flight intentional stop finalizes through its own
+                // ShutdownComplete; the observed code never becomes a
+                // completion or a failure there.
+                let stopping_intentionally = self.entries[index].lifecycle == Lifecycle::Stopping;
+                if !stopping_intentionally {
+                    match self.project.processes()[index].kind {
+                        ProcessKind::OneShot => self.complete_one_shot(index, code),
+                        ProcessKind::Service => self.observe_service_exit(index, code),
+                    }
                 }
                 self.evaluate();
             }
@@ -239,7 +245,11 @@ impl Core {
                 let entry = &mut self.entries[index];
                 entry.current_run = None;
                 entry.metrics = None;
-                entry.lifecycle = Lifecycle::Stopped;
+                // A One-shot that completed successfully stays Done instead
+                // of falling back to Stopped with its cleanup result.
+                if entry.lifecycle != Lifecycle::Done {
+                    entry.lifecycle = Lifecycle::Stopped;
+                }
                 if !confirmed {
                     entry.failure = Some(FailureSummary {
                         detail: detail
@@ -269,6 +279,52 @@ impl Core {
                     rss_kib,
                 });
             }
+        }
+    }
+
+    /// Project one One-shot Run exit into its terminal lifecycle state.
+    /// Exit code zero completes the One-shot; every other exit fails it.
+    /// Either way Desired State reverts to Stopped: restarting is manual
+    /// until automatic restart policy work lands.
+    fn complete_one_shot(&mut self, index: usize, code: Option<i32>) {
+        let entry = &mut self.entries[index];
+        match code {
+            Some(0) => {
+                entry.lifecycle = Lifecycle::Done;
+                entry.completed = true;
+                entry.failure = None;
+            }
+            other => {
+                entry.lifecycle = Lifecycle::Running;
+                entry.completed = false;
+                entry.failure = Some(FailureSummary {
+                    detail: match other {
+                        Some(exit_code) => format!("exited with code {exit_code}"),
+                        None => "exited without an exit code".to_string(),
+                    },
+                });
+            }
+        }
+        entry.desired = DesiredState::Stopped;
+        entry.blocked = None;
+    }
+
+    /// Record a Service's unexpected natural exit. The Run identity stays
+    /// occupied until bounded shutdown reports ShutdownComplete, which then
+    /// shows the Process as Stopped with this failure. Desired State reverts
+    /// to Stopped so the Supervisor never silently crash-loops; automatic
+    /// restart policy is later milestone work.
+    fn observe_service_exit(&mut self, index: usize, code: Option<i32>) {
+        let entry = &mut self.entries[index];
+        if entry.desired == DesiredState::Running {
+            entry.failure = Some(FailureSummary {
+                detail: match code {
+                    Some(code) => format!("exited unexpectedly with code {code}"),
+                    None => "exited unexpectedly".to_string(),
+                },
+            });
+            entry.desired = DesiredState::Stopped;
+            entry.blocked = None;
         }
     }
 

@@ -43,3 +43,11 @@ pub use run::{
     RunStartRequest,
 };
 pub use terminal_handle::TerminalHandle;
+
+/// Whether one Run's root child has exited but is not yet reaped. The
+/// observation never reaps, so Process Group identity stays intact for the
+/// Run's own bounded cleanup. Exposed for the Supervisor adapter's
+/// natural-exit watchers; the type itself stays inside this module tree.
+pub(crate) fn root_exit_pending(root_pid: OsPid) -> bool {
+    process_tree::UnixProcessTree::root_exit_pending(root_pid.get())
+}

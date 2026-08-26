@@ -85,6 +85,9 @@ pub enum InputPolicy {
 pub enum DependencyCondition {
     /// The dependency Process has an active Run that is Starting or Running.
     Started,
+    /// The dependency One-shot's latest completed Run exited with code zero.
+    /// Valid only when the dependency Process is a One-shot.
+    CompletedSuccessfully,
 }
 
 impl DependencyCondition {
@@ -92,6 +95,7 @@ impl DependencyCondition {
     pub fn label(self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::CompletedSuccessfully => "completed_successfully",
         }
     }
 }
@@ -134,6 +138,13 @@ pub enum ProjectError {
         process: String,
         dependency: String,
     },
+    /// A Dependency condition is not valid for the dependency Process's
+    /// kind; only One-shot dependencies support `completed_successfully`.
+    InvalidCondition {
+        process: String,
+        dependency: String,
+        condition: String,
+    },
     /// The Dependency graph has a cycle; the path repeats its first name.
     DependencyCycle(Vec<String>),
 }
@@ -162,10 +173,19 @@ impl EffectiveProject {
             .collect();
         for spec in &processes {
             for dependency in &spec.dependencies {
-                if !positions.contains_key(dependency.name.as_str()) {
+                let Some(&dependency_index) = positions.get(dependency.name.as_str()) else {
                     return Err(ProjectError::UnknownDependency {
                         process: spec.name.clone(),
                         dependency: dependency.name.clone(),
+                    });
+                };
+                if dependency.condition == DependencyCondition::CompletedSuccessfully
+                    && processes[dependency_index].kind == ProcessKind::Service
+                {
+                    return Err(ProjectError::InvalidCondition {
+                        process: spec.name.clone(),
+                        dependency: dependency.name.clone(),
+                        condition: dependency.condition.label().to_string(),
                     });
                 }
             }
@@ -309,6 +329,28 @@ mod tests {
         assert_eq!(
             error,
             ProjectError::DependencyCycle(vec!["api".into(), "api".into()])
+        );
+    }
+
+    #[test]
+    fn completed_successfully_requires_a_one_shot_dependency() {
+        let mut setup = bare("setup");
+        setup.kind = ProcessKind::OneShot;
+        let mut api = depending_on("api", &["setup"]);
+        api.dependencies[0].condition = DependencyCondition::CompletedSuccessfully;
+
+        EffectiveProject::new(vec![api.clone(), setup])
+            .expect("a One-shot dependency supports completed_successfully");
+
+        let error = EffectiveProject::new(vec![api, bare("setup")])
+            .expect_err("a Service dependency must reject completed_successfully");
+        assert_eq!(
+            error,
+            ProjectError::InvalidCondition {
+                process: "api".into(),
+                dependency: "setup".into(),
+                condition: "completed_successfully".into(),
+            }
         );
     }
 

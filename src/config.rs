@@ -44,6 +44,13 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
         } => config_error(anyhow::anyhow!(
             "Process '{process}': dependency '{dependency}' does not match any configured Process"
         )),
+        crate::model::ProjectError::InvalidCondition {
+            process,
+            dependency,
+            condition,
+        } => config_error(anyhow::anyhow!(
+            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': it is valid only when the dependency Process is a One-shot"
+        )),
         crate::model::ProjectError::DependencyCycle(path) => {
             config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
@@ -229,11 +236,14 @@ fn build_dependency(
     };
     let condition = match condition.as_deref() {
         None => DependencyCondition::Started,
-        // Later milestones add conditions; keeping the schema honest now.
         Some("started") => DependencyCondition::Started,
+        // Kind honesty is enforced later against the full Process list: a
+        // One-shot dependency supports `completed_successfully`, a Service
+        // dependency does not.
+        Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
         Some(other) => {
             return fail(format!(
-                "unsupported condition '{other}' (this Stackhand supports only 'started')"
+                "unsupported condition '{other}' (this Stackhand supports 'started' and 'completed_successfully' for One-shot dependencies)"
             ));
         }
     };
@@ -479,21 +489,59 @@ processes:
     }
 
     #[test]
-    fn unsupported_conditions_are_rejected() {
-        for condition in ["completed_successfully", "ready"] {
-            let error = write_and_load(
-                "deps-condition",
-                &format!(
-                    "version: 1\nprocesses:\n  - name: web\n    depends_on: [{{name: db, condition: {condition}}}]\n    command: {{program: /bin/true}}\n  - name: db\n    command: {{program: /bin/true}}\n"
-                ),
-            )
-            .expect_err("an unimplemented condition must fail");
-            assert!(
-                error.message.contains("unsupported condition"),
-                "{condition}: {}",
-                error.message
-            );
-        }
+    fn completed_successfully_is_valid_only_on_one_shot_dependencies() {
+        let accepted = write_and_load(
+            "deps-completed-ok",
+            "version: 1
+processes:
+  - name: web
+    kind: one-shot
+    depends_on: [{name: setup, condition: completed_successfully}]
+    command: {program: /bin/true}
+  - name: setup
+    kind: one-shot
+    command: {program: /bin/true}
+",
+        )
+        .expect("a One-shot dependency accepts completed_successfully");
+        assert_eq!(
+            accepted.processes()[0].dependencies[0].condition,
+            crate::model::DependencyCondition::CompletedSuccessfully
+        );
+
+        let error = write_and_load(
+            "deps-completed-service",
+            "version: 1
+processes:
+  - name: web
+    depends_on: [{name: db, condition: completed_successfully}]
+    command: {program: /bin/true}
+  - name: db
+    command: {program: /bin/true}
+",
+        )
+        .expect_err("a Service dependency must reject completed_successfully");
+        assert!(
+            error.message.contains("'web'")
+                && error.message.contains("'db'")
+                && error.message.contains("completed_successfully"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn ready_stays_rejected() {
+        let error = write_and_load(
+            "deps-ready",
+            "version: 1\nprocesses:\n  - name: web\n    depends_on: [{name: db, condition: ready}]\n    command: {program: /bin/true}\n  - name: db\n    command: {program: /bin/true}\n",
+        )
+        .expect_err("an unimplemented condition must fail");
+        assert!(
+            error.message.contains("unsupported condition"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

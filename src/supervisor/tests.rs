@@ -9,8 +9,8 @@ use super::ProjectSnapshot;
 use super::support::{FakeClock, FakeRuntime, Intent};
 use super::{Command, Core, DesiredState, Lifecycle, ProcessSnapshot, SeamEvent, SeamSender};
 use crate::model::{
-    Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    TerminalMode,
+    Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
+    ProcessKind, ProcessSpec, TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
 
@@ -47,6 +47,16 @@ fn depending_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
             condition: crate::model::DependencyCondition::Started,
         })
         .collect();
+    spec
+}
+
+/// A Service that starts only after each named One-shot Dependency reports
+/// `completed_successfully`.
+fn depending_completed_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
+    let mut spec = depending_on(name, dependencies);
+    for dependency in &mut spec.dependencies {
+        dependency.condition = DependencyCondition::CompletedSuccessfully;
+    }
     spec
 }
 
@@ -456,6 +466,8 @@ fn unknown_commands_are_ignored() {
     h.command(Command::Stop("missing".into()));
     assert!(h.runtime.intents().is_empty());
 }
+
+mod one_shot_lifecycle;
 
 #[cfg(test)]
 mod dependency_scheduling {

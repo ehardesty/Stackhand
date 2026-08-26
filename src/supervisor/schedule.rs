@@ -12,7 +12,7 @@
 //! already-running dependent when a dependency later stops.
 
 use super::core::{Core, DesiredState, Lifecycle};
-use crate::model::Enabled;
+use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
 
 impl Core {
@@ -93,15 +93,24 @@ impl Core {
             if !self.is_enabled(dependency_index) {
                 return Some(format!("{}: disabled", dependency.name));
             }
-            if !self.started_condition_satisfied(dependency_index) {
-                return Some(format!(
-                    "{}: {}",
-                    dependency.name,
-                    dependency.condition.label()
-                ));
+            if !self.condition_satisfied(dependency_index, dependency.condition) {
+                // A visible reason names the Dependency and its condition;
+                // a failed dependency adds its bounded failure summary.
+                let mut reason = format!("{}: {}", dependency.name, dependency.condition.label());
+                if let Some(failure) = &self.entries[dependency_index].failure {
+                    reason.push_str(&format!(" ({})", failure.detail));
+                }
+                return Some(reason);
             }
         }
         None
+    }
+
+    fn condition_satisfied(&self, index: usize, condition: DependencyCondition) -> bool {
+        match condition {
+            DependencyCondition::Started => self.started_condition_satisfied(index),
+            DependencyCondition::CompletedSuccessfully => self.completed_condition_satisfied(index),
+        }
     }
 
     /// `started` holds only while the dependency has an active Run that is
@@ -110,6 +119,15 @@ impl Core {
         let entry = &self.entries[index];
         entry.current_run.is_some()
             && matches!(entry.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+    }
+
+    /// `completed_successfully` holds once the dependency's latest completed
+    /// Run exited with code zero. The satisfaction survives later evaluation
+    /// passes and stays while a new Run is active; only that Run reaching a
+    /// completion replaces it (rerun semantics are Issue #32's work).
+    fn completed_condition_satisfied(&self, index: usize) -> bool {
+        let entry = &self.entries[index];
+        entry.lifecycle == Lifecycle::Done || entry.completed
     }
 
     fn is_enabled(&self, index: usize) -> bool {

@@ -14,6 +14,15 @@ const STARTUP_WAIT: Duration = Duration::from_secs(15);
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
+/// The lifecycle each Process kind must reach during startup: Services run,
+/// One-shots complete.
+fn expected_startup_lifecycle(kind: crate::model::ProcessKind) -> Lifecycle {
+    match kind {
+        crate::model::ProcessKind::OneShot => Lifecycle::Done,
+        crate::model::ProcessKind::Service => Lifecycle::Running,
+    }
+}
+
 /// Console text that proves inline environment reached the child. The
 /// fixture configuration in `tests/project_fixture.rs` prints it from
 /// `$FIXTURE_TOKEN`.
@@ -53,20 +62,25 @@ fn prove_slice(
     supervisor: &crate::supervisor::SupervisorHandle,
     consoles: &crate::supervisor::Consoles,
 ) -> Result<()> {
-    // Every enabled autostart Service reaches its active lifecycle.
-    // Starting becomes Running on the Spawned event, so this waits past the
-    // spawn window into the active Run.
+    // Every enabled autostart Process reaches its terminal-for-now state:
+    // Services run, One-shots complete. Starting becomes Running on the
+    // Spawned event; a One-shot becomes Done once its natural exit is
+    // observed, and this waits past its completion report so the Run identity
+    // has cleared.
     let snapshot = wait_for(supervisor, STARTUP_WAIT, |snapshot| {
         snapshot.processes.iter().all(|process| {
-            !process.enabled || !process.autostart || process.lifecycle == Lifecycle::Running
+            !process.enabled
+                || !process.autostart
+                || (process.lifecycle == expected_startup_lifecycle(process.kind)
+                    && (process.lifecycle != Lifecycle::Done || process.current_run.is_none()))
         })
     })?;
     for process in &snapshot.processes {
         if process.enabled && process.autostart {
             assert_eq!(
                 process.lifecycle,
-                Lifecycle::Running,
-                "Process {} did not start",
+                expected_startup_lifecycle(process.kind),
+                "Process {} did not reach its expected lifecycle",
                 process.name
             );
         }
@@ -88,6 +102,26 @@ fn prove_slice(
     let off = snapshot.named("off").expect("the fixture defines 'off'");
     assert!(!off.enabled);
     assert_eq!(off.current_run, None);
+
+    // The One-shot completed through natural exit observation: it ends Done
+    // with no failure and no desire to run again.
+    let setup = snapshot
+        .named("setup")
+        .expect("the fixture defines 'setup'");
+    assert_eq!(setup.lifecycle, Lifecycle::Done);
+    assert_eq!(setup.desired, DesiredState::Stopped);
+    assert_eq!(setup.failure, None);
+    assert_eq!(setup.current_run, None);
+
+    // Its dependent started only after `completed_successfully` held and is
+    // an active Service Run now.
+    let gated = snapshot
+        .named("gated")
+        .expect("the fixture defines 'gated'");
+    assert_eq!(gated.lifecycle, Lifecycle::Running);
+    assert!(gated.current_run.is_some());
+    assert_eq!(gated.failure, None);
+    println!("fixture-one-shot-ok");
 
     // Output flows to each Process console without entering the control
     // plane; every proof must appear in its own Process's console.

@@ -8,8 +8,7 @@ use crate::console::{ConsoleInteraction, SelectionMove};
 use crate::geometry::TerminalGeometry;
 use crate::supervisor::Lifecycle;
 use crate::supervisor::{
-    Command, ConsoleView, Consoles, DesiredState, ProcessSnapshot, ProjectSnapshot,
-    SupervisorHandle,
+    Command, ConsoleView, Consoles, ProcessSnapshot, ProjectSnapshot, SupervisorHandle,
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
@@ -251,13 +250,19 @@ fn status_label(process: &ProcessSnapshot) -> String {
     if !process.enabled {
         return "Disabled".to_string();
     }
-    if process.desired == DesiredState::Running
+    if process.lifecycle == Lifecycle::Done {
+        return "Done".to_string();
+    }
+    // A failure stays visible while the Process is not mid-shutdown; the
+    // Stopping branch folds its own failure reason into the label.
+    if process.lifecycle != Lifecycle::Stopping
         && let Some(failure) = &process.failure
     {
         return format!("Failed ({})", short_reason(&failure.detail));
     }
     match process.lifecycle {
-        Lifecycle::Idle | Lifecycle::Stopped => "Stopped".to_string(),
+        // Done returns above; this arm keeps the match exhaustive.
+        Lifecycle::Done | Lifecycle::Idle | Lifecycle::Stopped => "Stopped".to_string(),
         Lifecycle::Starting => "Starting".to_string(),
         Lifecycle::Running => "Ready".to_string(),
         Lifecycle::Waiting => match &process.blocked_reason {

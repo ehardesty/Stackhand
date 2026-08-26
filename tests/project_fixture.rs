@@ -51,7 +51,18 @@ fn fixture_config() -> String {
          \x20 - name: off\n\
          \x20   enabled: false\n\
          \x20   command:\n\
-         \x20     program: /bin/true\n",
+         \x20     program: /bin/true\n\
+         \x20 - name: setup\n\
+         \x20   kind: one-shot\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /usr/bin/true\n\
+         \x20 - name: gated\n\
+         \x20   depends_on: [{{name: setup, condition: completed_successfully}}]\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n",
     )
 }
 
@@ -80,6 +91,9 @@ fn one_configured_service_runs_end_to_end() {
     // marker, the inline-environment token, and the shell pipeline's
     // transformed output all reached their consoles.
     assert!(stdout.contains("fixture-output-ok"), "{stdout}");
+    // The One-shot completed through natural exit observation and its
+    // dependent started only after `completed_successfully` held.
+    assert!(stdout.contains("fixture-one-shot-ok"), "{stdout}");
     assert!(stdout.contains("fixture-shutdown-ok"), "{stdout}");
 
     fs::remove_dir_all(&dir).ok();
