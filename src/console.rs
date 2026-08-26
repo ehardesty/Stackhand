@@ -8,11 +8,21 @@ use crate::runtime::TerminalHandle;
 use crate::terminal::{CopyRequest, PasteCompletion, PasteRequest};
 use crate::tui::{ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
 
+/// One requested move of the Process-list selection. Command modes carry
+/// only this request; the app event loop owns the selection itself, so a
+/// keypress never reaches the PTY child or changes lifecycle truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMove {
+    Up,
+    Down,
+}
+
 pub(crate) struct ConsoleInteraction {
     view: ConsoleViewState,
     mouse: MouseRouter,
     paste_requests: Vec<PasteRequest>,
     copy_requests: Vec<CopyRequest>,
+    selection_requests: Vec<SelectionMove>,
     selection_clock: Instant,
 }
 
@@ -23,6 +33,7 @@ impl Default for ConsoleInteraction {
             mouse: MouseRouter::default(),
             paste_requests: Vec::new(),
             copy_requests: Vec::new(),
+            selection_requests: Vec::new(),
             selection_clock: Instant::now(),
         }
     }
@@ -35,6 +46,11 @@ impl ConsoleInteraction {
 
     pub fn warn(&mut self, warning: ConsoleWarning) {
         self.view.warning = Some(warning);
+    }
+
+    /// Drain every Process-selection move queued by command modes.
+    pub fn take_selection_moves(&mut self) -> Vec<SelectionMove> {
+        std::mem::take(&mut self.selection_requests)
     }
 
     pub fn poll_requests(&mut self) -> bool {
@@ -175,6 +191,14 @@ impl ConsoleInteraction {
             }
             KeyCode::Char('s') => {
                 self.view.mode = ConsoleViewMode::Selection;
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selection_requests.push(SelectionMove::Up);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selection_requests.push(SelectionMove::Down);
                 true
             }
             KeyCode::Esc => {
@@ -336,5 +360,55 @@ mod tests {
         let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
 
         assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
+    }
+
+    #[test]
+    fn app_command_j_k_and_arrows_queue_selection_moves_without_touching_the_child() {
+        let (session, peer) = session();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let handle = crate::runtime::handle_for_test(&session, &stopped);
+        let mut interaction = ConsoleInteraction::default();
+
+        assert!(interaction.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &handle,
+            20,
+        ));
+        assert_eq!(interaction.take_selection_moves(), Vec::new());
+
+        for (key, expected) in [
+            (KeyCode::Down, SelectionMove::Down),
+            (KeyCode::Char('j'), SelectionMove::Down),
+            (KeyCode::Up, SelectionMove::Up),
+            (KeyCode::Char('k'), SelectionMove::Up),
+        ] {
+            assert!(interaction.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &handle, 20));
+            assert_eq!(interaction.take_selection_moves(), vec![expected]);
+            assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
+        }
+        assert_eq!(interaction.take_selection_moves(), Vec::new());
+
+        drop(peer);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn child_input_keys_never_queue_selection_moves() {
+        let (session, peer) = session();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let handle = crate::runtime::handle_for_test(&session, &stopped);
+        let mut interaction = ConsoleInteraction::default();
+
+        // In ChildInput mode j/k are child keystrokes; selection stays put.
+        assert!(!interaction.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &handle,
+            20,
+        ));
+
+        assert_eq!(interaction.take_selection_moves(), Vec::new());
+
+        drop(peer);
+        session.shutdown().unwrap();
     }
 }

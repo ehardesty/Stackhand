@@ -22,6 +22,7 @@ const MARKER_SCRIPT: &str = "printf 'fixture-marker-12345\\n'; printf 'fixture-t
 const SHELL_SCRIPT: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep 60";
 
 fn fixture_config() -> String {
+    let marker = MARKER_SCRIPT.replace('"', "\\\"");
     format!(
         "version: 1\n\
          processes:\n\
@@ -34,15 +35,23 @@ fn fixture_config() -> String {
          \x20     FIXTURE_TOKEN: stackhand-env-ok\n\
          \x20   command:\n\
          \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{}\"]\n\
+         \x20     args: [\"-c\", \"{marker}\"]\n\
          \x20 - name: shelled\n\
          \x20   kind: service\n\
          \x20   terminal: pty\n\
          \x20   input: focused\n\
          \x20   command:\n\
-         \x20     shell: {}\n",
-        MARKER_SCRIPT.replace('"', "\\\""),
-        SHELL_SCRIPT,
+         \x20     shell: {SHELL_SCRIPT}\n\
+         \x20 - name: manual\n\
+         \x20   kind: service\n\
+         \x20   autostart: false\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n\
+         \x20 - name: off\n\
+         \x20   enabled: false\n\
+         \x20   command:\n\
+         \x20     program: /bin/true\n",
     )
 }
 

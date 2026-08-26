@@ -274,6 +274,37 @@ mod tests {
     }
 
     #[test]
+    fn multiple_unique_processes_load_with_their_flags() {
+        let project = write_and_load(
+            "multi",
+            "version: 1
+processes:
+  - name: web
+    command: {program: /bin/sleep, args: [\"1\"]}
+  - name: worker
+    autostart: false
+    command: {program: /bin/sleep, args: [\"1\"]}
+  - name: debug
+    enabled: false
+    command: {program: /bin/sleep, args: [\"1\"]}
+",
+        )
+        .expect("valid config");
+
+        let names: Vec<_> = project
+            .processes()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["web", "worker", "debug"]);
+        // Unset flags default to true; explicit flags surface as set.
+        assert_eq!(project.processes()[0].enabled, Enabled::Yes);
+        assert_eq!(project.processes()[0].autostart, Autostart::Yes);
+        assert_eq!(project.processes()[1].autostart, Autostart::No);
+        assert_eq!(project.processes()[2].enabled, Enabled::No);
+    }
+
+    #[test]
     fn duplicate_names_are_rejected() {
         let error = write_and_load(
             "dup",

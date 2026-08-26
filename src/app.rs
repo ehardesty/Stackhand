@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
-use crate::console::ConsoleInteraction;
+use crate::console::{ConsoleInteraction, SelectionMove};
 use crate::geometry::TerminalGeometry;
 use crate::supervisor::Lifecycle;
 use crate::supervisor::{
@@ -87,6 +87,15 @@ fn run_event_loop(
             bail!("this Project has no Processes");
         }
         selected = selected.min(snapshot.processes.len() - 1);
+        for request in console.take_selection_moves() {
+            // Selection is UI state only: movement clamps at the list ends
+            // and never sends a command to the Supervisor.
+            selected = match request {
+                SelectionMove::Up => selected.saturating_sub(1),
+                SelectionMove::Down => (selected + 1).min(snapshot.processes.len() - 1),
+            };
+            dirty = true;
+        }
         let selected_process = &snapshot.processes[selected];
         let view = current_view(consoles, selected, selected_process);
         drain_console_events(&mut console, view.as_ref(), &mut dirty);

@@ -210,6 +210,56 @@ fn autostart_starts_only_enabled_autostart_processes() {
 }
 
 #[test]
+fn snapshots_surface_enabled_and_autostart_flags() {
+    let project = EffectiveProject::new(vec![
+        service("api"),
+        simple("db", ProcessKind::Service, Enabled::Yes, Autostart::No),
+        simple("worker", ProcessKind::Service, Enabled::No, Autostart::Yes),
+        simple("cron", ProcessKind::Service, Enabled::No, Autostart::No),
+    ])
+    .expect("unique names");
+    let h = Harness::new(project);
+
+    let api = h.process("api");
+    assert!(api.enabled && api.autostart);
+    let db = h.process("db");
+    assert!(db.enabled && !db.autostart);
+    let worker = h.process("worker");
+    assert!(!worker.enabled && worker.autostart);
+    let cron = h.process("cron");
+    assert!(!cron.enabled && !cron.autostart);
+}
+
+#[test]
+fn a_mixed_project_leaves_manual_and_disabled_processes_available() {
+    let project = EffectiveProject::new(vec![
+        service("api"),
+        simple("setup", ProcessKind::OneShot, Enabled::Yes, Autostart::No),
+        simple("debug", ProcessKind::Service, Enabled::No, Autostart::No),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+
+    // Autostart touches only the enabled autostart Process.
+    h.command(Command::StartAutostart);
+    let setup = h.process("setup");
+    assert_eq!(setup.lifecycle, Lifecycle::Idle);
+    assert_eq!(h.process("debug").lifecycle, Lifecycle::Idle);
+
+    // A disabled Process stays visible and cannot start even manually.
+    h.command(Command::Start("debug".into()));
+    let debug = h.process("debug");
+    assert!(!debug.enabled);
+    assert_eq!(debug.desired, DesiredState::Stopped);
+    assert_eq!(debug.current_run, None);
+
+    // An enabled non-autostart Process starts only by an explicit Start.
+    h.command(Command::Start("setup".into()));
+    assert_eq!(h.process("setup").desired, DesiredState::Running);
+    assert_eq!(h.process("setup").current_run, Some(1));
+}
+
+#[test]
 fn manual_stop_finishes_as_stopped_without_failure() {
     let mut h = Harness::new(four_process_project());
     h.command(Command::Start("api".into()));

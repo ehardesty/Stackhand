@@ -193,7 +193,7 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
         (ConsoleViewMode::ChildInput, true) => "Ctrl-A: commands · Ctrl-Q: quit · LIVE",
         (ConsoleViewMode::ChildInput, false) => "Ctrl-A: commands · history view · NOT FOLLOWING",
         (ConsoleViewMode::AppCommand, _) => {
-            "PageUp: history · s: selection · f: live tail · Esc: child input"
+            "PageUp: history · s: selection · j/k or ↑↓: select Process · f: live tail · Esc: child input"
         }
         (ConsoleViewMode::Scroll, _) => {
             "PageUp/Down: move · f: live tail · history target 64 KiB; page rounding and truncation signal unavailable"
@@ -221,6 +221,71 @@ fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(name: &str, status: &str, selected: bool) -> ProcessRowView {
+        ProcessRowView {
+            name: name.to_string(),
+            status: status.to_string(),
+            selected,
+        }
+    }
+
+    /// Render one frame into a test buffer for assertions. Small but tall
+    /// enough that three Process rows stay inside the capped list band.
+    fn rendered(rows: &[ProcessRowView]) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(60, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_project(frame, rows, None, ConsoleViewState::default());
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn every_process_row_shows_its_name_and_status_label() {
+        let rows = [
+            row("web", "Ready", true),
+            row("worker", "Stopped", false),
+            row("cron", "Disabled", false),
+        ];
+        let text = buffer_text(&rendered(&rows));
+
+        assert!(text.contains(" Processes "), "{text:?}");
+        for row in &rows {
+            assert!(text.contains(&row.name), "{} missing: {text:?}", row.name);
+            assert!(
+                text.contains(&row.status),
+                "{} missing: {text:?}",
+                row.status
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_the_selected_row_is_reversed() {
+        let rows = [row("web", "Ready", false), row("db", "Starting", true)];
+        let buffer = rendered(&rows);
+
+        // The list body starts inside its border on row 1.
+        let web_reversed = buffer[(1, 1)].modifier.contains(Modifier::REVERSED);
+        let db_reversed = buffer[(1, 2)].modifier.contains(Modifier::REVERSED);
+        assert!(!web_reversed);
+        assert!(db_reversed);
+    }
+
+    #[test]
+    fn a_single_row_keeps_one_valid_selection() {
+        let rows = [row("only", "Stopped", true)];
+        let buffer = rendered(&rows);
+
+        assert!(buffer[(1, 1)].modifier.contains(Modifier::REVERSED));
+    }
 
     #[test]
     fn the_console_pane_stays_visible_on_small_screens() {

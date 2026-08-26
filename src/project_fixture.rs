@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::supervisor::{Command, Lifecycle};
+use crate::supervisor::{Command, DesiredState, Lifecycle};
 
 const STARTUP_WAIT: Duration = Duration::from_secs(15);
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
@@ -72,6 +72,22 @@ fn prove_slice(
         }
     }
     println!("fixture-started-ok");
+
+    // Enabled non-autostart Processes stay stopped and available for a
+    // manual start; disabled Processes stay visible without any Run.
+    let manual = snapshot
+        .named("manual")
+        .expect("the fixture defines 'manual'");
+    assert!(manual.enabled && !manual.autostart);
+    assert_eq!(manual.desired, DesiredState::Stopped);
+    assert!(matches!(
+        manual.lifecycle,
+        Lifecycle::Idle | Lifecycle::Stopped
+    ));
+    assert_eq!(manual.current_run, None);
+    let off = snapshot.named("off").expect("the fixture defines 'off'");
+    assert!(!off.enabled);
+    assert_eq!(off.current_run, None);
 
     // Output flows to each Process console without entering the control
     // plane; every proof must appear in its own Process's console.
