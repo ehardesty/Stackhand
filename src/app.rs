@@ -260,6 +260,10 @@ fn status_label(process: &ProcessSnapshot) -> String {
         Lifecycle::Idle | Lifecycle::Stopped => "Stopped".to_string(),
         Lifecycle::Starting => "Starting".to_string(),
         Lifecycle::Running => "Ready".to_string(),
+        Lifecycle::Waiting => match &process.blocked_reason {
+            Some(reason) => format!("Waiting ({})", short_reason(reason)),
+            None => "Waiting".to_string(),
+        },
         Lifecycle::Stopping => {
             if let Some(failure) = &process.failure {
                 format!("Stopping ({})", short_reason(&failure.detail))

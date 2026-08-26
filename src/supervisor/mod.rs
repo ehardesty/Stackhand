@@ -26,6 +26,7 @@ use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender};
 mod clock;
 mod core;
 mod runtime;
+mod schedule;
 mod seam;
 #[cfg(test)]
 mod support;

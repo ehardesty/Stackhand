@@ -29,6 +29,10 @@ pub enum Lifecycle {
     Starting,
     /// The current Run is active.
     Running,
+    /// Desired State is Running but an unsatisfied Dependency blocks the
+    /// start. Scheduling starts the Process automatically once its
+    /// Dependencies are satisfied.
+    Waiting,
     /// Bounded shutdown is in progress for the current Run.
     Stopping,
     /// No current Run remains after a stop or exit.
@@ -50,25 +54,43 @@ pub struct FailureSummary {
 }
 
 pub(crate) struct Core {
-    project: EffectiveProject,
-    entries: Vec<Entry>,
+    pub(super) project: EffectiveProject,
+    pub(super) entries: Vec<Entry>,
     /// The console pane geometry at startup time; each Run's PTY opens with
     /// it so children never see a stale default size.
     initial_geometry: TerminalGeometry,
-    seam: Box<dyn RunSeam>,
+    pub(super) seam: Box<dyn RunSeam>,
     #[allow(dead_code)] // Readiness intervals consume this from Issue #27 on.
     clock: Box<dyn Clock>,
-    events: SeamSender,
+    pub(super) events: SeamSender,
 }
 
-struct Entry {
-    process_id: ProcessId,
-    next_run: u64,
-    desired: DesiredState,
-    lifecycle: Lifecycle,
-    current_run: Option<RunId>,
-    failure: Option<FailureSummary>,
-    metrics: Option<MetricsMetadata>,
+pub(super) struct Entry {
+    pub(super) process_id: ProcessId,
+    pub(super) next_run: u64,
+    pub(super) desired: DesiredState,
+    pub(super) lifecycle: Lifecycle,
+    pub(super) current_run: Option<RunId>,
+    pub(super) failure: Option<FailureSummary>,
+    pub(super) metrics: Option<MetricsMetadata>,
+    /// Why Desired State Running has not produced a Run yet, as a bounded
+    /// "dependency: condition" reason.
+    pub(super) blocked: Option<String>,
+}
+
+impl Entry {
+    fn new(process_id: ProcessId) -> Self {
+        Self {
+            process_id,
+            next_run: 1,
+            desired: DesiredState::Stopped,
+            lifecycle: Lifecycle::Idle,
+            current_run: None,
+            failure: None,
+            metrics: None,
+            blocked: None,
+        }
+    }
 }
 
 impl Core {
@@ -84,15 +106,7 @@ impl Core {
             .processes()
             .iter()
             .enumerate()
-            .map(|(index, _)| Entry {
-                process_id: ProcessId::new(index as u32),
-                next_run: 1,
-                desired: DesiredState::Stopped,
-                lifecycle: Lifecycle::Idle,
-                current_run: None,
-                failure: None,
-                metrics: None,
-            })
+            .map(|(index, _)| Entry::new(ProcessId::new(index as u32)))
             .collect();
         Self {
             project,
@@ -132,33 +146,14 @@ impl Core {
     }
 
     /// Resolve one configured Process name to its stable session position.
-    fn named_index(&self, name: &str) -> Option<usize> {
+    pub(super) fn named_index(&self, name: &str) -> Option<usize> {
         self.project
             .processes()
             .iter()
             .position(|spec| spec.name == name)
     }
 
-    fn start_at(&mut self, index: usize) {
-        if !matches!(self.project.processes()[index].enabled, Enabled::Yes) {
-            return;
-        }
-        let entry = &mut self.entries[index];
-        if entry.current_run.is_some() || entry.desired == DesiredState::Running {
-            return;
-        }
-        let run_id = RunId::new(entry.next_run);
-        entry.next_run += 1;
-        entry.current_run = Some(run_id);
-        entry.desired = DesiredState::Running;
-        entry.lifecycle = Lifecycle::Starting;
-        entry.failure = None;
-        entry.metrics = None;
-        let intent = self.build_intent(index, run_id);
-        self.seam.start(intent, &self.events);
-    }
-
-    fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
+    pub(super) fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
         let spec = &self.project.processes()[index];
         // Shell command text reaches the child through the user's own shell
         // so its syntax means what configuration promised; direct commands
@@ -184,16 +179,22 @@ impl Core {
 
     fn stop_at(&mut self, index: usize) {
         let entry = &mut self.entries[index];
-        let Some(run_id) = entry.current_run else {
-            return;
-        };
         if entry.desired != DesiredState::Running {
             return;
         }
+        // A Process without a Run (idle or Waiting on a Dependency) just
+        // loses its desire to run.
+        let Some(run_id) = entry.current_run else {
+            entry.desired = DesiredState::Stopped;
+            entry.lifecycle = Lifecycle::Stopped;
+            entry.blocked = None;
+            return;
+        };
         // Record the intentional desired state before cleanup begins so a
         // later exit reads as an intended stop.
         entry.desired = DesiredState::Stopped;
         entry.lifecycle = Lifecycle::Stopping;
+        entry.blocked = None;
         self.seam.stop(entry.process_id, run_id, &self.events);
     }
 
@@ -214,6 +215,7 @@ impl Core {
                     // probe-gated readiness arrives with Issues #27/#28.
                     entry.lifecycle = Lifecycle::Running;
                 }
+                self.evaluate();
             }
             SeamEvent::Exited { code, .. } => {
                 let entry = &mut self.entries[index];
@@ -229,6 +231,7 @@ impl Core {
                         },
                     });
                 }
+                self.evaluate();
             }
             SeamEvent::ShutdownComplete {
                 confirmed, detail, ..
@@ -243,6 +246,7 @@ impl Core {
                             .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
                     });
                 }
+                self.evaluate();
             }
             SeamEvent::Failed { detail, .. } => {
                 let entry = &mut self.entries[index];
@@ -253,6 +257,7 @@ impl Core {
                 entry.desired = DesiredState::Stopped;
                 entry.lifecycle = Lifecycle::Stopped;
                 entry.metrics = None;
+                self.evaluate();
             }
             SeamEvent::Metrics {
                 cpu_percent,
@@ -290,6 +295,7 @@ impl Core {
                 current_run: entry.current_run.map(RunId::get),
                 failure: entry.failure.clone(),
                 metrics: entry.metrics,
+                blocked_reason: entry.blocked.clone(),
             })
             .collect();
         ProjectSnapshot { processes }
@@ -341,6 +347,9 @@ pub struct ProcessSnapshot {
     pub current_run: Option<u64>,
     pub failure: Option<FailureSummary>,
     pub metrics: Option<MetricsMetadata>,
+    /// Why this Process has not started although Desired State is Running:
+    /// a bounded "dependency: condition" (or "dependency: disabled") reason.
+    pub blocked_reason: Option<String>,
 }
 
 #[cfg(test)]

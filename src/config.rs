@@ -10,8 +10,8 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::model::{
-    Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    TerminalMode,
+    Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
+    InputPolicy, ProcessKind, ProcessSpec, TerminalMode,
 };
 
 /// Load and validate the Project at `path`. Relative working directories
@@ -37,6 +37,15 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
     EffectiveProject::new(processes).map_err(|error| match error {
         crate::model::ProjectError::DuplicateName(name) => {
             config_error(anyhow::anyhow!("duplicate Process name '{name}'"))
+        }
+        crate::model::ProjectError::UnknownDependency {
+            process,
+            dependency,
+        } => config_error(anyhow::anyhow!(
+            "Process '{process}': dependency '{dependency}' does not match any configured Process"
+        )),
+        crate::model::ProjectError::DependencyCycle(path) => {
+            config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
     })
 }
@@ -146,6 +155,14 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
             ));
         }
     };
+    let dependencies = match &process.depends_on {
+        None => Vec::new(),
+        Some(entries) => entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| build_dependency(&name, index, entry))
+            .collect::<Result<Vec<_>, ConfigError>>()?,
+    };
     Ok(ProcessSpec {
         name,
         kind,
@@ -160,7 +177,67 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
             .unwrap_or_default(),
         terminal_mode,
         input_policy,
+        dependencies,
     })
+}
+
+/// One `depends_on` entry: a plain Process name (`started` condition) or an
+/// explicit `{name, condition}` mapping.
+fn build_dependency(
+    process_name: &str,
+    index: usize,
+    entry: &serde_yaml::Value,
+) -> Result<DependencySpec, ConfigError> {
+    let fail = |detail: String| {
+        Err(ConfigError {
+            message: format!(
+                "Process '{process_name}': invalid depends_on entry {index}: {detail}"
+            ),
+        })
+    };
+    let (name, condition) = match entry {
+        serde_yaml::Value::String(name) => (name.clone(), None),
+        serde_yaml::Value::Mapping(map) => {
+            let mut name = None;
+            let mut condition = None;
+            for (key, value) in map {
+                let serde_yaml::Value::String(key) = key else {
+                    return fail(format!("mapping keys must be strings, got {key:?}"));
+                };
+                match key.as_str() {
+                    "name" => match value.as_str() {
+                        Some(value) => name = Some(value.to_string()),
+                        None => return fail("'name' must be a string".to_string()),
+                    },
+                    "condition" => match value.as_str() {
+                        Some(value) => condition = Some(value.to_string()),
+                        None => return fail("'condition' must be a string".to_string()),
+                    },
+                    other => return fail(format!("unknown field '{other}'")),
+                }
+            }
+            match name {
+                Some(name) => (name, condition),
+                None => return fail("a mapping entry requires 'name'".to_string()),
+            }
+        }
+        other => {
+            return fail(format!(
+                "use a Process name or a {{name, condition}} mapping, got {other:?}"
+            ));
+        }
+    };
+    let condition = match condition.as_deref() {
+        None => DependencyCondition::Started,
+        // Later milestones add conditions; keeping the schema honest now.
+        Some("started") => DependencyCondition::Started,
+        Some(other) => {
+            return fail(format!(
+                "unsupported condition '{other}' (this Stackhand supports only 'started')"
+            ));
+        }
+    };
+    Ok(DependencySpec { name, condition })
 }
 
 #[derive(Deserialize)]
@@ -182,6 +259,7 @@ struct ProcessFile {
     env: Option<std::collections::BTreeMap<String, String>>,
     terminal: Option<String>,
     input: Option<String>,
+    depends_on: Option<Vec<serde_yaml::Value>>,
     command: CommandFile,
 }
 
@@ -329,6 +407,121 @@ processes:
         )
         .expect_err("no form must fail");
         assert!(neither.message.contains("'program' or 'shell'"));
+    }
+
+    #[test]
+    fn depends_on_accepts_plain_names_and_condition_mappings() {
+        let project = write_and_load(
+            "deps-ok",
+            "version: 1
+processes:
+  - name: web
+    depends_on: [db, {name: cache, condition: started}]
+    command: {program: /bin/sleep, args: [\"1\"]}
+  - name: db
+    command: {program: /bin/sleep, args: [\"1\"]}
+  - name: cache
+    command: {program: /bin/sleep, args: [\"1\"]}
+",
+        )
+        .expect("valid dependencies");
+        let web = &project.processes()[0];
+        assert_eq!(web.dependencies.len(), 2);
+        assert_eq!(web.dependencies[0].name, "db");
+        assert_eq!(
+            web.dependencies[0].condition,
+            crate::model::DependencyCondition::Started
+        );
+        assert_eq!(web.dependencies[1].name, "cache");
+        assert_eq!(project.processes()[1].dependencies, Vec::new());
+    }
+
+    #[test]
+    fn unknown_dependency_references_are_rejected() {
+        let error = write_and_load(
+            "deps-missing",
+            "version: 1
+processes:
+  - name: web
+    depends_on: [db]
+    command: {program: /bin/true}
+",
+        )
+        .expect_err("a missing reference must fail");
+        assert!(
+            error.message.contains("Process 'web'") && error.message.contains("'db'"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn dependency_cycles_are_rejected_before_startup() {
+        let error = write_and_load(
+            "deps-cycle",
+            "version: 1
+processes:
+  - name: web
+    depends_on: [worker]
+    command: {program: /bin/true}
+  - name: worker
+    depends_on: [web]
+    command: {program: /bin/true}
+",
+        )
+        .expect_err("a cycle must fail");
+        assert!(
+            error.message.contains("dependency cycle")
+                && error.message.contains("web -> worker -> web"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn unsupported_conditions_are_rejected() {
+        for condition in ["completed_successfully", "ready"] {
+            let error = write_and_load(
+                "deps-condition",
+                &format!(
+                    "version: 1\nprocesses:\n  - name: web\n    depends_on: [{{name: db, condition: {condition}}}]\n    command: {{program: /bin/true}}\n  - name: db\n    command: {{program: /bin/true}}\n"
+                ),
+            )
+            .expect_err("an unimplemented condition must fail");
+            assert!(
+                error.message.contains("unsupported condition"),
+                "{condition}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_depends_on_entries_are_rejected() {
+        let unknown_field = write_and_load(
+            "deps-field",
+            "version: 1\nprocesses:\n  - name: web\n    depends_on: [{name: db, when: started}]\n    command: {program: /bin/true}\n  - name: db\n    command: {program: /bin/true}\n",
+        )
+        .expect_err("an unknown field must fail");
+        assert!(unknown_field.message.contains("unknown field 'when'"));
+
+        let missing_name = write_and_load(
+            "deps-noname",
+            "version: 1\nprocesses:\n  - name: web\n    depends_on: [{condition: started}]\n    command: {program: /bin/true}\n",
+        )
+        .expect_err("a mapping without a name must fail");
+        assert!(missing_name.message.contains("requires 'name'"));
+
+        let not_a_name = write_and_load(
+            "deps-scalar",
+            "version: 1\nprocesses:\n  - name: web\n    depends_on: [7]\n    command: {program: /bin/true}\n",
+        )
+        .expect_err("a scalar entry must fail");
+        assert!(
+            not_a_name
+                .message
+                .contains("Process name or a {name, condition} mapping")
+        );
     }
 
     #[test]
