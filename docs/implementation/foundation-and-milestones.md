@@ -317,6 +317,8 @@ Implement:
 
 At the end of Milestone 1, the prototype should manage the synthetic Quadrant-like fixture and be usable enough to test with a small real project.
 
+Evidence and the macOS-scoped go recommendation are recorded in [Milestone 1 validation](milestone-1-validation.md).
+
 ### Milestone 2 — lifecycle hardening
 
 Add and test:

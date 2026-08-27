@@ -14,6 +14,7 @@ fn main() -> Result<()> {
         Mode::FixtureScrollback => stackhand::prototype::run_fixture_scrollback(),
         Mode::FixtureMouse => stackhand::prototype::run_fixture_mouse(),
         Mode::FixtureInteraction(path) => stackhand::interaction_fixture::run(&path),
+        Mode::FixtureSmoke(path) => stackhand::smoke_fixture::run(&path),
     }
 }
 
@@ -27,6 +28,7 @@ enum Mode {
     FixtureScrollback,
     FixtureMouse,
     FixtureInteraction(PathBuf),
+    FixtureSmoke(PathBuf),
 }
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
@@ -74,6 +76,13 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
             bail!("--fixture-mouse does not accept arguments");
         }
         return Ok(Mode::FixtureMouse);
+    }
+
+    if first == "--fixture-smoke" {
+        let path = args
+            .next()
+            .context("--fixture-smoke requires a YAML path")?;
+        return Ok(Mode::FixtureSmoke(PathBuf::from(path)));
     }
 
     if first == "--fixture-interaction" {

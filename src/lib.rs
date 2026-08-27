@@ -16,6 +16,7 @@ pub mod project_fixture;
 pub mod prototype;
 mod runtime;
 mod scrollback_fixture;
+pub mod smoke_fixture;
 mod stress;
 pub mod supervisor;
 mod terminal;

@@ -38,6 +38,7 @@ fn host_http_health_endpoint() -> u16 {
     let port = listener.local_addr().expect("local address").port();
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
             let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
         }
     });
@@ -62,8 +63,15 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
     format!(
         "version: 1\n\
          processes:\n\
+         \x20 - name: gated-started\n\
+         \x20   depends_on: [{{name: hello, condition: started}}]\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n\
          \x20 - name: hello\n\
          \x20   kind: service\n\
+         \x20   depends_on: [{{name: http-ready, condition: ready}}]\n\
          \x20   terminal: pty\n\
          \x20   input: focused\n\
          \x20   working_dir: ./web\n\
@@ -98,7 +106,8 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
          \x20   kind: one-shot\n\
          \x20   terminal: pipe\n\
          \x20   command:\n\
-         \x20     program: /usr/bin/true\n\
+         \x20     program: /bin/sh\n\
+         \x20     args: [\"-c\", \"sleep 0.5; printf 'fixture-setup-ok\\\\n'\"]\n\
          \x20 - name: gated\n\
          \x20   depends_on: [{{name: setup, condition: completed_successfully}}]\n\
          \x20   terminal: pipe\n\
@@ -111,6 +120,12 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
          \x20     tcp:\n\
          \x20       host: 127.0.0.1\n\
          \x20       port: {tcp_port}\n\
+         \x20   terminal: pipe\n\
+         \x20   command:\n\
+         \x20     program: /bin/sleep\n\
+         \x20     args: [\"60\"]\n\
+         \x20 - name: gated-ready\n\
+         \x20   depends_on: [{{name: http-ready, condition: ready}}]\n\
          \x20   terminal: pipe\n\
          \x20   command:\n\
          \x20     program: /bin/sleep\n\
@@ -151,6 +166,7 @@ fn one_configured_service_runs_end_to_end() {
         "fixture failed: {stdout} {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(stdout.contains("fixture-blocked-ok"), "{stdout}");
     assert!(stdout.contains("fixture-started-ok"), "{stdout}");
     // The fixture prints this checkpoint only after the direct command's
     // marker, the inline-environment token, and the shell pipeline's

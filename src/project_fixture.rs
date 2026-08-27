@@ -78,6 +78,35 @@ fn prove_slice(
     consoles: &crate::supervisor::Consoles,
     outputs: &crate::output::OutputViews,
 ) -> Result<u32> {
+    // Configuration order puts the started-condition dependent before its
+    // Dependency, so its first serialized snapshot proves the exact edge.
+    let started_blocked = wait_for(supervisor, STARTUP_WAIT, |snapshot| {
+        snapshot.named("gated-started").is_some_and(|process| {
+            process.lifecycle == Lifecycle::Waiting
+                && process.blocked_reason.as_deref() == Some("hello: started")
+        })
+    })?;
+    assert_eq!(
+        started_blocked
+            .named("gated-started")
+            .and_then(|process| process.blocked_reason.as_deref()),
+        Some("hello: started"),
+        "the started-condition dependent names its graph edge"
+    );
+
+    // Slow readiness and One-shot completion keep the other dependents
+    // Waiting long enough to prove their graph diagnostics.
+    wait_for(supervisor, STARTUP_WAIT, |snapshot| {
+        snapshot.named("gated").is_some_and(|process| {
+            process.lifecycle == Lifecycle::Waiting
+                && process.blocked_reason.as_deref() == Some("setup: completed_successfully")
+        }) && snapshot.named("gated-ready").is_some_and(|process| {
+            process.lifecycle == Lifecycle::Waiting
+                && process.blocked_reason.as_deref() == Some("http-ready: ready")
+        })
+    })?;
+    println!("fixture-blocked-ok");
+
     // Every enabled autostart Process reaches its terminal-for-now state:
     // Services run, One-shots complete. Starting becomes Running on the
     // Spawned event; a One-shot becomes Done once its natural exit is
@@ -137,6 +166,25 @@ fn prove_slice(
     assert_eq!(gated.lifecycle, Lifecycle::Running);
     assert!(gated.current_run.is_some());
     assert_eq!(gated.failure, None);
+    let hello = snapshot.named("hello").expect("the fixture defines hello");
+    let gated_started = snapshot
+        .named("gated-started")
+        .expect("the fixture defines gated-started");
+    assert!(
+        gated_started.run_started_at_ms >= hello.run_started_at_ms,
+        "the started-condition dependent starts after its Dependency"
+    );
+    let setup_finished_at = setup
+        .recent_runs
+        .first()
+        .expect("the setup Run is summarized")
+        .ended_at_ms;
+    assert!(
+        gated
+            .run_started_at_ms
+            .is_some_and(|started| started >= setup_finished_at),
+        "the completed-successfully dependent starts after the One-shot"
+    );
     println!("fixture-one-shot-ok");
 
     // The TCP-probed Service reached Running only through a real probe pass
@@ -149,7 +197,6 @@ fn prove_slice(
     assert!(tcp_ready.current_run.is_some());
     assert_eq!(tcp_ready.readiness, None, "a passed Run keeps no tracking");
     assert_eq!(tcp_ready.failure, None);
-
     // The same holds for the HTTP-probed Service against the real local
     // health endpoint this process hosts.
     let http_ready = snapshot
@@ -159,6 +206,13 @@ fn prove_slice(
     assert!(http_ready.current_run.is_some());
     assert_eq!(http_ready.readiness, None);
     assert_eq!(http_ready.failure, None);
+    let gated_ready = snapshot
+        .named("gated-ready")
+        .expect("the fixture defines gated-ready");
+    assert!(
+        gated_ready.run_started_at_ms >= http_ready.run_started_at_ms,
+        "the ready-condition dependent starts after the probed Service"
+    );
     println!("fixture-tcp-ready-ok");
 
     // Output flows to each Process console without entering the control
