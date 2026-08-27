@@ -39,13 +39,11 @@ fn run_cycle(project: crate::model::EffectiveProject) -> Result<()> {
             .named("hold")
             .is_some_and(|process| process.lifecycle == Lifecycle::Running)
     })?;
-    let inspect_index = snapshot
-        .processes
-        .iter()
-        .position(|process| process.name == "inspect")
+    let inspect = snapshot
+        .named("inspect")
         .expect("the smoke Project defines inspect");
     let retained = outputs
-        .for_process(inspect_index as u32)
+        .for_process_id(inspect.process_id)
         .expect("inspect has retained output")
         .snapshot();
     let output = retained
@@ -141,16 +139,14 @@ fn wait_for(
     supervisor: &crate::supervisor::SupervisorHandle,
     done: impl Fn(&crate::supervisor::ProjectSnapshot) -> bool,
 ) -> Result<crate::supervisor::ProjectSnapshot> {
-    let deadline = Instant::now() + SMOKE_WAIT;
-    loop {
-        match supervisor.snapshot() {
-            Some(snapshot) if done(&snapshot) => return Ok(snapshot),
-            Some(_) => {}
-            None => bail!("the Supervisor stopped before the smoke proof completed"),
-        }
-        if Instant::now() >= deadline {
-            bail!("the real Project smoke proof exceeded its bound");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    crate::sync_fixture::wait_for_snapshot(
+        supervisor,
+        crate::sync_fixture::SnapshotWait {
+            timeout: SMOKE_WAIT,
+            poll_interval: Duration::from_millis(25),
+            stopped_message: "the Supervisor stopped before the smoke proof completed",
+            timeout_message: "the real Project smoke proof exceeded its bound",
+        },
+        done,
+    )
 }

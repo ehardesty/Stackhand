@@ -4,8 +4,7 @@
 //! Supervisor.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,58 +16,275 @@ use crate::runtime::{
     root_exit_pending,
 };
 use crate::supervisor::FailureKind;
-use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender, StartIntent};
+use crate::supervisor::seam::{FinishedRun, RunSeam, SeamEvent, SeamSender, StartIntent};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 
 /// Identifies one active Run inside the adapter.
 type RunKey = (u32, u64);
+type RunRegistry = Arc<Mutex<HashMap<RunKey, Arc<RunRecord>>>>;
 
-/// How often a Run's owner loop polls its root child for natural exit.
-const NATURAL_EXIT_POLL: Duration = Duration::from_millis(50);
+/// How often a Run owner polls for natural exit and low-volume events.
+const OWNER_POLL: Duration = Duration::from_millis(50);
 /// How often a retained-output drain polls for the Run's output channel
 /// closing; output chunks themselves arrive without waiting for this.
 const OUTPUT_DRAIN_POLL: Duration = Duration::from_millis(50);
-
-/// One map slot for a Run between the start request and the finished
-/// spawn. The reservation exists synchronously before the spawn worker
-/// starts so a stop request can cancel a Run that has not appeared yet.
-#[allow(clippy::large_enum_variant)] // The spawning slot exists only for the short spawn window.
-enum RunSlot {
-    Spawning {
-        cancelled: Arc<AtomicBool>,
-        shutdown_remaining: Arc<Mutex<Option<Duration>>>,
-    },
-    Active(OwnedRun),
-}
-
 const METRICS_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Starts Runs through the real Run interface and performs bounded shutdown
-/// on worker threads. Each active Run has one owner loop that observes a
-/// root exiting on its own — a One-shot completing or a Service dying — and
-/// reports `Exited` plus `ShutdownComplete` without user action. All results
-/// return as typed [`SeamEvent`]s.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct AdapterTestHooks {
+    after_spawn: Option<TestPause>,
+    after_finished: Option<TestPause>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestPause {
+    reached: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl TestPause {
+    fn new() -> Self {
+        Self {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            resume: Arc::new(std::sync::Barrier::new(2)),
+        }
+    }
+
+    fn pause_worker(&self) {
+        self.reached.wait();
+        self.resume.wait();
+    }
+
+    fn wait_until_reached(&self) {
+        self.reached.wait();
+    }
+
+    fn resume(&self) {
+        self.resume.wait();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StopRequest {
+    remaining: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+enum FinishCause {
+    Natural,
+    Stop(StopRequest),
+}
+
+impl FinishCause {
+    fn intentional_stop(self) -> bool {
+        matches!(self, Self::Stop(_))
+    }
+}
+
+/// One serialized ownership protocol for a Run from synchronous reservation
+/// through confirmed cleanup. The Run stays in exactly one phase. Stop,
+/// natural exit, terminal access, and Project deadline updates all use this
+/// record instead of competing map removals or a second completion registry.
+enum RunState {
+    Spawning,
+    StopBeforeSpawn(StopRequest),
+    Active(OwnedRun),
+    Pending { run: OwnedRun, cause: FinishCause },
+    Finishing,
+    Unconfirmed(OwnedRun),
+    Finished,
+}
+
+struct RunCoordination {
+    state: RunState,
+    project_deadline: Option<Instant>,
+}
+
+struct RunRecord {
+    coordination: Mutex<RunCoordination>,
+    wake: Condvar,
+    #[cfg(test)]
+    test_hooks: AdapterTestHooks,
+}
+
+impl RunRecord {
+    fn spawning() -> Self {
+        Self {
+            coordination: Mutex::new(RunCoordination {
+                state: RunState::Spawning,
+                project_deadline: None,
+            }),
+            wake: Condvar::new(),
+            #[cfg(test)]
+            test_hooks: AdapterTestHooks::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn spawning_with_test_hooks(test_hooks: AdapterTestHooks) -> Self {
+        Self {
+            test_hooks,
+            ..Self::spawning()
+        }
+    }
+
+    /// Install a spawned Run. Its output marker and drain are ready before
+    /// either active use or a stop queued during spawn can finish the Run.
+    fn install(&self, run: OwnedRun, on_spawned: impl FnOnce()) {
+        let mut coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        on_spawned();
+        coordination.state = match coordination.state {
+            RunState::Spawning => RunState::Active(run),
+            RunState::StopBeforeSpawn(request) => RunState::Pending {
+                run,
+                cause: FinishCause::Stop(request),
+            },
+            _ => panic!("a Run can be installed only into its spawn reservation"),
+        };
+        self.wake.notify_one();
+    }
+
+    fn request_stop(&self, remaining: Option<Duration>) {
+        let request = StopRequest { remaining };
+        let mut coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = std::mem::replace(&mut coordination.state, RunState::Finishing);
+        coordination.state = match state {
+            RunState::Spawning => RunState::StopBeforeSpawn(request),
+            RunState::StopBeforeSpawn(_) => RunState::StopBeforeSpawn(request),
+            RunState::Active(run) | RunState::Unconfirmed(run) => RunState::Pending {
+                run,
+                cause: FinishCause::Stop(request),
+            },
+            state @ (RunState::Pending { .. } | RunState::Finishing | RunState::Finished) => state,
+        };
+        self.wake.notify_one();
+    }
+
+    fn set_project_deadline(&self, deadline: Instant) {
+        let mut coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        coordination.project_deadline = Some(deadline);
+        self.wake.notify_one();
+    }
+
+    /// Claim the only completion action. A queued stop wins over natural
+    /// exit because it was recorded first under the same lock.
+    fn take_completion(&self, natural_exit: bool) -> Option<(OwnedRun, FinishCause)> {
+        let mut coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = std::mem::replace(&mut coordination.state, RunState::Finishing);
+        match state {
+            RunState::Pending { run, cause } => Some((run, cause)),
+            RunState::Active(run) if natural_exit => Some((run, FinishCause::Natural)),
+            state => {
+                coordination.state = state;
+                None
+            }
+        }
+    }
+
+    fn project_remaining(&self) -> Option<Duration> {
+        self.coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .project_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn finish(&self, run: OwnedRun, cleanup_confirmed: bool) {
+        let mut coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        coordination.state = if cleanup_confirmed {
+            RunState::Finished
+        } else {
+            RunState::Unconfirmed(run)
+        };
+        self.wake.notify_all();
+    }
+
+    fn wait_for_work(&self) {
+        let coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = self
+            .wake
+            .wait_timeout(coordination, OWNER_POLL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(
+            self.coordination
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .state,
+            RunState::Active(_)
+        )
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(
+            self.coordination
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .state,
+            RunState::Finished
+        )
+    }
+
+    fn with_terminal<R>(&self, f: impl FnOnce(&TerminalHandle<'_>) -> R) -> Option<R> {
+        let coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &coordination.state {
+            RunState::Active(run) => run.terminal().map(|handle| f(&handle)),
+            _ => None,
+        }
+    }
+}
+
+/// Starts Runs through the real Run interface. Synchronous reservations and
+/// cheap coordinator updates stay on the caller. Spawn, completion, output
+/// drain, and worker joins stay on Run-owned worker threads.
 pub(crate) struct RealRunSeam {
-    runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
-    /// Run keys whose bounded cleanup a worker already claimed. A stop for a
-    /// tombstoned key is a harmless no-op: the in-flight natural completion
-    /// already reports this Run's ShutdownComplete.
-    completed: Arc<Mutex<std::collections::HashSet<RunKey>>>,
-    /// The one retained-output module per Process. Pipe bytes drain into
-    /// it off the control task; PTY bytes stay in each Run's terminal.
+    runs: RunRegistry,
     outputs: Arc<OutputViews>,
-    /// Shared Project deadline, visible to a natural-exit owner that can
-    /// already have claimed its Run before the ordered stop wave arrives.
-    project_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
+    #[cfg(test)]
+    test_hooks: AdapterTestHooks,
 }
 
 impl RealRunSeam {
     pub(crate) fn new(outputs: Arc<OutputViews>) -> Self {
         Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
-            completed: Arc::new(Mutex::new(std::collections::HashSet::new())),
             outputs,
-            project_shutdown_deadline: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_hooks: AdapterTestHooks::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_hooks(outputs: Arc<OutputViews>, test_hooks: AdapterTestHooks) -> Self {
+        Self {
+            test_hooks,
+            ..Self::new(outputs)
         }
     }
 
@@ -81,38 +297,41 @@ impl RealRunSeam {
 
 impl RunSeam for RealRunSeam {
     fn begin_shutdown(&self, remaining: Duration) {
-        *self
-            .project_shutdown_deadline
+        let deadline = Instant::now() + remaining;
+        let records: Vec<_> = self
+            .runs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + remaining);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for record in records {
+            record.set_project_deadline(deadline);
+        }
     }
 
     fn start(&self, intent: StartIntent, events: &SeamSender) {
+        let key = (intent.process_id.get(), intent.run_id.get());
+        #[cfg(not(test))]
+        let record = Arc::new(RunRecord::spawning());
+        #[cfg(test)]
+        let record = Arc::new(RunRecord::spawning_with_test_hooks(self.test_hooks.clone()));
+        let mut runs = self
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep at most one published completion per Process. It closes the
+        // stop-before-application race, then the next Run reservation
+        // replaces it without a separate tombstone registry.
+        runs.retain(|existing_key, existing| existing_key.0 != key.0 || !existing.is_finished());
+        runs.insert(key, Arc::clone(&record));
+        drop(runs);
+
         let events = events.clone();
         let runs = Arc::clone(&self.runs);
-        let completed = Arc::clone(&self.completed);
         let outputs = Arc::clone(&self.outputs);
-        let project_shutdown_deadline = Arc::clone(&self.project_shutdown_deadline);
-        // Reserve the Run identity synchronously so no stop can fall into
-        // the window before the spawn worker registers the OwnedRun.
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let shutdown_remaining = Arc::new(Mutex::new(None));
-        self.runs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                (intent.process_id.get(), intent.run_id.get()),
-                RunSlot::Spawning {
-                    cancelled: Arc::clone(&cancelled),
-                    shutdown_remaining: Arc::clone(&shutdown_remaining),
-                },
-            );
-        // Spawn work stays off the Supervisor control task.
         thread::spawn(move || {
-            let key = (intent.process_id.get(), intent.run_id.get());
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
-            // The retained-output receiver lives for this Run only; its
-            // sender drops with the Run, which ends the drain thread.
             let (output_tx, output_rx) = crate::runtime::output_channel();
             let request = RunStartRequest {
                 process_id: intent.process_id,
@@ -132,55 +351,23 @@ impl RunSeam for RealRunSeam {
                 on_output_wake: None,
             };
             match RunRuntime.start(request) {
-                Ok(mut run) => {
-                    if cancelled.load(Ordering::Acquire) {
-                        // A stop arrived while the spawn was starting;
-                        // finish it immediately instead of leaving an
-                        // orphaned process behind.
-                        let remaining = *shutdown_remaining
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let outcome = match remaining {
-                            Some(limit) => run.shutdown_with_timeout(limit),
-                            None => run.shutdown(),
-                        };
-                        report_shutdown((intent.process_id, intent.run_id), outcome, &events);
-                        return;
+                Ok(run) => {
+                    #[cfg(test)]
+                    if let Some(pause) = &record.test_hooks.after_spawn {
+                        pause.pause_worker();
                     }
-                    // Record this attempt in the Process's retained output
-                    // before any drain, so the marker orders ahead of this
-                    // Run's output. PTY Runs keep their bytes in the fresh
-                    // terminal session; the marker still divides attempts.
-                    outputs
-                        .for_process(intent.process_id.get())
-                        .expect("the registry covers every configured Process")
-                        .mark_run(intent.run_id.get());
                     let root_pid = run.root_pid();
-                    runs.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(key, RunSlot::Active(run));
-                    // Retained pipe output drains on its own thread, never
-                    // on the Supervisor control task, and ends when this
-                    // Run's sender drops.
-                    drain_retained_output(output_rx, outputs, intent.process_id);
-                    // This worker becomes the Run's single owner: it
-                    // forwards Run events and observes natural root exit in
-                    // one serialized loop, so the Supervisor always sees
-                    // `Exited` before the completion report.
-                    own_run(
-                        key,
-                        root_pid,
-                        runs,
-                        completed,
-                        project_shutdown_deadline,
-                        events,
-                        event_rx,
-                    );
+                    record.install(run, || {
+                        outputs
+                            .for_process_id(intent.process_id)
+                            .expect("the registry covers every configured Process")
+                            .mark_run(intent.run_id.get());
+                        drain_retained_output(output_rx, outputs, intent.process_id);
+                    });
+                    own_run(key, root_pid, record, events, event_rx);
                 }
                 Err(error) => {
-                    runs.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&key);
+                    remove_record(&runs, key, &record);
                     events.send(SeamEvent::Failed {
                         process_id: intent.process_id,
                         run_id: intent.run_id,
@@ -200,49 +387,14 @@ impl RunSeam for RealRunSeam {
         events: &SeamSender,
     ) {
         let key = (process_id.get(), run_id.get());
-        let completed = Arc::clone(&self.completed);
-        let slot = self
+        let record = self
             .runs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
-        match slot {
-            Some(RunSlot::Active(run)) => {
-                completed
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(key);
-                let events = events.clone();
-                thread::spawn(move || {
-                    let mut run = run;
-                    // The complete bounded shutdown ladder runs here, never
-                    // on the control task.
-                    let outcome = match remaining {
-                        Some(limit) => run.shutdown_with_timeout(limit),
-                        None => run.shutdown(),
-                    };
-                    report_shutdown((process_id, run_id), outcome, &events);
-                });
-            }
-            Some(RunSlot::Spawning {
-                cancelled,
-                shutdown_remaining,
-            }) => {
-                // The spawn worker owns this Run's completion; ask it to
-                // shut down as soon as the child appears.
-                *shutdown_remaining
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = remaining;
-                cancelled.store(true, Ordering::Release);
-            }
-            // A tombstoned Run already has an in-flight natural completion
-            // that will report this Run's ShutdownComplete; stay silent so a
-            // racing stop never fabricates a false failure.
-            None if self
-                .completed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&key) => {}
+            .get(&key)
+            .cloned();
+        match record {
+            Some(record) => record.request_stop(remaining),
             None => events.send(SeamEvent::Failed {
                 process_id,
                 run_id,
@@ -253,16 +405,12 @@ impl RunSeam for RealRunSeam {
     }
 }
 
-/// One retained-output drain thread for one Run. It moves the Run's
-/// high-volume pipe bytes into the Process's bounded output module and
-/// ends when this Run's sender drops, so an ended attempt's drain never
-/// lingers into a later attempt.
 fn drain_retained_output(
     output_rx: RunOutputReceiver,
     outputs: Arc<OutputViews>,
     process_id: ProcessId,
 ) {
-    let Some(module) = outputs.for_process(process_id.get()) else {
+    let Some(module) = outputs.for_process_id(process_id) else {
         return;
     };
     thread::spawn(move || {
@@ -276,85 +424,67 @@ fn drain_retained_output(
     });
 }
 
-/// Own one active Run until it ends: forward low-volume Run events into the
-/// Supervisor seam and observe natural root exit in one serialized loop, so
-/// `Exited` always reaches the Supervisor before the Run's completion
-/// report. When a stop worker claims the Run first, this loop keeps only the
-/// forwarding duty until the Run's event channel closes.
+/// Own one Run from spawn through confirmed cleanup. The same loop forwards
+/// low-volume live events, chooses stop versus natural completion, consumes
+/// the public Run completion events, and reports one finished-Run fact.
 fn own_run(
     key: RunKey,
     root_pid: Option<OsPid>,
-    runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
-    completed: Arc<Mutex<std::collections::HashSet<RunKey>>>,
-    project_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
+    record: Arc<RunRecord>,
     events: SeamSender,
     event_rx: mpsc::Receiver<RunEvent>,
 ) {
     loop {
-        // Everything the Run already emitted goes out first; the Spawned
-        // event is waiting here before this loop ever runs.
-        match event_rx.try_recv() {
-            Ok(event) => forward_event(key, event, &events),
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => return,
-        }
-        if completed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&key)
-        {
-            // A stop worker owns this Run's cleanup; keep forwarding until
-            // the channel closes.
-            while let Ok(event) = event_rx.recv() {
-                forward_event(key, event, &events);
+        forward_pending_events(key, &event_rx, &events);
+        let natural_exit = root_pid.is_some_and(root_exit_pending);
+        if let Some((mut run, cause)) = record.take_completion(natural_exit) {
+            let result = match cause {
+                FinishCause::Natural => match record.project_remaining() {
+                    Some(remaining) => run.wait_with_timeout(remaining),
+                    None => run.wait(),
+                },
+                FinishCause::Stop(request) => match request.remaining {
+                    Some(remaining) => run.shutdown_with_timeout(remaining),
+                    None => run.shutdown(),
+                },
+            };
+            // `OwnedRun` emits Exited before its completion event. Consume
+            // that ordered public protocol before publishing the one seam
+            // fact derived from its returned outcome.
+            forward_pending_events(key, &event_rx, &events);
+            let finished = finished_run(key, &result, cause.intentional_stop());
+            let cleanup_confirmed = finished.cleanup_confirmed;
+            record.finish(run, cleanup_confirmed);
+            events.send(SeamEvent::Finished(finished));
+            if cleanup_confirmed {
+                // Keep this finished record until the Process reserves its
+                // next Run. A stop racing event application then sees the
+                // completed state and remains a no-op.
+                #[cfg(test)]
+                if let Some(pause) = &record.test_hooks.after_finished {
+                    pause.pause_worker();
+                }
+                return;
             }
-            return;
-        }
-        let Some(root) = root_pid else {
-            // Without a root identity there is nothing to observe; forward
-            // until the Run ends.
-            while let Ok(event) = event_rx.recv() {
-                forward_event(key, event, &events);
-            }
-            return;
-        };
-        if !root_exit_pending(root) {
-            thread::sleep(NATURAL_EXIT_POLL);
             continue;
         }
-        // Natural root exit observed. Claiming the map entry makes a
-        // concurrent stop a harmless no-op against the completed set.
-        let claimed = runs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
-        let Some(RunSlot::Active(mut run)) = claimed else {
-            // Still spawning or already claimed by a stop; that owner
-            // reports this Run's completion.
-            continue;
-        };
-        completed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key);
-        // shutdown() emits the Run's own Exited event synchronously; every
-        // emission is already buffered when it returns, so a non-blocking
-        // sweep forwards them before the completion report. (The channel
-        // itself only closes when `run` drops below.)
-        let deadline = *project_shutdown_deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = match deadline {
-            Some(deadline) => {
-                run.shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
-            }
-            None => run.shutdown(),
-        };
-        while let Ok(event) = event_rx.try_recv() {
-            forward_event(key, event, &events);
-        }
-        report_shutdown(key_to_ids(key), outcome, &events);
-        return;
+        record.wait_for_work();
+    }
+}
+
+fn remove_record(runs: &RunRegistry, key: RunKey, record: &Arc<RunRecord>) {
+    let mut runs = runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runs
+        .get(&key)
+        .is_some_and(|stored| Arc::ptr_eq(stored, record))
+    {
+        runs.remove(&key);
+    }
+}
+
+fn forward_pending_events(key: RunKey, event_rx: &mpsc::Receiver<RunEvent>, events: &SeamSender) {
+    while let Ok(event) = event_rx.try_recv() {
+        forward_event(key, event, events);
     }
 }
 
@@ -366,26 +496,13 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
             run_id,
             root_pid,
         },
-        RunEventKind::Exited { code } => SeamEvent::Exited {
-            process_id,
-            run_id,
-            code,
-        },
-        // Completion is reported by the Run's owning worker so it can carry
-        // structured cleanup results.
-        RunEventKind::ShutdownComplete => return,
-        RunEventKind::Failed(detail) => SeamEvent::Failed {
-            process_id,
-            run_id,
-            kind: FailureKind::Spawn,
-            detail,
-        },
-        // Bounded backpressure is metadata, not a failure. The Run keeps
-        // draining the operating-system pipe; what is lost is observable in
-        // the retained module's truncation metadata.
+        // The returned RunOutcome is the one completion authority. These
+        // ordered Run events are consumed here and do not create a second
+        // Supervisor completion protocol.
+        RunEventKind::Exited { .. } | RunEventKind::ShutdownComplete | RunEventKind::Failed(_) => {
+            return;
+        }
         RunEventKind::OutputDropped { .. } => return,
-        // A hard output-path failure (a read error, or the sink closing
-        // early) is a bounded, first-report-only Run-level failure.
         RunEventKind::IoFailed(detail) => SeamEvent::OutputFailure {
             process_id,
             run_id,
@@ -401,36 +518,41 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
     events.send(seam_event);
 }
 
-fn key_to_ids(key: RunKey) -> (ProcessId, RuntimeRunId) {
-    (ProcessId::new(key.0), RuntimeRunId::new(key.1))
+fn finished_run(
+    key: RunKey,
+    result: &anyhow::Result<crate::runtime::RunOutcome>,
+    intentional_stop_if_error: bool,
+) -> FinishedRun {
+    let (process_id, run_id) = key_to_ids(key);
+    match result {
+        Ok(outcome) => FinishedRun {
+            process_id,
+            run_id,
+            exit_code: outcome.exit_code,
+            intentional_stop: outcome.intentional_stop,
+            cleanup_confirmed: outcome.cleanup_confirmed,
+            detail: (!outcome.cleanup_confirmed).then(|| {
+                format!(
+                    "cleanup did not confirm; remaining PIDs: {:?}",
+                    outcome.remaining_pids
+                )
+            }),
+            remaining_pids: outcome.remaining_pids.clone(),
+        },
+        Err(error) => FinishedRun {
+            process_id,
+            run_id,
+            exit_code: None,
+            intentional_stop: intentional_stop_if_error,
+            cleanup_confirmed: false,
+            detail: Some(error.to_string()),
+            remaining_pids: Vec::new(),
+        },
+    }
 }
 
-fn report_shutdown(
-    (process_id, run_id): (ProcessId, RuntimeRunId),
-    outcome: anyhow::Result<crate::runtime::RunOutcome>,
-    events: &SeamSender,
-) {
-    let (confirmed, detail, remaining_pids) = match outcome {
-        Ok(outcome) if outcome.cleanup_confirmed => (true, None, Vec::new()),
-        Ok(outcome) => {
-            let remaining_pids = outcome.remaining_pids;
-            (
-                false,
-                Some(format!(
-                    "cleanup did not confirm; remaining PIDs: {remaining_pids:?}"
-                )),
-                remaining_pids,
-            )
-        }
-        Err(error) => (false, Some(error.to_string()), Vec::new()),
-    };
-    events.send(SeamEvent::ShutdownComplete {
-        process_id,
-        run_id,
-        confirmed,
-        detail,
-        remaining_pids,
-    });
+fn key_to_ids(key: RunKey) -> (ProcessId, RuntimeRunId) {
+    (ProcessId::new(key.0), RuntimeRunId::new(key.1))
 }
 
 fn build_command(intent: &StartIntent) -> SpawnCommand {
@@ -445,45 +567,41 @@ fn build_command(intent: &StartIntent) -> SpawnCommand {
     command
 }
 
-/// Data-plane access to the terminal session each PTY Run owns. Output
-/// bytes and terminal interaction stay outside the Supervisor control
-/// queue; this registry only locates the current Run of a Process.
+/// Data-plane access to the terminal session each PTY Run owns. Output bytes
+/// and terminal interaction stay outside the Supervisor control queue.
 pub struct Consoles {
-    runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
+    runs: RunRegistry,
 }
 
 impl Consoles {
     /// The live console view for one Process's current Run, when one is
     /// active.
-    pub fn view(&self, process_id: u32, run_id: u64) -> Option<ConsoleView> {
-        let guard = self
+    pub fn view_process(&self, process_id: ProcessId, run_id: u64) -> Option<ConsoleView> {
+        let record = self
             .runs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        matches!(guard.get(&(process_id, run_id)), Some(RunSlot::Active(_))).then(|| ConsoleView {
-            runs: Arc::clone(&self.runs),
-            key: (process_id, run_id),
-        })
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(process_id.get(), run_id))
+            .cloned()?;
+        record.is_active().then_some(ConsoleView { record })
+    }
+
+    /// The live console view by scalar Process identity.
+    /// Kept for caller compatibility; internal callers use [`Self::view_process`].
+    pub fn view(&self, process_id: u32, run_id: u64) -> Option<ConsoleView> {
+        self.view_process(ProcessId::new(process_id), run_id)
     }
 }
 
 /// A shared handle to one active PTY Run's terminal. Every operation locks
-/// briefly and never blocks on process work.
+/// one Run coordinator briefly and never performs process work.
 pub struct ConsoleView {
-    runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
-    key: RunKey,
+    record: Arc<RunRecord>,
 }
 
 impl ConsoleView {
     pub(crate) fn with<R>(&self, f: impl FnOnce(&TerminalHandle<'_>) -> R) -> Option<R> {
-        let guard = self
-            .runs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.get(&self.key) {
-            Some(RunSlot::Active(run)) => run.terminal().map(|handle| f(&handle)),
-            _ => None,
-        }
+        self.record.with_terminal(f)
     }
 
     pub fn snapshot(&self) -> Option<OwnedTerminalSnapshot> {
@@ -505,3 +623,7 @@ impl ConsoleView {
         !matches!(result, Some(Err(_)))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/runtime_adapter.rs"]
+mod tests;

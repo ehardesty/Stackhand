@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
@@ -196,16 +196,14 @@ fn wait_for(
     limit: Duration,
     done: impl Fn(&crate::supervisor::ProjectSnapshot) -> bool,
 ) -> Result<crate::supervisor::ProjectSnapshot> {
-    let deadline = Instant::now() + limit;
-    loop {
-        match supervisor.snapshot() {
-            Some(snapshot) if done(&snapshot) => return Ok(snapshot),
-            Some(_) => {}
-            None => bail!("the Supervisor stopped"),
-        }
-        if Instant::now() >= deadline {
-            bail!("the phase did not finish within its bound");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    crate::sync_fixture::wait_for_snapshot(
+        supervisor,
+        crate::sync_fixture::SnapshotWait {
+            timeout: limit,
+            poll_interval: Duration::from_millis(50),
+            stopped_message: "the Supervisor stopped",
+            timeout_message: "the phase did not finish within its bound",
+        },
+        done,
+    )
 }

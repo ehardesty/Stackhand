@@ -117,13 +117,15 @@ fn later_waves_receive_only_the_shared_deadlines_remaining_time() {
     h.clock.advance(Duration::from_secs(3));
 
     for process in ["worker", "setup"] {
-        h.event(SeamEvent::ShutdownComplete {
+        h.event(SeamEvent::Finished(FinishedRun {
             process_id: ProcessId::new(process_index(process)),
             run_id: RunId::new(1),
-            confirmed: true,
+            exit_code: Some(0),
+            intentional_stop: true,
+            cleanup_confirmed: true,
             detail: None,
             remaining_pids: Vec::new(),
-        });
+        }));
     }
     let budgets: Vec<_> = runtime
         .intents()

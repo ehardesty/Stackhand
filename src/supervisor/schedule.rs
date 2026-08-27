@@ -40,13 +40,12 @@ impl Core {
         self.require_running(index, trigger);
         let entry = &mut self.entries[index];
         if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
-            // A stopping Run releases its identity on ShutdownComplete;
+            // A stopping Run releases its identity on the finished report;
             // that pass starts the replacement through the scheduler. The
             // stop is intentional: its summary must not read as a failure.
             entry.lifecycle = Lifecycle::Stopping;
             entry.blocked = None;
             entry.readiness = None;
-            entry.stop_intended = true;
             self.seam.stop(entry.process_id, run_id, None, &self.events);
         }
         self.evaluate();
@@ -66,9 +65,13 @@ impl Core {
         }
         entry.desired = DesiredState::Running;
         entry.pending_trigger = trigger;
-        let dependencies = self.dependency_indices(index);
-        for dependency in dependencies {
-            self.require_running(dependency, RunTrigger::Dependency);
+        let dependency_indices = self
+            .project
+            .resolved_dependencies(index)
+            .map(|(dependency_index, _)| dependency_index)
+            .collect::<Vec<_>>();
+        for dependency_index in dependency_indices {
+            self.require_running(dependency_index, RunTrigger::Dependency);
         }
     }
 
@@ -97,12 +100,9 @@ impl Core {
         entry.failure = None;
         entry.metrics = None;
         entry.blocked = None;
-        // A new Run invalidates any earlier completion of this Process; the
-        // condition is satisfied only when this Run completes.
-        entry.completed = false;
+        // Starting is the immediate invalidation of an earlier successful
+        // One-shot completion represented by Done.
         entry.run_started_at_ms = Some(now_ms);
-        entry.stop_intended = false;
-        entry.natural_exit_code = None;
         entry.run_trigger = entry.pending_trigger;
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
@@ -122,11 +122,7 @@ impl Core {
     /// Why this Process cannot start yet, or `None` when every Dependency
     /// condition is satisfied.
     fn blocked_reason(&self, index: usize) -> Option<String> {
-        let dependencies = &self.project.processes()[index].dependencies;
-        for dependency in dependencies {
-            let dependency_index = self
-                .named_index(&dependency.name)
-                .expect("configuration validation resolved every dependency");
+        for (dependency_index, dependency) in self.project.resolved_dependencies(index) {
             if !self.is_enabled(dependency_index) {
                 return Some(format!("{}: disabled", dependency.name));
             }
@@ -168,29 +164,13 @@ impl Core {
         entry.current_run.is_some() && entry.lifecycle == Lifecycle::Running
     }
 
-    /// `completed_successfully` holds once the dependency's latest completed
-    /// Run exited with code zero. The satisfaction survives later evaluation
-    /// passes and stays while a new Run is active; only that Run reaching a
-    /// completion replaces it (rerun semantics are Issue #32's work).
+    /// `completed_successfully` holds while the dependency's authoritative
+    /// lifecycle is Done. Starting a later Run immediately replaces Done.
     fn completed_condition_satisfied(&self, index: usize) -> bool {
-        let entry = &self.entries[index];
-        entry.lifecycle == Lifecycle::Done || entry.completed
+        self.entries[index].lifecycle == Lifecycle::Done
     }
 
     pub(super) fn is_enabled(&self, index: usize) -> bool {
         matches!(self.project.processes()[index].enabled, Enabled::Yes)
-    }
-
-    /// The session positions of one Process's Dependencies. Configuration
-    /// validation resolved every name before startup.
-    pub(super) fn dependency_indices(&self, index: usize) -> Vec<usize> {
-        self.project.processes()[index]
-            .dependencies
-            .iter()
-            .map(|dependency| {
-                self.named_index(&dependency.name)
-                    .expect("configuration validation resolved every dependency")
-            })
-            .collect()
     }
 }

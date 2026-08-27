@@ -38,6 +38,7 @@ mod support;
 #[cfg(test)]
 mod tests;
 
+pub use crate::runtime::ProcessId;
 pub use command::Command;
 pub use core::{
     DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,

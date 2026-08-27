@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::byte_budget::ByteBudget;
 
 pub const WRITER_QUEUE_SLOTS: usize = 1_024;
 pub const WRITER_EVENT_SLOTS: usize = 64;
@@ -130,7 +130,7 @@ impl Drop for PtyWriterOwner {
 
 pub(crate) struct BoundedPtyWriter {
     sender: SyncSender<WriterItem>,
-    pending_bytes: Arc<AtomicUsize>,
+    budget: ByteBudget,
     limit_bytes: usize,
     status: Arc<WriterStatus>,
 }
@@ -162,28 +162,30 @@ impl BoundedPtyWriter {
             return Ok(());
         }
 
-        let pending = reserve_bytes(&self.pending_bytes, data.len(), self.limit_bytes).map_err(
-            |pending_bytes| {
-                self.status.record(PtyWriterEvent::Backpressure {
-                    attempted_bytes: data.len(),
-                    pending_bytes,
-                    limit_bytes: self.limit_bytes,
-                });
-                io::Error::new(io::ErrorKind::WouldBlock, "PTY input queue is full")
-            },
-        )?;
+        let reservation = self.budget.reserve(data.len()).map_err(|error| {
+            self.status.record(PtyWriterEvent::Backpressure {
+                attempted_bytes: data.len(),
+                pending_bytes: error.pending_bytes,
+                limit_bytes: self.limit_bytes,
+            });
+            io::Error::new(io::ErrorKind::WouldBlock, "PTY input queue is full")
+        })?;
+        let pending_before = reservation.pending_before();
 
         let item = WriterItem {
             data: data.to_vec(),
             completion: completion.cloned(),
         };
         match self.sender.try_send(item) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                reservation.commit();
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
-                self.pending_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                drop(reservation);
                 self.status.record(PtyWriterEvent::Backpressure {
                     attempted_bytes: data.len(),
-                    pending_bytes: pending,
+                    pending_bytes: pending_before,
                     limit_bytes: self.limit_bytes,
                 });
                 Err(io::Error::new(
@@ -192,7 +194,7 @@ impl BoundedPtyWriter {
                 ))
             }
             Err(TrySendError::Disconnected(item)) => {
-                self.pending_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                drop(reservation);
                 if let Some(completion) = item.completion {
                     let _ = completion.send(Err("PTY writer is not available".to_string()));
                 }
@@ -231,9 +233,9 @@ pub(crate) fn spawn_bounded_pty_writer(
     }
 
     let (sender, receiver) = mpsc::sync_channel::<WriterItem>(WRITER_QUEUE_SLOTS);
-    let pending_bytes = Arc::new(AtomicUsize::new(0));
+    let budget = ByteBudget::new(limit_bytes);
     let status = Arc::new(WriterStatus::default());
-    let thread_pending = Arc::clone(&pending_bytes);
+    let thread_budget = budget.clone();
     let thread_status = Arc::clone(&status);
     let thread_limit = limit_bytes;
     let thread = thread::Builder::new()
@@ -245,10 +247,10 @@ pub(crate) fn spawn_bounded_pty_writer(
                     &mut writer,
                     &item.data,
                     &thread_status,
-                    &thread_pending,
+                    &thread_budget,
                     thread_limit,
                 );
-                thread_pending.fetch_sub(item.data.len(), Ordering::AcqRel);
+                thread_budget.release(item.data.len());
                 if let Err(error) = result {
                     if let Some(completion) = item.completion {
                         let _ = completion.send(Err(error.to_string()));
@@ -264,7 +266,7 @@ pub(crate) fn spawn_bounded_pty_writer(
 
     let queued_writer = BoundedPtyWriter {
         sender,
-        pending_bytes,
+        budget,
         limit_bytes,
         status: Arc::clone(&status),
     };
@@ -279,7 +281,7 @@ fn write_with_retry(
     writer: &mut Box<dyn Write + Send>,
     data: &[u8],
     status: &WriterStatus,
-    pending_bytes: &AtomicUsize,
+    budget: &ByteBudget,
     limit_bytes: usize,
 ) -> io::Result<()> {
     let mut offset = 0;
@@ -297,7 +299,7 @@ fn write_with_retry(
                 if !reported_backpressure {
                     status.record(PtyWriterEvent::Backpressure {
                         attempted_bytes: data.len(),
-                        pending_bytes: pending_bytes.load(Ordering::Acquire),
+                        pending_bytes: budget.pending_bytes(),
                         limit_bytes,
                     });
                     reported_backpressure = true;
@@ -315,7 +317,7 @@ fn write_with_retry(
                 if !reported_backpressure {
                     status.record(PtyWriterEvent::Backpressure {
                         attempted_bytes: data.len(),
-                        pending_bytes: pending_bytes.load(Ordering::Acquire),
+                        pending_bytes: budget.pending_bytes(),
                         limit_bytes,
                     });
                     reported_backpressure = true;
@@ -327,21 +329,10 @@ fn write_with_retry(
     }
 }
 
-fn reserve_bytes(pending: &AtomicUsize, amount: usize, limit: usize) -> Result<usize, usize> {
-    let mut current = pending.load(Ordering::Acquire);
-    loop {
-        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
-            return Err(current);
-        };
-        match pending.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Ok(current),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[derive(Clone, Default)]

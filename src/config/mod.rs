@@ -312,6 +312,35 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_example_projects_load() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut paths = fs::read_dir(&examples)
+            .expect("the examples directory exists")
+            .map(|entry| entry.expect("an example directory entry reads").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "yaml")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths.len(), 5, "every documented example is checked");
+
+        for path in paths {
+            let project = load(&path).unwrap_or_else(|error| {
+                panic!("example Project '{}' must load: {error}", path.display())
+            });
+            for process in project.processes() {
+                assert!(
+                    matches!(process.command, CommandForm::Direct { .. }),
+                    "example Process '{}:{}' must not depend on the user's login-shell syntax",
+                    path.display(),
+                    process.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn one_direct_command_service_loads_with_defaults() {
         let project = write_and_load(
             "ok",

@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::runtime::OutputStream;
+use crate::runtime::{OutputStream, ProcessId};
 
 /// The maximum retained output bytes for one Process.
 pub const RETAINED_BYTES: usize = 1024 * 1024;
@@ -77,31 +77,20 @@ impl RetainedOutput {
                         OutputStream::Stdout => "out: ",
                         OutputStream::Stderr => "err: ",
                     };
-                    let split: Vec<&str> = text.split('\n').collect();
-                    let mut chunk_lines: Vec<PipeLine> = Vec::new();
-                    for (index, line) in split.iter().enumerate().rev() {
-                        // The final empty split is the chunk's trailing
-                        // newline, not a line of its own.
-                        if index + 1 == split.len() && line.is_empty() {
-                            continue;
-                        }
-                        if index == 0 && !line.is_empty() {
-                            chunk_lines.push(PipeLine {
-                                text: format!("{prefix}{line}"),
-                                marker: false,
-                            });
-                        } else {
-                            chunk_lines.push(PipeLine {
-                                text: (*line).to_string(),
-                                marker: false,
-                            });
-                        }
-                    }
-                    for line in chunk_lines {
-                        lines.push(line);
-                        if lines.len() >= tail_limit {
+                    let mut chunk_lines = text.split_terminator('\n').rev().peekable();
+                    while lines.len() < tail_limit {
+                        let Some(line) = chunk_lines.next() else {
                             break;
-                        }
+                        };
+                        let is_first = chunk_lines.peek().is_none();
+                        lines.push(PipeLine {
+                            text: if is_first && !line.is_empty() {
+                                format!("{prefix}{line}")
+                            } else {
+                                line.to_string()
+                            },
+                            marker: false,
+                        });
                     }
                     if lines.len() >= tail_limit {
                         break;
@@ -251,9 +240,15 @@ impl OutputViews {
         }
     }
 
-    /// The module for one Process, by its stable session position.
+    /// The module for one Process, by its stable session identity.
+    pub fn for_process_id(&self, process_id: ProcessId) -> Option<Arc<ProcessOutput>> {
+        self.inner.get(process_id.get() as usize).cloned()
+    }
+
+    /// The module for one Process, by its stable scalar session identity.
+    /// Kept for caller compatibility; internal callers use [`Self::for_process_id`].
     pub fn for_process(&self, process_id: u32) -> Option<Arc<ProcessOutput>> {
-        self.inner.get(process_id as usize).cloned()
+        self.for_process_id(ProcessId::new(process_id))
     }
 }
 
@@ -460,5 +455,100 @@ mod tests {
 
         assert_eq!(text, vec!["out: a", "b", "── Run 2 started ──", "err: c"]);
         assert_eq!(markers, vec![false, false, true, false]);
+    }
+
+    /// A simple full projection used only as a differential oracle for the
+    /// bounded reverse-tail implementation.
+    fn materialized_display_lines(
+        output: &RetainedOutput,
+        tail_limit: usize,
+    ) -> Vec<crate::tui::PipeLine> {
+        use crate::tui::PipeLine;
+
+        let mut lines = Vec::new();
+        for chunk in &output.chunks {
+            match chunk {
+                RetainedChunk::Marker { label, .. } => lines.push(PipeLine {
+                    text: label.clone(),
+                    marker: true,
+                }),
+                RetainedChunk::Data { stream, text, .. } => {
+                    let prefix = match stream {
+                        OutputStream::Stdout => "out: ",
+                        OutputStream::Stderr => "err: ",
+                    };
+                    let mut split: Vec<&str> = text.split('\n').collect();
+                    if split.last() == Some(&"") {
+                        split.pop();
+                    }
+                    lines.extend(split.into_iter().enumerate().map(|(index, line)| PipeLine {
+                        text: if index == 0 && !line.is_empty() {
+                            format!("{prefix}{line}")
+                        } else {
+                            line.to_string()
+                        },
+                        marker: false,
+                    }));
+                }
+            }
+        }
+        let keep_from = lines.len().saturating_sub(tail_limit);
+        lines.into_iter().skip(keep_from).collect()
+    }
+
+    #[test]
+    fn display_lines_matches_a_full_projection_for_line_boundaries_and_tails() {
+        let text_cases = [
+            "",
+            "\n",
+            "\n\n",
+            "first",
+            "first\n",
+            "first\nsecond",
+            "first\n\n",
+            "\nsecond",
+            "\nsecond\n",
+        ];
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            for text in text_cases {
+                let output = RetainedOutput {
+                    chunks: vec![
+                        RetainedChunk::Marker {
+                            run_id: 1,
+                            label: "── Run 1 started ──".to_string(),
+                        },
+                        RetainedChunk::Data {
+                            run_id: 1,
+                            stream: OutputStream::Stdout,
+                            text: "older\nlines\n".to_string(),
+                        },
+                        RetainedChunk::Data {
+                            run_id: 2,
+                            stream,
+                            text: text.to_string(),
+                        },
+                        RetainedChunk::Marker {
+                            run_id: 3,
+                            label: "── Run 3 started ──".to_string(),
+                        },
+                        RetainedChunk::Data {
+                            run_id: 3,
+                            stream: OutputStream::Stderr,
+                            text: "newest\nwithout-newline".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                };
+                for tail_limit in 0..=12 {
+                    let actual = output.display_lines(tail_limit);
+                    assert_eq!(
+                        actual,
+                        materialized_display_lines(&output, tail_limit),
+                        "stream {stream:?}, text {text:?}, tail {tail_limit}"
+                    );
+                    assert!(actual.len() <= tail_limit);
+                }
+            }
+        }
     }
 }

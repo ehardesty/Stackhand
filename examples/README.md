@@ -1,0 +1,88 @@
+# Example Projects
+
+These Projects show the behavior that the current macOS prototype supports.
+They use standard shell tools. The readiness example also uses `nc`, which is
+included with macOS.
+
+The examples run POSIX command text through an explicit `/bin/sh` direct
+command. They do not depend on your login shell. The current `shell:` form uses
+`$SHELL`, so its syntax can differ when your login shell is Fish, Zsh, or
+another shell.
+
+Run an example from the repository root:
+
+```sh
+cargo run -- examples/basic.yaml
+```
+
+Stackhand starts enabled autostart Processes. Press `Ctrl-A` to enter
+application commands. Then use:
+
+```text
+j/k or Up/Down   select a Process
+s                start the selected Process
+x                stop the selected Process
+r                restart a Service or rerun a One-shot
+PageUp/PageDown  inspect retained output
+f                return to live output
+v                select text in a PTY console
+Esc              return to child input
+Ctrl-Q           stop the Project and quit
+```
+
+## Examples
+
+### `basic.yaml`
+
+Start here. This Project has a pipe Service, a manual interactive PTY shell, a
+manual One-shot, and a disabled Service.
+
+Manual checks:
+
+1. Confirm that `clock` starts and prints once per second.
+2. Start `shell`, press `Esc`, and run `echo hello` or `stty size`.
+3. Start or rerun `manual-task` and look for a new Run marker.
+4. Confirm that `disabled-example` cannot start.
+
+### `dependencies.yaml`
+
+This Project shows all three Dependency conditions:
+
+- `started` waits for a Service to start;
+- `ready` waits for a Service readiness probe;
+- `completed_successfully` waits for a successful One-shot.
+
+Watch the Process rows and selected headers. Waiting Processes name the
+Dependency condition that is not yet satisfied.
+
+### `readiness.yaml`
+
+This Project shows TCP and HTTP readiness probes. The listeners delay startup
+so that you can see readiness attempts and Waiting states.
+
+It uses ports `43123` and `43124`. Change both the command and probe when one of
+these ports is already in use.
+
+### `failures.yaml`
+
+This Project shows failures without stopping the TUI:
+
+- a One-shot exits with status 7;
+- its dependent remains Waiting;
+- a Service exits unexpectedly;
+- a manual Process has a missing executable and fails when you start it.
+
+### `output-pressure.yaml`
+
+This Project produces enough pipe output to cross the one-MiB retained-output
+bound. Select `noisy` to see the truncation warning. Then stop or restart
+`steady` to confirm that lifecycle commands still work while output is busy.
+
+The example is intentionally noisy. Press `Ctrl-Q` when the check is complete.
+
+## Current limits
+
+These examples are for the current macOS prototype. Windows is not supported.
+Linux interactive PTY behavior is not yet current validation evidence.
+Stackhand does not yet support automatic restart policies, hooks, liveness,
+startup timeouts, profiles, overlays, or configuration discovery.

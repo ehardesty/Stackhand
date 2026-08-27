@@ -4,24 +4,16 @@
 use super::*;
 use crate::supervisor::{FailureKind, FailureSummary, RunTrigger};
 
-fn confirmed(process: &str, run: u64) -> SeamEvent {
-    SeamEvent::ShutdownComplete {
-        process_id: ProcessId::new(process_index(process)),
-        run_id: RunId::new(run),
-        confirmed: true,
-        detail: None,
-        remaining_pids: Vec::new(),
-    }
-}
-
 fn unconfirmed(process: &str, run: u64) -> SeamEvent {
-    SeamEvent::ShutdownComplete {
+    SeamEvent::Finished(FinishedRun {
         process_id: ProcessId::new(process_index(process)),
         run_id: RunId::new(run),
-        confirmed: false,
+        exit_code: None,
+        intentional_stop: true,
+        cleanup_confirmed: false,
         detail: None,
         remaining_pids: Vec::new(),
-    }
+    })
 }
 
 /// A runtime whose spawn always fails, for the Configuration-kind case.
@@ -47,8 +39,7 @@ fn stale_metrics_cannot_change_a_newer_run() {
 
     // The Run ends and the replacement Run begins: the old sample's
     // identity must not bleed into the new Run.
-    h.event(exited("api", 1, Some(0)));
-    h.event(confirmed("api", 1));
+    h.event(finished("api", 1, Some(0)));
     h.command(Command::Start("api".into()));
     h.event(spawned("api", 2));
 
@@ -99,8 +90,7 @@ fn active_snapshots_carry_pid_start_time_and_session_time() {
     );
 
     // A finished Run clears the observed PID and the start stamp.
-    h.event(exited("api", 1, Some(0)));
-    h.event(confirmed("api", 1));
+    h.event(finished("api", 1, Some(0)));
     let finished = h.process("api");
     assert_eq!(finished.root_pid, None);
     assert_eq!(finished.run_started_at_ms, None);
@@ -194,8 +184,7 @@ fn failure_kinds_cover_the_supported_failure_sources() {
     let mut h = Harness::new(four_process_project());
     h.command(Command::Start("setup".into()));
     h.event(spawned("setup", 1));
-    h.event(exited("setup", 1, Some(3)));
-    h.event(confirmed("setup", 1));
+    h.event(finished("setup", 1, Some(3)));
     let one_shot = h.process("setup");
     assert_eq!(
         one_shot.failure.as_ref().map(|failure| failure.kind),
@@ -260,8 +249,7 @@ fn recent_summaries_record_what_started_the_run() {
     h.report_spawns();
     h.command(Command::Start("setup".into()));
     h.event(spawned("setup", 1));
-    h.event(exited("setup", 1, Some(0)));
-    h.event(confirmed("setup", 1));
+    h.event(finished("setup", 1, Some(0)));
 
     let process = h.process("setup");
     let summary = process

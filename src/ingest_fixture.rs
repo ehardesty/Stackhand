@@ -15,7 +15,7 @@ use crate::interaction_fixture::{
     WAIT, apply_move, console_text, last_tick, module_text, wait_for, wait_for_tick,
 };
 use crate::output::OutputViews;
-use crate::supervisor::{Consoles, SupervisorHandle};
+use crate::supervisor::{Consoles, ProcessId, SupervisorHandle};
 
 /// The fixture process indexes the ingestion proof needs.
 #[derive(Debug, Clone, Copy)]
@@ -37,16 +37,16 @@ pub(crate) fn prove_ingest(
 ) -> Result<()> {
     let ingest_snapshot = wait_for(supervisor, WAIT, |_| true)?;
     let focused_live = consoles
-        .view(
-            indexes.focused as u32,
+        .view_process(
+            ingest_snapshot.processes[indexes.focused].process_id,
             ingest_snapshot.processes[indexes.focused]
                 .current_run
                 .expect("the restarted Process keeps a live Run"),
         )
         .expect("the restarted Process has a live console");
     let mute_live = consoles
-        .view(
-            indexes.mute as u32,
+        .view_process(
+            ingest_snapshot.processes[indexes.mute].process_id,
             ingest_snapshot.processes[indexes.mute]
                 .current_run
                 .expect("the restarted Process keeps a live Run"),
@@ -56,8 +56,9 @@ pub(crate) fn prove_ingest(
     let base_mute = wait_for_tick(&mute_live, "tick-", 2)?;
     // The pipe module retains chunks from earlier Runs, whose counters sit
     // above the restarted counter, so progress is proven at the tail.
-    wait_for_module_tick(outputs, indexes.piped, "pipe-tick-", 2)?;
-    let base_piped = last_tick(&module_text(outputs, indexes.piped), "pipe-tick-").unwrap_or(0);
+    let piped_id = ingest_snapshot.processes[indexes.piped].process_id;
+    wait_for_module_tick(outputs, piped_id, "pipe-tick-", 2)?;
+    let base_piped = last_tick(&module_text(outputs, piped_id), "pipe-tick-").unwrap_or(0);
     let moves = [
         SelectionMove::Down,
         SelectionMove::Down,
@@ -99,7 +100,7 @@ pub(crate) fn prove_ingest(
         "selection moves stopped ingestion into the muted terminal"
     );
     assert!(
-        last_tick(&module_text(outputs, indexes.piped), "pipe-tick-").unwrap_or(0) > base_piped,
+        last_tick(&module_text(outputs, piped_id), "pipe-tick-").unwrap_or(0) > base_piped,
         "selection moves stopped ingestion into the pipe module"
     );
     Ok(())
@@ -107,7 +108,7 @@ pub(crate) fn prove_ingest(
 
 fn wait_for_module_tick(
     outputs: &OutputViews,
-    piped: usize,
+    piped: ProcessId,
     prefix: &str,
     minimum: u32,
 ) -> Result<u32> {

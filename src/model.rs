@@ -4,6 +4,7 @@
 //! [`EffectiveProject`]. The Supervisor consumes that validated Project and
 //! never sees YAML text or diagnostics.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -192,27 +193,37 @@ pub enum ProjectError {
 
 /// The validated set of Processes for one Stackhand session. Process order
 /// is configuration order and stays stable for the session.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct EffectiveProject {
     processes: Vec<ProcessSpec>,
+    positions: HashMap<String, usize>,
+    /// Each inner list follows its Process's configured Dependency order.
+    dependency_indices: Vec<Vec<usize>>,
+}
+
+impl std::fmt::Debug for EffectiveProject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectiveProject")
+            .field("processes", &self.processes)
+            .finish()
+    }
 }
 
 impl EffectiveProject {
     /// Build one Project, rejecting duplicate Process names and invalid
     /// Dependency graphs before any Process can start.
     pub fn new(processes: Vec<ProcessSpec>) -> Result<Self, ProjectError> {
-        let mut seen = std::collections::HashSet::new();
-        for spec in &processes {
-            if !seen.insert(spec.name.as_str()) {
+        let mut positions = HashMap::with_capacity(processes.len());
+        for (index, spec) in processes.iter().enumerate() {
+            if positions.insert(spec.name.clone(), index).is_some() {
                 return Err(ProjectError::DuplicateName(spec.name.clone()));
             }
         }
-        let positions: std::collections::HashMap<&str, usize> = processes
-            .iter()
-            .enumerate()
-            .map(|(index, spec)| (spec.name.as_str(), index))
-            .collect();
+
+        let mut dependency_indices = Vec::with_capacity(processes.len());
         for spec in &processes {
+            let mut resolved = Vec::with_capacity(spec.dependencies.len());
             for dependency in &spec.dependencies {
                 let Some(&dependency_index) = positions.get(dependency.name.as_str()) else {
                     return Err(ProjectError::UnknownDependency {
@@ -236,20 +247,46 @@ impl EffectiveProject {
                         condition: dependency.condition.label().to_string(),
                     });
                 }
+                resolved.push(dependency_index);
             }
             if spec.readiness.is_some() && spec.kind == ProcessKind::OneShot {
                 return Err(ProjectError::ReadinessOnOneShot {
                     process: spec.name.clone(),
                 });
             }
+            dependency_indices.push(resolved);
         }
-        find_dependency_cycle(&processes, &positions).map_or(Ok(Self { processes }), |path| {
-            Err(ProjectError::DependencyCycle(path))
+
+        if let Some(path) = find_dependency_cycle(&processes, &dependency_indices) {
+            return Err(ProjectError::DependencyCycle(path));
+        }
+        Ok(Self {
+            processes,
+            positions,
+            dependency_indices,
         })
     }
 
     pub fn processes(&self) -> &[ProcessSpec] {
         &self.processes
+    }
+
+    /// Resolve a user-facing Process name to its stable session position.
+    pub(crate) fn process_index(&self, name: &str) -> Option<usize> {
+        self.positions.get(name).copied()
+    }
+
+    /// Iterate one Process's validated Dependencies in configuration order.
+    /// Each item keeps the configured name and condition for diagnostics and
+    /// adds the stable session position used by Project operations.
+    pub(crate) fn resolved_dependencies(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = (usize, &DependencySpec)> {
+        self.dependency_indices[index]
+            .iter()
+            .copied()
+            .zip(&self.processes[index].dependencies)
     }
 }
 
@@ -259,7 +296,7 @@ impl EffectiveProject {
 /// failures stay stable.
 fn find_dependency_cycle(
     processes: &[ProcessSpec],
-    positions: &std::collections::HashMap<&str, usize>,
+    dependency_indices: &[Vec<usize>],
 ) -> Option<Vec<String>> {
     // 0 = unvisited, 1 = on the current path, 2 = fully explored.
     let mut state = vec![0u8; processes.len()];
@@ -268,7 +305,7 @@ fn find_dependency_cycle(
     fn visit(
         index: usize,
         processes: &[ProcessSpec],
-        positions: &std::collections::HashMap<&str, usize>,
+        dependency_indices: &[Vec<usize>],
         state: &mut [u8],
         path: &mut Vec<usize>,
     ) -> Option<Vec<String>> {
@@ -290,9 +327,9 @@ fn find_dependency_cycle(
         }
         state[index] = 1;
         path.push(index);
-        for dependency in &processes[index].dependencies {
-            let next = positions[dependency.name.as_str()];
-            if let Some(cycle) = visit(next, processes, positions, state, path) {
+        for &dependency_index in &dependency_indices[index] {
+            if let Some(cycle) = visit(dependency_index, processes, dependency_indices, state, path)
+            {
                 return Some(cycle);
             }
         }
@@ -302,7 +339,7 @@ fn find_dependency_cycle(
     }
 
     for index in 0..processes.len() {
-        if let Some(cycle) = visit(index, processes, positions, &mut state, &mut path) {
+        if let Some(cycle) = visit(index, processes, dependency_indices, &mut state, &mut path) {
             return Some(cycle);
         }
     }
@@ -417,5 +454,22 @@ mod tests {
         ])
         .expect("shared dependencies are valid");
         assert_eq!(project.processes().len(), 3);
+    }
+
+    #[test]
+    fn resolved_dependencies_keep_configuration_order_and_public_names() {
+        let project = EffectiveProject::new(vec![
+            depending_on("api", &["cache", "db"]),
+            bare("db"),
+            bare("cache"),
+        ])
+        .expect("the graph is valid");
+
+        let dependencies = project
+            .resolved_dependencies(project.process_index("api").expect("api is configured"))
+            .map(|(index, dependency)| (index, dependency.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(dependencies, [(2, "cache"), (1, "db")]);
+        assert_eq!(project.processes()[0].name, "api");
     }
 }

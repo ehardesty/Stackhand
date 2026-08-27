@@ -15,7 +15,7 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
 use crate::supervisor::command::{Command, shell_program};
 use crate::supervisor::seam::{
-    ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
 };
 use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
 
@@ -45,7 +45,7 @@ pub enum Lifecycle {
     /// No current Run remains after a stop or exit.
     Stopped,
     /// A One-shot Run completed with exit code zero. Done survives like a
-    /// satisfied Dependency condition until a new Run completes.
+    /// satisfied Dependency condition until a new Run starts.
     Done,
 }
 
@@ -169,11 +169,6 @@ pub(super) struct Entry {
     /// Why Desired State Running has not produced a Run yet, as a bounded
     /// "dependency: condition" reason.
     pub(super) blocked: Option<String>,
-    /// Whether this Process's latest completed Run exited with code zero.
-    /// The latch persists across evaluations and while a new Run is active;
-    /// only a later Run completion replaces it (rerun semantics are Issue
-    /// #32's work).
-    pub(super) completed: bool,
     /// Present only while the current Run of a probed Service is alive and
     /// still awaiting its first passing attempt.
     pub(super) readiness: Option<ReadinessTracking>,
@@ -185,10 +180,6 @@ pub(super) struct Entry {
     pub(super) runs: VecDeque<RunSummary>,
     /// When the current Run began, in session milliseconds.
     pub(super) run_started_at_ms: Option<u64>,
-    /// Whether the user asked the current Run to stop before it completed.
-    pub(super) stop_intended: bool,
-    /// The natural exit code of the current Run, when it exited on its own.
-    pub(super) natural_exit_code: Option<i32>,
     /// What will start the next Run: the latest command that marked the
     /// Desired State Running, or a restart/rerun request pending cleanup.
     pub(super) pending_trigger: RunTrigger,
@@ -209,13 +200,10 @@ impl Entry {
             failure: None,
             metrics: None,
             blocked: None,
-            completed: false,
             readiness: None,
             cleanup_unconfirmed: false,
             runs: VecDeque::new(),
             run_started_at_ms: None,
-            stop_intended: false,
-            natural_exit_code: None,
             pending_trigger: RunTrigger::Dependency,
             run_trigger: RunTrigger::Dependency,
             root_pid: None,
@@ -226,7 +214,7 @@ impl Entry {
     /// through a confirmed cleanup. The caller must invoke it before
     /// clearing the Run's identity; the summary window keeps its older
     /// entries.
-    fn record_finished_run(&mut self, now_ms: u64) {
+    fn record_finished_run(&mut self, now_ms: u64, exit_code: Option<i32>, intentional_stop: bool) {
         let Some(started_at_ms) = self.run_started_at_ms.take() else {
             return;
         };
@@ -235,38 +223,31 @@ impl Entry {
         };
         let exit = if self.lifecycle == Lifecycle::Done {
             RunExitDisposition::Success
-        } else if self.stop_intended {
+        } else if intentional_stop {
             RunExitDisposition::Stopped
         } else {
-            RunExitDisposition::Failed {
-                code: self.natural_exit_code,
-            }
+            RunExitDisposition::Failed { code: exit_code }
         };
-        let failure = if self.lifecycle == Lifecycle::Done {
+        let failure = if self.lifecycle == Lifecycle::Done || intentional_stop {
             None
         } else {
             self.failure
                 .as_ref()
                 .map(|failure| failure.detail.clone())
-                .or_else(|| {
-                    self.natural_exit_code
-                        .map(|code| format!("exited with code {code}"))
-                })
+                .or_else(|| exit_code.map(|code| format!("exited with code {code}")))
         };
         self.runs.push_back(RunSummary {
             run_id: run_id.get(),
             started_at_ms,
             ended_at_ms: now_ms,
             exit,
-            intentional_stop: self.stop_intended,
+            intentional_stop,
             failure,
             trigger: self.run_trigger,
         });
         if self.runs.len() > RECENT_RUNS {
             self.runs.pop_front();
         }
-        self.stop_intended = false;
-        self.natural_exit_code = None;
     }
 }
 
@@ -322,12 +303,12 @@ impl Core {
         }
         match command {
             Command::Start(name) => {
-                if let Some(index) = self.named_index(&name) {
+                if let Some(index) = self.project.process_index(&name) {
                     self.start_at(index, RunTrigger::Manual);
                 }
             }
             Command::Stop(name) => {
-                if let Some(index) = self.named_index(&name) {
+                if let Some(index) = self.project.process_index(&name) {
                     self.stop_at(index);
                 }
             }
@@ -345,12 +326,12 @@ impl Core {
             }
             Command::Shutdown { deadline } => self.begin_shutdown(deadline),
             Command::Restart(name) => {
-                if let Some(index) = self.named_index(&name) {
+                if let Some(index) = self.project.process_index(&name) {
                     self.restart_at(index, RunTrigger::Restart);
                 }
             }
             Command::Rerun(name) => {
-                if let Some(index) = self.named_index(&name) {
+                if let Some(index) = self.project.process_index(&name) {
                     self.rerun_at(index);
                 }
             }
@@ -366,14 +347,6 @@ impl Core {
             return;
         }
         self.restart_at(index, RunTrigger::Rerun);
-    }
-
-    /// Resolve one configured Process name to its stable session position.
-    pub(super) fn named_index(&self, name: &str) -> Option<usize> {
-        self.project
-            .processes()
-            .iter()
-            .position(|spec| spec.name == name)
     }
 
     pub(super) fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
@@ -430,7 +403,6 @@ impl Core {
         entry.desired = DesiredState::Stopped;
         entry.lifecycle = Lifecycle::Stopping;
         entry.blocked = None;
-        entry.stop_intended = true;
         // Pending readiness belongs to the ending Run; its tracking ends
         // here and any in-flight attempt's result is rejected by the gate.
         entry.readiness = None;
@@ -448,22 +420,19 @@ impl Core {
         }
         // While a cleanup retry is held, only the confirming completion of
         // the held Run is meaningful; stale reports for it stay stale.
-        if self.entries[index].cleanup_unconfirmed
-            && !matches!(event, SeamEvent::ShutdownComplete { .. })
-        {
+        if self.entries[index].cleanup_unconfirmed && !matches!(event, SeamEvent::Finished(_)) {
             return;
         }
         match &event {
-            SeamEvent::ShutdownComplete {
-                confirmed,
-                detail,
-                remaining_pids,
-                ..
-            } => self.finish_shutdown_run(
+            SeamEvent::Finished(finished) => self.finish_shutdown_run(
                 index,
-                *confirmed,
-                detail.clone(),
-                remaining_pids.iter().map(|pid| pid.get()).collect(),
+                finished.cleanup_confirmed,
+                finished.detail.clone(),
+                finished
+                    .remaining_pids
+                    .iter()
+                    .map(|pid| pid.get())
+                    .collect(),
             ),
             SeamEvent::Failed { detail, .. } if self.shutdown_in_progress() => {
                 self.finish_shutdown_run(index, false, Some(detail.clone()), Vec::new());
@@ -522,68 +491,14 @@ impl Core {
                 }
                 self.evaluate();
             }
-            SeamEvent::Exited { code, .. } => {
-                // An in-flight intentional stop finalizes through its own
-                // ShutdownComplete; the observed code never becomes a
-                // completion or a failure there.
-                let stopping_intentionally = self.entries[index].lifecycle == Lifecycle::Stopping;
-                if stopping_intentionally {
-                    // The intentional stop's own completion report finalizes
-                    // the Run; the observed code is not a result there.
-                } else {
-                    // Record the natural exit before projecting it: the code
-                    // becomes the finished-Run summary's disposition.
-                    self.entries[index].natural_exit_code = code;
-                    match self.project.processes()[index].kind {
-                        ProcessKind::OneShot => self.complete_one_shot(index, code),
-                        ProcessKind::Service => self.observe_service_exit(index, code),
-                    }
-                }
-                self.evaluate();
-            }
-            SeamEvent::ShutdownComplete {
-                confirmed, detail, ..
-            } => {
-                let now_ms = self.now_ms();
-                let entry = &mut self.entries[index];
-                if !confirmed {
-                    // Hold the Run identity: the cleanup is unconfirmed, so
-                    // a manual Stop can retry it and no replacement Run
-                    // may start until the retry confirms.
-                    entry.cleanup_unconfirmed = true;
-                    entry.failure = Some(FailureSummary {
-                        kind: FailureKind::Shutdown,
-                        detail: detail
-                            .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
-                    });
-                    if entry.lifecycle != Lifecycle::Done {
-                        entry.lifecycle = Lifecycle::Stopped;
-                    }
-                    entry.metrics = None;
-                    entry.readiness = None;
-                    self.evaluate();
-                    return;
-                }
-                entry.record_finished_run(now_ms);
-                entry.current_run = None;
-                entry.root_pid = None;
-                entry.metrics = None;
-                entry.readiness = None;
-                entry.cleanup_unconfirmed = false;
-                // A One-shot that completed successfully stays Done instead
-                // of falling back to Stopped with its cleanup result.
-                if entry.lifecycle != Lifecycle::Done {
-                    entry.lifecycle = Lifecycle::Stopped;
-                }
-                self.evaluate();
-            }
+            SeamEvent::Finished(finished) => self.apply_finished_run(index, finished),
             SeamEvent::Failed { kind, detail, .. } => {
                 let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
                 entry.failure = Some(FailureSummary { kind, detail });
                 // A failed adapter report ends the Run identity and reverts
                 // the Process to stopped so it can be started again.
-                entry.record_finished_run(now_ms);
+                entry.record_finished_run(now_ms, None, false);
                 entry.current_run = None;
                 entry.root_pid = None;
                 entry.desired = DesiredState::Stopped;
@@ -620,7 +535,54 @@ impl Core {
         }
     }
 
-    /// Project one One-shot Run exit into its terminal lifecycle state.
+    /// Apply one authoritative finished-Run fact. Natural results are
+    /// classified before cleanup releases the identity, so Done, failure,
+    /// held cleanup, recent history, and replacement scheduling change in
+    /// one serialized Supervisor turn.
+    fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
+        if !finished.intentional_stop {
+            match self.project.processes()[index].kind {
+                ProcessKind::OneShot => self.complete_one_shot(index, finished.exit_code),
+                ProcessKind::Service => self.observe_service_exit(index, finished.exit_code),
+            }
+        }
+
+        let now_ms = self.now_ms();
+        let entry = &mut self.entries[index];
+        if !finished.cleanup_confirmed {
+            // Hold the Run identity. A later Stop retries the same adapter
+            // owner; no replacement Run can start before confirmation.
+            entry.cleanup_unconfirmed = true;
+            entry.failure = Some(FailureSummary {
+                kind: FailureKind::Shutdown,
+                detail: finished
+                    .detail
+                    .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
+            });
+            if entry.lifecycle != Lifecycle::Done {
+                entry.lifecycle = Lifecycle::Stopped;
+            }
+            entry.metrics = None;
+            entry.readiness = None;
+            self.evaluate();
+            return;
+        }
+
+        entry.record_finished_run(now_ms, finished.exit_code, finished.intentional_stop);
+        entry.current_run = None;
+        entry.root_pid = None;
+        entry.metrics = None;
+        entry.readiness = None;
+        entry.cleanup_unconfirmed = false;
+        // A successful One-shot stays Done. Every other finished Run settles
+        // at Stopped after its result has been recorded.
+        if entry.lifecycle != Lifecycle::Done {
+            entry.lifecycle = Lifecycle::Stopped;
+        }
+        self.evaluate();
+    }
+
+    /// Project one One-shot Run result into its terminal lifecycle state.
     /// Exit code zero completes the One-shot; every other exit fails it.
     /// Either way Desired State reverts to Stopped: restarting is manual
     /// until automatic restart policy work lands.
@@ -629,12 +591,10 @@ impl Core {
         match code {
             Some(0) => {
                 entry.lifecycle = Lifecycle::Done;
-                entry.completed = true;
                 entry.failure = None;
             }
             other => {
                 entry.lifecycle = Lifecycle::Running;
-                entry.completed = false;
                 entry.failure = Some(FailureSummary {
                     kind: FailureKind::ProcessExit,
                     detail: match other {
@@ -648,9 +608,8 @@ impl Core {
         entry.blocked = None;
     }
 
-    /// Record a Service's unexpected natural exit. The Run identity stays
-    /// occupied until bounded shutdown reports ShutdownComplete, which then
-    /// shows the Process as Stopped with this failure. Desired State reverts
+    /// Record a Service's unexpected natural result. The Run identity stays
+    /// occupied until the finished fact confirms cleanup. Desired State reverts
     /// to Stopped so the Supervisor never silently crash-loops; automatic
     /// restart policy is later milestone work.
     fn observe_service_exit(&mut self, index: usize, code: Option<i32>) {
@@ -764,6 +723,7 @@ impl Core {
             .iter()
             .zip(&self.entries)
             .map(|(spec, entry)| ProcessSnapshot {
+                process_id: entry.process_id,
                 name: spec.name.clone(),
                 kind: spec.kind,
                 enabled: matches!(spec.enabled, Enabled::Yes),

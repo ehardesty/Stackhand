@@ -1,0 +1,60 @@
+version: 1
+
+processes:
+  # The TCP port opens after three seconds. Until then, the selected header
+  # shows failed readiness attempts.
+  - name: tcp-listener
+    kind: service
+    terminal: pipe
+    readiness:
+      tcp:
+        host: 127.0.0.1
+        port: 43123
+      interval_ms: 500
+      timeout_ms: 500
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - |
+          printf "TCP listener delayed for 3 seconds\n"
+          sleep 3
+          printf "TCP listener ready\n"
+          exec nc -lk 127.0.0.1 43123
+
+  # The helper uses /bin/sh and the macOS nc command to return HTTP 200.
+  - name: http-listener
+    kind: service
+    terminal: pipe
+    readiness:
+      http:
+        url: http://127.0.0.1:43124/health
+      interval_ms: 500
+      timeout_ms: 500
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - |
+          printf "HTTP listener delayed for 5 seconds\n"
+          sleep 5
+          exec ./scripts/http-ok.sh 43124
+
+  # This Process remains Waiting until both probes pass.
+  - name: ready-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: tcp-listener
+        condition: ready
+      - name: http-listener
+        condition: ready
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - |
+          while :; do
+            printf "both listeners are ready\n"
+            sleep 2
+          done

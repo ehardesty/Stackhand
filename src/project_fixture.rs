@@ -218,16 +218,14 @@ fn prove_slice(
     // Output flows to each Process console without entering the control
     // plane; every proof must appear in its own Process's console.
     for (name, needle) in CONSOLE_PROOFS {
-        let index = snapshot
-            .processes
-            .iter()
-            .position(|process| process.name == *name)
+        let process = snapshot
+            .named(name)
             .unwrap_or_else(|| panic!("Process {name} is part of the fixture contract"));
-        let run_id = snapshot.processes[index]
+        let run_id = process
             .current_run
             .unwrap_or_else(|| panic!("Process {name} has an active Run"));
         let view = consoles
-            .view(index as u32, run_id)
+            .view_process(process.process_id, run_id)
             .ok_or_else(|| anyhow!("no live console view for {name}"))?;
         wait_for_console_text(view, needle)?;
     }
@@ -237,27 +235,21 @@ fn prove_slice(
     // bounded per-Process module with stream identity, under the Run
     // marker that divides attempts.
     for (name, needle, stream) in PIPE_PROOFS {
-        let index = snapshot
-            .processes
-            .iter()
-            .position(|process| process.name == *name)
+        let process = snapshot
+            .named(name)
             .unwrap_or_else(|| panic!("Process {name} is part of the fixture contract"));
         let module = outputs
-            .for_process(index as u32)
+            .for_process_id(process.process_id)
             .ok_or_else(|| anyhow!("no retained output module for {name}"))?;
-        let run_id = snapshot.processes[index]
+        let run_id = process
             .current_run
             .unwrap_or_else(|| panic!("Process {name} has an active Run"));
         wait_for_retained_text(&module, *stream, needle, Some(run_id))?;
     }
     println!("fixture-pipe-output-ok");
-    let piped_index = snapshot
-        .processes
-        .iter()
-        .position(|process| process.name == "piped")
-        .expect("the fixture defines piped");
+    let piped = snapshot.named("piped").expect("the fixture defines piped");
     let piped_output = outputs
-        .for_process(piped_index as u32)
+        .for_process_id(piped.process_id)
         .expect("piped has retained output")
         .snapshot()
         .chunks
@@ -346,18 +338,16 @@ fn wait_for(
     limit: Duration,
     done: impl Fn(&crate::supervisor::ProjectSnapshot) -> bool,
 ) -> Result<crate::supervisor::ProjectSnapshot> {
-    let deadline = Instant::now() + limit;
-    loop {
-        match supervisor.snapshot() {
-            Some(snapshot) if done(&snapshot) => return Ok(snapshot),
-            Some(_) => {}
-            None => bail!("the Supervisor stopped before startup completed"),
-        }
-        if Instant::now() >= deadline {
-            bail!("startup did not finish within its bound");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    crate::sync_fixture::wait_for_snapshot(
+        supervisor,
+        crate::sync_fixture::SnapshotWait {
+            timeout: limit,
+            poll_interval: Duration::from_millis(25),
+            stopped_message: "the Supervisor stopped before startup completed",
+            timeout_message: "startup did not finish within its bound",
+        },
+        done,
+    )
 }
 
 /// Flatten a terminal snapshot into plain text for marker assertions.

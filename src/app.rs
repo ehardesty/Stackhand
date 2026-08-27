@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
-use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
+use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll};
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
 use crate::supervisor::Lifecycle;
 use crate::supervisor::{
-    Command, ConsoleView, Consoles, ProcessSnapshot, ProjectSnapshot, SupervisorHandle,
+    Command, ConsoleView, Consoles, ProcessSnapshot, ProjectShutdownSnapshot, ProjectSnapshot,
+    SupervisorHandle,
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
@@ -31,33 +32,25 @@ pub fn run_project(config_path: &Path) -> Result<()> {
     let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
     supervisor.command(Command::StartAutostart);
 
-    // The terminal restores when this scope ends, before the bounded
-    // shutdown wait, so the user sees shutdown progress instead of a frozen
-    // screen.
-    let loop_result = {
+    // The TUI remains active while shutdown progresses. This scope restores
+    // the outer terminal before the already-observed result reaches the CLI.
+    let shutdown = {
         let mut outer = OuterTerminal::enter()?;
         run_event_loop(&mut outer, &supervisor, &consoles, &outputs)
-    };
-    loop_result?;
-    shutdown_project(supervisor)
+    }?;
+    finish_project(supervisor, shutdown)
 }
 
-/// Stop every desired-Running Process and wait, within one shared deadline,
-/// for all current Runs to finish their existing bounded shutdown.
-fn shutdown_project(supervisor: SupervisorHandle) -> Result<()> {
+/// Stop the Supervisor task and report the immutable result already observed
+/// by the interactive quit operation. This does not start or wait for a
+/// second Project shutdown.
+fn finish_project(supervisor: SupervisorHandle, result: ProjectShutdownSnapshot) -> Result<()> {
     eprintln!("Stackhand is shutting down the Project…");
-    let deadline = Instant::now() + PROJECT_SHUTDOWN_WAIT;
-    supervisor.command(Command::Shutdown { deadline });
-    let result = loop {
-        let snapshot = supervisor
-            .snapshot()
-            .ok_or_else(|| anyhow!("the Supervisor stopped during Project shutdown"))?;
-        if let Some(result) = snapshot.shutdown.filter(|result| result.complete) {
-            break result;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
     supervisor.stop_task();
+    report_shutdown_result(&result)
+}
+
+fn report_shutdown_result(result: &ProjectShutdownSnapshot) -> Result<()> {
     if result.failures.is_empty() {
         eprintln!("Project shutdown complete.");
         return Ok(());
@@ -85,7 +78,7 @@ fn run_event_loop(
     supervisor: &SupervisorHandle,
     consoles: &Consoles,
     outputs: &OutputViews,
-) -> Result<()> {
+) -> Result<ProjectShutdownSnapshot> {
     let mut console = ConsoleInteraction::default();
     let mut selected: usize = 0;
     let mut pending_resize = PendingResize::default();
@@ -112,12 +105,9 @@ fn run_event_loop(
             bail!("this Project has no Processes");
         }
         if shutting_down
-            && snapshot
-                .shutdown
-                .as_ref()
-                .is_some_and(|result| result.complete)
+            && let Some(result) = snapshot.shutdown.as_ref().filter(|result| result.complete)
         {
-            return Ok(());
+            return Ok(result.clone());
         }
         if last_project_snapshot.as_ref().is_none_or(|previous| {
             previous.processes != snapshot.processes
@@ -128,15 +118,7 @@ fn run_event_loop(
         last_project_snapshot = Some(snapshot.clone());
         selected = selected.min(snapshot.processes.len() - 1);
         pipe_scroll.resize(snapshot.processes.len(), None);
-        for request in console.take_selection_moves() {
-            // Selection is UI state only: movement clamps at the list ends
-            // and never sends a command to the Supervisor.
-            selected = match request {
-                SelectionMove::Up => selected.saturating_sub(1),
-                SelectionMove::Down => (selected + 1).min(snapshot.processes.len() - 1),
-            };
-            // The warning describes the previously selected Process.
-            console.clear_pane_warning();
+        if console.apply_selection_moves(&mut selected, snapshot.processes.len()) {
             dirty = true;
         }
         for request in console.take_lifecycle_commands() {
@@ -160,7 +142,7 @@ fn run_event_loop(
             });
         }
         let selected_process = &snapshot.processes[selected];
-        let pane = selected_pane(consoles, outputs, selected, selected_process);
+        let pane = selected_pane(consoles, outputs, selected_process);
         match &pane {
             SelectedPane::Terminal(view) => drain_console_events(&mut console, view, &mut dirty),
             SelectedPane::Pipe(retained) => {
@@ -371,7 +353,6 @@ enum SelectedPane {
 fn selected_pane(
     consoles: &Consoles,
     outputs: &OutputViews,
-    selected: usize,
     process: &ProcessSnapshot,
 ) -> SelectedPane {
     match process.terminal_mode {
@@ -379,12 +360,12 @@ fn selected_pane(
             let Some(run_id) = process.current_run else {
                 return SelectedPane::Empty;
             };
-            match consoles.view(selected as u32, run_id) {
+            match consoles.view_process(process.process_id, run_id) {
                 Some(view) => SelectedPane::Terminal(view),
                 None => SelectedPane::Empty,
             }
         }
-        crate::model::TerminalMode::Pipe => match outputs.for_process(selected as u32) {
+        crate::model::TerminalMode::Pipe => match outputs.for_process_id(process.process_id) {
             Some(module) => SelectedPane::Pipe(module.snapshot()),
             None => SelectedPane::Empty,
         },
@@ -610,6 +591,25 @@ fn is_quit(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_result_keeps_failures_and_remaining_pids() {
+        let result = ProjectShutdownSnapshot {
+            complete: true,
+            timed_out: true,
+            failures: vec![crate::supervisor::ProcessShutdownFailure {
+                process: "api".to_string(),
+                detail: "Project shutdown deadline expired".to_string(),
+                remaining_pids: vec![41, 42],
+            }],
+        };
+
+        let error = report_shutdown_result(&result).expect_err("cleanup failure is reported");
+        assert_eq!(
+            error.to_string(),
+            "Project shutdown did not finish cleanly: api: Project shutdown deadline expired (remaining PIDs: [41, 42])"
+        );
+    }
 
     #[test]
     fn metric_and_age_labels_use_compact_units() {

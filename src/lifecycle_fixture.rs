@@ -34,8 +34,8 @@ pub(crate) fn prove_lifecycle(
     } = processes;
     let focused_snapshot = wait_for(supervisor, WAIT, |_| true)?;
     let focused_view = consoles
-        .view(
-            focused as u32,
+        .view_process(
+            focused_snapshot.processes[focused].process_id,
             focused_snapshot.processes[focused]
                 .current_run
                 .expect("the focused Process keeps a live Run"),
@@ -103,7 +103,7 @@ pub(crate) fn prove_lifecycle(
         .current_run
         .expect("the restarted Process has a live Run");
     let focused_live = consoles
-        .view(focused as u32, focused_run)
+        .view_process(live_snapshot.processes[focused].process_id, focused_run)
         .expect("the restarted Process has a live console");
     focused_live.with(|session| {
         console.route_pane_key(
@@ -158,7 +158,7 @@ pub(crate) fn prove_lifecycle(
         .current_run
         .expect("the muted Process has a live Run");
     let mute_live = consoles
-        .view(mute as u32, mute_run)
+        .view_process(live_snapshot.processes[mute].process_id, mute_run)
         .expect("the muted Process has a live console");
     mute_live.with(|session| {
         console.route_pane_key(
@@ -277,19 +277,31 @@ pub(crate) fn prove_metrics_degradation(
             .current_run
             .is_some_and(|run_id| run_id > previous_run)
             && process.metrics.is_none()
+            && process.root_pid.is_some_and(|pid| pid > 0)
+            && process
+                .run_started_at_ms
+                .is_some_and(|started_at| snapshot.now_ms >= started_at)
     })?;
+    let process = &snapshot.processes[focused];
     assert!(
-        snapshot.processes[focused]
-            .root_pid
-            .is_some_and(|pid| pid > 0),
+        process
+            .current_run
+            .is_some_and(|run_id| run_id > previous_run),
+        "the restart opens a new Run"
+    );
+    assert_eq!(
+        process.metrics, None,
+        "the fresh Run is readable before its first metrics sample"
+    );
+    assert!(
+        process.root_pid.is_some_and(|pid| pid > 0),
         "the active Run's observed PID projects into the snapshot"
     );
+    let started_at = process
+        .run_started_at_ms
+        .expect("an active Run carries its start stamp");
     assert!(
-        snapshot.processes[focused].run_started_at_ms.is_some(),
-        "an active Run carries its start stamp"
-    );
-    assert!(
-        snapshot.now_ms >= snapshot.processes[focused].run_started_at_ms.unwrap_or(0),
+        snapshot.now_ms >= started_at,
         "the session time never trails the Run's start stamp"
     );
 
@@ -475,7 +487,7 @@ pub(crate) fn prove_rerun(
     // The retained output still carries a marker for each attempt within
     // its bounds.
     let retained = outputs
-        .for_process(oneoff as u32)
+        .for_process_id(oneoff_snapshot.processes[oneoff].process_id)
         .expect("the One-shot has a retained output module")
         .snapshot();
     let markers: Vec<u64> = retained

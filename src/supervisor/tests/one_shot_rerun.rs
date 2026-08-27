@@ -32,29 +32,22 @@ fn local_spawned(process_id: u32, run: u64) -> SeamEvent {
     }
 }
 
-fn local_exited(process_id: u32, run: u64, code: Option<i32>) -> SeamEvent {
-    SeamEvent::Exited {
+fn local_finished(process_id: u32, run: u64, code: Option<i32>) -> SeamEvent {
+    SeamEvent::Finished(FinishedRun {
         process_id: ProcessId::new(process_id),
         run_id: RunId::new(run),
-        code,
-    }
-}
-
-fn local_shutdown_complete(process_id: u32, run: u64, confirmed: bool) -> SeamEvent {
-    SeamEvent::ShutdownComplete {
-        process_id: ProcessId::new(process_id),
-        run_id: RunId::new(run),
-        confirmed,
+        exit_code: code,
+        intentional_stop: false,
+        cleanup_confirmed: true,
         detail: None,
         remaining_pids: Vec::new(),
-    }
+    })
 }
 
 /// Bring the One-shot to a successful completion and release the dependent.
 fn complete_run_1(h: &mut Harness) {
     h.event(local_spawned(1, 1));
-    h.event(local_exited(1, 1, Some(0)));
-    h.event(local_shutdown_complete(1, 1, true));
+    h.event(local_finished(1, 1, Some(0)));
     assert_eq!(h.process("setup").lifecycle, Lifecycle::Done);
     assert_eq!(h.process("api").current_run, Some(1));
 }
@@ -106,8 +99,7 @@ fn a_rerun_receives_the_next_run_id_and_blocks_new_dependents() {
 
     // Success satisfies the dependents again.
     h.event(local_spawned(1, 2));
-    h.event(local_exited(1, 2, Some(0)));
-    h.event(local_shutdown_complete(1, 2, true));
+    h.event(local_finished(1, 2, Some(0)));
     let worker = h.process("worker");
     assert_eq!(worker.current_run, Some(1));
     assert_eq!(worker.lifecycle, Lifecycle::Starting);
@@ -123,7 +115,7 @@ fn a_failed_rerun_keeps_a_structured_blocked_reason() {
     h.event(local_spawned(1, 2));
 
     h.command(Command::Start("worker".into()));
-    h.event(local_exited(1, 2, Some(3)));
+    h.event(local_finished(1, 2, Some(3)));
     let setup = h.process("setup");
     assert_eq!(
         setup.failure.expect("the failure is visible").detail,
@@ -148,8 +140,7 @@ fn late_events_from_the_prior_attempt_are_ignored() {
     // Every old event for the finished first attempt is dropped by the
     // Run-identity gate while the second attempt is active.
     h.event(local_spawned(1, 1));
-    h.event(local_exited(1, 1, Some(0)));
-    h.event(local_shutdown_complete(1, 1, true));
+    h.event(local_finished(1, 1, Some(0)));
     let setup = h.process("setup");
     assert_eq!(setup.current_run, Some(2));
     assert_eq!(setup.lifecycle, Lifecycle::Starting);
@@ -157,8 +148,7 @@ fn late_events_from_the_prior_attempt_are_ignored() {
 
     // The real attempt still completes normally.
     h.event(local_spawned(1, 2));
-    h.event(local_exited(1, 2, Some(0)));
-    h.event(local_shutdown_complete(1, 2, true));
+    h.event(local_finished(1, 2, Some(0)));
     assert_eq!(h.process("setup").lifecycle, Lifecycle::Done);
 }
 
@@ -173,16 +163,12 @@ fn a_bounded_recent_run_summary_records_attempts() {
     h.command(Command::Rerun("setup".into()));
     h.event(local_spawned(1, 2));
     h.command(Command::Stop("setup".into()));
-    h.event(local_exited(1, 2, Some(0)));
-    h.event(local_shutdown_complete(1, 1, true)); // stale identity: ignored
-    h.event(local_shutdown_complete(1, 2, true));
     h.advance_and_poll(std::time::Duration::from_secs(1));
 
     // A failed attempt records its exit code.
     h.command(Command::Rerun("setup".into()));
     h.event(local_spawned(1, 3));
-    h.event(local_exited(1, 3, Some(5)));
-    h.event(local_shutdown_complete(1, 3, true));
+    h.event(local_finished(1, 3, Some(5)));
 
     let setup = h.process("setup");
     let recent = &setup.recent_runs;
@@ -224,8 +210,7 @@ fn a_bounded_recent_run_summary_records_attempts() {
     for attempt in 4..=(RECENT_RUNS + 3) as u64 {
         h.command(Command::Rerun("setup".into()));
         h.event(local_spawned(1, attempt));
-        h.event(local_exited(1, attempt, Some(0)));
-        h.event(local_shutdown_complete(1, attempt, true));
+        h.event(local_finished(1, attempt, Some(0)));
     }
     let recent = &h.process("setup").recent_runs;
     assert_eq!(recent.len(), RECENT_RUNS);

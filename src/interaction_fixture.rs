@@ -78,13 +78,19 @@ fn prove(
     let mut console = ConsoleInteraction::default();
     let mut pipe_scroll = vec![None; snapshot.processes.len()];
     let focused_view = consoles
-        .view(focused as u32, run_of(&snapshot.processes[focused]))
+        .view_process(
+            snapshot.processes[focused].process_id,
+            run_of(&snapshot.processes[focused]),
+        )
         .ok_or_else(|| anyhow!("no live console view for focused"))?;
     let mute_view = consoles
-        .view(mute as u32, run_of(&snapshot.processes[mute]))
+        .view_process(
+            snapshot.processes[mute].process_id,
+            run_of(&snapshot.processes[mute]),
+        )
         .ok_or_else(|| anyhow!("no live console view for mute"))?;
     outputs
-        .for_process(piped as u32)
+        .for_process_id(snapshot.processes[piped].process_id)
         .ok_or_else(|| anyhow!("no retained output module for piped"))?;
 
     // Both terminals are live: their tick counters are climbing in the
@@ -520,13 +526,7 @@ pub(crate) fn apply_move(
         *selected,
         direction,
     );
-    for request in console.take_selection_moves() {
-        *selected = match request {
-            SelectionMove::Down => (*selected + 1).min(snapshot.processes.len() - 1),
-            SelectionMove::Up => selected.saturating_sub(1),
-        };
-        console.clear_pane_warning();
-    }
+    console.apply_selection_moves(selected, snapshot.processes.len());
 }
 
 /// Send one selection move through the production pane key seam, from
@@ -555,7 +555,7 @@ fn move_selection_key(
         let live = matches!(process.lifecycle, Lifecycle::Starting | Lifecycle::Running)
             .then(|| process.current_run)
             .flatten()
-            .and_then(|run_id| consoles.view(selected as u32, run_id));
+            .and_then(|run_id| consoles.view_process(process.process_id, run_id));
         // Esc first: a scroll-mode pane lands in the command UI, and the
         // press is a no-op anywhere else, so the leader below reaches the
         // command UI from every mode.
@@ -594,7 +594,7 @@ fn move_selection_key(
         }
     } else {
         outputs
-            .for_process(selected as u32)
+            .for_process_id(process.process_id)
             .expect("the fixture's pipe Process has a module");
         console.route_pane_key(
             ConsolePaneKind::Pipe,
@@ -660,23 +660,24 @@ pub(crate) fn wait_for(
     limit: Duration,
     done: impl Fn(&crate::supervisor::ProjectSnapshot) -> bool,
 ) -> Result<crate::supervisor::ProjectSnapshot> {
-    let deadline = Instant::now() + limit;
-    loop {
-        match supervisor.snapshot() {
-            Some(snapshot) if done(&snapshot) => return Ok(snapshot),
-            Some(_) => {}
-            None => bail!("the Supervisor stopped before the fixture condition was met"),
-        }
-        if Instant::now() >= deadline {
-            bail!("the fixture condition was not met within its bound");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    crate::sync_fixture::wait_for_snapshot(
+        supervisor,
+        crate::sync_fixture::SnapshotWait {
+            timeout: limit,
+            poll_interval: Duration::from_millis(25),
+            stopped_message: "the Supervisor stopped before the fixture condition was met",
+            timeout_message: "the fixture condition was not met within its bound",
+        },
+        done,
+    )
 }
 
-pub(crate) fn module_text(outputs: &crate::output::OutputViews, index: usize) -> String {
+pub(crate) fn module_text(
+    outputs: &crate::output::OutputViews,
+    process_id: crate::supervisor::ProcessId,
+) -> String {
     let module = outputs
-        .for_process(index as u32)
+        .for_process_id(process_id)
         .expect("the fixture defines the pipe Process");
     module
         .snapshot()

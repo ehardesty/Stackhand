@@ -17,9 +17,57 @@ pub enum SelectionMove {
     Down,
 }
 
-pub use crate::lifecycle::LifecycleCommand;
-use crate::lifecycle::{LifecycleQueue, lifecycle_request_for};
 pub use crate::pipe_scroll::PipeScroll;
+
+/// One requested lifecycle command for the currently selected Process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleCommand {
+    Start,
+    Stop,
+    Restart,
+}
+
+fn lifecycle_request_for(c: char) -> Option<LifecycleCommand> {
+    match c {
+        's' => Some(LifecycleCommand::Start),
+        'x' => Some(LifecycleCommand::Stop),
+        'r' => Some(LifecycleCommand::Restart),
+        _ => None,
+    }
+}
+
+/// A key meaning shared by terminal and read-only console panes. The pane
+/// handlers keep terminal effects and pipe-view effects separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleCommand {
+    MoveSelection(SelectionMove),
+    ScrollPage(isize),
+    Follow,
+    Lifecycle(LifecycleCommand),
+    EnterSelection,
+    Escape,
+}
+
+fn console_command(mode: ConsoleViewMode, code: KeyCode) -> Option<ConsoleCommand> {
+    if !matches!(mode, ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll) {
+        return None;
+    }
+    match code {
+        KeyCode::Up | KeyCode::Char('k') if mode == ConsoleViewMode::AppCommand => {
+            Some(ConsoleCommand::MoveSelection(SelectionMove::Up))
+        }
+        KeyCode::Down | KeyCode::Char('j') if mode == ConsoleViewMode::AppCommand => {
+            Some(ConsoleCommand::MoveSelection(SelectionMove::Down))
+        }
+        KeyCode::PageUp => Some(ConsoleCommand::ScrollPage(-1)),
+        KeyCode::PageDown => Some(ConsoleCommand::ScrollPage(1)),
+        KeyCode::Char('f') => Some(ConsoleCommand::Follow),
+        KeyCode::Char('v') => Some(ConsoleCommand::EnterSelection),
+        KeyCode::Char(c) => lifecycle_request_for(c).map(ConsoleCommand::Lifecycle),
+        KeyCode::Esc => Some(ConsoleCommand::Escape),
+        _ => None,
+    }
+}
 
 pub(crate) struct ConsoleInteraction {
     view: ConsoleViewState,
@@ -27,7 +75,7 @@ pub(crate) struct ConsoleInteraction {
     paste_requests: Vec<PasteRequest>,
     copy_requests: Vec<CopyRequest>,
     selection_requests: Vec<SelectionMove>,
-    lifecycle: LifecycleQueue,
+    lifecycle_requests: Vec<LifecycleCommand>,
     selection_clock: Instant,
 }
 
@@ -39,7 +87,7 @@ impl Default for ConsoleInteraction {
             paste_requests: Vec::new(),
             copy_requests: Vec::new(),
             selection_requests: Vec::new(),
-            lifecycle: LifecycleQueue::new(),
+            lifecycle_requests: Vec::new(),
             selection_clock: Instant::now(),
         }
     }
@@ -92,10 +140,29 @@ impl ConsoleInteraction {
         std::mem::take(&mut self.selection_requests)
     }
 
+    /// Apply every queued Process-list move to application selection state.
+    /// Movement clamps to Project bounds. Per-Process scroll state is not
+    /// changed, and pane warnings are cleared after each handled move.
+    pub fn apply_selection_moves(&mut self, selected: &mut usize, process_count: usize) -> bool {
+        if process_count == 0 {
+            return false;
+        }
+        *selected = (*selected).min(process_count - 1);
+        let requests = self.take_selection_moves();
+        for request in &requests {
+            *selected = match request {
+                SelectionMove::Up => selected.saturating_sub(1),
+                SelectionMove::Down => (*selected + 1).min(process_count - 1),
+            };
+            self.clear_pane_warning();
+        }
+        !requests.is_empty()
+    }
+
     /// Drain every lifecycle command queued by command modes. The app event
     /// loop dispatches each one for the currently selected Process.
     pub fn take_lifecycle_commands(&mut self) -> Vec<LifecycleCommand> {
-        self.lifecycle.take()
+        std::mem::take(&mut self.lifecycle_requests)
     }
 
     pub fn poll_requests(&mut self) -> bool {
@@ -175,8 +242,12 @@ impl ConsoleInteraction {
                 true
             }
             ConsoleViewMode::ChildInput => self.record_input_result(session.send_key(key)),
-            ConsoleViewMode::AppCommand => self.handle_app_command(key, session, page_rows),
-            ConsoleViewMode::Scroll => self.handle_scroll_command(key, session, page_rows),
+            ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll => {
+                let Some(command) = console_command(self.view.mode, key.code) else {
+                    return false;
+                };
+                self.apply_terminal_command(command, session, page_rows)
+            }
             ConsoleViewMode::Selection => self.handle_selection_command(key, session),
         }
     }
@@ -208,74 +279,12 @@ impl ConsoleInteraction {
                 self.view.warning = Some(ConsoleWarning::PipeReadOnly);
                 true
             }
-            ConsoleViewMode::AppCommand => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selection_requests.push(SelectionMove::Up);
-                    true
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selection_requests.push(SelectionMove::Down);
-                    true
-                }
-                KeyCode::PageUp => {
-                    scroll.get_or_insert_default().scroll_page(page_rows, -1);
-                    self.view.mode = ConsoleViewMode::Scroll;
-                    true
-                }
-                KeyCode::PageDown => {
-                    scroll.get_or_insert_default().scroll_page(page_rows, 1);
-                    self.view.mode = ConsoleViewMode::Scroll;
-                    true
-                }
-                KeyCode::Char('f') => {
-                    scroll.get_or_insert_default().follow();
-                    self.view.mode = ConsoleViewMode::ChildInput;
-                    true
-                }
-                KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
-                    self.lifecycle
-                        .queue(lifecycle_request_for(c).expect("the guard checked the key"));
-                    true
-                }
-                KeyCode::Char('v') => {
-                    self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
-                    true
-                }
-                KeyCode::Esc => {
-                    self.view.mode = ConsoleViewMode::ChildInput;
-                    true
-                }
-                _ => false,
-            },
-            ConsoleViewMode::Scroll => match key.code {
-                KeyCode::PageUp => {
-                    scroll.get_or_insert_default().scroll_page(page_rows, -1);
-                    true
-                }
-                KeyCode::PageDown => {
-                    scroll.get_or_insert_default().scroll_page(page_rows, 1);
-                    true
-                }
-                KeyCode::Char('f') => {
-                    scroll.get_or_insert_default().follow();
-                    self.view.mode = ConsoleViewMode::ChildInput;
-                    true
-                }
-                KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
-                    self.lifecycle
-                        .queue(lifecycle_request_for(c).expect("the guard checked the key"));
-                    true
-                }
-                KeyCode::Char('v') => {
-                    self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
-                    true
-                }
-                KeyCode::Esc => {
-                    self.view.mode = ConsoleViewMode::AppCommand;
-                    true
-                }
-                _ => false,
-            },
+            ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll => {
+                let Some(command) = console_command(self.view.mode, key.code) else {
+                    return false;
+                };
+                self.apply_read_only_command(command, scroll, page_rows)
+            }
             ConsoleViewMode::Selection => {
                 // 's' is rejected in read-only panes, so this mode is
                 // unreachable; Esc is kept for a future path that enters it.
@@ -347,88 +356,68 @@ impl ConsoleInteraction {
         failed
     }
 
-    fn handle_app_command(
+    fn apply_terminal_command(
         &mut self,
-        key: KeyEvent,
+        command: ConsoleCommand,
         session: &TerminalHandle<'_>,
         page_rows: u16,
     ) -> bool {
-        match key.code {
-            KeyCode::PageUp => {
-                scroll_page(session, page_rows, -1);
+        match command {
+            ConsoleCommand::MoveSelection(direction) => {
+                self.selection_requests.push(direction);
+            }
+            ConsoleCommand::ScrollPage(direction) => {
+                scroll_page(session, page_rows, direction);
                 self.view.mode = ConsoleViewMode::Scroll;
                 self.view.following = false;
-                true
             }
-            KeyCode::PageDown => {
-                scroll_page(session, page_rows, 1);
-                self.view.mode = ConsoleViewMode::Scroll;
-                self.view.following = false;
-                true
+            ConsoleCommand::Follow => self.return_to_live_tail(session),
+            ConsoleCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
+            ConsoleCommand::EnterSelection => self.view.mode = ConsoleViewMode::Selection,
+            ConsoleCommand::Escape => {
+                self.view.mode = match self.view.mode {
+                    ConsoleViewMode::AppCommand => ConsoleViewMode::ChildInput,
+                    ConsoleViewMode::Scroll => ConsoleViewMode::AppCommand,
+                    _ => unreachable!("only command modes produce Escape"),
+                };
             }
-            KeyCode::Char('f') => {
-                self.return_to_live_tail(session);
-                true
-            }
-            KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
-                self.lifecycle
-                    .queue(lifecycle_request_for(c).expect("the guard checked the key"));
-                true
-            }
-            KeyCode::Char('v') => {
-                self.view.mode = ConsoleViewMode::Selection;
-                true
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selection_requests.push(SelectionMove::Up);
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.selection_requests.push(SelectionMove::Down);
-                true
-            }
-            KeyCode::Esc => {
-                self.view.mode = ConsoleViewMode::ChildInput;
-                true
-            }
-            _ => false,
         }
+        true
     }
 
-    fn handle_scroll_command(
+    fn apply_read_only_command(
         &mut self,
-        key: KeyEvent,
-        session: &TerminalHandle<'_>,
+        command: ConsoleCommand,
+        scroll: &mut Option<PipeScroll>,
         page_rows: u16,
     ) -> bool {
-        match key.code {
-            KeyCode::PageUp => {
-                scroll_page(session, page_rows, -1);
-                true
+        match command {
+            ConsoleCommand::MoveSelection(direction) => {
+                self.selection_requests.push(direction);
             }
-            KeyCode::PageDown => {
-                scroll_page(session, page_rows, 1);
-                true
+            ConsoleCommand::ScrollPage(direction) => {
+                scroll
+                    .get_or_insert_default()
+                    .scroll_page(page_rows, direction);
+                self.view.mode = ConsoleViewMode::Scroll;
             }
-            KeyCode::Char('f') => {
-                self.return_to_live_tail(session);
-                true
+            ConsoleCommand::Follow => {
+                scroll.get_or_insert_default().follow();
+                self.view.mode = ConsoleViewMode::ChildInput;
             }
-            KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
-                self.lifecycle
-                    .queue(lifecycle_request_for(c).expect("the guard checked the key"));
-                true
+            ConsoleCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
+            ConsoleCommand::EnterSelection => {
+                self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
             }
-            KeyCode::Char('v') => {
-                self.view.mode = ConsoleViewMode::Selection;
-                true
+            ConsoleCommand::Escape => {
+                self.view.mode = match self.view.mode {
+                    ConsoleViewMode::AppCommand => ConsoleViewMode::ChildInput,
+                    ConsoleViewMode::Scroll => ConsoleViewMode::AppCommand,
+                    _ => unreachable!("only command modes produce Escape"),
+                };
             }
-            KeyCode::Esc => {
-                self.view.mode = ConsoleViewMode::AppCommand;
-                true
-            }
-            _ => false,
         }
+        true
     }
 
     fn handle_selection_command(&mut self, key: KeyEvent, session: &TerminalHandle<'_>) -> bool {
@@ -502,298 +491,4 @@ fn write_clipboard(text: String) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io;
-    use std::os::unix::net::UnixStream;
-
-    use super::*;
-    use crate::geometry::TerminalGeometry;
-    use crate::runtime::PtyIo;
-    use crate::terminal::TerminalSession;
-
-    fn session() -> (TerminalSession, UnixStream) {
-        let (reader, peer) = UnixStream::pair().unwrap();
-        let session = TerminalSession::spawn(
-            PtyIo {
-                reader: Box::new(reader),
-                writer: Box::new(io::sink()),
-                resizer: Box::new(|_, _| Ok(())),
-            },
-            TerminalGeometry::DEFAULT,
-            || {},
-        )
-        .unwrap();
-        (session, peer)
-    }
-
-    #[test]
-    fn scroll_navigation_stops_following_and_f_returns_to_live_tail() {
-        let (session, peer) = session();
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        let handle = crate::runtime::handle_for_test(&session, &stopped);
-        let mut interaction = ConsoleInteraction::default();
-
-        assert!(interaction.handle_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &handle,
-            20,
-        ));
-        assert!(interaction.handle_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &handle,
-            20,
-        ));
-        assert_eq!(interaction.view().mode, ConsoleViewMode::Scroll);
-        assert!(!interaction.view().following);
-
-        assert!(interaction.handle_key(
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-            &handle,
-            20,
-        ));
-        assert_eq!(interaction.view().mode, ConsoleViewMode::ChildInput);
-        assert!(interaction.view().following);
-
-        drop(peer);
-        session.shutdown().unwrap();
-    }
-
-    #[test]
-    fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
-        let warning = copy_warning(Ok(Some("selected".to_string())), |_| {
-            Err(anyhow::anyhow!("clipboard unavailable"))
-        });
-
-        assert_eq!(warning, Some(ConsoleWarning::ClipboardFailed));
-    }
-
-    #[test]
-    fn empty_selection_does_not_call_the_clipboard() {
-        let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
-
-        assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
-    }
-
-    #[test]
-    fn app_command_j_k_and_arrows_queue_selection_moves_without_touching_the_child() {
-        let (session, peer) = session();
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        let handle = crate::runtime::handle_for_test(&session, &stopped);
-        let mut interaction = ConsoleInteraction::default();
-
-        assert!(interaction.handle_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &handle,
-            20,
-        ));
-        assert_eq!(interaction.take_selection_moves(), Vec::new());
-
-        for (key, expected) in [
-            (KeyCode::Down, SelectionMove::Down),
-            (KeyCode::Char('j'), SelectionMove::Down),
-            (KeyCode::Up, SelectionMove::Up),
-            (KeyCode::Char('k'), SelectionMove::Up),
-        ] {
-            assert!(interaction.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &handle, 20));
-            assert_eq!(interaction.take_selection_moves(), vec![expected]);
-            assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
-        }
-        assert_eq!(interaction.take_selection_moves(), Vec::new());
-
-        drop(peer);
-        session.shutdown().unwrap();
-    }
-
-    #[test]
-    fn child_input_gate_rejects_only_disabled_terminal_child_input() {
-        let plain = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
-        let repeat = KeyEvent {
-            kind: KeyEventKind::Repeat,
-            ..plain
-        };
-        let release = KeyEvent {
-            kind: KeyEventKind::Release,
-            ..plain
-        };
-        let leader = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        let leader_repeat = KeyEvent {
-            kind: KeyEventKind::Repeat,
-            ..leader
-        };
-        let default = ConsoleViewState::default();
-
-        // Disabled input in child-input mode rejects keys of every kind.
-        assert!(child_input_rejected(default, false, &plain));
-        assert!(child_input_rejected(default, false, &repeat));
-        assert!(child_input_rejected(default, false, &release));
-        // Enabled focused input delivers everything on the terminal path.
-        assert!(!child_input_rejected(default, true, &plain));
-        assert!(!child_input_rejected(default, true, &repeat));
-        // The leader's press is never rejected; it enters the list.
-        assert!(!child_input_rejected(default, false, &leader));
-        // A leader repeat or release is still child input.
-        assert!(child_input_rejected(default, false, &leader_repeat));
-        // Command modes are not child input; keys route as commands.
-        let commands = ConsoleViewState {
-            mode: ConsoleViewMode::AppCommand,
-            ..ConsoleViewState::default()
-        };
-        assert!(!child_input_rejected(commands, false, &plain));
-    }
-
-    #[test]
-    fn pane_key_seam_rejects_disabled_terminal_input_and_keeps_read_only_keys() {
-        let mut interaction = ConsoleInteraction::default();
-        let mut scroll: Option<PipeScroll> = None;
-        let key = |code: KeyCode| -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) };
-
-        // A disabled terminal pane rejects child input visibly and keeps
-        // the leader available; no session write happens without one. The
-        // pane still owns a live session: a disabled-input PTY is a live
-        // PTY whose keys are gated.
-        let (session, _peer) = session();
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        let handle = crate::runtime::handle_for_test(&session, &stopped);
-        assert!(interaction.route_pane_key(
-            ConsolePaneKind::Terminal,
-            false,
-            key(KeyCode::Char('x')),
-            Some(&handle),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.view().warning,
-            Some(ConsoleWarning::InputDisabled)
-        );
-        // The read-only pane rejects child input and keeps commands.
-        assert!(interaction.route_pane_key(
-            ConsolePaneKind::Pipe,
-            false,
-            key(KeyCode::Char('x')),
-            None,
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.view().warning,
-            Some(ConsoleWarning::PipeReadOnly)
-        );
-        assert!(interaction.route_pane_key(
-            ConsolePaneKind::Pipe,
-            false,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            None,
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
-
-        // A pane change drops the pane-scoped warning.
-        interaction.set_pane(ConsolePaneKind::Terminal);
-        assert_eq!(interaction.view().warning, None);
-        // The explicit clear does the same from the app selection path.
-        interaction.clear_pane_warning();
-        assert_eq!(interaction.view().warning, None);
-    }
-
-    #[test]
-    fn read_only_pane_keys_reject_child_input_and_keep_commands_working() {
-        let mut interaction = ConsoleInteraction::default();
-        let mut scroll: Option<PipeScroll> = None;
-
-        // Plain child input is rejected visibly and consumed.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.view().warning,
-            Some(ConsoleWarning::PipeReadOnly)
-        );
-        interaction.clear_pane_warning();
-
-        // The leader enters command mode without a session.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(interaction.view().mode, ConsoleViewMode::AppCommand);
-
-        // Selection moves queue without a session.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.take_selection_moves(),
-            vec![SelectionMove::Down]
-        );
-
-        // Pipe scrolling and re-following work without a session.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(scroll.unwrap().offset(), 19);
-        assert!(!scroll.unwrap().following());
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert!(scroll.unwrap().following());
-        assert_eq!(interaction.view().mode, ConsoleViewMode::ChildInput);
-
-        // Text selection is unavailable in a read-only pane.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &mut scroll,
-            20,
-        ));
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.view().warning,
-            Some(ConsoleWarning::SelectionUnavailable)
-        );
-        // Lifecycle commands still work from a read-only pane: they are
-        // application commands, never child input.
-        assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &mut scroll,
-            20,
-        ));
-        assert_eq!(
-            interaction.take_lifecycle_commands(),
-            Vec::from([LifecycleCommand::Stop])
-        );
-    }
-
-    #[test]
-    fn child_input_keys_never_queue_selection_moves() {
-        let (session, peer) = session();
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        let handle = crate::runtime::handle_for_test(&session, &stopped);
-        let mut interaction = ConsoleInteraction::default();
-
-        // In ChildInput mode j/k are child keystrokes; selection stays put.
-        assert!(!interaction.handle_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &handle,
-            20,
-        ));
-
-        assert_eq!(interaction.take_selection_moves(), Vec::new());
-
-        drop(peer);
-        session.shutdown().unwrap();
-    }
-}
+mod tests;

@@ -1,0 +1,45 @@
+version: 1
+
+processes:
+  # This Service writes more than the one-MiB retained-output bound. The
+  # oldest output is removed while control commands remain responsive.
+  - name: noisy
+    kind: service
+    terminal: pipe
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - |
+          while :; do
+            awk 'BEGIN { for (i = 0; i < 12000; i++) printf "noisy-%06d abcdefghijklmnopqrstuvwxyz0123456789\n", i }'
+            sleep 1
+          done
+
+  # Use this quieter Process to confirm that output pressure does not block
+  # selection, stop, start, or restart commands.
+  - name: steady
+    kind: service
+    terminal: pipe
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - |
+          i=0
+          while :; do
+            printf "steady tick %s\n" "$i"
+            i=$((i+1))
+            sleep 1
+          done
+
+  # Start this shell manually to check that PTY input remains responsive while
+  # another Process produces heavy pipe output.
+  - name: shell
+    kind: service
+    autostart: false
+    terminal: pty
+    input: focused
+    command:
+      program: /bin/sh
+      args: ["-l"]

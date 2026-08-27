@@ -10,7 +10,7 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::FailureKind;
 use crate::supervisor::clock::Clock;
 use crate::supervisor::seam::{
-    ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
 };
 
 /// One observable runtime action the Supervisor requested.
@@ -114,28 +114,19 @@ impl RunSeam for FakeRuntime {
         if self.hold_stops.load(Ordering::Acquire) {
             return;
         }
-        // A real adapter observes the root exit during cleanup; the fake
-        // reports the same event order with a scripted code.
-        events.send(SeamEvent::Exited {
+        let cleanup_failed = self.fail_cleanup.load(Ordering::Acquire);
+        events.send(SeamEvent::Finished(FinishedRun {
             process_id,
             run_id,
-            code: Some(0),
-        });
-        events.send(SeamEvent::ShutdownComplete {
-            process_id,
-            run_id,
-            confirmed: !self.fail_cleanup.load(Ordering::Acquire),
-            detail: self
-                .fail_cleanup
-                .load(Ordering::Acquire)
-                .then(|| "scripted cleanup failure".to_string()),
-            remaining_pids: self
-                .fail_cleanup
-                .load(Ordering::Acquire)
+            exit_code: Some(0),
+            intentional_stop: true,
+            cleanup_confirmed: !cleanup_failed,
+            detail: cleanup_failed.then(|| "scripted cleanup failure".to_string()),
+            remaining_pids: cleanup_failed
                 .then(|| crate::runtime::OsPid::new(99))
                 .into_iter()
                 .collect(),
-        });
+        }));
     }
 }
 

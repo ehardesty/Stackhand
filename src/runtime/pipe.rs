@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::byte_budget::ByteBudget;
 use crate::runtime::{RunEvent, RunEventKind, RunId};
 
 /// Identifies which stream produced an output chunk.
@@ -56,13 +57,13 @@ const READ_BUFFER_BYTES: usize = 64 * 1_024;
 #[derive(Clone)]
 pub struct RunOutputSender {
     sender: SyncSender<RunOutput>,
-    pending_bytes: Arc<AtomicUsize>,
+    budget: ByteBudget,
 }
 
 #[allow(dead_code)]
 pub struct RunOutputReceiver {
     receiver: Receiver<RunOutput>,
-    pending_bytes: Arc<AtomicUsize>,
+    budget: ByteBudget,
 }
 
 pub enum OutputSendError {
@@ -72,48 +73,34 @@ pub enum OutputSendError {
 
 pub fn output_channel() -> (RunOutputSender, RunOutputReceiver) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(OUTPUT_QUEUE_SLOTS);
-    let pending_bytes = Arc::new(AtomicUsize::new(0));
+    let budget = ByteBudget::new(OUTPUT_QUEUE_BYTES);
     (
         RunOutputSender {
             sender,
-            pending_bytes: Arc::clone(&pending_bytes),
+            budget: budget.clone(),
         },
-        RunOutputReceiver {
-            receiver,
-            pending_bytes,
-        },
+        RunOutputReceiver { receiver, budget },
     )
 }
 
 impl RunOutputSender {
     pub(crate) fn try_send(&self, chunk: RunOutput) -> Result<(), OutputSendError> {
         let amount = chunk.data.len();
-        let mut current = self.pending_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(amount) else {
-                return Err(OutputSendError::Full(chunk));
-            };
-            if next > OUTPUT_QUEUE_BYTES {
-                return Err(OutputSendError::Full(chunk));
-            }
-            match self.pending_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        let reservation = match self.budget.reserve(amount) {
+            Ok(reservation) => reservation,
+            Err(_) => return Err(OutputSendError::Full(chunk)),
+        };
         match self.sender.try_send(chunk) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                reservation.commit();
+                Ok(())
+            }
             Err(TrySendError::Full(chunk)) => {
-                self.pending_bytes.fetch_sub(amount, Ordering::AcqRel);
+                drop(reservation);
                 Err(OutputSendError::Full(chunk))
             }
-            Err(TrySendError::Disconnected(_chunk)) => {
-                self.pending_bytes.fetch_sub(amount, Ordering::AcqRel);
+            Err(TrySendError::Disconnected(_)) => {
+                drop(reservation);
                 Err(OutputSendError::Disconnected)
             }
         }
@@ -125,8 +112,7 @@ impl RunOutputReceiver {
     pub fn try_recv(&self) -> Result<RunOutput, TryRecvError> {
         match self.receiver.try_recv() {
             Ok(chunk) => {
-                self.pending_bytes
-                    .fetch_sub(chunk.data.len(), Ordering::AcqRel);
+                self.budget.release(chunk.data.len());
                 Ok(chunk)
             }
             Err(error) => Err(error),
@@ -136,8 +122,7 @@ impl RunOutputReceiver {
     pub fn recv_timeout(&self, timeout: Duration) -> Result<RunOutput, RecvTimeoutError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(chunk) => {
-                self.pending_bytes
-                    .fetch_sub(chunk.data.len(), Ordering::AcqRel);
+                self.budget.release(chunk.data.len());
                 Ok(chunk)
             }
             Err(error) => Err(error),
@@ -467,4 +452,43 @@ fn spawn_stream_reader(
             }
         })
         .expect("pipe reader thread spawns with valid configuration")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(data: Vec<u8>) -> RunOutput {
+        RunOutput {
+            run_id: RunId::new(1),
+            stream: OutputStream::Stdout,
+            data,
+        }
+    }
+
+    #[test]
+    fn output_queue_enforces_and_releases_the_exact_byte_limit() {
+        let (sender, receiver) = output_channel();
+        assert!(sender.try_send(output(vec![0; OUTPUT_QUEUE_BYTES])).is_ok());
+
+        assert!(matches!(
+            sender.try_send(output(vec![1])),
+            Err(OutputSendError::Full(chunk)) if chunk.data == vec![1]
+        ));
+
+        assert_eq!(receiver.try_recv().unwrap().data.len(), OUTPUT_QUEUE_BYTES);
+        assert!(sender.try_send(output(vec![1])).is_ok());
+    }
+
+    #[test]
+    fn oversized_output_is_returned_without_partial_admission() {
+        let (sender, receiver) = output_channel();
+        let oversized = vec![7; OUTPUT_QUEUE_BYTES + 1];
+
+        assert!(matches!(
+            sender.try_send(output(oversized)),
+            Err(OutputSendError::Full(chunk)) if chunk.data.len() == OUTPUT_QUEUE_BYTES + 1
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
 }

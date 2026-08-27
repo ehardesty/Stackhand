@@ -379,16 +379,21 @@ impl OwnedRun {
         }
     }
 
-    /// Wait for natural completion. Root exit is observed without reaping;
-    /// remaining Process Tree members are then cleaned up before the root is
-    /// reaped. The result remains natural or unexpected and never becomes an
-    /// intentional stop.
+    /// Wait naturally, clean descendants, then reap the root.
     pub fn wait(&mut self) -> Result<RunOutcome> {
+        self.wait_with_ladder(self.ladder)
+    }
+
+    /// Wait naturally while clamping cleanup to the Project deadline.
+    pub(crate) fn wait_with_timeout(&mut self, remaining: Duration) -> Result<RunOutcome> {
+        self.wait_with_ladder(self.ladder.clamped_to(remaining))
+    }
+
+    fn wait_with_ladder(&mut self, ladder: ShutdownLadder) -> Result<RunOutcome> {
         if let Some(outcome) = &self.outcome {
             return Ok(outcome.clone());
         }
-        // Natural completion still closes admission and stops the sampler:
-        // the Run is over either way.
+        // Natural completion also closes admission and stops the sampler.
         self.stopping.store(true, Ordering::Release);
         if self.inner.is_none() {
             return Err(anyhow::anyhow!("Run {} already completed", self.run_id.0));
@@ -411,10 +416,7 @@ impl OwnedRun {
             std::thread::sleep(RUN_EXIT_POLL_INTERVAL);
         }
 
-        // Keep the root unreaped while the ladder observes and cleans any
-        // descendants. A natural root exit is still a complete Run only after
-        // this check and bounded cleanup.
-        let trace = self.ladder_trace();
+        let trace = self.ladder_trace_with(ladder);
         let disposition = RunExitDisposition::UnexpectedExit;
         self.finalize_after_ladder(trace, disposition, false)
     }

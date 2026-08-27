@@ -125,7 +125,6 @@ impl Core {
         for index in unattempted {
             let entry = &mut self.entries[index];
             entry.lifecycle = Lifecycle::Stopping;
-            entry.stop_intended = true;
             self.seam.stop(
                 entry.process_id,
                 entry.current_run.expect("shutdown tracks active Runs"),
@@ -161,10 +160,9 @@ impl Core {
             .filter(|index| !state.dispatched.contains(index))
             .filter(|dependency| {
                 !state.remaining.iter().any(|dependent| {
-                    self.project.processes()[*dependent]
-                        .dependencies
-                        .iter()
-                        .any(|edge| edge.name == self.project.processes()[*dependency].name)
+                    self.project
+                        .resolved_dependencies(*dependent)
+                        .any(|(dependency_index, _)| dependency_index == *dependency)
                 })
             })
             .collect();
@@ -181,7 +179,6 @@ impl Core {
                 .insert(index);
             let entry = &mut self.entries[index];
             entry.lifecycle = Lifecycle::Stopping;
-            entry.stop_intended = true;
             self.seam
                 .stop(entry.process_id, run_id, Some(remaining), &self.events);
         }

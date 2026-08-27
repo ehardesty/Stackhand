@@ -1,11 +1,11 @@
 mod app;
+mod byte_budget;
 mod config;
 mod console;
 mod fixtures;
 mod geometry;
 mod ingest_fixture;
 pub mod interaction_fixture;
-mod lifecycle;
 mod lifecycle_fixture;
 pub mod model;
 mod mouse_fixture;
@@ -19,6 +19,7 @@ mod scrollback_fixture;
 pub mod smoke_fixture;
 mod stress;
 pub mod supervisor;
+mod sync_fixture;
 mod terminal;
 mod tui;
 

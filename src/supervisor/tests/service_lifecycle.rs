@@ -101,7 +101,7 @@ fn stale_events_for_finished_runs_cannot_change_state() {
     // Every Run-1 report is stale now: it cannot spawn, exit, report
     // metrics, or probe the new Run.
     h.event(spawned("worker", 1));
-    h.event(exited("worker", 1, Some(0)));
+    h.event(finished("worker", 1, Some(0)));
     h.event(readiness("worker", 1, true, None));
     let worker = h.process("worker");
     assert_eq!(worker.current_run, Some(2));
@@ -127,10 +127,9 @@ fn unconfirmed_cleanup_ignores_stale_events_for_the_held_run() {
     assert_eq!(held.current_run, Some(1));
     assert!(held.failure.is_some());
 
-    // Stale reports for the held Run cannot change state; only the
-    // confirming completion may.
+    // Non-completion reports for the held Run cannot change state. A
+    // confirming Finished fact is the one event that may release it.
     h.event(spawned("worker", 1));
-    h.event(exited("worker", 1, Some(0)));
     h.event(readiness("worker", 1, true, None));
     let worker = h.process("worker");
     assert_eq!(worker.lifecycle, Lifecycle::Stopped);

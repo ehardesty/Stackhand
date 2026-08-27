@@ -34,6 +34,20 @@ impl SeamSender {
     }
 }
 
+/// The one bounded fact produced when a Run and its cleanup finish.
+/// `exit_code` and `intentional_stop` come from the authoritative
+/// [`crate::runtime::RunOutcome`] when one was produced.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinishedRun {
+    pub process_id: ProcessId,
+    pub run_id: RunId,
+    pub exit_code: Option<i32>,
+    pub intentional_stop: bool,
+    pub cleanup_confirmed: bool,
+    pub detail: Option<String>,
+    pub remaining_pids: Vec<OsPid>,
+}
+
 /// One typed event from a runtime or probe adapter. Output bytes never
 /// travel through this type.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,20 +58,8 @@ pub enum SeamEvent {
         run_id: RunId,
         root_pid: Option<OsPid>,
     },
-    /// The root process exited with the reported code, when known.
-    Exited {
-        process_id: ProcessId,
-        run_id: RunId,
-        code: Option<i32>,
-    },
-    /// Bounded cleanup for this Run finished. The Run is over either way.
-    ShutdownComplete {
-        process_id: ProcessId,
-        run_id: RunId,
-        confirmed: bool,
-        detail: Option<String>,
-        remaining_pids: Vec<OsPid>,
-    },
+    /// The Run and its bounded cleanup finished.
+    Finished(FinishedRun),
     /// The Run could not start or an owned worker failed. Carries no output
     /// bytes.
     Failed {
@@ -95,24 +97,22 @@ impl SeamEvent {
     pub(crate) fn process_id(&self) -> ProcessId {
         match self {
             Self::Spawned { process_id, .. }
-            | Self::Exited { process_id, .. }
-            | Self::ShutdownComplete { process_id, .. }
             | Self::Failed { process_id, .. }
             | Self::OutputFailure { process_id, .. }
             | Self::Metrics { process_id, .. }
             | Self::Readiness { process_id, .. } => *process_id,
+            Self::Finished(finished) => finished.process_id,
         }
     }
 
     pub(crate) fn run_id(&self) -> RunId {
         match self {
             Self::Spawned { run_id, .. }
-            | Self::Exited { run_id, .. }
-            | Self::ShutdownComplete { run_id, .. }
             | Self::Failed { run_id, .. }
             | Self::OutputFailure { run_id, .. }
             | Self::Metrics { run_id, .. }
             | Self::Readiness { run_id, .. } => *run_id,
+            Self::Finished(finished) => finished.run_id,
         }
     }
 }
@@ -144,8 +144,9 @@ pub(crate) trait RunSeam: Send {
     /// never block the caller on process work beyond cheap bookkeeping.
     fn start(&self, intent: StartIntent, events: &SeamSender);
 
-    /// Perform the complete bounded shutdown for one active Run off the
-    /// control task, then report one [`SeamEvent::ShutdownComplete`].
+    /// Request the complete bounded shutdown for one active Run. The
+    /// adapter performs it off the control task and reports one finished-Run
+    /// fact.
     fn stop(
         &self,
         process_id: ProcessId,

@@ -1,6 +1,7 @@
 //! Immutable Supervisor views for rendering and other callers.
 
 use crate::model::ProcessKind;
+use crate::runtime::ProcessId;
 
 use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunSummary};
 
@@ -35,6 +36,9 @@ pub struct ReadinessStatus {
 /// The immutable lifecycle and diagnostic view of one Process.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessSnapshot {
+    /// The stable identity of this Process for the Supervisor session.
+    /// Callers use this value instead of reconstructing it from Project order.
+    pub process_id: ProcessId,
     pub name: String,
     pub kind: ProcessKind,
     pub enabled: bool,

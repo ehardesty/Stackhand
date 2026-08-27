@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as CompletionSender;
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +6,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossterm::event::KeyEvent;
 
 use super::mouse::TerminalMouseEvent;
+use crate::byte_budget::ByteBudget;
 use crate::geometry::TerminalGeometry;
 
 pub const COMMAND_QUEUE_SLOTS: usize = 256;
@@ -107,44 +107,41 @@ impl CommandStatus {
 
 pub struct CommandGate {
     sender: Mutex<Option<Sender<TerminalCommand>>>,
-    pending_bytes: Arc<AtomicUsize>,
+    budget: ByteBudget,
     status: Arc<CommandStatus>,
 }
 
 pub struct CommandReceiver {
     receiver: Receiver<TerminalCommand>,
-    pending_bytes: Arc<AtomicUsize>,
+    budget: ByteBudget,
 }
 
 impl CommandGate {
     pub fn new() -> (Self, CommandReceiver) {
         let (sender, receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_SLOTS);
-        let pending_bytes = Arc::new(AtomicUsize::new(0));
+        let budget = ByteBudget::new(COMMAND_QUEUE_BYTES);
         (
             Self {
                 sender: Mutex::new(Some(sender)),
-                pending_bytes: Arc::clone(&pending_bytes),
+                budget: budget.clone(),
                 status: Arc::new(CommandStatus::default()),
             },
-            CommandReceiver {
-                receiver,
-                pending_bytes,
-            },
+            CommandReceiver { receiver, budget },
         )
     }
 
     pub fn try_send(&self, command: TerminalCommand) -> Result<(), CommandRejection> {
         let attempted_bytes = command.estimated_bytes();
-        let reservation =
-            reserve_bytes(&self.pending_bytes, attempted_bytes).map_err(|pending| {
-                let error = CommandBackpressure {
-                    attempted_bytes,
-                    pending_bytes: pending,
-                    limit_bytes: COMMAND_QUEUE_BYTES,
-                };
-                self.status.record(CommandEvent::Backpressure(error));
-                CommandRejection::Backpressure(error)
-            })?;
+        let reservation = self.budget.reserve(attempted_bytes).map_err(|error| {
+            let error = CommandBackpressure {
+                attempted_bytes,
+                pending_bytes: error.pending_bytes,
+                limit_bytes: COMMAND_QUEUE_BYTES,
+            };
+            self.status.record(CommandEvent::Backpressure(error));
+            CommandRejection::Backpressure(error)
+        })?;
+        let pending_before = reservation.pending_before();
 
         let result = self
             .sender
@@ -153,29 +150,29 @@ impl CommandGate {
             .as_ref()
             .map(|sender| sender.try_send(command));
         match result {
-            Some(Ok(())) => Ok(()),
-            Some(Err(TrySendError::Full(command))) => {
-                self.pending_bytes
-                    .fetch_sub(command.estimated_bytes(), Ordering::AcqRel);
+            Some(Ok(())) => {
+                reservation.commit();
+                Ok(())
+            }
+            Some(Err(TrySendError::Full(_))) => {
+                drop(reservation);
                 let error = CommandBackpressure {
                     attempted_bytes,
-                    pending_bytes: reservation,
+                    pending_bytes: pending_before,
                     limit_bytes: COMMAND_QUEUE_BYTES,
                 };
                 self.status.record(CommandEvent::Backpressure(error));
                 Err(CommandRejection::Backpressure(error))
             }
-            Some(Err(TrySendError::Disconnected(command))) => {
-                self.pending_bytes
-                    .fetch_sub(command.estimated_bytes(), Ordering::AcqRel);
+            Some(Err(TrySendError::Disconnected(_))) => {
+                drop(reservation);
                 self.status.record(CommandEvent::Failed(
                     "terminal command owner is not available".to_string(),
                 ));
                 Err(CommandRejection::Stopping)
             }
             None => {
-                self.pending_bytes
-                    .fetch_sub(attempted_bytes, Ordering::AcqRel);
+                drop(reservation);
                 self.status.record(CommandEvent::Failed(
                     "terminal command gate is shut down".to_string(),
                 ));
@@ -202,24 +199,7 @@ impl CommandReceiver {
     }
 
     pub fn complete(&self, command_bytes: usize) {
-        self.pending_bytes
-            .fetch_sub(command_bytes, Ordering::AcqRel);
-    }
-}
-
-fn reserve_bytes(pending: &AtomicUsize, amount: usize) -> Result<usize, usize> {
-    let mut current = pending.load(Ordering::Acquire);
-    loop {
-        let Some(next) = current.checked_add(amount) else {
-            return Err(current);
-        };
-        if next > COMMAND_QUEUE_BYTES {
-            return Err(current);
-        }
-        match pending.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Ok(current),
-            Err(actual) => current = actual,
-        }
+        self.budget.release(command_bytes);
     }
 }
 
@@ -247,5 +227,26 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn slot_rejection_releases_its_tentative_byte_reservation() {
+        let (gate, receiver) = CommandGate::new();
+        for _ in 0..COMMAND_QUEUE_SLOTS {
+            gate.try_send(TerminalCommand::SelectionAll).unwrap();
+        }
+
+        assert_eq!(
+            gate.try_send(TerminalCommand::SelectionAll),
+            Err(CommandRejection::Backpressure(CommandBackpressure {
+                attempted_bytes: 1,
+                pending_bytes: COMMAND_QUEUE_SLOTS,
+                limit_bytes: COMMAND_QUEUE_BYTES,
+            }))
+        );
+
+        let command = receiver.try_recv().unwrap();
+        receiver.complete(command.estimated_bytes());
+        assert!(gate.try_send(TerminalCommand::SelectionAll).is_ok());
     }
 }
