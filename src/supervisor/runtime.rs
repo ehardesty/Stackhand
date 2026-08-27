@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
@@ -34,7 +34,10 @@ const OUTPUT_DRAIN_POLL: Duration = Duration::from_millis(50);
 /// starts so a stop request can cancel a Run that has not appeared yet.
 #[allow(clippy::large_enum_variant)] // The spawning slot exists only for the short spawn window.
 enum RunSlot {
-    Spawning { cancelled: Arc<AtomicBool> },
+    Spawning {
+        cancelled: Arc<AtomicBool>,
+        shutdown_remaining: Arc<Mutex<Option<Duration>>>,
+    },
     Active(OwnedRun),
 }
 
@@ -54,6 +57,9 @@ pub(crate) struct RealRunSeam {
     /// The one retained-output module per Process. Pipe bytes drain into
     /// it off the control task; PTY bytes stay in each Run's terminal.
     outputs: Arc<OutputViews>,
+    /// Shared Project deadline, visible to a natural-exit owner that can
+    /// already have claimed its Run before the ordered stop wave arrives.
+    project_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl RealRunSeam {
@@ -62,6 +68,7 @@ impl RealRunSeam {
             runs: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(std::collections::HashSet::new())),
             outputs,
+            project_shutdown_deadline: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -73,14 +80,23 @@ impl RealRunSeam {
 }
 
 impl RunSeam for RealRunSeam {
+    fn begin_shutdown(&self, remaining: Duration) {
+        *self
+            .project_shutdown_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + remaining);
+    }
+
     fn start(&self, intent: StartIntent, events: &SeamSender) {
         let events = events.clone();
         let runs = Arc::clone(&self.runs);
         let completed = Arc::clone(&self.completed);
         let outputs = Arc::clone(&self.outputs);
+        let project_shutdown_deadline = Arc::clone(&self.project_shutdown_deadline);
         // Reserve the Run identity synchronously so no stop can fall into
         // the window before the spawn worker registers the OwnedRun.
         let cancelled = Arc::new(AtomicBool::new(false));
+        let shutdown_remaining = Arc::new(Mutex::new(None));
         self.runs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -88,6 +104,7 @@ impl RunSeam for RealRunSeam {
                 (intent.process_id.get(), intent.run_id.get()),
                 RunSlot::Spawning {
                     cancelled: Arc::clone(&cancelled),
+                    shutdown_remaining: Arc::clone(&shutdown_remaining),
                 },
             );
         // Spawn work stays off the Supervisor control task.
@@ -120,11 +137,14 @@ impl RunSeam for RealRunSeam {
                         // A stop arrived while the spawn was starting;
                         // finish it immediately instead of leaving an
                         // orphaned process behind.
-                        report_shutdown(
-                            (intent.process_id, intent.run_id),
-                            run.shutdown(),
-                            &events,
-                        );
+                        let remaining = *shutdown_remaining
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let outcome = match remaining {
+                            Some(limit) => run.shutdown_with_timeout(limit),
+                            None => run.shutdown(),
+                        };
+                        report_shutdown((intent.process_id, intent.run_id), outcome, &events);
                         return;
                     }
                     // Record this attempt in the Process's retained output
@@ -147,7 +167,15 @@ impl RunSeam for RealRunSeam {
                     // forwards Run events and observes natural root exit in
                     // one serialized loop, so the Supervisor always sees
                     // `Exited` before the completion report.
-                    own_run(key, root_pid, runs, completed, events, event_rx);
+                    own_run(
+                        key,
+                        root_pid,
+                        runs,
+                        completed,
+                        project_shutdown_deadline,
+                        events,
+                        event_rx,
+                    );
                 }
                 Err(error) => {
                     runs.lock()
@@ -164,7 +192,13 @@ impl RunSeam for RealRunSeam {
         });
     }
 
-    fn stop(&self, process_id: ProcessId, run_id: RuntimeRunId, events: &SeamSender) {
+    fn stop(
+        &self,
+        process_id: ProcessId,
+        run_id: RuntimeRunId,
+        remaining: Option<Duration>,
+        events: &SeamSender,
+    ) {
         let key = (process_id.get(), run_id.get());
         let completed = Arc::clone(&self.completed);
         let slot = self
@@ -183,12 +217,22 @@ impl RunSeam for RealRunSeam {
                     let mut run = run;
                     // The complete bounded shutdown ladder runs here, never
                     // on the control task.
-                    report_shutdown((process_id, run_id), run.shutdown(), &events);
+                    let outcome = match remaining {
+                        Some(limit) => run.shutdown_with_timeout(limit),
+                        None => run.shutdown(),
+                    };
+                    report_shutdown((process_id, run_id), outcome, &events);
                 });
             }
-            Some(RunSlot::Spawning { cancelled }) => {
+            Some(RunSlot::Spawning {
+                cancelled,
+                shutdown_remaining,
+            }) => {
                 // The spawn worker owns this Run's completion; ask it to
                 // shut down as soon as the child appears.
+                *shutdown_remaining
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = remaining;
                 cancelled.store(true, Ordering::Release);
             }
             // A tombstoned Run already has an in-flight natural completion
@@ -242,6 +286,7 @@ fn own_run(
     root_pid: Option<OsPid>,
     runs: Arc<Mutex<HashMap<RunKey, RunSlot>>>,
     completed: Arc<Mutex<std::collections::HashSet<RunKey>>>,
+    project_shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     events: SeamSender,
     event_rx: mpsc::Receiver<RunEvent>,
 ) {
@@ -296,7 +341,15 @@ fn own_run(
         // emission is already buffered when it returns, so a non-blocking
         // sweep forwards them before the completion report. (The channel
         // itself only closes when `run` drops below.)
-        let outcome = run.shutdown();
+        let deadline = *project_shutdown_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outcome = match deadline {
+            Some(deadline) => {
+                run.shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => run.shutdown(),
+        };
         while let Ok(event) = event_rx.try_recv() {
             forward_event(key, event, &events);
         }
@@ -357,22 +410,26 @@ fn report_shutdown(
     outcome: anyhow::Result<crate::runtime::RunOutcome>,
     events: &SeamSender,
 ) {
-    let (confirmed, detail) = match outcome {
-        Ok(outcome) if outcome.cleanup_confirmed => (true, None),
-        Ok(outcome) => (
-            false,
-            Some(format!(
-                "cleanup did not confirm; remaining PIDs: {:?}",
-                outcome.remaining_pids
-            )),
-        ),
-        Err(error) => (false, Some(error.to_string())),
+    let (confirmed, detail, remaining_pids) = match outcome {
+        Ok(outcome) if outcome.cleanup_confirmed => (true, None, Vec::new()),
+        Ok(outcome) => {
+            let remaining_pids = outcome.remaining_pids;
+            (
+                false,
+                Some(format!(
+                    "cleanup did not confirm; remaining PIDs: {remaining_pids:?}"
+                )),
+                remaining_pids,
+            )
+        }
+        Err(error) => (false, Some(error.to_string()), Vec::new()),
     };
     events.send(SeamEvent::ShutdownComplete {
         process_id,
         run_id,
         confirmed,
         detail,
+        remaining_pids,
     });
 }
 

@@ -5,7 +5,7 @@
 //! snapshots — the same surface the serializing task wrapper drives.
 
 use std::collections::VecDeque;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use crate::geometry::TerminalGeometry;
 use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
+use crate::supervisor::command::{Command, shell_program};
 use crate::supervisor::seam::{
     ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
 };
@@ -137,10 +138,11 @@ pub(crate) struct Core {
     initial_geometry: TerminalGeometry,
     pub(super) seam: Box<dyn RunSeam>,
     pub(super) probes: Box<dyn ProbeSeam>,
-    clock: Arc<dyn Clock>,
+    pub(super) clock: Arc<dyn Clock>,
     /// The session start point every Run summary's millisecond stamps use.
     epoch: Instant,
     pub(super) events: SeamSender,
+    pub(super) shutdown: Option<crate::supervisor::shutdown::ShutdownState>,
 }
 
 /// Live readiness bookkeeping for one probed Service's current Run.
@@ -294,6 +296,7 @@ impl Core {
             clock,
             epoch,
             events,
+            shutdown: None,
         }
     }
 
@@ -306,6 +309,17 @@ impl Core {
     }
 
     pub(crate) fn command(&mut self, command: Command) {
+        if self.shutdown_in_progress()
+            && matches!(
+                command,
+                Command::Start(_)
+                    | Command::Restart(_)
+                    | Command::Rerun(_)
+                    | Command::StartAutostart
+            )
+        {
+            return;
+        }
         match command {
             Command::Start(name) => {
                 if let Some(index) = self.named_index(&name) {
@@ -329,6 +343,7 @@ impl Core {
                     self.stop_at(index);
                 }
             }
+            Command::Shutdown { deadline } => self.begin_shutdown(deadline),
             Command::Restart(name) => {
                 if let Some(index) = self.named_index(&name) {
                     self.restart_at(index, RunTrigger::Restart);
@@ -396,7 +411,7 @@ impl Core {
                 .expect("an unconfirmed cleanup holds its Run identity");
             entry.lifecycle = Lifecycle::Stopping;
             entry.readiness = None;
-            self.seam.stop(entry.process_id, run_id, &self.events);
+            self.seam.stop(entry.process_id, run_id, None, &self.events);
             return;
         }
         if entry.desired != DesiredState::Running {
@@ -419,7 +434,7 @@ impl Core {
         // Pending readiness belongs to the ending Run; its tracking ends
         // here and any in-flight attempt's result is rejected by the gate.
         entry.readiness = None;
-        self.seam.stop(entry.process_id, run_id, &self.events);
+        self.seam.stop(entry.process_id, run_id, None, &self.events);
     }
 
     pub(crate) fn event(&mut self, event: SeamEvent) {
@@ -437,6 +452,23 @@ impl Core {
             && !matches!(event, SeamEvent::ShutdownComplete { .. })
         {
             return;
+        }
+        match &event {
+            SeamEvent::ShutdownComplete {
+                confirmed,
+                detail,
+                remaining_pids,
+                ..
+            } => self.finish_shutdown_run(
+                index,
+                *confirmed,
+                detail.clone(),
+                remaining_pids.iter().map(|pid| pid.get()).collect(),
+            ),
+            SeamEvent::Failed { detail, .. } if self.shutdown_in_progress() => {
+                self.finish_shutdown_run(index, false, Some(detail.clone()), Vec::new());
+            }
+            _ => {}
         }
         match event {
             SeamEvent::Spawned { root_pid, .. } => {
@@ -649,6 +681,7 @@ impl Core {
         for index in self.due_probe_indices(now) {
             self.dispatch_probe(index);
         }
+        self.expire_shutdown(now);
     }
 
     fn due_probe_indices(&self, now: Instant) -> Vec<usize> {
@@ -702,9 +735,10 @@ impl Core {
 
     /// How long the caller may wait before some readiness attempt becomes
     /// due, or `None` when no probe work is pending.
-    pub(crate) fn time_until_next_probe(&self) -> Option<Duration> {
+    pub(crate) fn time_until_next_timer(&self) -> Option<Duration> {
         let now = self.clock.now();
-        self.entries
+        let probe_wait = self
+            .entries
             .iter()
             .filter_map(|entry| {
                 let tracking = entry.readiness.as_ref()?;
@@ -713,7 +747,13 @@ impl Core {
                     && !tracking.in_flight)
                     .then(|| tracking.next_attempt_at.saturating_duration_since(now))
             })
-            .min()
+            .min();
+        match (probe_wait, self.time_until_shutdown_deadline()) {
+            (Some(probe), Some(shutdown)) => Some(probe.min(shutdown)),
+            (Some(probe), None) => Some(probe),
+            (None, Some(shutdown)) => Some(shutdown),
+            (None, None) => None,
+        }
     }
 
     pub(crate) fn snapshot(&self) -> ProjectSnapshot {
@@ -745,38 +785,10 @@ impl Core {
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })
             .collect();
-        ProjectSnapshot { processes, now_ms }
-    }
-}
-
-/// The program that interprets shell command text: `$SHELL` from the
-/// environment when present, otherwise `/bin/sh`.
-fn shell_program(shell_env: Option<&OsStr>) -> OsString {
-    shell_env.map_or_else(|| OsString::from("/bin/sh"), OsString::from)
-}
-
-/// Semantic commands. Callers never mutate Supervisor state directly.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
-    Start(String),
-    Stop(String),
-    Restart(String),
-    /// Rerun one enabled One-shot; a no-op for every other Process.
-    Rerun(String),
-    StartAutostart,
-    StopAll,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_resolution_prefers_the_environment_and_falls_back() {
-        assert_eq!(
-            shell_program(Some(OsStr::new("/bin/zsh"))),
-            OsString::from("/bin/zsh")
-        );
-        assert_eq!(shell_program(None), OsString::from("/bin/sh"));
+        ProjectSnapshot {
+            processes,
+            now_ms,
+            shutdown: self.shutdown_snapshot(),
+        }
     }
 }

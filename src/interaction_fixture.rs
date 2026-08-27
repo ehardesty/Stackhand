@@ -624,14 +624,23 @@ fn move_selection_key(
 }
 
 fn shutdown(supervisor: SupervisorHandle, proof_ok: bool) -> Result<()> {
-    supervisor.command(Command::StopAll);
+    supervisor.command(Command::Shutdown {
+        deadline: Instant::now() + SHUTDOWN_WAIT,
+    });
     let snapshot = wait_for(&supervisor, SHUTDOWN_WAIT, |snapshot| {
-        snapshot.processes.iter().all(|p| p.current_run.is_none())
+        snapshot
+            .shutdown
+            .as_ref()
+            .is_some_and(|result| result.complete)
     })?;
     // A failed proof is already reported by the caller; a failed cleanup
     // behind it would only mask the real cause. A clean proof must stop
     // every Process without a cleanup failure.
     if proof_ok {
+        let shutdown = snapshot.shutdown.as_ref().expect("shutdown completed");
+        if !shutdown.failures.is_empty() {
+            bail!("Project shutdown failures: {:?}", shutdown.failures);
+        }
         for process in &snapshot.processes {
             if let Some(failure) = &process.failure {
                 bail!(

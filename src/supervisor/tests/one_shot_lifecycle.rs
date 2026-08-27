@@ -44,6 +44,7 @@ fn shutdown_complete(process: &str, run: u64) -> SeamEvent {
         run_id: RunId::new(run),
         confirmed: true,
         detail: None,
+        remaining_pids: Vec::new(),
     }
 }
 

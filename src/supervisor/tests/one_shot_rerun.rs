@@ -46,6 +46,7 @@ fn local_shutdown_complete(process_id: u32, run: u64, confirmed: bool) -> SeamEv
         run_id: RunId::new(run),
         confirmed,
         detail: None,
+        remaining_pids: Vec::new(),
     }
 }
 

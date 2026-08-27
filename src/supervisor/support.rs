@@ -23,6 +23,7 @@ pub(crate) enum Intent {
     Stop {
         process_id: ProcessId,
         run_id: RunId,
+        remaining: Option<Duration>,
     },
 }
 
@@ -38,6 +39,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) fail_cleanup: AtomicBool,
     /// When set, every start also reports the spawn through the seam.
     pub(crate) report_spawn: AtomicBool,
+    /// When set, stop intents remain pending until the test advances time.
+    pub(crate) hold_stops: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -51,6 +54,10 @@ impl FakeRuntime {
 
     pub(crate) fn set_report_spawn(&self, value: bool) {
         self.report_spawn.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_hold_stops(&self, value: bool) {
+        self.hold_stops.store(value, Ordering::Release);
     }
 
     pub(crate) fn intents(&self) -> Vec<Intent> {
@@ -92,8 +99,21 @@ impl RunSeam for FakeRuntime {
         }
     }
 
-    fn stop(&self, process_id: ProcessId, run_id: RunId, events: &SeamSender) {
-        self.record(Intent::Stop { process_id, run_id });
+    fn stop(
+        &self,
+        process_id: ProcessId,
+        run_id: RunId,
+        remaining: Option<Duration>,
+        events: &SeamSender,
+    ) {
+        self.record(Intent::Stop {
+            process_id,
+            run_id,
+            remaining,
+        });
+        if self.hold_stops.load(Ordering::Acquire) {
+            return;
+        }
         // A real adapter observes the root exit during cleanup; the fake
         // reports the same event order with a scripted code.
         events.send(SeamEvent::Exited {
@@ -109,6 +129,12 @@ impl RunSeam for FakeRuntime {
                 .fail_cleanup
                 .load(Ordering::Acquire)
                 .then(|| "scripted cleanup failure".to_string()),
+            remaining_pids: self
+                .fail_cleanup
+                .load(Ordering::Acquire)
+                .then(|| crate::runtime::OsPid::new(99))
+                .into_iter()
+                .collect(),
         });
     }
 }
@@ -152,8 +178,14 @@ impl RunSeam for Arc<FakeRuntime> {
         (**self).start(intent, events);
     }
 
-    fn stop(&self, process_id: ProcessId, run_id: RunId, events: &SeamSender) {
-        (**self).stop(process_id, run_id, events);
+    fn stop(
+        &self,
+        process_id: ProcessId,
+        run_id: RunId,
+        remaining: Option<Duration>,
+        events: &SeamSender,
+    ) {
+        (**self).stop(process_id, run_id, remaining, events);
     }
 }
 

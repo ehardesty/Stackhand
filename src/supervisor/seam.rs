@@ -56,6 +56,7 @@ pub enum SeamEvent {
         run_id: RunId,
         confirmed: bool,
         detail: Option<String>,
+        remaining_pids: Vec<OsPid>,
     },
     /// The Run could not start or an owned worker failed. Carries no output
     /// bytes.
@@ -135,13 +136,23 @@ pub struct StartIntent {
 
 /// The runtime seam. Implementations own every Run they start until stop.
 pub(crate) trait RunSeam: Send {
+    /// Apply the Project's shared remaining deadline to cleanup work that a
+    /// natural-exit owner can already be completing.
+    fn begin_shutdown(&self, _remaining: Duration) {}
+
     /// Begin one Run. Report progress only as [`SeamEvent`]s on `events`;
     /// never block the caller on process work beyond cheap bookkeeping.
     fn start(&self, intent: StartIntent, events: &SeamSender);
 
     /// Perform the complete bounded shutdown for one active Run off the
     /// control task, then report one [`SeamEvent::ShutdownComplete`].
-    fn stop(&self, process_id: ProcessId, run_id: RunId, events: &SeamSender);
+    fn stop(
+        &self,
+        process_id: ProcessId,
+        run_id: RunId,
+        remaining: Option<Duration>,
+        events: &SeamSender,
+    );
 }
 
 /// One request for exactly one bounded readiness attempt. The Supervisor

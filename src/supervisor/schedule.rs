@@ -47,7 +47,7 @@ impl Core {
             entry.blocked = None;
             entry.readiness = None;
             entry.stop_intended = true;
-            self.seam.stop(entry.process_id, run_id, &self.events);
+            self.seam.stop(entry.process_id, run_id, None, &self.events);
         }
         self.evaluate();
     }
@@ -183,7 +183,7 @@ impl Core {
 
     /// The session positions of one Process's Dependencies. Configuration
     /// validation resolved every name before startup.
-    fn dependency_indices(&self, index: usize) -> Vec<usize> {
+    pub(super) fn dependency_indices(&self, index: usize) -> Vec<usize> {
         self.project.processes()[index]
             .dependencies
             .iter()

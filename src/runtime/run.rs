@@ -335,6 +335,10 @@ impl OwnedRun {
     }
 
     fn ladder_trace(&self) -> ladder::LadderTrace {
+        self.ladder_trace_with(self.ladder)
+    }
+
+    fn ladder_trace_with(&self, ladder: crate::runtime::ShutdownLadder) -> ladder::LadderTrace {
         if self.signals_stopped.load(Ordering::Acquire) {
             let detail = self
                 .signal_failure
@@ -345,7 +349,7 @@ impl OwnedRun {
             ladder::LadderTrace::signal_failure(detail)
         } else {
             match self.tree.as_ref() {
-                Some(tree) => ladder::run(tree, self.ladder),
+                Some(tree) => ladder::run(tree, ladder),
                 None => ladder::LadderTrace::without_identity(),
             }
         }
@@ -646,24 +650,30 @@ impl OwnedRun {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(detail.to_string());
     }
 
-    /// Own the complete semantic shutdown ladder and produce one structured
-    /// outcome:
-    ///
-    /// record intentional stop → interrupt → wait `graceful_timeout` →
-    /// terminate remaining members → wait `terminate_timeout` → kill
-    /// remaining members → wait up to `final_deadline` → confirm containment
-    /// → reap the root → drain final output → finalize the optional
-    /// TerminalSession → join all Run tasks.
-    ///
-    /// Repeated calls observe the first shutdown instead of repeating it.
+    /// Run the semantic signal ladder, confirm containment, reap the root,
+    /// drain final output, finalize the terminal, and join all Run workers.
+    /// Repeated calls observe the first structured outcome.
     pub fn shutdown(&mut self) -> Result<RunOutcome> {
+        self.shutdown_with_ladder(self.ladder)
+    }
+
+    /// Shut down this Run with every ladder wait clamped to one remaining
+    /// Project deadline. Repeated calls still observe the first outcome.
+    pub fn shutdown_with_timeout(&mut self, remaining: Duration) -> Result<RunOutcome> {
+        self.shutdown_with_ladder(self.ladder.clamped_to(remaining))
+    }
+
+    fn shutdown_with_ladder(
+        &mut self,
+        ladder: crate::runtime::ShutdownLadder,
+    ) -> Result<RunOutcome> {
         if let Some(outcome) = &self.outcome {
             return Ok(outcome.clone());
         }
         // One shutdown request records intentional stop before cleanup.
         self.stopping.store(true, Ordering::Release);
 
-        let trace = self.ladder_trace();
+        let trace = self.ladder_trace_with(ladder);
         self.finalize_after_ladder(trace, RunExitDisposition::IntentionalStop, true)
     }
 

@@ -10,6 +10,7 @@ fn confirmed(process: &str, run: u64) -> SeamEvent {
         run_id: RunId::new(run),
         confirmed: true,
         detail: None,
+        remaining_pids: Vec::new(),
     }
 }
 
@@ -19,6 +20,7 @@ fn unconfirmed(process: &str, run: u64) -> SeamEvent {
         run_id: RunId::new(run),
         confirmed: false,
         detail: None,
+        remaining_pids: Vec::new(),
     }
 }
 

@@ -66,10 +66,9 @@ pub fn run(config_path: &Path) -> Result<()> {
     let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
     supervisor.command(Command::StartAutostart);
 
-    let result = prove_slice(&supervisor, &consoles, &outputs);
-    let shutdown_result = shutdown(supervisor);
-    result?;
-    shutdown_result?;
+    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs)?;
+    shutdown(supervisor)?;
+    wait_for_pid_exit(descendant_pid)?;
     println!("fixture-shutdown-ok");
     Ok(())
 }
@@ -78,7 +77,7 @@ fn prove_slice(
     supervisor: &crate::supervisor::SupervisorHandle,
     consoles: &crate::supervisor::Consoles,
     outputs: &crate::output::OutputViews,
-) -> Result<()> {
+) -> Result<u32> {
     // Every enabled autostart Process reaches its terminal-for-now state:
     // Services run, One-shots complete. Starting becomes Running on the
     // Spawned event; a One-shot becomes Done once its natural exit is
@@ -198,7 +197,43 @@ fn prove_slice(
         wait_for_retained_text(&module, *stream, needle, Some(run_id))?;
     }
     println!("fixture-pipe-output-ok");
-    Ok(())
+    let piped_index = snapshot
+        .processes
+        .iter()
+        .position(|process| process.name == "piped")
+        .expect("the fixture defines piped");
+    let piped_output = outputs
+        .for_process(piped_index as u32)
+        .expect("piped has retained output")
+        .snapshot()
+        .chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            crate::output::RetainedChunk::Data { text, .. } => Some(text.as_str()),
+            crate::output::RetainedChunk::Marker { .. } => None,
+        })
+        .collect::<String>();
+    let descendant_pid = piped_output
+        .split("fixture-descendant-pid-")
+        .nth(1)
+        .and_then(|suffix| suffix.lines().next())
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .ok_or_else(|| anyhow!("the fixture did not report its descendant PID"))?;
+    Ok(descendant_pid)
+}
+
+fn wait_for_pid_exit(pid: u32) -> Result<()> {
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    loop {
+        let status = unsafe { libc::kill(pid as i32, 0) };
+        if status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("ordinary descendant PID {pid} remained after Project shutdown");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_retained_text(
@@ -282,10 +317,22 @@ fn buffer_text(snapshot: &crate::terminal::OwnedTerminalSnapshot) -> String {
 }
 
 fn shutdown(supervisor: crate::supervisor::SupervisorHandle) -> Result<()> {
-    supervisor.command(Command::StopAll);
+    supervisor.command(Command::Shutdown {
+        deadline: Instant::now() + SHUTDOWN_WAIT,
+    });
     let snapshot = wait_for(&supervisor, SHUTDOWN_WAIT, |snapshot| {
-        snapshot.processes.iter().all(|p| p.current_run.is_none())
+        snapshot
+            .shutdown
+            .as_ref()
+            .is_some_and(|result| result.complete)
     })?;
+    assert!(
+        snapshot
+            .shutdown
+            .as_ref()
+            .is_some_and(|result| result.failures.is_empty()),
+        "Project shutdown reports every cleanup failure"
+    );
     for process in &snapshot.processes {
         assert!(
             process.failure.is_none(),

@@ -10,6 +10,8 @@ use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunS
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectSnapshot {
     pub processes: Vec<ProcessSnapshot>,
+    /// The one controlled Project shutdown, once requested.
+    pub shutdown: Option<super::shutdown::ProjectShutdownSnapshot>,
     /// The Supervisor session's elapsed milliseconds when this snapshot
     /// was projected; active-Run ages are measured against it.
     pub now_ms: u64,

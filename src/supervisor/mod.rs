@@ -25,22 +25,26 @@ use crate::supervisor::runtime::RealRunSeam;
 use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamEvent, SeamSender};
 
 mod clock;
+mod command;
 mod core;
 mod probe;
 mod runtime;
 mod schedule;
 mod seam;
+mod shutdown;
 mod snapshot;
 #[cfg(test)]
 mod support;
 #[cfg(test)]
 mod tests;
 
+pub use command::Command;
 pub use core::{
-    Command, DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
+    DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
     RunExitDisposition, RunSummary, RunTrigger,
 };
 pub use runtime::{ConsoleView, Consoles};
+pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
 pub use snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.
@@ -129,7 +133,7 @@ fn run_task(
         let mut select = Select::new();
         let inbox_index = select.recv(inbox);
         let _event_index = select.recv(events);
-        let oper = match core.time_until_next_probe() {
+        let oper = match core.time_until_next_timer() {
             Some(wait) => match select.select_timeout(wait) {
                 Ok(oper) => oper,
                 Err(SelectTimeoutError) => {

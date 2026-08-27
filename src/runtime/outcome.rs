@@ -32,6 +32,21 @@ pub struct ShutdownLadder {
     pub final_deadline: Duration,
 }
 
+impl ShutdownLadder {
+    pub(crate) fn clamped_to(self, remaining: Duration) -> Self {
+        let graceful_timeout = self.graceful_timeout.min(remaining);
+        let remaining = remaining.saturating_sub(graceful_timeout);
+        let terminate_timeout = self.terminate_timeout.min(remaining);
+        Self {
+            graceful_timeout,
+            terminate_timeout,
+            final_deadline: self
+                .final_deadline
+                .min(remaining.saturating_sub(terminate_timeout)),
+        }
+    }
+}
+
 impl Default for ShutdownLadder {
     fn default() -> Self {
         Self {

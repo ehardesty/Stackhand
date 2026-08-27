@@ -45,24 +45,39 @@ pub fn run_project(config_path: &Path) -> Result<()> {
 /// Stop every desired-Running Process and wait, within one shared deadline,
 /// for all current Runs to finish their existing bounded shutdown.
 fn shutdown_project(supervisor: SupervisorHandle) -> Result<()> {
-    supervisor.command(Command::StopAll);
+    eprintln!("Stackhand is shutting down the Project…");
     let deadline = Instant::now() + PROJECT_SHUTDOWN_WAIT;
-    loop {
-        match supervisor.snapshot() {
-            None => break,
-            Some(snapshot) => {
-                if snapshot.processes.iter().all(|p| p.current_run.is_none()) {
-                    break;
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("Project shutdown did not finish within its shared deadline");
+    supervisor.command(Command::Shutdown { deadline });
+    let result = loop {
+        let snapshot = supervisor
+            .snapshot()
+            .ok_or_else(|| anyhow!("the Supervisor stopped during Project shutdown"))?;
+        if let Some(result) = snapshot.shutdown.filter(|result| result.complete) {
+            break result;
         }
         std::thread::sleep(Duration::from_millis(25));
-    }
+    };
     supervisor.stop_task();
-    Ok(())
+    if result.failures.is_empty() {
+        eprintln!("Project shutdown complete.");
+        return Ok(());
+    }
+    let details = result
+        .failures
+        .iter()
+        .map(|failure| {
+            if failure.remaining_pids.is_empty() {
+                format!("{}: {}", failure.process, failure.detail)
+            } else {
+                format!(
+                    "{}: {} (remaining PIDs: {:?})",
+                    failure.process, failure.detail, failure.remaining_pids
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!("Project shutdown did not finish cleanly: {details}")
 }
 
 fn run_event_loop(
@@ -83,6 +98,7 @@ fn run_event_loop(
     // never changes another Process's view. Resized with the snapshot.
     let mut pipe_scroll: Vec<Option<PipeScroll>> = Vec::new();
     let mut last_project_snapshot: Option<ProjectSnapshot> = None;
+    let mut shutting_down = false;
     let mut dirty = true;
 
     loop {
@@ -94,6 +110,14 @@ fn run_event_loop(
             .ok_or_else(|| anyhow!("the Supervisor stopped"))?;
         if snapshot.processes.is_empty() {
             bail!("this Project has no Processes");
+        }
+        if shutting_down
+            && snapshot
+                .shutdown
+                .as_ref()
+                .is_some_and(|result| result.complete)
+        {
+            return Ok(());
         }
         if last_project_snapshot.as_ref().is_none_or(|previous| {
             previous.processes != snapshot.processes
@@ -195,13 +219,17 @@ fn run_event_loop(
         {
             dirty = false;
             let rows = process_rows(&snapshot, selected);
+            let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
+            if shutting_down {
+                header.insert_str(0, "Project shutdown in progress · ");
+            }
             let pane = render_frame(
                 outer,
                 &rows,
                 terminal_snapshot,
                 pipe_lines,
                 console.view(),
-                &selected_header(&snapshot.processes[selected], snapshot.now_ms),
+                &header,
             )?;
             console_pane = pane;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
@@ -213,7 +241,15 @@ fn run_event_loop(
         }
         let input_event = event::read()?;
         match input_event {
-            Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => return Ok(()),
+            Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => {
+                if !shutting_down {
+                    supervisor.command(Command::Shutdown {
+                        deadline: Instant::now() + PROJECT_SHUTDOWN_WAIT,
+                    });
+                    shutting_down = true;
+                    dirty = true;
+                }
+            }
             Event::Key(key) => match &pane {
                 SelectedPane::Terminal(view) => {
                     // The pane key seam is the one production boundary that

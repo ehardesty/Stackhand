@@ -194,8 +194,6 @@ fn readiness(process: &str, run: u64, passing: bool, diagnostic: Option<String>)
     }
 }
 
-/// Test processes are registered in this order: api, db, worker, setup.
-/// A Process identity is its stable position in the Project.
 fn process_index(name: &str) -> u32 {
     match name {
         "api" => 0,
@@ -366,7 +364,11 @@ fn manual_stop_finishes_as_stopped_without_failure() {
         .collect();
     assert!(matches!(
         stopped_intents.as_slice(),
-        [Intent::Stop { process_id, run_id }]
+        [Intent::Stop {
+            process_id,
+            run_id,
+            ..
+        }]
             if *process_id == ProcessId::new(process_index("api"))
                 && *run_id == RunId::new(1)
     ));
@@ -427,6 +429,7 @@ fn stale_events_cannot_change_current_state() {
         run_id: RunId::new(1),
         confirmed: true,
         detail: None,
+        remaining_pids: Vec::new(),
     });
 
     let after = h.snapshot();
@@ -568,6 +571,7 @@ mod readiness;
 mod diagnostics;
 mod one_shot_lifecycle;
 mod one_shot_rerun;
+mod project_shutdown;
 
 mod service_lifecycle;
 

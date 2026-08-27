@@ -54,8 +54,7 @@ const SHELL_SCRIPT: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep
 
 /// A pipe-mode Service that proves stdout and stderr keep their identity in
 /// the retained output module, then stays alive.
-const PIPED_SCRIPT: &str =
-    "printf 'fixture-pipe-out\\n'; printf 'fixture-pipe-err\\n' 1>&2; exec sleep 60";
+const PIPED_SCRIPT: &str = "sleep 60 & child=$!; printf 'fixture-descendant-pid-%s\\n' \"$child\"; printf 'fixture-pipe-out\\n'; printf 'fixture-pipe-err\\n' 1>&2; wait \"$child\"";
 
 fn fixture_config(tcp_port: u16, http_port: u16) -> String {
     let marker = MARKER_SCRIPT.replace('"', "\\\"");
