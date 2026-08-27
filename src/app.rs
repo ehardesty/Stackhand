@@ -20,6 +20,10 @@ use crate::tui::{
     render_project,
 };
 
+use self::input_batch::collect_input_batch;
+
+mod input_batch;
+
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
 /// One shared bound for waiting out every Run's existing shutdown ladder.
@@ -84,7 +88,6 @@ fn run_event_loop(
     let mut console = ConsoleInteraction::default();
     let mut selected: usize = 0;
     let mut pending_resize = PendingResize::default();
-    let mut console_snapshot: Option<OwnedTerminalSnapshot> = None;
     let mut console_pane = project_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1).1;
     let mut pipe_truncation: Option<(usize, bool)> = None;
     let mut pipe_generation: u64 = 0;
@@ -95,6 +98,7 @@ fn run_event_loop(
     let mut last_project_snapshot: Option<ProjectSnapshot> = None;
     let mut shutting_down = false;
     let mut dirty = true;
+    let mut pending_input_event: Option<Event> = None;
 
     loop {
         if console.poll_requests() {
@@ -174,11 +178,14 @@ fn run_event_loop(
             dirty = true;
         }
 
+        let console_snapshot = match &pane {
+            SelectedPane::Terminal(view) => view.snapshot(),
+            SelectedPane::Pipe(_) | SelectedPane::Empty => None,
+        };
         let mut pipe_window: Vec<crate::tui::PipeLine> = Vec::new();
         let (terminal_snapshot, pipe_lines) = match &pane {
-            SelectedPane::Terminal(view) => {
+            SelectedPane::Terminal(_) => {
                 console.set_pane(ConsolePaneKind::Terminal);
-                console_snapshot = view.snapshot();
                 (console_snapshot.as_ref(), None)
             }
             SelectedPane::Pipe(retained) => {
@@ -221,119 +228,167 @@ fn run_event_loop(
             outer.set_cursor_shape(cursor)?;
         }
 
-        if !event::poll(pending_resize.poll_interval(Instant::now()))? {
-            continue;
-        }
-        let input_event = event::read()?;
-        match input_event {
-            Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key, console.view()) => {
-                if !shutting_down {
-                    supervisor.command(Command::Shutdown {
-                        deadline: Instant::now() + PROJECT_SHUTDOWN_WAIT,
-                    });
-                    shutting_down = true;
-                    dirty = true;
-                }
+        let first_input_event = if let Some(event) = pending_input_event.take() {
+            event
+        } else {
+            if !event::poll(pending_resize.poll_interval(Instant::now()))? {
+                continue;
             }
-            Event::Key(key) => match &pane {
-                SelectedPane::Terminal(view) => {
-                    // The pane key seam is the one production boundary that
-                    // decides whether the event reaches the PTY child:
-                    // focused input enabled, or it is rejected visibly.
-                    let changed = view.with(|session| {
-                        console.route_pane_key(
-                            ConsolePaneKind::Terminal,
+            event::read()?
+        };
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (list_area, console_area, _) = project_layout(
+            ratatui::layout::Rect::new(0, 0, cols, rows),
+            snapshot.processes.len(),
+        );
+        let mode = console.view().mode;
+        let (input_events, deferred_event) = collect_input_batch(
+            first_input_event,
+            list_area,
+            console_area,
+            |mouse| {
+                if mode != crate::tui::ConsoleViewMode::Console
+                    || !selected_process.input_focused
+                    || mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::SHIFT)
+                {
+                    return true;
+                }
+                match &pane {
+                    SelectedPane::Terminal(view) => !view
+                        .snapshot()
+                        .is_some_and(|snapshot| snapshot.mouse_tracking),
+                    SelectedPane::Pipe(_) | SelectedPane::Empty => true,
+                }
+            },
+            || {
+                if event::poll(Duration::ZERO)? {
+                    Ok(Some(event::read()?))
+                } else {
+                    Ok(None)
+                }
+            },
+        )?;
+        pending_input_event = deferred_event;
+
+        for input_event in input_events {
+            match input_event {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press && is_quit(key, console.view()) =>
+                {
+                    if !shutting_down {
+                        supervisor.command(Command::Shutdown {
+                            deadline: Instant::now() + PROJECT_SHUTDOWN_WAIT,
+                        });
+                        shutting_down = true;
+                        dirty = true;
+                    }
+                }
+                Event::Key(key) => match &pane {
+                    SelectedPane::Terminal(view) => {
+                        // The pane key seam is the one production boundary that
+                        // decides whether the event reaches the PTY child:
+                        // focused input enabled, or it is rejected visibly.
+                        let changed = view.with(|session| {
+                            console.route_pane_key(
+                                ConsolePaneKind::Terminal,
+                                selected_process.input_focused,
+                                key,
+                                Some(session),
+                                &mut pipe_scroll[selected],
+                                console_pane.height.saturating_sub(2).max(1),
+                            )
+                        });
+                        if changed.unwrap_or(false) {
+                            dirty = true;
+                        }
+                    }
+                    SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                        let kind = match &pane {
+                            SelectedPane::Pipe(_) => ConsolePaneKind::Pipe,
+                            _ => ConsolePaneKind::Empty,
+                        };
+                        let changed = console.route_pane_key(
+                            kind,
                             selected_process.input_focused,
                             key,
-                            Some(session),
+                            None,
                             &mut pipe_scroll[selected],
                             console_pane.height.saturating_sub(2).max(1),
-                        )
-                    });
-                    if changed.unwrap_or(false) {
+                        );
+                        if changed {
+                            dirty = true;
+                        }
+                    }
+                },
+                Event::Paste(data) => match &pane {
+                    SelectedPane::Terminal(view)
+                        if console.accepts_child_input(selected_process.input_focused) =>
+                    {
+                        view.with(|session| console.handle_paste(&data, session));
                         dirty = true;
                     }
-                }
-                SelectedPane::Pipe(_) | SelectedPane::Empty => {
-                    let kind = match &pane {
-                        SelectedPane::Pipe(_) => ConsolePaneKind::Pipe,
-                        _ => ConsolePaneKind::Empty,
-                    };
-                    let changed = console.route_pane_key(
-                        kind,
-                        selected_process.input_focused,
-                        key,
-                        None,
-                        &mut pipe_scroll[selected],
-                        console_pane.height.saturating_sub(2).max(1),
-                    );
-                    if changed {
-                        dirty = true;
-                    }
-                }
-            },
-            Event::Paste(data) => match &pane {
-                SelectedPane::Terminal(view)
-                    if console.accepts_child_input(selected_process.input_focused) =>
-                {
-                    view.with(|session| console.handle_paste(&data, session));
-                    dirty = true;
-                }
-                SelectedPane::Terminal(_) if !selected_process.input_focused => {
-                    console.warn(ConsoleWarning::InputDisabled);
-                    dirty = true;
-                }
-                // Process-list and Copy focus never leak paste bytes to the
-                // child. Pipe and empty consoles are also read-only.
-                SelectedPane::Terminal(_) | SelectedPane::Pipe(_) | SelectedPane::Empty => {
-                    console.warn(ConsoleWarning::PasteRejected);
-                    dirty = true;
-                }
-            },
-            Event::FocusGained | Event::FocusLost => {
-                if let SelectedPane::Terminal(view) = &pane {
-                    let gained = matches!(input_event, Event::FocusGained);
-                    // Focus reports are child-bound, so they follow the
-                    // input policy like typed keys.
-                    let delivered = if selected_process.input_focused {
-                        view.with(|session| session.send_focus(gained).is_ok())
-                            .unwrap_or(false)
-                    } else {
+                    SelectedPane::Terminal(_) if !selected_process.input_focused => {
                         console.warn(ConsoleWarning::InputDisabled);
-                        false
-                    };
-                    // A failed delivery with focused input enabled is the
-                    // rejected-input case; a disabled pane keeps the more
-                    // specific disabled warning above.
-                    if !delivered && selected_process.input_focused {
-                        console.warn(ConsoleWarning::InputRejected);
                         dirty = true;
-                    } else if !delivered {
+                    }
+                    // Process-list and Copy focus never leak paste bytes to the
+                    // child. Pipe and empty consoles are also read-only.
+                    SelectedPane::Terminal(_) | SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                        console.warn(ConsoleWarning::PasteRejected);
+                        dirty = true;
+                    }
+                },
+                Event::FocusGained | Event::FocusLost => {
+                    if let SelectedPane::Terminal(view) = &pane {
+                        let gained = matches!(input_event, Event::FocusGained);
+                        // Focus reports are child-bound, so they follow the
+                        // input policy like typed keys.
+                        let delivered = if selected_process.input_focused {
+                            view.with(|session| session.send_focus(gained).is_ok())
+                                .unwrap_or(false)
+                        } else {
+                            console.warn(ConsoleWarning::InputDisabled);
+                            false
+                        };
+                        // A failed delivery with focused input enabled is the
+                        // rejected-input case; a disabled pane keeps the more
+                        // specific disabled warning above.
+                        if !delivered && selected_process.input_focused {
+                            console.warn(ConsoleWarning::InputRejected);
+                            dirty = true;
+                        } else if !delivered {
+                            dirty = true;
+                        }
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    let current_console_snapshot = match &pane {
+                        SelectedPane::Terminal(view) => view.snapshot(),
+                        SelectedPane::Pipe(_) | SelectedPane::Empty => None,
+                    };
+                    if handle_app_mouse(
+                        &mut console,
+                        mouse,
+                        &pane,
+                        &mut selected,
+                        selected_process.input_focused,
+                        current_console_snapshot.as_ref(),
+                        &mut pipe_scroll,
+                    ) {
                         dirty = true;
                     }
                 }
-            }
-            Event::Mouse(mouse) => {
-                if handle_app_mouse(
-                    &mut console,
-                    mouse,
-                    &pane,
-                    &mut selected,
-                    selected_process.input_focused,
-                    console_snapshot.as_ref(),
-                    &mut pipe_scroll,
-                ) {
-                    dirty = true;
+                Event::Resize(cols, rows) => {
+                    // The child sees exactly the rendered console pane.
+                    let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+                    let (_, pane, _) = project_layout(area, snapshot.processes.len());
+                    pending_resize.update(
+                        TerminalGeometry::from_pane(pane_inner(pane)),
+                        Instant::now(),
+                    );
                 }
-            }
-            Event::Resize(cols, rows) => {
-                // The child sees exactly the rendered console pane.
-                let area = ratatui::layout::Rect::new(0, 0, cols, rows);
-                let (_, pane, _) = project_layout(area, snapshot.processes.len());
-                pending_resize.update(
-                    TerminalGeometry::from_pane(pane_inner(pane)),
-                    Instant::now(),
-                );
             }
         }
     }
