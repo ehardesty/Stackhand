@@ -1,5 +1,6 @@
 mod mouse;
 mod restore;
+mod theme;
 mod view;
 
 pub use mouse::MouseRouter;

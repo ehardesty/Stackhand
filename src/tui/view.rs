@@ -1,9 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::OwnedTerminalSnapshot;
+
+use super::theme::TERMINAL_THEME;
 
 const FOOTER_HEIGHT: u16 = 1;
 
@@ -125,10 +127,7 @@ fn render_pipe_console(frame: &mut Frame<'_>, lines: &[PipeLine], pane: Rect) {
         .iter()
         .map(|line| {
             if line.marker {
-                ratatui::text::Line::styled(
-                    line.text.as_str(),
-                    Style::default().fg(Color::DarkGray),
-                )
+                ratatui::text::Line::styled(line.text.as_str(), TERMINAL_THEME.secondary_text())
             } else {
                 ratatui::text::Line::from(line.text.as_str())
             }
@@ -169,9 +168,9 @@ pub fn render_project(
         })
         .collect();
     let list_border = if view.mode == ConsoleViewMode::ProcessList {
-        Style::default().fg(Color::Cyan)
+        TERMINAL_THEME.focus_border()
     } else {
-        Style::default().fg(Color::DarkGray)
+        TERMINAL_THEME.inactive_border()
     };
     frame.render_widget(
         ratatui::widgets::List::new(list_rows).block(
@@ -191,9 +190,9 @@ pub fn render_project(
         format!(" Console · {selected_header} ")
     };
     let console_border = match view.mode {
-        ConsoleViewMode::ProcessList => Style::default().fg(Color::DarkGray),
-        ConsoleViewMode::Console => Style::default().fg(Color::Cyan),
-        ConsoleViewMode::Copy => Style::default().fg(Color::Yellow),
+        ConsoleViewMode::ProcessList => TERMINAL_THEME.inactive_border(),
+        ConsoleViewMode::Console => TERMINAL_THEME.focus_border(),
+        ConsoleViewMode::Copy => TERMINAL_THEME.copy_border(),
     };
     frame.render_widget(
         Block::bordered().border_style(console_border).title(header),
@@ -212,7 +211,7 @@ pub fn render_project(
     }
     frame.render_widget(
         Paragraph::new(footer_text(view, mouse_tracking))
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(TERMINAL_THEME.footer(view.warning.is_some())),
         footer,
     );
     // A pipe console has no terminal cursor. Console focus shows the child
@@ -416,6 +415,20 @@ mod tests {
                 row.status
             );
         }
+    }
+
+    #[test]
+    fn secondary_chrome_uses_the_legible_terminal_palette_role() {
+        let rows = [row("web", "Ready", true), row("db", "Stopped", false)];
+        let buffer = rendered(&rows);
+        let (list, console, footer) = project_layout(buffer.area, rows.len());
+
+        assert_eq!(buffer[(list.x, list.y)].fg, ratatui::style::Color::Cyan);
+        assert_eq!(
+            buffer[(console.x, console.y)].fg,
+            ratatui::style::Color::Gray
+        );
+        assert_eq!(buffer[(footer.x, footer.y)].fg, ratatui::style::Color::Gray);
     }
 
     #[test]
