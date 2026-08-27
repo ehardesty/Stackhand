@@ -5,7 +5,7 @@ use libghostty_vt::key;
 use libghostty_vt::render::RenderState;
 use libghostty_vt::terminal::{ScrollViewport, Terminal};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use super::command_gate::TerminalCommand;
 use super::input;
@@ -101,6 +101,21 @@ impl TerminalState {
                 self.selection.clear(&self.terminal)?;
                 return Ok(None);
             }
+            TerminalCommand::SelectionKeyboardStart => {
+                self.selection
+                    .enter_keyboard_navigation(&mut self.terminal)?;
+                return Ok(None);
+            }
+            TerminalCommand::SelectionKeyboardToggle => {
+                self.selection
+                    .toggle_keyboard_endpoint(&mut self.terminal)?;
+                return Ok(None);
+            }
+            TerminalCommand::SelectionKeyboardMove(direction) => {
+                self.selection
+                    .move_keyboard_cursor(&mut self.terminal, direction)?;
+                return Ok(None);
+            }
             TerminalCommand::SelectionText(completion) => {
                 let result = self
                     .selection
@@ -135,13 +150,20 @@ impl TerminalState {
 
     pub fn render(&mut self, buffer: &mut Buffer) -> Result<Option<OwnedCursorState>> {
         let area = self.area();
-        Ok(render::render(
-            &self.terminal,
-            &mut self.render,
-            buffer,
-            self.focused,
-            area,
-        )?)
+        let terminal_cursor =
+            render::render(&self.terminal, &mut self.render, buffer, self.focused, area)?;
+        let copy_cursor = self
+            .selection
+            .keyboard_cursor(&self.terminal)?
+            .and_then(|point| {
+                let row = u16::try_from(point.surface_row).ok()?;
+                (point.col < area.width && row < area.height).then_some(OwnedCursorState {
+                    position: Position::new(area.x + point.col, area.y + row),
+                    shape: super::session::CursorShape::Block,
+                    blinking: false,
+                })
+            });
+        Ok(copy_cursor.or(terminal_cursor))
     }
 
     pub fn mouse_tracking(&self) -> bool {

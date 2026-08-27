@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossterm::event::KeyEvent;
 
 use super::mouse::TerminalMouseEvent;
+use super::selection::SelectionDirection;
 use crate::byte_budget::ByteBudget;
 use crate::geometry::TerminalGeometry;
 
@@ -27,6 +28,9 @@ pub enum TerminalCommand {
     Scroll(isize),
     SelectionAll,
     SelectionClear,
+    SelectionKeyboardStart,
+    SelectionKeyboardToggle,
+    SelectionKeyboardMove(SelectionDirection),
     SelectionText(CompletionSender<Result<Option<String>, String>>),
 }
 
@@ -42,7 +46,11 @@ impl TerminalCommand {
             Self::Paste { data, .. } => data.len().saturating_add(12),
             Self::Resize(_) => 4,
             Self::Scroll(_) => std::mem::size_of::<isize>(),
-            Self::SelectionAll | Self::SelectionClear => 1,
+            Self::SelectionAll
+            | Self::SelectionClear
+            | Self::SelectionKeyboardStart
+            | Self::SelectionKeyboardToggle => 1,
+            Self::SelectionKeyboardMove(_) => 2,
             Self::SelectionText(_) => 64,
         }
     }
@@ -227,6 +235,19 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn keyboard_selection_commands_have_precise_queue_estimates() {
+        assert_eq!(TerminalCommand::SelectionKeyboardStart.estimated_bytes(), 1);
+        assert_eq!(
+            TerminalCommand::SelectionKeyboardToggle.estimated_bytes(),
+            1
+        );
+        assert_eq!(
+            TerminalCommand::SelectionKeyboardMove(SelectionDirection::Down).estimated_bytes(),
+            2
+        );
     }
 
     #[test]

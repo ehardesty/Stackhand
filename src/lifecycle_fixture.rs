@@ -1,5 +1,5 @@
 use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
-use crate::interaction_fixture::{PAGE_ROWS, WAIT, apply_move, key, leader, wait_for};
+use crate::interaction_fixture::{PAGE_ROWS, WAIT, apply_move, key, wait_for};
 use crate::output::OutputViews;
 use crate::output::RetainedChunk;
 use crate::supervisor::{Command, Consoles, Lifecycle, RunExitDisposition, SupervisorHandle};
@@ -42,14 +42,7 @@ pub(crate) fn prove_lifecycle(
         )
         .expect("the focused Process has a live console");
     focused_view.with(|session| {
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            true,
-            leader(),
-            Some(session),
-            &mut pipe_scroll[focused],
-            PAGE_ROWS,
-        );
+        console.focus_process_list(Some(session));
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             true,
@@ -73,14 +66,7 @@ pub(crate) fn prove_lifecycle(
     );
     // While stopped its pane is empty; commands still queue through the
     // read-only path.
-    console.route_pane_key(
-        ConsolePaneKind::Empty,
-        true,
-        leader(),
-        None,
-        &mut pipe_scroll[focused],
-        PAGE_ROWS,
-    );
+    console.focus_process_list(None);
     console.route_pane_key(
         ConsolePaneKind::Empty,
         true,
@@ -106,14 +92,7 @@ pub(crate) fn prove_lifecycle(
         .view_process(live_snapshot.processes[focused].process_id, focused_run)
         .expect("the restarted Process has a live console");
     focused_live.with(|session| {
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            true,
-            leader(),
-            Some(session),
-            &mut pipe_scroll[focused],
-            PAGE_ROWS,
-        );
+        console.focus_process_list(Some(session));
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             true,
@@ -161,14 +140,7 @@ pub(crate) fn prove_lifecycle(
         .view_process(live_snapshot.processes[mute].process_id, mute_run)
         .expect("the muted Process has a live console");
     mute_live.with(|session| {
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            false,
-            leader(),
-            Some(session),
-            &mut pipe_scroll[mute],
-            PAGE_ROWS,
-        );
+        console.focus_process_list(Some(session));
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             false,
@@ -201,14 +173,7 @@ pub(crate) fn prove_lifecycle(
         SelectionMove::Down,
     );
     assert_eq!(*selected, piped);
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        leader(),
-        None,
-        &mut pipe_scroll[piped],
-        PAGE_ROWS,
-    );
+    console.focus_process_list(None);
     console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
@@ -416,14 +381,7 @@ pub(crate) fn prove_rerun(
     }
     // Start the first attempt through the pane seam; the app dispatches
     // Start for the selected Process.
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        leader(),
-        None,
-        &mut pipe_scroll[oneoff],
-        PAGE_ROWS,
-    );
+    console.focus_process_list(None);
     console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
@@ -446,14 +404,7 @@ pub(crate) fn prove_rerun(
     );
     // Rerun: the app maps `r` on a One-shot to the Supervisor's Rerun
     // command, and the new attempt receives the next Run ID.
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        leader(),
-        None,
-        &mut pipe_scroll[oneoff],
-        PAGE_ROWS,
-    );
+    console.focus_process_list(None);
     console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,

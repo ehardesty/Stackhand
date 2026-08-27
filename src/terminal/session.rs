@@ -13,7 +13,7 @@ use super::history::OutputHistoryMetrics;
 use super::mouse::TerminalMouseEvent;
 use super::owner::{OwnerEvent, OwnerHandle};
 use super::paste::{self, PasteRejection, PasteRequest};
-pub use super::selection::SelectionPoint;
+pub use super::selection::{SelectionDirection, SelectionPoint};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{PtyIo, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer};
 
@@ -222,6 +222,27 @@ impl TerminalSession {
 
     pub fn clear_selection(&self) {
         let _ = self.commands.try_send(TerminalCommand::SelectionClear);
+    }
+
+    /// Show the terminal-owned keyboard copy cursor. This never writes to the child.
+    pub fn start_keyboard_selection(&self) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionKeyboardStart);
+    }
+
+    /// Toggle whether keyboard movement extends the terminal selection.
+    pub fn toggle_keyboard_selection(&self) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionKeyboardToggle);
+    }
+
+    /// Move the terminal-owned copy cursor or active selection endpoint.
+    pub fn move_keyboard_selection(&self, direction: SelectionDirection) {
+        let _ = self
+            .commands
+            .try_send(TerminalCommand::SelectionKeyboardMove(direction));
     }
 
     pub fn request_copy(&self) -> CopyRequest {
@@ -478,6 +499,68 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn keyboard_selection_is_visible_and_never_writes_to_the_child() {
+        let (reader, mut peer) = UnixStream::pair().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let io = PtyIo {
+            reader: Box::new(reader),
+            writer: Box::new(RecordingWriter {
+                bytes: Arc::clone(&captured),
+            }),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let geometry = TerminalGeometry::new(8, 3).unwrap();
+        let session = TerminalSession::spawn(io, geometry, || {}).unwrap();
+        peer.write_all(b"abcd\x1b[1;1H\x1b[?25l").unwrap();
+
+        let output_deadline = Instant::now() + Duration::from_secs(1);
+        while session.snapshot().text() != "abcd" {
+            assert!(
+                Instant::now() < output_deadline,
+                "terminal output was not parsed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.snapshot().cursor, None);
+
+        session.start_keyboard_selection();
+        let cursor_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = session.snapshot();
+            if snapshot.cursor.map(|cursor| cursor.position) == Some(Position::new(0, 0)) {
+                break;
+            }
+            assert!(
+                Instant::now() < cursor_deadline,
+                "keyboard copy cursor did not become visible"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        session.move_keyboard_selection(SelectionDirection::Right);
+        session.toggle_keyboard_selection();
+        session.move_keyboard_selection(SelectionDirection::Right);
+        let request = session.request_copy();
+        let copy_deadline = Instant::now() + Duration::from_secs(1);
+        let copied = loop {
+            if let Some(result) = request.poll() {
+                break result.unwrap();
+            }
+            assert!(
+                Instant::now() < copy_deadline,
+                "copy request did not complete"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(copied.as_deref(), Some("bc"));
+        assert!(captured.lock().unwrap().is_empty());
+
+        drop(peer);
+        session.shutdown().unwrap();
     }
 
     #[test]

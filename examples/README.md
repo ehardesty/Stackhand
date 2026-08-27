@@ -15,8 +15,7 @@ Run an example from the repository root:
 cargo run -- examples/basic.yaml
 ```
 
-Stackhand starts enabled autostart Processes. Press `Ctrl-A` to enter
-application commands. Then use:
+Stackhand starts enabled autostart Processes with the Process list focused:
 
 ```text
 j/k or Up/Down   select a Process
@@ -25,10 +24,15 @@ x                stop the selected Process
 r                restart a Service or rerun a One-shot
 PageUp/PageDown  inspect retained output
 f                return to live output
-v                select text in a PTY console
-Esc              return to child input
-Ctrl-Q           stop the Project and quit
+v                enter Copy mode for a PTY console
+Ctrl-A           toggle Process-list and console focus
+q                stop the Project and quit from the Process list
+Ctrl-Q           stop the Project and quit from any focus
 ```
+
+In Copy mode, use `h`/`j`/`k`/`l` or the arrow keys to move. Press `v` to
+start the selection endpoint, `c` or `y` to copy, and `Esc` to return to the
+Process list. A mouse drag enters Copy mode directly.
 
 ## Examples
 
@@ -40,7 +44,7 @@ manual One-shot, and a disabled Service.
 Manual checks:
 
 1. Confirm that `clock` starts and prints once per second.
-2. Start `shell`, press `Esc`, and run `echo hello` or `stty size`.
+2. Start `shell`, press `Ctrl-A`, and run `echo hello` or `stty size`.
 3. Start or rerun `manual-task` and look for a new Run marker.
 4. Confirm that `disabled-example` cannot start.
 

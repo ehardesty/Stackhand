@@ -7,12 +7,14 @@ use crate::terminal::OwnedTerminalSnapshot;
 
 const FOOTER_HEIGHT: u16 = 1;
 
+/// The active keyboard scope. Stackhand starts in the Process list so
+/// navigation and lifecycle keys work immediately. Only Console sends
+/// unbound keys to an input-enabled PTY. Copy owns text-selection keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleViewMode {
-    ChildInput,
-    AppCommand,
-    Scroll,
-    Selection,
+    ProcessList,
+    Console,
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +54,7 @@ pub struct ConsoleViewState {
 impl Default for ConsoleViewState {
     fn default() -> Self {
         Self {
-            mode: ConsoleViewMode::ChildInput,
+            mode: ConsoleViewMode::ProcessList,
             following: true,
             warning: None,
             stackhand_mouse_gesture: false,
@@ -166,9 +168,18 @@ pub fn render_project(
             ratatui::text::Line::styled(row_line(row, list.width.saturating_sub(2) as usize), style)
         })
         .collect();
+    let list_border = if view.mode == ConsoleViewMode::ProcessList {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     frame.render_widget(
-        ratatui::widgets::List::new(list_rows)
-            .block(Block::new().borders(Borders::ALL).title(" Processes ")),
+        ratatui::widgets::List::new(list_rows).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(list_border)
+                .title(" Processes "),
+        ),
         list,
     );
     // The header names the selected Process and its live Run identity; it
@@ -179,7 +190,15 @@ pub fn render_project(
     } else {
         format!(" Console · {selected_header} ")
     };
-    frame.render_widget(Block::bordered().title(header), console_pane);
+    let console_border = match view.mode {
+        ConsoleViewMode::ProcessList => Style::default().fg(Color::DarkGray),
+        ConsoleViewMode::Console => Style::default().fg(Color::Cyan),
+        ConsoleViewMode::Copy => Style::default().fg(Color::Yellow),
+    };
+    frame.render_widget(
+        Block::bordered().border_style(console_border).title(header),
+        console_pane,
+    );
 
     let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
     if let Some(lines) = pipe_lines {
@@ -196,9 +215,10 @@ pub fn render_project(
             .style(Style::default().fg(Color::DarkGray)),
         footer,
     );
-    // A pipe console has no terminal cursor; only a live terminal snapshot
-    // positions the cursor for the child.
-    if pipe_lines.is_none()
+    // A pipe console has no terminal cursor. Console focus shows the child
+    // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
+    if matches!(view.mode, ConsoleViewMode::Console | ConsoleViewMode::Copy)
+        && pipe_lines.is_none()
         && let Some(cursor) = console_snapshot.and_then(|snap| snap.cursor)
     {
         let x = console_inner.x.saturating_add(cursor.position.x);
@@ -249,44 +269,42 @@ fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console
 }
 
 fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
-    // Scroll mode operates on the console's history, not the Process
-    // list; only command mode owns list movement.
     let focus = match view.mode {
-        ConsoleViewMode::ChildInput | ConsoleViewMode::Scroll => "FOCUS: CONSOLE",
-        ConsoleViewMode::AppCommand => "FOCUS: LIST",
-        ConsoleViewMode::Selection => "FOCUS: SELECT",
+        ConsoleViewMode::ProcessList => "FOCUS: PROCESSES",
+        ConsoleViewMode::Console => "FOCUS: CONSOLE",
+        ConsoleViewMode::Copy => "MODE: COPY",
     };
     if let Some(warning) = view.warning {
         let warning = match warning {
             ConsoleWarning::PasteRejected => {
-                "WARNING: paste rejected; no partial bytes sent · Ctrl-A: commands"
+                "WARNING: paste rejected; focus an input-enabled console first"
             }
             ConsoleWarning::InputRejected => {
-                "WARNING: terminal input was rejected; Run is stopping or its queue is full · Ctrl-A: commands"
+                "WARNING: terminal input was rejected; Run is stopping or its queue is full"
             }
             ConsoleWarning::InputBackpressure => {
-                "WARNING: child input queue is saturated; delivery is bounded · Ctrl-A: commands"
+                "WARNING: child input queue is saturated; delivery is bounded"
             }
             ConsoleWarning::OutputTruncated => {
-                "WARNING: oldest Process output was removed at the history bound · Ctrl-A: commands"
+                "WARNING: oldest Process output was removed at the history bound"
             }
             ConsoleWarning::PasteDeliveryFailed => {
-                "WARNING: an admitted paste did not reach the child · Ctrl-A: commands"
+                "WARNING: an admitted paste did not reach the child"
             }
             ConsoleWarning::ClipboardFailed => {
-                "WARNING: clipboard write failed; terminal session continues · Esc: selection"
+                "WARNING: clipboard write failed; selection remains available"
             }
             ConsoleWarning::NothingSelected => {
-                "WARNING: no terminal text is selected · Esc: selection"
+                "WARNING: no terminal text is selected · v: start selection"
             }
             ConsoleWarning::InputDisabled => {
-                "WARNING: input is not enabled for this Process · Ctrl-A: commands"
+                "WARNING: input is not enabled for this Process · Ctrl-A: Process list"
             }
             ConsoleWarning::PipeReadOnly => {
-                "WARNING: pipe output is read-only; no child input · Ctrl-A: commands"
+                "WARNING: pipe output is read-only · Ctrl-A: Process list"
             }
             ConsoleWarning::SelectionUnavailable => {
-                "WARNING: text selection is unavailable in pipe output · Esc: commands"
+                "WARNING: text selection is available only in a PTY console"
             }
         };
         return format!(
@@ -295,62 +313,35 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
         );
     }
 
-    let (controls, note) = if view.pane == ConsolePaneKind::Terminal {
-        match (view.mode, view.following) {
-            (ConsoleViewMode::ChildInput, true) => ("Ctrl-A: commands · Ctrl-Q: quit", "LIVE"),
-            (ConsoleViewMode::ChildInput, false) => {
-                ("Ctrl-A: commands · Ctrl-Q: quit", "NOT FOLLOWING")
-            }
-            (ConsoleViewMode::AppCommand, _) => (
-                "PageUp: history · s: selection · j/k or ↑↓: select Process · f: live tail · Esc: console",
-                "",
-            ),
-            (ConsoleViewMode::Scroll, _) => (
-                "PageUp/Down: move · f: live tail",
-                "history target 64 KiB; page rounding and truncation signal unavailable",
-            ),
-            (ConsoleViewMode::Selection, _) => (
-                "Drag: cells · double: word · triple: line · a: all · y: copy · Esc: commands",
-                "",
-            ),
+    let controls = match view.mode {
+        ConsoleViewMode::ProcessList => {
+            "j/k or ↑↓: select · s: start · x: stop · r: restart · v: copy · Ctrl-A: console · q: quit"
         }
-    } else {
-        match view.mode {
-            ConsoleViewMode::ChildInput => (
-                "Ctrl-A: commands · Ctrl-Q: quit",
-                if view.pane == ConsolePaneKind::Pipe {
-                    "read-only output"
-                } else {
-                    "no active Run"
-                },
-            ),
-            ConsoleViewMode::AppCommand => (
-                "j/k or ↑↓: select Process · PageUp/Down: scroll · f: live tail · s: selection · Esc: console",
-                "",
-            ),
-            ConsoleViewMode::Scroll => ("PageUp/Down: scroll · f: live tail · Esc: commands", ""),
-            ConsoleViewMode::Selection => (
-                "a: all · y: copy · Esc: commands",
-                "unavailable in pipe output",
-            ),
+        ConsoleViewMode::Console => match view.pane {
+            ConsolePaneKind::Terminal => "keys: child · Ctrl-A: Process list · Ctrl-Q: quit",
+            ConsolePaneKind::Pipe => "read-only output · Ctrl-A: Process list · Ctrl-Q: quit",
+            ConsolePaneKind::Empty => "no active Run · Ctrl-A: Process list · Ctrl-Q: quit",
+        },
+        ConsoleViewMode::Copy => {
+            "h/j/k/l or arrows: move · v: begin selection · c/y: copy · a: all · Esc: Process list"
         }
     };
-    let note = if note.is_empty() {
-        String::new()
+    let tail = if view.following {
+        "LIVE"
     } else {
-        format!(" · {note}")
+        "NOT FOLLOWING"
     };
     format!(
-        "{} · {focus} · {controls}{note}",
+        "{} · {focus} · {controls} · {tail}",
         mouse_owner_text(view, child_mouse_tracking)
     )
 }
 
 fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'static str {
     if view.stackhand_mouse_gesture {
-        "MOUSE: STACKHAND · active gesture"
-    } else if view.mode == ConsoleViewMode::ChildInput && child_mouse_tracking {
-        "MOUSE: CHILD · Shift+mouse: Stackhand"
+        "MOUSE: STACKHAND · selecting"
+    } else if view.mode == ConsoleViewMode::Console && child_mouse_tracking {
+        "MOUSE: CHILD · Shift+drag: copy"
     } else {
         "MOUSE: STACKHAND"
     }
@@ -512,10 +503,47 @@ mod tests {
     }
 
     #[test]
-    fn scroll_footer_reports_the_bound_and_missing_truncation_signal() {
+    fn copy_mode_positions_the_terminal_owned_keyboard_cursor() {
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let snapshot = OwnedTerminalSnapshot {
+            buffer: ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 12)),
+            cursor: Some(crate::terminal::OwnedCursorState {
+                position: ratatui::layout::Position::new(2, 1),
+                shape: crate::terminal::CursorShape::Block,
+                blinking: false,
+            }),
+            mouse_tracking: false,
+        };
+        let mut console_inner = Rect::default();
+
+        terminal
+            .draw(|frame| {
+                console_inner = render_project(
+                    frame,
+                    &[],
+                    Some(&snapshot),
+                    None,
+                    ConsoleViewState {
+                        mode: ConsoleViewMode::Copy,
+                        ..ConsoleViewState::default()
+                    },
+                    "",
+                );
+            })
+            .unwrap();
+
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(console_inner.x + 2, console_inner.y + 1)
+        );
+    }
+
+    #[test]
+    fn scrolling_keeps_process_list_focus_and_reports_live_state() {
         let text = footer_text(
             ConsoleViewState {
-                mode: ConsoleViewMode::Scroll,
+                mode: ConsoleViewMode::ProcessList,
                 following: false,
                 warning: None,
                 stackhand_mouse_gesture: false,
@@ -524,19 +552,16 @@ mod tests {
             false,
         );
 
-        assert!(text.contains("target 64 KiB"));
-        assert!(text.contains("page rounding"));
-        assert!(text.contains("truncation signal unavailable"));
-        // Scrolling the history is console focus, not list focus.
-        assert!(text.contains("FOCUS: CONSOLE"), "{text}");
-        assert!(!text.contains("FOCUS: LIST"), "{text}");
+        assert!(text.contains("FOCUS: PROCESSES"), "{text}");
+        assert!(text.contains("NOT FOLLOWING"), "{text}");
+        assert!(text.contains("j/k or ↑↓: select"), "{text}");
     }
 
     #[test]
     fn footer_makes_paste_rejection_visible() {
         let text = footer_text(
             ConsoleViewState {
-                mode: ConsoleViewMode::ChildInput,
+                mode: ConsoleViewMode::Console,
                 following: true,
                 warning: Some(ConsoleWarning::PasteRejected),
                 stackhand_mouse_gesture: false,
@@ -546,14 +571,14 @@ mod tests {
         );
 
         assert!(text.contains("WARNING: paste rejected"));
-        assert!(text.contains("no partial bytes sent"));
+        assert!(text.contains("focus an input-enabled console"));
     }
 
     #[test]
     fn footer_makes_admitted_paste_delivery_failure_visible() {
         let text = footer_text(
             ConsoleViewState {
-                mode: ConsoleViewMode::ChildInput,
+                mode: ConsoleViewMode::Console,
                 following: true,
                 warning: Some(ConsoleWarning::PasteDeliveryFailed),
                 stackhand_mouse_gesture: false,
@@ -568,7 +593,7 @@ mod tests {
     fn footer_makes_clipboard_failure_visible_and_keeps_selection_controls() {
         let text = footer_text(
             ConsoleViewState {
-                mode: ConsoleViewMode::Selection,
+                mode: ConsoleViewMode::Copy,
                 following: false,
                 warning: Some(ConsoleWarning::ClipboardFailed),
                 stackhand_mouse_gesture: false,
@@ -578,16 +603,22 @@ mod tests {
         );
 
         assert!(text.contains("clipboard write failed"));
-        assert!(text.contains("session continues"));
+        assert!(text.contains("selection remains available"));
         assert!(text.contains("MOUSE: STACKHAND"));
     }
 
     #[test]
     fn footer_shows_child_mouse_ownership_and_the_override() {
-        let text = footer_text(ConsoleViewState::default(), true);
+        let text = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::Console,
+                ..ConsoleViewState::default()
+            },
+            true,
+        );
 
         assert!(text.contains("MOUSE: CHILD"));
-        assert!(text.contains("Shift+mouse: Stackhand"));
+        assert!(text.contains("Shift+drag: copy"));
     }
 
     #[test]
@@ -600,12 +631,18 @@ mod tests {
             true,
         );
 
-        assert!(text.starts_with("MOUSE: STACKHAND · active gesture"));
+        assert!(text.starts_with("MOUSE: STACKHAND · selecting"));
     }
 
     #[test]
     fn footer_labels_the_focus_and_the_pane() {
-        let console_footer = footer_text(ConsoleViewState::default(), false);
+        let console_footer = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::Console,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
         assert!(
             console_footer.contains("FOCUS: CONSOLE"),
             "{console_footer}"
@@ -614,15 +651,16 @@ mod tests {
 
         let list_footer = footer_text(
             ConsoleViewState {
-                mode: ConsoleViewMode::AppCommand,
+                mode: ConsoleViewMode::ProcessList,
                 ..ConsoleViewState::default()
             },
             false,
         );
-        assert!(list_footer.contains("FOCUS: LIST"), "{list_footer}");
+        assert!(list_footer.contains("FOCUS: PROCESSES"), "{list_footer}");
 
         let pipe_footer = footer_text(
             ConsoleViewState {
+                mode: ConsoleViewMode::Console,
                 pane: ConsolePaneKind::Pipe,
                 ..ConsoleViewState::default()
             },
@@ -632,6 +670,7 @@ mod tests {
 
         let empty_footer = footer_text(
             ConsoleViewState {
+                mode: ConsoleViewMode::Console,
                 pane: ConsolePaneKind::Empty,
                 ..ConsoleViewState::default()
             },
@@ -647,7 +686,7 @@ mod tests {
             (ConsoleWarning::PipeReadOnly, "pipe output is read-only"),
             (
                 ConsoleWarning::SelectionUnavailable,
-                "text selection is unavailable",
+                "text selection is available only in a PTY console",
             ),
         ] {
             let state = ConsoleViewState {

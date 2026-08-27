@@ -98,9 +98,18 @@ fn prove(
     wait_for_tick(&focused_view, "tick-", 2)?;
     wait_for_tick(&mute_view, "tick-", 2)?;
 
-    // Input reaches the selected active PTY Process with focused input
-    // enabled, through the same pane-key seam the app event loop uses.
+    // The Process list owns the keyboard at startup. Ctrl-A moves focus to
+    // the selected console before child input can cross the pane-key seam.
+    assert_eq!(console.view().mode, ConsoleViewMode::ProcessList);
     focused_view.with(|session| {
+        console.route_pane_key(
+            ConsolePaneKind::Terminal,
+            true,
+            leader(),
+            Some(session),
+            &mut pipe_scroll[focused],
+            PAGE_ROWS,
+        );
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             true,
@@ -141,7 +150,7 @@ fn prove(
     });
     // The second flushed input line carries the 0x03 byte.
     wait_for_console(&focused_view, second_input_line_has_zero_three)?;
-    // The leader round-trips: into the list and back to the console.
+    // The leader round-trips between console and Process-list focus.
     focused_view.with(|session| {
         console.route_pane_key(
             ConsolePaneKind::Terminal,
@@ -152,18 +161,18 @@ fn prove(
             PAGE_ROWS,
         );
     });
-    assert_eq!(console.view().mode, ConsoleViewMode::AppCommand);
+    assert_eq!(console.view().mode, ConsoleViewMode::ProcessList);
     focused_view.with(|session| {
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             true,
-            key(KeyCode::Esc),
+            leader(),
             Some(session),
             &mut pipe_scroll[focused],
             PAGE_ROWS,
         );
     });
-    assert_eq!(console.view().mode, ConsoleViewMode::ChildInput);
+    assert_eq!(console.view().mode, ConsoleViewMode::Console);
     println!("interaction-input-ok");
 
     // The PTY Process without focused input visibly rejects child input
@@ -194,12 +203,12 @@ fn prove(
             PAGE_ROWS,
         );
     });
-    assert_eq!(console.view().mode, ConsoleViewMode::AppCommand);
+    assert_eq!(console.view().mode, ConsoleViewMode::ProcessList);
     mute_view.with(|session| {
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             false,
-            key(KeyCode::Esc),
+            leader(),
             Some(session),
             &mut pipe_scroll[mute],
             PAGE_ROWS,
@@ -232,7 +241,7 @@ fn prove(
         &mut pipe_scroll[piped],
         PAGE_ROWS,
     ));
-    assert_eq!(console.view().mode, ConsoleViewMode::AppCommand);
+    assert_eq!(console.view().mode, ConsoleViewMode::ProcessList);
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
@@ -376,17 +385,9 @@ fn prove(
         console_text(&mute_view).contains("mute-ready"),
         "the selection move reset the muted Process's scroll"
     );
-    // Return the muted terminal to its live tail and end on the focused
-    // Process in child-input mode.
+    // Return the muted terminal to its live tail while Process-list focus
+    // remains active, then focus the selected interactive console.
     mute_view.with(|session| {
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            false,
-            leader(),
-            Some(session),
-            &mut pipe_scroll[mute],
-            PAGE_ROWS,
-        );
         console.route_pane_key(
             ConsolePaneKind::Terminal,
             false,
@@ -396,7 +397,17 @@ fn prove(
             PAGE_ROWS,
         );
     });
-    assert_eq!(console.view().mode, ConsoleViewMode::ChildInput);
+    focused_view.with(|session| {
+        console.route_pane_key(
+            ConsolePaneKind::Terminal,
+            true,
+            leader(),
+            Some(session),
+            &mut pipe_scroll[focused],
+            PAGE_ROWS,
+        );
+    });
+    assert_eq!(console.view().mode, ConsoleViewMode::Console);
     println!("interaction-scroll-ok");
 
     // A resize reaches only the selected live PTY, and the geometry it
@@ -548,79 +559,61 @@ fn move_selection_key(
         SelectionMove::Up => KeyCode::Char('k'),
     };
     let process = &snapshot.processes[selected];
-    if process.terminal_mode == crate::model::TerminalMode::Pty {
-        // A live terminal routes through its session; a Process whose Run
-        // is stopped or being cleaned up routes through the empty pane
-        // path, exactly like the app's pane kind selection.
+    let pane = if process.terminal_mode == crate::model::TerminalMode::Pty {
         let live = matches!(process.lifecycle, Lifecycle::Starting | Lifecycle::Running)
             .then(|| process.current_run)
             .flatten()
             .and_then(|run_id| consoles.view_process(process.process_id, run_id));
-        // Esc first: a scroll-mode pane lands in the command UI, and the
-        // press is a no-op anywhere else, so the leader below reaches the
-        // command UI from every mode.
-        let keys = [
-            KeyEvent::from(KeyCode::Esc),
-            leader(),
-            KeyEvent::from(move_key),
-        ];
         match live {
             Some(view) => {
                 view.with(|session| {
-                    for key_event in keys {
+                    if console.view().mode != ConsoleViewMode::ProcessList {
                         console.route_pane_key(
                             ConsolePaneKind::Terminal,
                             process.input_focused,
-                            key_event,
+                            leader(),
                             Some(session),
                             &mut pipe_scroll[selected],
                             PAGE_ROWS,
                         );
                     }
-                });
-            }
-            None => {
-                for key_event in keys {
                     console.route_pane_key(
-                        ConsolePaneKind::Empty,
+                        ConsolePaneKind::Terminal,
                         process.input_focused,
-                        key_event,
-                        None,
+                        key(move_key),
+                        Some(session),
                         &mut pipe_scroll[selected],
                         PAGE_ROWS,
                     );
-                }
+                });
+                return;
             }
+            None => ConsolePaneKind::Empty,
         }
     } else {
         outputs
             .for_process_id(process.process_id)
             .expect("the fixture's pipe Process has a module");
+        ConsolePaneKind::Pipe
+    };
+    if console.view().mode != ConsoleViewMode::ProcessList {
         console.route_pane_key(
-            ConsolePaneKind::Pipe,
-            process.input_focused,
-            key(KeyCode::Esc),
-            None,
-            &mut pipe_scroll[selected],
-            PAGE_ROWS,
-        );
-        console.route_pane_key(
-            ConsolePaneKind::Pipe,
+            pane,
             process.input_focused,
             leader(),
             None,
             &mut pipe_scroll[selected],
             PAGE_ROWS,
         );
-        console.route_pane_key(
-            ConsolePaneKind::Pipe,
-            process.input_focused,
-            key(move_key),
-            None,
-            &mut pipe_scroll[selected],
-            PAGE_ROWS,
-        );
     }
+    console.route_pane_key(
+        pane,
+        process.input_focused,
+        key(move_key),
+        None,
+        &mut pipe_scroll[selected],
+        PAGE_ROWS,
+    );
 }
 
 fn shutdown(supervisor: SupervisorHandle, proof_ok: bool) -> Result<()> {

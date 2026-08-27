@@ -33,6 +33,16 @@ impl PipeScroll {
         }
     }
 
+    /// Move by a small line count. A negative direction moves toward the
+    /// retained head. Mouse-wheel input uses this instead of page jumps.
+    pub fn scroll_lines(&mut self, lines: usize, direction: isize) {
+        if direction < 0 {
+            self.offset = self.offset.saturating_add(lines).min(PIPE_MAX_SCROLL_LINES);
+        } else {
+            self.offset = self.offset.saturating_sub(lines);
+        }
+    }
+
     /// Return the pane to the live tail.
     pub fn follow(&mut self) {
         self.offset = 0;

@@ -33,19 +33,22 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run -- examples/basic.yaml
 ```
 
 Stackhand loads one explicit YAML Project file. It starts enabled autostart
-Processes and opens the Process list and selected console. Press `Ctrl-A` to
-enter application commands. Use `j` or `k` to select a Process, `s` to start,
-`x` to stop, and `r` to restart a Service or rerun a One-shot. Press `Esc` to
-return to child input. Press `Ctrl-Q` to stop the Project and restore the outer
-terminal.
+Processes with the Process list focused. Use `j` or `k` to select a Process,
+`s` to start, `x` to stop, and `r` to restart a Service or rerun a One-shot.
+Press `Ctrl-A` to focus the selected console and send keys to an input-enabled
+PTY. Press `Ctrl-A` again to return to the Process list. Press `q` from the
+Process list, or `Ctrl-Q` from anywhere, to stop the Project and restore the
+outer terminal.
 
 For ready-to-run Projects and manual checks, see
 [Example Projects](./examples/README.md).
 
-In a PTY console, press `Ctrl-A`, then `v`, to enter selection mode. Drag to
-select cells. A double click selects a word. A triple click selects a logical
-line. Press `a` to select all retained terminal text, `y` to copy, or `Esc` to
-return to application commands. Child clipboard reads and writes are denied.
+Press `v` from the Process list to enter Copy mode for a PTY console. Use
+`h`/`j`/`k`/`l` or the arrow keys to move, and press `v` again to begin the
+selection endpoint. You can also click and drag to enter Copy mode directly.
+A double click selects a word. A triple click selects a logical line. Press
+`a` to select all retained terminal text, `c` or `y` to copy, or `Esc` to
+return to the Process list. Child clipboard reads and writes are denied.
 
 Run the automated checks with the pinned Zig version on `PATH`:
 

@@ -25,6 +25,12 @@ pub struct MouseRouter {
 }
 
 impl MouseRouter {
+    /// True between a console mouse press and its matching release. The app
+    /// uses this to keep routing a drag after it leaves the console bounds.
+    pub fn gesture_active(&self) -> bool {
+        self.gesture_owner.is_some()
+    }
+
     pub fn route(
         &mut self,
         mouse: MouseEvent,
@@ -47,7 +53,7 @@ impl MouseRouter {
             return None;
         }
 
-        let current_owner = if mode != ConsoleViewMode::ChildInput
+        let current_owner = if mode != ConsoleViewMode::Console
             || mouse.modifiers.contains(KeyModifiers::SHIFT)
             || !child_tracking
         {
@@ -160,13 +166,12 @@ mod tests {
                     KeyModifiers::SHIFT,
                 ),
                 Rect::new(10, 5, 20, 4),
-                ConsoleViewMode::ChildInput,
+                ConsoleViewMode::Console,
                 true,
                 Duration::ZERO,
             )
             .unwrap();
 
-        assert!(route.event.stackhand_owned);
         assert!(route.event.stackhand_owned);
         assert!(route.changes_history_view);
         assert_eq!(
@@ -184,24 +189,19 @@ mod tests {
             .route(
                 event(MouseEventKind::Moved, KeyModifiers::NONE),
                 Rect::new(10, 5, 20, 4),
-                ConsoleViewMode::ChildInput,
+                ConsoleViewMode::Console,
                 true,
                 Duration::ZERO,
             )
             .unwrap();
 
         assert!(!route.event.stackhand_owned);
-        assert!(!route.event.stackhand_owned);
         assert!(!route.changes_history_view);
     }
 
     #[test]
     fn app_modes_keep_mouse_ownership() {
-        for mode in [
-            ConsoleViewMode::AppCommand,
-            ConsoleViewMode::Scroll,
-            ConsoleViewMode::Selection,
-        ] {
+        for mode in [ConsoleViewMode::ProcessList, ConsoleViewMode::Copy] {
             let route = MouseRouter::default()
                 .route(
                     event(MouseEventKind::ScrollUp, KeyModifiers::NONE),
@@ -231,7 +231,7 @@ mod tests {
             .route(
                 release,
                 Rect::new(10, 5, 20, 4),
-                ConsoleViewMode::ChildInput,
+                ConsoleViewMode::Console,
                 true,
                 Duration::ZERO,
             )
@@ -256,7 +256,7 @@ mod tests {
                 MouseEventKind::Down(HostMouseButton::Left),
                 KeyModifiers::NONE,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
         let drag = route(
@@ -265,7 +265,7 @@ mod tests {
                 MouseEventKind::Drag(HostMouseButton::Left),
                 KeyModifiers::SHIFT,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
         let release = route(
@@ -274,7 +274,7 @@ mod tests {
                 MouseEventKind::Up(HostMouseButton::Left),
                 KeyModifiers::SHIFT,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
 
@@ -295,7 +295,7 @@ mod tests {
                 MouseEventKind::Down(HostMouseButton::Left),
                 KeyModifiers::SHIFT,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
         let drag = route(
@@ -304,7 +304,7 @@ mod tests {
                 MouseEventKind::Drag(HostMouseButton::Left),
                 KeyModifiers::NONE,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
         let release = route(
@@ -313,7 +313,7 @@ mod tests {
                 MouseEventKind::Up(HostMouseButton::Left),
                 KeyModifiers::NONE,
             ),
-            ConsoleViewMode::ChildInput,
+            ConsoleViewMode::Console,
             true,
         );
 

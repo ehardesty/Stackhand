@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll};
 use crate::geometry::TerminalGeometry;
@@ -183,6 +185,7 @@ fn run_event_loop(
                 console.set_pane(ConsolePaneKind::Pipe);
                 let pane_rows = console_pane.height.saturating_sub(2).max(1) as usize;
                 let scroll = &pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
+                console.set_following(scroll.following());
                 pipe_window.clear();
                 pipe_window
                     .extend(retained.display_lines(pane_rows.saturating_add(scroll.offset())));
@@ -223,7 +226,7 @@ fn run_event_loop(
         }
         let input_event = event::read()?;
         match input_event {
-            Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key) => {
+            Event::Key(key) if key.kind == KeyEventKind::Press && is_quit(key, console.view()) => {
                 if !shutting_down {
                     supervisor.command(Command::Shutdown {
                         deadline: Instant::now() + PROJECT_SHUTDOWN_WAIT,
@@ -270,19 +273,19 @@ fn run_event_loop(
                 }
             },
             Event::Paste(data) => match &pane {
-                SelectedPane::Terminal(view) => {
-                    // Paste is child input: it follows the same policy as
-                    // typed keys and is rejected visibly when disabled.
-                    if selected_process.input_focused {
-                        view.with(|session| console.handle_paste(&data, session));
-                    } else {
-                        console.warn(ConsoleWarning::InputDisabled);
-                    }
+                SelectedPane::Terminal(view)
+                    if console.accepts_child_input(selected_process.input_focused) =>
+                {
+                    view.with(|session| console.handle_paste(&data, session));
                     dirty = true;
                 }
-                // A read-only pane rejects paste visibly instead of
-                // dropping it silently.
-                SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                SelectedPane::Terminal(_) if !selected_process.input_focused => {
+                    console.warn(ConsoleWarning::InputDisabled);
+                    dirty = true;
+                }
+                // Process-list and Copy focus never leak paste bytes to the
+                // child. Pipe and empty consoles are also read-only.
+                SelectedPane::Terminal(_) | SelectedPane::Pipe(_) | SelectedPane::Empty => {
                     console.warn(ConsoleWarning::PasteRejected);
                     dirty = true;
                 }
@@ -311,20 +314,16 @@ fn run_event_loop(
                 }
             }
             Event::Mouse(mouse) => {
-                if let SelectedPane::Terminal(view) = &pane {
-                    // Child mouse tracking is child input: a disabled
-                    // Process keeps Stackhand's selection and scroll
-                    // gestures but receives no mouse events.
-                    let child_tracking = selected_process.input_focused
-                        && console_snapshot
-                            .as_ref()
-                            .is_some_and(|snap| snap.mouse_tracking);
-                    let changed = view.with(|session| {
-                        console.handle_mouse(mouse, console_pane, child_tracking, session)
-                    });
-                    if changed.unwrap_or(false) {
-                        dirty = true;
-                    }
+                if handle_app_mouse(
+                    &mut console,
+                    mouse,
+                    &pane,
+                    &mut selected,
+                    selected_process.input_focused,
+                    console_snapshot.as_ref(),
+                    &mut pipe_scroll,
+                ) {
+                    dirty = true;
                 }
             }
             Event::Resize(cols, rows) => {
@@ -338,6 +337,115 @@ fn run_event_loop(
             }
         }
     }
+}
+
+fn handle_app_mouse(
+    console: &mut ConsoleInteraction,
+    mouse: MouseEvent,
+    pane: &SelectedPane,
+    selected: &mut usize,
+    input_focused: bool,
+    console_snapshot: Option<&OwnedTerminalSnapshot>,
+    pipe_scroll: &mut [Option<PipeScroll>],
+) -> bool {
+    let process_count = pipe_scroll.len();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (list, console_outer, _) =
+        project_layout(ratatui::layout::Rect::new(0, 0, cols, rows), process_count);
+    let console_inner = pane_inner(console_outer);
+
+    // A console-owned drag keeps its original owner when the pointer leaves
+    // the pane. Deliver Drag and Up before hit-testing another surface.
+    if console.mouse_gesture_active()
+        && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+        && let SelectedPane::Terminal(view) = pane
+    {
+        let child_tracking =
+            input_focused && console_snapshot.is_some_and(|snapshot| snapshot.mouse_tracking);
+        return view
+            .with(|session| console.handle_mouse(mouse, console_inner, child_tracking, session))
+            .unwrap_or(false);
+    }
+
+    if rect_contains(list, mouse.column, mouse.row) {
+        if mouse_changes_focus(mouse.kind) {
+            match pane {
+                SelectedPane::Terminal(view) => {
+                    view.with(|session| console.focus_process_list(Some(session)));
+                }
+                SelectedPane::Pipe(_) | SelectedPane::Empty => console.focus_process_list(None),
+            }
+        }
+        let previous = *selected;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = process_row_at(list, mouse.row, process_count) {
+                    *selected = index;
+                    console.clear_pane_warning();
+                }
+            }
+            MouseEventKind::ScrollUp => *selected = (*selected).saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                *selected = (*selected + 1).min(process_count.saturating_sub(1));
+            }
+            _ => {}
+        }
+        return previous != *selected || matches!(mouse.kind, MouseEventKind::Down(_));
+    }
+
+    if !rect_contains(console_outer, mouse.column, mouse.row) {
+        return false;
+    }
+    match pane {
+        SelectedPane::Terminal(view) => view
+            .with(|session| {
+                if mouse_starts_console_focus(mouse.kind, console.view().mode) {
+                    console.focus_console(Some(session));
+                }
+                let child_tracking = input_focused
+                    && console_snapshot.is_some_and(|snapshot| snapshot.mouse_tracking);
+                console.handle_mouse(mouse, console_inner, child_tracking, session)
+            })
+            .unwrap_or(false),
+        SelectedPane::Pipe(_) => {
+            if mouse_starts_console_focus(mouse.kind, console.view().mode) {
+                console.focus_console(None);
+            }
+            console.handle_read_only_mouse(mouse, &mut pipe_scroll[*selected])
+                || mouse_changes_focus(mouse.kind)
+        }
+        SelectedPane::Empty => {
+            if mouse_changes_focus(mouse.kind) {
+                if mouse_starts_console_focus(mouse.kind, console.view().mode) {
+                    console.focus_console(None);
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn mouse_changes_focus(kind: MouseEventKind) -> bool {
+    matches!(kind, MouseEventKind::Down(_))
+}
+
+fn mouse_starts_console_focus(kind: MouseEventKind, mode: crate::tui::ConsoleViewMode) -> bool {
+    mouse_changes_focus(kind) && mode == crate::tui::ConsoleViewMode::ProcessList
+}
+
+fn rect_contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn process_row_at(list: ratatui::layout::Rect, row: u16, process_count: usize) -> Option<usize> {
+    let inner = pane_inner(list);
+    if row < inner.y || row >= inner.bottom() {
+        return None;
+    }
+    let index = usize::from(row - inner.y);
+    (index < process_count).then_some(index)
 }
 
 /// What the selected Process's console pane shows. A PTY Run owns a live
@@ -581,72 +689,14 @@ impl PendingResize {
     }
 }
 
-fn is_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('q')
-        && key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
+fn is_quit(key: KeyEvent, view: crate::tui::ConsoleViewState) -> bool {
+    if key.code != KeyCode::Char('q') {
+        return false;
+    }
+    key.modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+        || (view.mode == crate::tui::ConsoleViewMode::ProcessList && key.modifiers.is_empty())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shutdown_result_keeps_failures_and_remaining_pids() {
-        let result = ProjectShutdownSnapshot {
-            complete: true,
-            timed_out: true,
-            failures: vec![crate::supervisor::ProcessShutdownFailure {
-                process: "api".to_string(),
-                detail: "Project shutdown deadline expired".to_string(),
-                remaining_pids: vec![41, 42],
-            }],
-        };
-
-        let error = report_shutdown_result(&result).expect_err("cleanup failure is reported");
-        assert_eq!(
-            error.to_string(),
-            "Project shutdown did not finish cleanly: api: Project shutdown deadline expired (remaining PIDs: [41, 42])"
-        );
-    }
-
-    #[test]
-    fn metric_and_age_labels_use_compact_units() {
-        assert_eq!(format_cpu(3.24), "3.2%");
-        assert_eq!(format_cpu(12.4), "12%");
-        assert_eq!(format_rss(768), "768K");
-        assert_eq!(format_rss(180 * 1024), "180M");
-        assert_eq!(format_rss(1024 * 1024), "1.0G");
-        assert_eq!(format_age(59_000), "59s");
-        assert_eq!(format_age(61_000), "1m1s");
-    }
-
-    #[test]
-    fn rapid_resize_uses_only_the_last_valid_geometry() {
-        let started = Instant::now();
-        let mut pending = PendingResize::default();
-        pending.update(TerminalGeometry::new(120, 40).unwrap(), started);
-        pending.update(
-            TerminalGeometry::new(1, 1).unwrap(),
-            started + Duration::from_millis(2),
-        );
-        pending.update(
-            TerminalGeometry::new(73, 19).unwrap(),
-            started + Duration::from_millis(4),
-        );
-
-        assert_eq!(
-            pending.take_ready(started + Duration::from_millis(19)),
-            None
-        );
-        assert_eq!(
-            pending.take_ready(started + Duration::from_millis(20)),
-            TerminalGeometry::new(73, 19)
-        );
-        assert_eq!(
-            pending.take_ready(started + Duration::from_millis(21)),
-            None
-        );
-    }
-}
+mod tests;

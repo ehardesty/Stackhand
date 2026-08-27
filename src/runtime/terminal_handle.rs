@@ -6,8 +6,8 @@ use crate::geometry::TerminalGeometry;
 use crate::runtime::outcome::ResizeRejected;
 use crate::terminal::{
     CopyRequest, InputRejection as SessionInputRejection, OutputHistoryMetrics,
-    OwnedTerminalSnapshot, PasteRejection, PasteRequest, TerminalEvent, TerminalMouseEvent,
-    TerminalSession,
+    OwnedTerminalSnapshot, PasteRejection, PasteRequest, SelectionDirection, TerminalEvent,
+    TerminalMouseEvent, TerminalSession,
 };
 
 use super::InputRejected;
@@ -112,6 +112,21 @@ impl TerminalHandle<'_> {
 
     pub fn clear_selection(&self) {
         self.session.clear_selection();
+    }
+
+    /// Show a terminal-owned keyboard copy cursor without sending child input.
+    pub fn start_keyboard_selection(&self) {
+        self.session.start_keyboard_selection();
+    }
+
+    /// Toggle whether movement extends the terminal-owned selection endpoint.
+    pub fn toggle_keyboard_selection(&self) {
+        self.session.toggle_keyboard_selection();
+    }
+
+    /// Move the terminal-owned copy cursor or active selection endpoint.
+    pub fn move_keyboard_selection(&self, direction: SelectionDirection) {
+        self.session.move_keyboard_selection(direction);
     }
 
     pub fn request_copy(&self) -> CopyRequest {

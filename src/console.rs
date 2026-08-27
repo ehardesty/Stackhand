@@ -1,16 +1,19 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use crate::runtime::TerminalHandle;
-use crate::terminal::{CopyRequest, PasteCompletion, PasteRequest};
+use crate::terminal::{
+    CopyRequest, PasteCompletion, PasteRequest, SelectionDirection as CopyDirection,
+};
 use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
 
-/// One requested move of the Process-list selection. Command modes carry
-/// only this request; the app event loop owns the selection itself, so a
-/// keypress never reaches the PTY child or changes lifecycle truth.
+/// One requested move of the Process-list selection. The app event loop owns
+/// the selected Process, so navigation never mutates Supervisor truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMove {
     Up,
@@ -36,35 +39,28 @@ fn lifecycle_request_for(c: char) -> Option<LifecycleCommand> {
     }
 }
 
-/// A key meaning shared by terminal and read-only console panes. The pane
-/// handlers keep terminal effects and pipe-view effects separate.
+/// A key owned by Process-list focus. Terminal and pipe panes apply the same
+/// meaning through their own output and selection seams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConsoleCommand {
+enum ProcessCommand {
     MoveSelection(SelectionMove),
     ScrollPage(isize),
     Follow,
     Lifecycle(LifecycleCommand),
-    EnterSelection,
-    Escape,
+    EnterCopy,
 }
 
-fn console_command(mode: ConsoleViewMode, code: KeyCode) -> Option<ConsoleCommand> {
-    if !matches!(mode, ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll) {
-        return None;
-    }
+fn process_command(code: KeyCode) -> Option<ProcessCommand> {
     match code {
-        KeyCode::Up | KeyCode::Char('k') if mode == ConsoleViewMode::AppCommand => {
-            Some(ConsoleCommand::MoveSelection(SelectionMove::Up))
+        KeyCode::Up | KeyCode::Char('k') => Some(ProcessCommand::MoveSelection(SelectionMove::Up)),
+        KeyCode::Down | KeyCode::Char('j') => {
+            Some(ProcessCommand::MoveSelection(SelectionMove::Down))
         }
-        KeyCode::Down | KeyCode::Char('j') if mode == ConsoleViewMode::AppCommand => {
-            Some(ConsoleCommand::MoveSelection(SelectionMove::Down))
-        }
-        KeyCode::PageUp => Some(ConsoleCommand::ScrollPage(-1)),
-        KeyCode::PageDown => Some(ConsoleCommand::ScrollPage(1)),
-        KeyCode::Char('f') => Some(ConsoleCommand::Follow),
-        KeyCode::Char('v') => Some(ConsoleCommand::EnterSelection),
-        KeyCode::Char(c) => lifecycle_request_for(c).map(ConsoleCommand::Lifecycle),
-        KeyCode::Esc => Some(ConsoleCommand::Escape),
+        KeyCode::PageUp => Some(ProcessCommand::ScrollPage(-1)),
+        KeyCode::PageDown => Some(ProcessCommand::ScrollPage(1)),
+        KeyCode::Char('f') => Some(ProcessCommand::Follow),
+        KeyCode::Char('v') => Some(ProcessCommand::EnterCopy),
+        KeyCode::Char(c) => lifecycle_request_for(c).map(ProcessCommand::Lifecycle),
         _ => None,
     }
 }
@@ -77,6 +73,7 @@ pub(crate) struct ConsoleInteraction {
     selection_requests: Vec<SelectionMove>,
     lifecycle_requests: Vec<LifecycleCommand>,
     selection_clock: Instant,
+    last_stackhand_press: Option<(u16, u16, Duration)>,
 }
 
 impl Default for ConsoleInteraction {
@@ -89,6 +86,7 @@ impl Default for ConsoleInteraction {
             selection_requests: Vec::new(),
             lifecycle_requests: Vec::new(),
             selection_clock: Instant::now(),
+            last_stackhand_press: None,
         }
     }
 }
@@ -102,9 +100,6 @@ impl ConsoleInteraction {
         self.view.warning = Some(warning);
     }
 
-    /// Set which console pane the view renders; the footer shows the pane's
-    /// controls and the pane-aware input gating reads it. A pane change
-    /// invalidates the pane-scoped routing warnings.
     pub fn set_pane(&mut self, pane: ConsolePaneKind) {
         if self.view.pane != pane {
             Self::clear_pane_warnings(&mut self.view);
@@ -112,15 +107,14 @@ impl ConsoleInteraction {
         self.view.pane = pane;
     }
 
-    /// Clear the warnings that describe the selected pane's input routing.
-    /// Call when the selected Process changes; use before asserting a
-    /// fresh rejection so the asserted warning is the new one.
+    pub fn set_following(&mut self, following: bool) {
+        self.view.following = following;
+    }
+
     pub fn clear_pane_warning(&mut self) {
         Self::clear_pane_warnings(&mut self.view);
     }
 
-    /// The routing warnings belong to the selected pane and Process: a
-    /// pane or selection change makes them stale.
     fn clear_pane_warnings(view: &mut ConsoleViewState) {
         if matches!(
             view.warning,
@@ -135,14 +129,49 @@ impl ConsoleInteraction {
         }
     }
 
-    /// Drain every Process-selection move queued by command modes.
+    /// Focus the Process list. Leaving Copy also clears its terminal
+    /// selection so stale selected cells do not look active.
+    pub fn focus_process_list(&mut self, session: Option<&TerminalHandle<'_>>) {
+        if self.view.mode == ConsoleViewMode::Copy
+            && let Some(session) = session
+        {
+            session.clear_selection();
+        }
+        self.view.mode = ConsoleViewMode::ProcessList;
+        self.view.stackhand_mouse_gesture = false;
+        self.last_stackhand_press = None;
+    }
+
+    /// Focus the selected console. Only an input-enabled PTY will forward
+    /// unbound keys; pipe and empty consoles stay read-only.
+    pub fn focus_console(&mut self, session: Option<&TerminalHandle<'_>>) {
+        let reset_mouse_clicks = self.view.mode != ConsoleViewMode::Console;
+        if self.view.mode == ConsoleViewMode::Copy
+            && let Some(session) = session
+        {
+            session.clear_selection();
+        }
+        self.view.mode = ConsoleViewMode::Console;
+        self.view.stackhand_mouse_gesture = false;
+        if reset_mouse_clicks {
+            self.last_stackhand_press = None;
+        }
+    }
+
+    pub fn accepts_child_input(&self, input_focused: bool) -> bool {
+        self.view.mode == ConsoleViewMode::Console
+            && self.view.pane == ConsolePaneKind::Terminal
+            && input_focused
+    }
+
+    pub fn mouse_gesture_active(&self) -> bool {
+        self.mouse.gesture_active()
+    }
+
     pub fn take_selection_moves(&mut self) -> Vec<SelectionMove> {
         std::mem::take(&mut self.selection_requests)
     }
 
-    /// Apply every queued Process-list move to application selection state.
-    /// Movement clamps to Project bounds. Per-Process scroll state is not
-    /// changed, and pane warnings are cleared after each handled move.
     pub fn apply_selection_moves(&mut self, selected: &mut usize, process_count: usize) -> bool {
         if process_count == 0 {
             return false;
@@ -159,8 +188,6 @@ impl ConsoleInteraction {
         !requests.is_empty()
     }
 
-    /// Drain every lifecycle command queued by command modes. The app event
-    /// loop dispatches each one for the currently selected Process.
     pub fn take_lifecycle_commands(&mut self) -> Vec<LifecycleCommand> {
         std::mem::take(&mut self.lifecycle_requests)
     }
@@ -182,11 +209,6 @@ impl ConsoleInteraction {
         changed
     }
 
-    /// Route one key event for the selected pane through the input
-    /// policy: the production boundary that decides whether the event
-    /// reaches a terminal session. A terminal pane delivers only while
-    /// its Process's focused input is enabled; pipe and empty panes
-    /// reject child input visibly while command mode keeps working.
     pub fn route_pane_key(
         &mut self,
         pane: ConsolePaneKind,
@@ -196,8 +218,6 @@ impl ConsoleInteraction {
         pipe_scroll: &mut Option<PipeScroll>,
         page_rows: u16,
     ) -> bool {
-        // Routing a key into a pane makes that pane the current one; a
-        // pane change drops the stale pane-scoped warning.
         self.set_pane(pane);
         match pane {
             ConsolePaneKind::Terminal => {
@@ -220,47 +240,41 @@ impl ConsoleInteraction {
         session: &TerminalHandle<'_>,
         page_rows: u16,
     ) -> bool {
-        if key.kind == KeyEventKind::Press
-            && self.view.mode == ConsoleViewMode::Selection
-            && key.code == KeyCode::Char('y')
-        {
-            self.copy_requests.push(session.request_copy());
-            self.view.warning = None;
+        // Stackhand owns every event in the Ctrl-A key cycle. In terminals
+        // that report event types, forwarding the release after focus moves
+        // to the console would leak part of the binding to the child.
+        if is_focus_toggle(key) {
+            if key.kind == KeyEventKind::Press {
+                match self.view.mode {
+                    ConsoleViewMode::ProcessList => self.focus_console(Some(session)),
+                    ConsoleViewMode::Console | ConsoleViewMode::Copy => {
+                        self.focus_process_list(Some(session));
+                    }
+                }
+            }
             return true;
         }
 
         if key.kind != KeyEventKind::Press {
-            if self.view.mode == ConsoleViewMode::ChildInput {
-                return self.record_input_result(session.send_key(key));
-            }
-            return false;
+            return if self.view.mode == ConsoleViewMode::Console {
+                self.record_input_result(session.send_key(key))
+            } else {
+                false
+            };
         }
 
         match self.view.mode {
-            ConsoleViewMode::ChildInput if is_command_leader(key) => {
-                self.view.mode = ConsoleViewMode::AppCommand;
-                true
-            }
-            ConsoleViewMode::ChildInput => self.record_input_result(session.send_key(key)),
-            ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll => {
-                let Some(command) = console_command(self.view.mode, key.code) else {
+            ConsoleViewMode::Console => self.record_input_result(session.send_key(key)),
+            ConsoleViewMode::ProcessList => {
+                let Some(command) = process_command(key.code) else {
                     return false;
                 };
                 self.apply_terminal_command(command, session, page_rows)
             }
-            ConsoleViewMode::Selection => self.handle_selection_command(key, session),
+            ConsoleViewMode::Copy => self.handle_copy_key(key, session, page_rows),
         }
     }
 
-    /// Route one key when the selected pane has no terminal session: the
-    /// pipe output pane, or a Process without an active Run. The command
-    /// leader still enters command mode and plain child input is rejected
-    /// visibly; selection moves and pipe scrolling work without a session.
-    /// Route one key into a read-only pane (pipe output or no active
-    /// Run). Child input is a Press event; repeat and release events
-    /// carry no input of their own and are consumed here. The Press
-    /// rejection warning they would trigger is already visible from the
-    /// original press until the pane or selection changes.
     pub fn handle_key_read_only(
         &mut self,
         key: KeyEvent,
@@ -270,26 +284,31 @@ impl ConsoleInteraction {
         if key.kind != KeyEventKind::Press {
             return false;
         }
+        if is_focus_toggle(key) {
+            self.view.mode = match self.view.mode {
+                ConsoleViewMode::ProcessList => ConsoleViewMode::Console,
+                ConsoleViewMode::Console | ConsoleViewMode::Copy => ConsoleViewMode::ProcessList,
+            };
+            return true;
+        }
         match self.view.mode {
-            ConsoleViewMode::ChildInput => {
-                if is_command_leader(key) {
-                    self.view.mode = ConsoleViewMode::AppCommand;
-                    return true;
-                }
-                self.view.warning = Some(ConsoleWarning::PipeReadOnly);
+            ConsoleViewMode::Console => {
+                self.view.warning = Some(if self.view.pane == ConsolePaneKind::Pipe {
+                    ConsoleWarning::PipeReadOnly
+                } else {
+                    ConsoleWarning::InputDisabled
+                });
                 true
             }
-            ConsoleViewMode::AppCommand | ConsoleViewMode::Scroll => {
-                let Some(command) = console_command(self.view.mode, key.code) else {
+            ConsoleViewMode::ProcessList => {
+                let Some(command) = process_command(key.code) else {
                     return false;
                 };
                 self.apply_read_only_command(command, scroll, page_rows)
             }
-            ConsoleViewMode::Selection => {
-                // 's' is rejected in read-only panes, so this mode is
-                // unreachable; Esc is kept for a future path that enters it.
-                self.view.mode = ConsoleViewMode::AppCommand;
-                key.code == KeyCode::Esc
+            ConsoleViewMode::Copy => {
+                self.view.mode = ConsoleViewMode::ProcessList;
+                true
             }
         }
     }
@@ -304,6 +323,22 @@ impl ConsoleInteraction {
         }
     }
 
+    pub fn handle_read_only_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        scroll: &mut Option<PipeScroll>,
+    ) -> bool {
+        let direction = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return false,
+        };
+        let scroll = scroll.get_or_insert_default();
+        scroll.scroll_lines(3, direction);
+        self.view.following = scroll.following();
+        true
+    }
+
     pub fn handle_mouse(
         &mut self,
         mouse: MouseEvent,
@@ -311,21 +346,45 @@ impl ConsoleInteraction {
         child_tracking: bool,
         session: &TerminalHandle<'_>,
     ) -> bool {
-        let Some(route) = self.mouse.route(
-            mouse,
-            area,
-            self.view.mode,
-            child_tracking,
-            self.selection_clock.elapsed(),
-        ) else {
+        let event_time = self.selection_clock.elapsed();
+        let Some(route) = self
+            .mouse
+            .route(mouse, area, self.view.mode, child_tracking, event_time)
+        else {
             return false;
         };
         self.view.stackhand_mouse_gesture = route.stackhand_gesture_active;
         if route.changes_history_view {
             self.view.following = false;
         }
+        let repeated_press = route.event.stackhand_owned
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .last_stackhand_press
+                .is_some_and(|(column, row, prior_time)| {
+                    u32::from(column.abs_diff(mouse.column)) + u32::from(row.abs_diff(mouse.row))
+                        <= 1
+                        && event_time.saturating_sub(prior_time) <= Duration::from_millis(500)
+                });
+        if route.event.stackhand_owned
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            self.last_stackhand_press = Some((mouse.column, mouse.row, event_time));
+        }
+        let starts_copy = route.event.stackhand_owned
+            && (matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) || repeated_press);
+        let enters_copy = starts_copy && self.view.mode != ConsoleViewMode::Copy;
+        if starts_copy {
+            self.view.mode = ConsoleViewMode::Copy;
+            self.view.warning = None;
+        }
         if self.record_input_result(session.send_mouse(route.event)) {
             self.view.stackhand_mouse_gesture = false;
+        } else if enters_copy || repeated_press {
+            // The mouse selection supplies the anchor and endpoint. Enabling
+            // keyboard navigation makes that endpoint visible and lets Vim
+            // movement extend it without replacing the mouse selection.
+            session.start_keyboard_selection();
         }
         true
     }
@@ -358,28 +417,22 @@ impl ConsoleInteraction {
 
     fn apply_terminal_command(
         &mut self,
-        command: ConsoleCommand,
+        command: ProcessCommand,
         session: &TerminalHandle<'_>,
         page_rows: u16,
     ) -> bool {
         match command {
-            ConsoleCommand::MoveSelection(direction) => {
-                self.selection_requests.push(direction);
-            }
-            ConsoleCommand::ScrollPage(direction) => {
+            ProcessCommand::MoveSelection(direction) => self.selection_requests.push(direction),
+            ProcessCommand::ScrollPage(direction) => {
                 scroll_page(session, page_rows, direction);
-                self.view.mode = ConsoleViewMode::Scroll;
                 self.view.following = false;
             }
-            ConsoleCommand::Follow => self.return_to_live_tail(session),
-            ConsoleCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
-            ConsoleCommand::EnterSelection => self.view.mode = ConsoleViewMode::Selection,
-            ConsoleCommand::Escape => {
-                self.view.mode = match self.view.mode {
-                    ConsoleViewMode::AppCommand => ConsoleViewMode::ChildInput,
-                    ConsoleViewMode::Scroll => ConsoleViewMode::AppCommand,
-                    _ => unreachable!("only command modes produce Escape"),
-                };
+            ProcessCommand::Follow => self.return_to_live_tail(session),
+            ProcessCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
+            ProcessCommand::EnterCopy => {
+                session.start_keyboard_selection();
+                self.view.mode = ConsoleViewMode::Copy;
+                self.view.following = false;
             }
         }
         true
@@ -387,49 +440,75 @@ impl ConsoleInteraction {
 
     fn apply_read_only_command(
         &mut self,
-        command: ConsoleCommand,
+        command: ProcessCommand,
         scroll: &mut Option<PipeScroll>,
         page_rows: u16,
     ) -> bool {
         match command {
-            ConsoleCommand::MoveSelection(direction) => {
-                self.selection_requests.push(direction);
-            }
-            ConsoleCommand::ScrollPage(direction) => {
+            ProcessCommand::MoveSelection(direction) => self.selection_requests.push(direction),
+            ProcessCommand::ScrollPage(direction) => {
                 scroll
                     .get_or_insert_default()
                     .scroll_page(page_rows, direction);
-                self.view.mode = ConsoleViewMode::Scroll;
+                self.view.following = false;
             }
-            ConsoleCommand::Follow => {
+            ProcessCommand::Follow => {
                 scroll.get_or_insert_default().follow();
-                self.view.mode = ConsoleViewMode::ChildInput;
+                self.view.following = true;
             }
-            ConsoleCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
-            ConsoleCommand::EnterSelection => {
+            ProcessCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
+            ProcessCommand::EnterCopy => {
                 self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
-            }
-            ConsoleCommand::Escape => {
-                self.view.mode = match self.view.mode {
-                    ConsoleViewMode::AppCommand => ConsoleViewMode::ChildInput,
-                    ConsoleViewMode::Scroll => ConsoleViewMode::AppCommand,
-                    _ => unreachable!("only command modes produce Escape"),
-                };
             }
         }
         true
     }
 
-    fn handle_selection_command(&mut self, key: KeyEvent, session: &TerminalHandle<'_>) -> bool {
+    fn handle_copy_key(
+        &mut self,
+        key: KeyEvent,
+        session: &TerminalHandle<'_>,
+        page_rows: u16,
+    ) -> bool {
+        let direction = match key.code {
+            KeyCode::Left | KeyCode::Char('h') => Some(CopyDirection::Left),
+            KeyCode::Down | KeyCode::Char('j') => Some(CopyDirection::Down),
+            KeyCode::Up | KeyCode::Char('k') => Some(CopyDirection::Up),
+            KeyCode::Right | KeyCode::Char('l') => Some(CopyDirection::Right),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            session.move_keyboard_selection(direction);
+            self.view.following = false;
+            return true;
+        }
         match key.code {
+            KeyCode::Char('v') => {
+                session.toggle_keyboard_selection();
+                true
+            }
             KeyCode::Char('a') => {
                 session.select_all();
                 self.view.following = false;
                 true
             }
+            KeyCode::Char('c') | KeyCode::Char('y') => {
+                self.copy_requests.push(session.request_copy());
+                self.view.warning = None;
+                true
+            }
+            KeyCode::PageUp => {
+                scroll_page(session, page_rows, -1);
+                self.view.following = false;
+                true
+            }
+            KeyCode::PageDown => {
+                scroll_page(session, page_rows, 1);
+                self.view.following = false;
+                true
+            }
             KeyCode::Esc => {
-                session.clear_selection();
-                self.view.mode = ConsoleViewMode::AppCommand;
+                self.focus_process_list(Some(session));
                 true
             }
             _ => false,
@@ -439,29 +518,17 @@ impl ConsoleInteraction {
     fn return_to_live_tail(&mut self, session: &TerminalHandle<'_>) {
         session.follow_live();
         self.view.following = true;
-        self.view.mode = ConsoleViewMode::ChildInput;
     }
 }
 
-pub(crate) fn is_command_leader(key: KeyEvent) -> bool {
+pub(crate) fn is_focus_toggle(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// The application's child-input gate for the selected terminal pane. True
-/// when this key attempt is rejected visibly instead of delivered: the
-/// Process's focused input is disabled and the key is plain child input.
-/// The command leader is never rejected, so the Process list stays
-/// reachable from a disabled pane.
-/// Whether the event is child input the selected PTY Process must never
-/// receive: its focused input is disabled, and the event is a plain child
-/// key of any kind in child-input mode. The leader's Press is the only
-/// exception: it moves the user into the command UI, where nothing
-/// reaches the child. Repeat and release events are gated too, so no
-/// byte of any kind reaches a disabled Process.
 fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEvent) -> bool {
     !input_focused
-        && view.mode == ConsoleViewMode::ChildInput
-        && !(key.kind == KeyEventKind::Press && is_command_leader(*key))
+        && view.mode == ConsoleViewMode::Console
+        && !(key.kind == KeyEventKind::Press && is_focus_toggle(*key))
 }
 
 fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {
