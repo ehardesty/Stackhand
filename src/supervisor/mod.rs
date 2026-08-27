@@ -27,6 +27,7 @@ use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamEvent, SeamSender};
 mod clock;
 mod command;
 mod core;
+mod events;
 mod probe;
 mod runtime;
 mod schedule;
@@ -77,7 +78,7 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, A
         start_with(
             project,
             Box::new(seam),
-            Box::new(RealProbes),
+            Box::new(RealProbes::default()),
             Arc::new(SystemClock),
             initial_geometry,
         ),

@@ -38,12 +38,15 @@ impl Core {
         }
         self.seam
             .begin_shutdown(deadline.saturating_duration_since(self.clock.now()));
-        let remaining = self
+        let remaining: BTreeSet<usize> = self
             .entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| entry.current_run.map(|_| index))
             .collect();
+        for index in remaining.iter().copied() {
+            self.cancel_run_work(index);
+        }
         self.shutdown = Some(ShutdownState {
             deadline,
             remaining,

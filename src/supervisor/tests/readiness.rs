@@ -20,6 +20,7 @@ fn start_probed(h: &mut Harness) {
 fn a_probed_service_stays_starting_until_its_probe_passes() {
     let mut h = Harness::new(probed_project());
     start_probed(&mut h);
+    h.advance_and_poll(Duration::from_millis(0));
 
     assert_eq!(h.process("api").lifecycle, Lifecycle::Starting);
     assert!(h.process("api").readiness.is_some());
@@ -98,6 +99,7 @@ fn passing_readiness_releases_ready_dependents_exactly_once_per_run() {
     // A spawned-but-not-ready Run does not satisfy `ready`.
     h.event(spawned("db", 1));
     assert_eq!(h.process("api").lifecycle, Lifecycle::Waiting);
+    h.advance_and_poll(Duration::from_millis(0));
 
     h.event(readiness("db", 1, true, None));
     assert_eq!(h.process("db").lifecycle, Lifecycle::Running);
@@ -135,6 +137,60 @@ fn stopping_invalidates_pending_readiness_and_stale_results_are_ignored() {
     // No further attempts are scheduled for the ended Run.
     h.advance_and_poll(Duration::from_secs(60));
     assert_eq!(h.probes.attempts().len(), 1);
+}
+
+#[test]
+fn cancellation_records_work_identity_and_rejects_a_released_result() {
+    let mut h = Harness::new(probed_project());
+    start_probed(&mut h);
+    h.advance_and_poll(Duration::from_millis(0));
+    let request = h
+        .probes
+        .requests()
+        .into_iter()
+        .next()
+        .expect("attempt exists");
+
+    h.command(Command::Stop("api".into()));
+
+    assert_eq!(
+        h.probes.cancellations(),
+        vec![(request.process_id, request.run_id, request.work_id)]
+    );
+    assert!(h.runtime.intents().iter().any(|intent| {
+        matches!(intent, Intent::Cancel { process_id, run_id }
+            if *process_id == request.process_id && *run_id == request.run_id)
+    }));
+
+    // Metrics and output-owner reports released after cancellation are also
+    // harmless; they cannot write into the stopped snapshot.
+    h.event(SeamEvent::Metrics {
+        process_id: request.process_id,
+        run_id: request.run_id,
+        cpu_percent: 99.0,
+        rss_kib: 9999,
+    });
+    h.event(SeamEvent::OutputFailure {
+        process_id: request.process_id,
+        run_id: request.run_id,
+        detail: "late output failure".to_string(),
+    });
+
+    // The adapter may release the already-started attempt after cancellation,
+    // but the stopped Run cannot be made ready again.
+    h.probes.release(
+        request.process_id,
+        request.run_id,
+        request.work_id,
+        request.attempt_id,
+        true,
+        None,
+    );
+    h.drain();
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Stopped);
+    assert_eq!(api.metrics, None);
+    assert_eq!(api.failure, None);
 }
 
 #[test]

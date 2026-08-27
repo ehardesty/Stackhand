@@ -14,6 +14,37 @@ use crate::model::ReadinessProbe;
 use crate::runtime::{OsPid, ProcessId, RunId};
 use crate::supervisor::FailureKind;
 
+/// Identity of one long-lived piece of work within a Run, such as a
+/// readiness check. Work identities are never reused for a later Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WorkId(u64);
+
+impl WorkId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identity of one attempt made by a Run-scoped piece of work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AttemptId(u64);
+
+impl AttemptId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Where adapters deliver typed events back to the Supervisor. Every
 /// Run-scoped event carries both identities so the Supervisor can reject
 /// stale events in one place.
@@ -88,6 +119,8 @@ pub enum SeamEvent {
     Readiness {
         process_id: ProcessId,
         run_id: RunId,
+        work_id: WorkId,
+        attempt_id: AttemptId,
         passing: bool,
         diagnostic: Option<String>,
     },
@@ -136,6 +169,11 @@ pub struct StartIntent {
 
 /// The runtime seam. Implementations own every Run they start until stop.
 pub(crate) trait RunSeam: Send {
+    /// Cancel Run-scoped work that is not part of the Process Tree owner,
+    /// such as output observations or future hooks. Cancellation is
+    /// idempotent and never changes Supervisor state by itself.
+    fn cancel(&self, _process_id: ProcessId, _run_id: RunId) {}
+
     /// Apply the Project's shared remaining deadline to cleanup work that a
     /// natural-exit owner can already be completing.
     fn begin_shutdown(&self, _remaining: Duration) {}
@@ -164,12 +202,18 @@ pub(crate) trait RunSeam: Send {
 pub struct ProbeIntent {
     pub process_id: ProcessId,
     pub run_id: RunId,
+    pub work_id: WorkId,
+    pub attempt_id: AttemptId,
     pub probe: ReadinessProbe,
     pub timeout: Duration,
 }
 
 /// The readiness seam. Implementations own network waits so they never run
-/// on the Supervisor control task.
+/// on the Supervisor control task. Cancellation is logical and idempotent:
+/// an adapter may still finish a bounded operation, but its result must not
+/// be used after the matching work is canceled.
 pub(crate) trait ProbeSeam: Send {
     fn probe(&self, intent: ProbeIntent, events: &SeamSender);
+
+    fn cancel(&self, _process_id: ProcessId, _run_id: RunId, _work_id: WorkId) {}
 }

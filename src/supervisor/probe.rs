@@ -4,12 +4,16 @@
 //! identities. Network waits and socket errors never touch the Supervisor
 //! control task.
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::model::ReadinessProbe;
-use crate::supervisor::seam::{ProbeIntent, ProbeSeam, SeamEvent, SeamSender};
+use crate::runtime::{ProcessId, RunId};
+use crate::supervisor::seam::{AttemptId, ProbeIntent, ProbeSeam, SeamEvent, SeamSender, WorkId};
 
 /// Longest allowed diagnostic string; adapter error text stays bounded.
 const MAX_DIAGNOSTIC_CHARS: usize = 200;
@@ -17,29 +21,83 @@ const MAX_DIAGNOSTIC_CHARS: usize = 200;
 /// never retained.
 const HTTP_RESPONSE_CAP_BYTES: u64 = 1024;
 
+type ProbeKey = (ProcessId, RunId, WorkId, AttemptId);
+
 /// Performs real network readiness attempts off the Supervisor control
-/// task.
-#[derive(Default)]
-pub(crate) struct RealProbes;
+/// task. Cancellation closes the logical admission gate immediately; the
+/// bounded socket operation may still take its configured timeout to return.
+pub(crate) struct RealProbes {
+    active: Arc<Mutex<HashMap<ProbeKey, Arc<AtomicBool>>>>,
+}
+
+impl Default for RealProbes {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
 
 impl ProbeSeam for RealProbes {
     fn probe(&self, intent: ProbeIntent, events: &SeamSender) {
-        let attempt = match &intent.probe {
-            ReadinessProbe::Tcp { host, port } => tcp_attempt(host, *port, intent.timeout),
-            ReadinessProbe::Http { host, port, path } => {
-                http_attempt(host, *port, path, intent.timeout)
+        let key = (
+            intent.process_id,
+            intent.run_id,
+            intent.work_id,
+            intent.attempt_id,
+        );
+        let canceled = Arc::new(AtomicBool::new(false));
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, Arc::clone(&canceled));
+        let active = Arc::clone(&self.active);
+        let events = events.clone();
+        std::thread::Builder::new()
+            .name("readiness-probe".to_string())
+            .spawn(move || {
+                if !canceled.load(Ordering::Acquire) {
+                    let attempt = match &intent.probe {
+                        ReadinessProbe::Tcp { host, port } => {
+                            tcp_attempt(host, *port, intent.timeout)
+                        }
+                        ReadinessProbe::Http { host, port, path } => {
+                            http_attempt(host, *port, path, intent.timeout)
+                        }
+                    };
+                    if !canceled.load(Ordering::Acquire) {
+                        let (passing, diagnostic) = match attempt {
+                            Ok(()) => (true, None),
+                            Err(diagnostic) => (false, Some(diagnostic)),
+                        };
+                        events.send(SeamEvent::Readiness {
+                            process_id: intent.process_id,
+                            run_id: intent.run_id,
+                            work_id: intent.work_id,
+                            attempt_id: intent.attempt_id,
+                            passing,
+                            diagnostic,
+                        });
+                    }
+                }
+                active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+            })
+            .expect("readiness probe thread spawns with valid configuration");
+    }
+
+    fn cancel(&self, process_id: ProcessId, run_id: RunId, work_id: WorkId) {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for ((process, run, work, _), canceled) in active.iter() {
+            if *process == process_id && *run == run_id && *work == work_id {
+                canceled.store(true, Ordering::Release);
             }
-        };
-        let (passing, diagnostic) = match attempt {
-            Ok(()) => (true, None),
-            Err(diagnostic) => (false, Some(diagnostic)),
-        };
-        events.send(SeamEvent::Readiness {
-            process_id: intent.process_id,
-            run_id: intent.run_id,
-            passing,
-            diagnostic,
-        });
+        }
     }
 }
 
@@ -283,10 +341,12 @@ mod tests {
     fn the_probe_seam_reports_one_event_for_an_http_request() {
         let port = spawn_http_server(b"HTTP/1.0 200 OK\r\n\r\n");
         let (tx, rx) = crossbeam_channel::unbounded();
-        RealProbes.probe(
+        RealProbes::default().probe(
             ProbeIntent {
                 process_id: ProcessId::new(7),
                 run_id: RunId::new(3),
+                work_id: WorkId::new(1),
+                attempt_id: crate::supervisor::seam::AttemptId::new(1),
                 probe: ReadinessProbe::Http {
                     host: "127.0.0.1".into(),
                     port,
@@ -302,6 +362,7 @@ mod tests {
                 run_id,
                 passing,
                 diagnostic,
+                ..
             }) => {
                 assert_eq!(process_id, ProcessId::new(7));
                 assert_eq!(run_id, RunId::new(3));

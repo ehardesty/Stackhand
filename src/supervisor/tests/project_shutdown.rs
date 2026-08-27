@@ -35,7 +35,7 @@ fn stop_names(runtime: &FakeRuntime) -> Vec<&'static str> {
                 3 => "setup",
                 other => panic!("unexpected Process identity {other}"),
             }),
-            Intent::Start { .. } => None,
+            Intent::Start { .. } | Intent::Cancel { .. } => None,
         })
         .collect()
 }
@@ -132,7 +132,7 @@ fn later_waves_receive_only_the_shared_deadlines_remaining_time() {
         .into_iter()
         .filter_map(|intent| match intent {
             Intent::Stop { remaining, .. } => remaining,
-            Intent::Start { .. } => None,
+            Intent::Start { .. } | Intent::Cancel { .. } => None,
         })
         .collect();
     assert_eq!(

@@ -15,7 +15,7 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
 use crate::supervisor::command::{Command, shell_program};
 use crate::supervisor::seam::{
-    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+    AttemptId, ProbeIntent, ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId,
 };
 use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
 
@@ -148,12 +148,16 @@ pub(crate) struct Core {
 /// Live readiness bookkeeping for one probed Service's current Run.
 #[derive(Debug)]
 pub(super) struct ReadinessTracking {
+    /// Stable identity of this check within its Run.
+    pub(super) work_id: WorkId,
     /// Attempts dispatched for this Run so far.
     pub(super) attempts: u32,
+    /// The next attempt identity. Attempt identities are never reused.
+    pub(super) next_attempt_id: u64,
     pub(super) last_error: Option<String>,
     /// One bounded attempt is out with the probe adapter; attempts for one
     /// Run never overlap.
-    pub(super) in_flight: bool,
+    pub(super) in_flight: Option<AttemptId>,
     /// Earliest time [`Core::poll_timers`] may dispatch the next attempt.
     pub(super) next_attempt_at: Instant,
 }
@@ -187,6 +191,12 @@ pub(super) struct Entry {
     pub(super) run_trigger: RunTrigger,
     /// The spawned root PID of the current Run, when observed.
     pub(super) root_pid: Option<u32>,
+    /// Work identities allocated for this Process. They are monotonic across
+    /// Runs so a late result cannot become current through reuse.
+    pub(super) next_work_id: u64,
+    /// True after Run-scoped work has been canceled. Cleanup facts are still
+    /// accepted, but late observations cannot change the current snapshot.
+    pub(super) run_cancelled: bool,
 }
 
 impl Entry {
@@ -207,6 +217,8 @@ impl Entry {
             pending_trigger: RunTrigger::Dependency,
             run_trigger: RunTrigger::Dependency,
             root_pid: None,
+            next_work_id: 1,
+            run_cancelled: false,
         }
     }
 
@@ -214,7 +226,12 @@ impl Entry {
     /// through a confirmed cleanup. The caller must invoke it before
     /// clearing the Run's identity; the summary window keeps its older
     /// entries.
-    fn record_finished_run(&mut self, now_ms: u64, exit_code: Option<i32>, intentional_stop: bool) {
+    pub(super) fn record_finished_run(
+        &mut self,
+        now_ms: u64,
+        exit_code: Option<i32>,
+        intentional_stop: bool,
+    ) {
         let Some(started_at_ms) = self.run_started_at_ms.take() else {
             return;
         };
@@ -349,6 +366,29 @@ impl Core {
         self.restart_at(index, RunTrigger::Rerun);
     }
 
+    pub(super) fn allocate_work_id(&mut self, index: usize) -> WorkId {
+        let entry = &mut self.entries[index];
+        let work_id = WorkId::new(entry.next_work_id);
+        entry.next_work_id += 1;
+        work_id
+    }
+
+    /// Cancel every Run-scoped adapter operation currently known to the
+    /// Supervisor before the Run is stopped or replaced. Removing the local
+    /// tracking below makes any result released later harmless as well.
+    pub(super) fn cancel_run_work(&mut self, index: usize) {
+        let Some(run_id) = self.entries[index].current_run else {
+            return;
+        };
+        let process_id = self.entries[index].process_id;
+        if let Some(tracking) = self.entries[index].readiness.as_ref() {
+            self.probes.cancel(process_id, run_id, tracking.work_id);
+        }
+        self.seam.cancel(process_id, run_id);
+        self.entries[index].run_cancelled = true;
+        self.entries[index].readiness = None;
+    }
+
     pub(super) fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
         let spec = &self.project.processes()[index];
         // Shell command text reaches the child through the user's own shell
@@ -374,25 +414,26 @@ impl Core {
     }
 
     fn stop_at(&mut self, index: usize) {
-        let entry = &mut self.entries[index];
         // An unconfirmed cleanup holds its Run identity: Stop retries the
-        // bounded cleanup for that same Run, and only a confirmed
-        // completion releases it.
-        if entry.cleanup_unconfirmed {
-            let run_id = entry
+        // bounded cleanup for that same Run, and only a confirmed completion
+        // releases it.
+        if self.entries[index].cleanup_unconfirmed {
+            let run_id = self.entries[index]
                 .current_run
                 .expect("an unconfirmed cleanup holds its Run identity");
-            entry.lifecycle = Lifecycle::Stopping;
-            entry.readiness = None;
-            self.seam.stop(entry.process_id, run_id, None, &self.events);
+            let process_id = self.entries[index].process_id;
+            self.entries[index].lifecycle = Lifecycle::Stopping;
+            self.cancel_run_work(index);
+            self.seam.stop(process_id, run_id, None, &self.events);
             return;
         }
-        if entry.desired != DesiredState::Running {
+        if self.entries[index].desired != DesiredState::Running {
             return;
         }
         // A Process without a Run (idle or Waiting on a Dependency) just
         // loses its desire to run.
-        let Some(run_id) = entry.current_run else {
+        let Some(run_id) = self.entries[index].current_run else {
+            let entry = &mut self.entries[index];
             entry.desired = DesiredState::Stopped;
             entry.lifecycle = Lifecycle::Stopped;
             entry.blocked = None;
@@ -400,235 +441,19 @@ impl Core {
         };
         // Record the intentional desired state before cleanup begins so a
         // later exit reads as an intended stop.
+        let process_id = self.entries[index].process_id;
+        let entry = &mut self.entries[index];
         entry.desired = DesiredState::Stopped;
         entry.lifecycle = Lifecycle::Stopping;
         entry.blocked = None;
-        // Pending readiness belongs to the ending Run; its tracking ends
-        // here and any in-flight attempt's result is rejected by the gate.
-        entry.readiness = None;
-        self.seam.stop(entry.process_id, run_id, None, &self.events);
-    }
-
-    pub(crate) fn event(&mut self, event: SeamEvent) {
-        // The single stale-event gate: every Run-scoped event must match the
-        // receiving Process's current Run or it cannot change state.
-        let Some(index) = self.index_of(event.process_id()) else {
-            return;
-        };
-        if Some(event.run_id()) != self.entries[index].current_run {
-            return;
-        }
-        // While a cleanup retry is held, only the confirming completion of
-        // the held Run is meaningful; stale reports for it stay stale.
-        if self.entries[index].cleanup_unconfirmed && !matches!(event, SeamEvent::Finished(_)) {
-            return;
-        }
-        match &event {
-            SeamEvent::Finished(finished) => self.finish_shutdown_run(
-                index,
-                finished.cleanup_confirmed,
-                finished.detail.clone(),
-                finished
-                    .remaining_pids
-                    .iter()
-                    .map(|pid| pid.get())
-                    .collect(),
-            ),
-            SeamEvent::Failed { detail, .. } if self.shutdown_in_progress() => {
-                self.finish_shutdown_run(index, false, Some(detail.clone()), Vec::new());
-            }
-            _ => {}
-        }
-        match event {
-            SeamEvent::Spawned { root_pid, .. } => {
-                let probed = self.project.processes()[index].readiness.is_some();
-                let entry = &mut self.entries[index];
-                entry.root_pid = root_pid.map(|pid| pid.get());
-                if entry.lifecycle == Lifecycle::Starting {
-                    if probed {
-                        // The Run exists but is not available yet; its first
-                        // attempt is due immediately once timers are polled.
-                        entry.readiness = Some(ReadinessTracking {
-                            attempts: 0,
-                            last_error: None,
-                            in_flight: false,
-                            next_attempt_at: self.clock.now(),
-                        });
-                    } else {
-                        // A Service without readiness becomes Running at
-                        // spawn; its label projects as Ready.
-                        entry.lifecycle = Lifecycle::Running;
-                    }
-                }
-                self.evaluate();
-            }
-            SeamEvent::Readiness {
-                passing,
-                diagnostic,
-                ..
-            } => {
-                let interval = self.project.processes()[index]
-                    .readiness
-                    .as_ref()
-                    .map(|config| config.interval);
-                let entry = &mut self.entries[index];
-                let Some(tracking) = entry.readiness.as_mut() else {
-                    return;
-                };
-                tracking.in_flight = false;
-                if passing {
-                    // Passing releases dependents through the Running
-                    // transition exactly once per Run; per-Run readiness
-                    // bookkeeping ends here, which also makes any further
-                    // result for this Run land on no tracking at all.
-                    entry.lifecycle = Lifecycle::Running;
-                    entry.readiness = None;
-                } else if !passing {
-                    tracking.last_error = diagnostic;
-                    if let Some(interval) = interval {
-                        tracking.next_attempt_at = self.clock.now() + interval;
-                    }
-                }
-                self.evaluate();
-            }
-            SeamEvent::Finished(finished) => self.apply_finished_run(index, finished),
-            SeamEvent::Failed { kind, detail, .. } => {
-                let now_ms = self.now_ms();
-                let entry = &mut self.entries[index];
-                entry.failure = Some(FailureSummary { kind, detail });
-                // A failed adapter report ends the Run identity and reverts
-                // the Process to stopped so it can be started again.
-                entry.record_finished_run(now_ms, None, false);
-                entry.current_run = None;
-                entry.root_pid = None;
-                entry.desired = DesiredState::Stopped;
-                entry.lifecycle = Lifecycle::Stopped;
-                entry.metrics = None;
-                entry.readiness = None;
-                self.evaluate();
-            }
-            SeamEvent::Metrics {
-                run_id,
-                cpu_percent,
-                rss_kib,
-                ..
-            } => {
-                // The stale-event gate already matched the Run; the stamp
-                // keeps the sample attributable to exactly that Run.
-                self.entries[index].metrics = Some(MetricsMetadata {
-                    run_id: run_id.get(),
-                    cpu_percent,
-                    rss_kib,
-                });
-            }
-            SeamEvent::OutputFailure { detail, .. } => {
-                // Output-path failure: record it without flipping a healthy
-                // Run's lifecycle, and never clobber a real failure.
-                let entry = &mut self.entries[index];
-                if entry.failure.is_none() {
-                    entry.failure = Some(FailureSummary {
-                        kind: FailureKind::Output,
-                        detail,
-                    });
-                }
-            }
-        }
-    }
-
-    /// Apply one authoritative finished-Run fact. Natural results are
-    /// classified before cleanup releases the identity, so Done, failure,
-    /// held cleanup, recent history, and replacement scheduling change in
-    /// one serialized Supervisor turn.
-    fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
-        if !finished.intentional_stop {
-            match self.project.processes()[index].kind {
-                ProcessKind::OneShot => self.complete_one_shot(index, finished.exit_code),
-                ProcessKind::Service => self.observe_service_exit(index, finished.exit_code),
-            }
-        }
-
-        let now_ms = self.now_ms();
-        let entry = &mut self.entries[index];
-        if !finished.cleanup_confirmed {
-            // Hold the Run identity. A later Stop retries the same adapter
-            // owner; no replacement Run can start before confirmation.
-            entry.cleanup_unconfirmed = true;
-            entry.failure = Some(FailureSummary {
-                kind: FailureKind::Shutdown,
-                detail: finished
-                    .detail
-                    .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
-            });
-            if entry.lifecycle != Lifecycle::Done {
-                entry.lifecycle = Lifecycle::Stopped;
-            }
-            entry.metrics = None;
-            entry.readiness = None;
-            self.evaluate();
-            return;
-        }
-
-        entry.record_finished_run(now_ms, finished.exit_code, finished.intentional_stop);
-        entry.current_run = None;
-        entry.root_pid = None;
-        entry.metrics = None;
-        entry.readiness = None;
-        entry.cleanup_unconfirmed = false;
-        // A successful One-shot stays Done. Every other finished Run settles
-        // at Stopped after its result has been recorded.
-        if entry.lifecycle != Lifecycle::Done {
-            entry.lifecycle = Lifecycle::Stopped;
-        }
-        self.evaluate();
-    }
-
-    /// Project one One-shot Run result into its terminal lifecycle state.
-    /// Exit code zero completes the One-shot; every other exit fails it.
-    /// Either way Desired State reverts to Stopped: restarting is manual
-    /// until automatic restart policy work lands.
-    fn complete_one_shot(&mut self, index: usize, code: Option<i32>) {
-        let entry = &mut self.entries[index];
-        match code {
-            Some(0) => {
-                entry.lifecycle = Lifecycle::Done;
-                entry.failure = None;
-            }
-            other => {
-                entry.lifecycle = Lifecycle::Running;
-                entry.failure = Some(FailureSummary {
-                    kind: FailureKind::ProcessExit,
-                    detail: match other {
-                        Some(exit_code) => format!("exited with code {exit_code}"),
-                        None => "exited without an exit code".to_string(),
-                    },
-                });
-            }
-        }
-        entry.desired = DesiredState::Stopped;
-        entry.blocked = None;
-    }
-
-    /// Record a Service's unexpected natural result. The Run identity stays
-    /// occupied until the finished fact confirms cleanup. Desired State reverts
-    /// to Stopped so the Supervisor never silently crash-loops; automatic
-    /// restart policy is later milestone work.
-    fn observe_service_exit(&mut self, index: usize, code: Option<i32>) {
-        let entry = &mut self.entries[index];
-        if entry.desired == DesiredState::Running {
-            entry.failure = Some(FailureSummary {
-                kind: FailureKind::ProcessExit,
-                detail: match code {
-                    Some(code) => format!("exited unexpectedly with code {code}"),
-                    None => "exited unexpectedly".to_string(),
-                },
-            });
-            entry.desired = DesiredState::Stopped;
-            entry.blocked = None;
-        }
+        // Pending readiness belongs to the ending Run. The work cancellation
+        // also rejects any result released after this command.
+        self.cancel_run_work(index);
+        self.seam.stop(process_id, run_id, None, &self.events);
     }
 
     /// A Process identity is its stable position in the Project.
-    fn index_of(&self, process_id: ProcessId) -> Option<usize> {
+    pub(super) fn index_of(&self, process_id: ProcessId) -> Option<usize> {
         let index = process_id.get() as usize;
         (index < self.entries.len()).then_some(index)
     }
@@ -653,7 +478,7 @@ impl Core {
                 };
                 entry.desired == DesiredState::Running
                     && entry.current_run.is_some()
-                    && !tracking.in_flight
+                    && tracking.in_flight.is_none()
                     && tracking.next_attempt_at <= now
             })
             .map(|(index, _)| index)
@@ -677,14 +502,18 @@ impl Core {
             let Some(tracking) = entry.readiness.as_mut() else {
                 return;
             };
-            if tracking.in_flight {
+            if tracking.in_flight.is_some() {
                 return;
             }
-            tracking.in_flight = true;
+            let attempt_id = AttemptId::new(tracking.next_attempt_id);
+            tracking.next_attempt_id += 1;
+            tracking.in_flight = Some(attempt_id);
             tracking.attempts += 1;
             ProbeIntent {
                 process_id: entry.process_id,
                 run_id,
+                work_id: tracking.work_id,
+                attempt_id,
                 probe,
                 timeout,
             }
@@ -703,8 +532,8 @@ impl Core {
                 let tracking = entry.readiness.as_ref()?;
                 (entry.desired == DesiredState::Running
                     && entry.current_run.is_some()
-                    && !tracking.in_flight)
-                    .then(|| tracking.next_attempt_at.saturating_duration_since(now))
+                    && tracking.in_flight.is_none())
+                .then(|| tracking.next_attempt_at.saturating_duration_since(now))
             })
             .min();
         match (probe_wait, self.time_until_shutdown_deadline()) {

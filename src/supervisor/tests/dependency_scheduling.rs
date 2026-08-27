@@ -6,7 +6,7 @@ fn start_intents(h: &Harness) -> Vec<(ProcessId, RunId)> {
         .iter()
         .filter_map(|intent| match intent {
             Intent::Start { process_id, run_id } => Some((*process_id, *run_id)),
-            Intent::Stop { .. } => None,
+            Intent::Stop { .. } | Intent::Cancel { .. } => None,
         })
         .collect()
 }

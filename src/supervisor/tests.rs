@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::ProjectSnapshot;
-use super::seam::FinishedRun;
+use super::seam::{AttemptId, FinishedRun, WorkId};
 use super::support::{FakeClock, FakeProbes, FakeRuntime, Intent};
 use super::{Command, Core, DesiredState, Lifecycle, ProcessSnapshot, SeamEvent, SeamSender};
 use crate::model::{
@@ -194,6 +194,8 @@ fn readiness(process: &str, run: u64, passing: bool, diagnostic: Option<String>)
     SeamEvent::Readiness {
         process_id: ProcessId::new(process_index(process)),
         run_id: RunId::new(run),
+        work_id: WorkId::new(run),
+        attempt_id: AttemptId::new(1),
         passing,
         diagnostic,
     }

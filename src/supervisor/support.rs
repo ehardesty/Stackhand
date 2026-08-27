@@ -10,7 +10,7 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::FailureKind;
 use crate::supervisor::clock::Clock;
 use crate::supervisor::seam::{
-    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId,
 };
 
 /// One observable runtime action the Supervisor requested.
@@ -24,6 +24,10 @@ pub(crate) enum Intent {
         process_id: ProcessId,
         run_id: RunId,
         remaining: Option<Duration>,
+    },
+    Cancel {
+        process_id: ProcessId,
+        run_id: RunId,
     },
 }
 
@@ -76,6 +80,10 @@ impl FakeRuntime {
 }
 
 impl RunSeam for FakeRuntime {
+    fn cancel(&self, process_id: ProcessId, run_id: RunId) {
+        self.record(Intent::Cancel { process_id, run_id });
+    }
+
     fn start(&self, intent: StartIntent, events: &SeamSender) {
         self.record(Intent::Start {
             process_id: intent.process_id,
@@ -165,6 +173,10 @@ impl Clock for FakeClock {
 /// Let tests keep a shared handle to the scripted runtime while the core
 /// owns its boxed seam.
 impl RunSeam for Arc<FakeRuntime> {
+    fn cancel(&self, process_id: ProcessId, run_id: RunId) {
+        (**self).cancel(process_id, run_id);
+    }
+
     fn start(&self, intent: StartIntent, events: &SeamSender) {
         (**self).start(intent, events);
     }
@@ -186,6 +198,9 @@ impl RunSeam for Arc<FakeRuntime> {
 #[derive(Default)]
 pub(crate) struct FakeProbes {
     attempts: Mutex<Vec<(ProcessId, RunId)>>,
+    requests: Mutex<Vec<ProbeIntent>>,
+    cancellations: Mutex<Vec<(ProcessId, RunId, WorkId)>>,
+    sender: Mutex<Option<SeamSender>>,
 }
 
 impl FakeProbes {
@@ -200,19 +215,96 @@ impl FakeProbes {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    pub(crate) fn requests(&self) -> Vec<ProbeIntent> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn cancellations(&self) -> Vec<(ProcessId, RunId, WorkId)> {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Release one deferred result through the same event path as a
+    /// production probe. Tests can release attempts in any order.
+    pub(crate) fn release(
+        &self,
+        process_id: ProcessId,
+        run_id: RunId,
+        work_id: WorkId,
+        attempt_id: crate::supervisor::seam::AttemptId,
+        passing: bool,
+        diagnostic: Option<String>,
+    ) {
+        let request = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|request| {
+                request.process_id == process_id
+                    && request.run_id == run_id
+                    && request.work_id == work_id
+                    && request.attempt_id == attempt_id
+            })
+            .cloned();
+        let Some(request) = request else {
+            return;
+        };
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            sender.send(SeamEvent::Readiness {
+                process_id: request.process_id,
+                run_id: request.run_id,
+                work_id,
+                attempt_id,
+                passing,
+                diagnostic,
+            });
+        }
+    }
 }
 
 impl ProbeSeam for FakeProbes {
-    fn probe(&self, intent: ProbeIntent, _events: &SeamSender) {
+    fn probe(&self, intent: ProbeIntent, events: &SeamSender) {
         self.attempts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((intent.process_id, intent.run_id));
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(intent);
+        *self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events.clone());
+    }
+
+    fn cancel(&self, process_id: ProcessId, run_id: RunId, work_id: WorkId) {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((process_id, run_id, work_id));
     }
 }
 
 impl ProbeSeam for Arc<FakeProbes> {
     fn probe(&self, intent: ProbeIntent, events: &SeamSender) {
         (**self).probe(intent, events);
+    }
+
+    fn cancel(&self, process_id: ProcessId, run_id: RunId, work_id: WorkId) {
+        (**self).cancel(process_id, run_id, work_id);
     }
 }

@@ -210,13 +210,14 @@ fn readiness_diagnostics_carry_attempts_and_the_last_error() {
         Harness::new(EffectiveProject::new(vec![probed_service("api")]).expect("unique names"));
     h.report_spawns();
     h.command(Command::Start("api".into()));
-    h.event(spawned("api", 1));
     // The timer poll dispatches the first attempt; the failing result
     // lands through the probe's bounded report.
     h.advance_and_poll(std::time::Duration::from_millis(0));
     h.event(SeamEvent::Readiness {
         process_id: ProcessId::new(process_index("api")),
         run_id: RunId::new(1),
+        work_id: super::WorkId::new(1),
+        attempt_id: super::AttemptId::new(1),
         passing: false,
         diagnostic: Some("connection refused".to_string()),
     });
@@ -230,9 +231,12 @@ fn readiness_diagnostics_carry_attempts_and_the_last_error() {
         "the last error stays bounded and visible"
     );
 
+    h.advance_and_poll(std::time::Duration::from_secs(1));
     h.event(SeamEvent::Readiness {
         process_id: ProcessId::new(process_index("api")),
         run_id: RunId::new(1),
+        work_id: super::WorkId::new(1),
+        attempt_id: super::AttemptId::new(2),
         passing: true,
         diagnostic: None,
     });

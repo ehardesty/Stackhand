@@ -4,6 +4,7 @@
 //! Supervisor.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -106,6 +107,10 @@ struct RunCoordination {
 struct RunRecord {
     coordination: Mutex<RunCoordination>,
     wake: Condvar,
+    /// Closes terminal access and auxiliary observations as soon as the
+    /// Supervisor replaces or stops this Run. Process cleanup and the
+    /// bounded output drain remain owned by `OwnedRun`.
+    cancelled: AtomicBool,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -118,6 +123,7 @@ impl RunRecord {
                 project_deadline: None,
             }),
             wake: Condvar::new(),
+            cancelled: AtomicBool::new(false),
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
@@ -148,6 +154,11 @@ impl RunRecord {
             _ => panic!("a Run can be installed only into its spawn reservation"),
         };
         self.wake.notify_one();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_all();
     }
 
     fn request_stop(&self, remaining: Option<Duration>) {
@@ -229,13 +240,14 @@ impl RunRecord {
     }
 
     fn is_active(&self) -> bool {
-        matches!(
-            self.coordination
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .state,
-            RunState::Active(_)
-        )
+        !self.cancelled.load(Ordering::Acquire)
+            && matches!(
+                self.coordination
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .state,
+                RunState::Active(_)
+            )
     }
 
     fn is_finished(&self) -> bool {
@@ -249,6 +261,9 @@ impl RunRecord {
     }
 
     fn with_terminal<R>(&self, f: impl FnOnce(&TerminalHandle<'_>) -> R) -> Option<R> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return None;
+        }
         let coordination = self
             .coordination
             .lock()
@@ -296,6 +311,19 @@ impl RealRunSeam {
 }
 
 impl RunSeam for RealRunSeam {
+    fn cancel(&self, process_id: ProcessId, run_id: RuntimeRunId) {
+        let key = (process_id.get(), run_id.get());
+        if let Some(record) = self
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            record.cancel();
+        }
+    }
+
     fn begin_shutdown(&self, remaining: Duration) {
         let deadline = Instant::now() + remaining;
         let records: Vec<_> = self
@@ -405,6 +433,10 @@ impl RunSeam for RealRunSeam {
     }
 }
 
+/// Drain output independently of the cancellation latch. Output is a
+/// bounded data-plane stream, not a lifecycle result; continuing the drain
+/// preserves final child output while the existing `OwnedRun` cleanup ladder
+/// runs. Lifecycle events are gated separately by `RunRecord::cancel`.
 fn drain_retained_output(
     output_rx: RunOutputReceiver,
     outputs: Arc<OutputViews>,
@@ -427,6 +459,9 @@ fn drain_retained_output(
 /// Own one Run from spawn through confirmed cleanup. The same loop forwards
 /// low-volume live events, chooses stop versus natural completion, consumes
 /// the public Run completion events, and reports one finished-Run fact.
+/// Output remains a separate data plane during cancellation so bytes already
+/// produced by the child can still drain before `OwnedRun` cleanup completes;
+/// output never changes the Supervisor lifecycle snapshot.
 fn own_run(
     key: RunKey,
     root_pid: Option<OsPid>,

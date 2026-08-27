@@ -43,10 +43,12 @@ impl Core {
             // A stopping Run releases its identity on the finished report;
             // that pass starts the replacement through the scheduler. The
             // stop is intentional: its summary must not read as a failure.
+            let process_id = entry.process_id;
             entry.lifecycle = Lifecycle::Stopping;
             entry.blocked = None;
-            entry.readiness = None;
-            self.seam.stop(entry.process_id, run_id, None, &self.events);
+            let _ = entry;
+            self.cancel_run_work(index);
+            self.seam.stop(process_id, run_id, None, &self.events);
         }
         self.evaluate();
     }
@@ -99,6 +101,7 @@ impl Core {
         entry.lifecycle = Lifecycle::Starting;
         entry.failure = None;
         entry.metrics = None;
+        entry.run_cancelled = false;
         entry.blocked = None;
         // Starting is the immediate invalidation of an earlier successful
         // One-shot completion represented by Done.
