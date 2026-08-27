@@ -156,6 +156,9 @@ fn terminal_operation_across_process_selection() {
     assert!(stdout.contains("interaction-scroll-ok"), "{stdout}");
     // A resize reaches only the selected PTY, and never zero dimensions.
     assert!(stdout.contains("interaction-resize-ok"), "{stdout}");
+    // Stop, start, and restart target the selected Service through the
+    // Supervisor; a clean stop and restart leave no failure behind.
+    assert!(stdout.contains("interaction-lifecycle-ok"), "{stdout}");
     // Selection moves never stop output ingestion for any Process.
     assert!(stdout.contains("interaction-ingest-ok"), "{stdout}");
     assert!(stdout.contains("interaction-shutdown-ok"), "{stdout}");

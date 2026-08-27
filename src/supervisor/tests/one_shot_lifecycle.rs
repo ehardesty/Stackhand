@@ -17,6 +17,7 @@ fn pair_index(name: &str) -> u32 {
     match name {
         "api" => 0,
         "setup" => 1,
+        "worker" => 2,
         other => panic!("unknown test process {other}"),
     }
 }
@@ -168,4 +169,45 @@ fn service_natural_exit_shows_stopped_with_failure_never_done() {
             .count(),
         1
     );
+}
+
+#[test]
+fn a_rerun_invalidates_the_previous_completion_until_it_completes() {
+    let project = EffectiveProject::new(vec![
+        depending_completed_on("api", &["setup"]),
+        simple("setup", ProcessKind::OneShot, Enabled::Yes, Autostart::No),
+        depending_completed_on("worker", &["setup"]),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    h.event(pair_spawned("setup", 1));
+    h.event(pair_exited("setup", 1, Some(0)));
+    h.event(shutdown_complete("setup", 1));
+    assert_eq!(h.process("setup").lifecycle, Lifecycle::Done);
+    assert_eq!(h.process("api").current_run, Some(1));
+
+    // Rerunning the One-shot immediately invalidates the previous
+    // completion: a dependent that has not started yet must still wait
+    // for the new Run to complete.
+    h.command(Command::Restart("setup".into()));
+    let setup = h.process("setup");
+    assert_eq!(setup.current_run, Some(2));
+    assert_eq!(setup.lifecycle, Lifecycle::Starting);
+
+    h.command(Command::Start("worker".into()));
+    let worker = h.process("worker");
+    assert_eq!(worker.lifecycle, Lifecycle::Waiting);
+    assert_eq!(
+        worker.blocked_reason.as_deref(),
+        Some("setup: completed_successfully")
+    );
+
+    // The new Run completing satisfies the condition again.
+    h.event(pair_spawned("setup", 2));
+    h.event(pair_exited("setup", 2, Some(0)));
+    h.event(shutdown_complete("setup", 2));
+    let worker = h.process("worker");
+    assert_eq!(worker.current_run, Some(1));
+    assert_eq!(worker.lifecycle, Lifecycle::Starting);
 }

@@ -478,7 +478,41 @@ fn unconfirmed_cleanup_keeps_a_bounded_reason() {
         h.process("api").failure.expect("reason is visible").detail,
         "scripted cleanup failure"
     );
+    // The held Run identity blocks any replacement Run; only the retry
+    // through Stop can release it.
+    assert!(h.process("api").current_run.is_some());
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Stopped);
+
+    h.command(Command::Start("api".into()));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Stopped);
+    assert!(h.process("api").current_run.is_some());
+}
+
+#[test]
+fn stop_retry_releases_an_unconfirmed_cleanup() {
+    let runtime = FakeRuntime::shared();
+    runtime
+        .fail_cleanup
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut h = Harness::with(four_process_project(), Arc::clone(&runtime));
+    h.command(Command::Start("api".into()));
+    h.command(Command::Stop("api".into()));
+    assert!(h.process("api").failure.is_some());
+
+    // The retry succeeds: the Run identity frees and a replacement may
+    // start; the failure summary stays visible until the next Run begins.
+    runtime
+        .fail_cleanup
+        .store(false, std::sync::atomic::Ordering::Release);
+    h.command(Command::Stop("api".into()));
     assert_eq!(h.process("api").current_run, None);
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Stopped);
+    assert!(h.process("api").failure.is_some());
+
+    // A replacement Run may start now and receives the next Run ID.
+    h.command(Command::Start("api".into()));
+    assert!(h.process("api").current_run.is_some());
+    assert!(h.process("api").failure.is_none());
 }
 
 #[test]
@@ -524,6 +558,8 @@ fn unknown_commands_are_ignored() {
 mod readiness;
 
 mod one_shot_lifecycle;
+
+mod service_lifecycle;
 
 #[cfg(test)]
 mod dependency_scheduling {

@@ -17,6 +17,8 @@ pub enum SelectionMove {
     Down,
 }
 
+pub use crate::lifecycle::LifecycleCommand;
+use crate::lifecycle::{LifecycleQueue, lifecycle_request_for};
 pub use crate::pipe_scroll::PipeScroll;
 
 pub(crate) struct ConsoleInteraction {
@@ -25,6 +27,7 @@ pub(crate) struct ConsoleInteraction {
     paste_requests: Vec<PasteRequest>,
     copy_requests: Vec<CopyRequest>,
     selection_requests: Vec<SelectionMove>,
+    lifecycle: LifecycleQueue,
     selection_clock: Instant,
 }
 
@@ -36,6 +39,7 @@ impl Default for ConsoleInteraction {
             paste_requests: Vec::new(),
             copy_requests: Vec::new(),
             selection_requests: Vec::new(),
+            lifecycle: LifecycleQueue::new(),
             selection_clock: Instant::now(),
         }
     }
@@ -86,6 +90,12 @@ impl ConsoleInteraction {
     /// Drain every Process-selection move queued by command modes.
     pub fn take_selection_moves(&mut self) -> Vec<SelectionMove> {
         std::mem::take(&mut self.selection_requests)
+    }
+
+    /// Drain every lifecycle command queued by command modes. The app event
+    /// loop dispatches each one for the currently selected Process.
+    pub fn take_lifecycle_commands(&mut self) -> Vec<LifecycleCommand> {
+        self.lifecycle.take()
     }
 
     pub fn poll_requests(&mut self) -> bool {
@@ -222,7 +232,12 @@ impl ConsoleInteraction {
                     self.view.mode = ConsoleViewMode::ChildInput;
                     true
                 }
-                KeyCode::Char('s') => {
+                KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
+                    self.lifecycle
+                        .queue(lifecycle_request_for(c).expect("the guard checked the key"));
+                    true
+                }
+                KeyCode::Char('v') => {
                     self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
                     true
                 }
@@ -244,6 +259,15 @@ impl ConsoleInteraction {
                 KeyCode::Char('f') => {
                     scroll.get_or_insert_default().follow();
                     self.view.mode = ConsoleViewMode::ChildInput;
+                    true
+                }
+                KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
+                    self.lifecycle
+                        .queue(lifecycle_request_for(c).expect("the guard checked the key"));
+                    true
+                }
+                KeyCode::Char('v') => {
+                    self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
                     true
                 }
                 KeyCode::Esc => {
@@ -346,7 +370,12 @@ impl ConsoleInteraction {
                 self.return_to_live_tail(session);
                 true
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
+                self.lifecycle
+                    .queue(lifecycle_request_for(c).expect("the guard checked the key"));
+                true
+            }
+            KeyCode::Char('v') => {
                 self.view.mode = ConsoleViewMode::Selection;
                 true
             }
@@ -383,6 +412,15 @@ impl ConsoleInteraction {
             }
             KeyCode::Char('f') => {
                 self.return_to_live_tail(session);
+                true
+            }
+            KeyCode::Char(c) if lifecycle_request_for(c).is_some() => {
+                self.lifecycle
+                    .queue(lifecycle_request_for(c).expect("the guard checked the key"));
+                true
+            }
+            KeyCode::Char('v') => {
+                self.view.mode = ConsoleViewMode::Selection;
                 true
             }
             KeyCode::Esc => {
@@ -718,13 +756,24 @@ mod tests {
             20,
         ));
         assert!(interaction.handle_key_read_only(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
             &mut scroll,
             20,
         ));
         assert_eq!(
             interaction.view().warning,
             Some(ConsoleWarning::SelectionUnavailable)
+        );
+        // Lifecycle commands still work from a read-only pane: they are
+        // application commands, never child input.
+        assert!(interaction.handle_key_read_only(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut scroll,
+            20,
+        ));
+        assert_eq!(
+            interaction.take_lifecycle_commands(),
+            Vec::from([LifecycleCommand::Stop])
         );
     }
 

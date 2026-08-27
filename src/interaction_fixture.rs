@@ -9,20 +9,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::console::{ConsoleInteraction, PipeScroll, SelectionMove};
+use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
 use crate::supervisor::{Command, Consoles, Lifecycle, ProcessSnapshot, SupervisorHandle};
 use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleWarning};
 
-const WAIT: Duration = Duration::from_secs(15);
+pub(crate) const WAIT: Duration = Duration::from_secs(15);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 /// The console pane height the fixture drives; the real app measures it.
-const PAGE_ROWS: u16 = 20;
+pub(crate) const PAGE_ROWS: u16 = 20;
 
-fn leader() -> KeyEvent {
+pub(crate) fn leader() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
 }
 
-fn key(code: KeyCode) -> KeyEvent {
+pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
@@ -224,7 +224,7 @@ fn prove(
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
-        key(KeyCode::Char('s')),
+        key(KeyCode::Char('v')),
         None,
         &mut pipe_scroll[piped],
         PAGE_ROWS,
@@ -234,6 +234,20 @@ fn prove(
         Some(ConsoleWarning::SelectionUnavailable)
     );
     console.clear_pane_warning();
+    // Lifecycle commands work from a read-only pane: they are
+    // application commands, never child input.
+    assert!(console.route_pane_key(
+        ConsolePaneKind::Pipe,
+        false,
+        key(KeyCode::Char('x')),
+        None,
+        &mut pipe_scroll[piped],
+        PAGE_ROWS,
+    ));
+    assert_eq!(
+        console.take_lifecycle_commands(),
+        vec![LifecycleCommand::Stop]
+    );
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
@@ -414,13 +428,52 @@ fn prove(
     );
     println!("interaction-resize-ok");
 
+    // Lifecycle commands target the selected Process through the
+    // Supervisor: stop finishes as Stopped, restart brings the next Run
+    // back, and a clean cycle leaves no failure behind.
+    crate::lifecycle_fixture::prove_lifecycle(
+        &mut console,
+        &mut pipe_scroll[..],
+        consoles,
+        outputs,
+        supervisor,
+        crate::lifecycle_fixture::FixtureProcesses {
+            focused,
+            mute,
+            piped,
+        },
+        &mut selected,
+    )?;
+    println!("interaction-lifecycle-ok");
+
     // Moving selection around must not stop output ingestion for any
     // Process: the move is routed through the currently selected pane and
     // applied only from the drained request, clamped at the list ends, and
-    // every tick counter keeps climbing.
-    let base_focused = wait_for_tick(&focused_view, "tick-", 2)?;
-    let base_mute = wait_for_tick(&mute_view, "tick-", 2)?;
-    let base_piped = wait_for_module_tick(outputs, piped, "pipe-tick-", 2)?;
+    // every tick counter keeps climbing. The restarts above opened new
+    // Runs, so the proof follows each Process's current Run view.
+    let ingest_snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    let focused_live = consoles
+        .view(
+            focused as u32,
+            ingest_snapshot.processes[focused]
+                .current_run
+                .expect("the restarted Process keeps a live Run"),
+        )
+        .expect("the restarted Process has a live console");
+    let mute_live = consoles
+        .view(
+            mute as u32,
+            ingest_snapshot.processes[mute]
+                .current_run
+                .expect("the restarted Process keeps a live Run"),
+        )
+        .expect("the restarted Process has a live console");
+    let base_focused = wait_for_tick(&focused_live, "tick-", 2)?;
+    let base_mute = wait_for_tick(&mute_live, "tick-", 2)?;
+    // The pipe module retains chunks from earlier Runs, whose counters sit
+    // above the restarted counter, so progress is proven at the tail.
+    wait_for_module_tick(outputs, piped, "pipe-tick-", 2)?;
+    let base_piped = last_tick(&module_text(outputs, piped), "pipe-tick-").unwrap_or(0);
     let moves = [
         SelectionMove::Down,
         SelectionMove::Down,
@@ -435,7 +488,7 @@ fn prove(
             &mut pipe_scroll,
             consoles,
             outputs,
-            &snapshot,
+            &ingest_snapshot,
             &mut selected,
             *direction,
         );
@@ -446,15 +499,15 @@ fn prove(
         std::thread::sleep(Duration::from_millis(500));
     }
     assert!(
-        max_tick(&console_text(&focused_view), "tick-").unwrap_or(0) > base_focused,
+        max_tick(&console_text(&focused_live), "tick-").unwrap_or(0) > base_focused,
         "selection moves stopped ingestion into the focused terminal"
     );
     assert!(
-        max_tick(&console_text(&mute_view), "tick-").unwrap_or(0) > base_mute,
+        max_tick(&console_text(&mute_live), "tick-").unwrap_or(0) > base_mute,
         "selection moves stopped ingestion into the muted terminal"
     );
     assert!(
-        max_tick(&module_text(outputs, piped), "pipe-tick-").unwrap_or(0) > base_piped,
+        last_tick(&module_text(outputs, piped), "pipe-tick-").unwrap_or(0) > base_piped,
         "selection moves stopped ingestion into the pipe module"
     );
     println!("interaction-ingest-ok");
@@ -465,7 +518,7 @@ fn prove(
 /// the currently selected pane, then apply the drained request exactly
 /// like the app event loop does: moves clamp at the list ends, and a
 /// moved selection clears the pane-scoped warning.
-fn apply_move(
+pub(crate) fn apply_move(
     console: &mut ConsoleInteraction,
     pipe_scroll: &mut [Option<PipeScroll>],
     consoles: &Consoles,
@@ -512,41 +565,49 @@ fn move_selection_key(
     };
     let process = &snapshot.processes[selected];
     if process.terminal_mode == crate::model::TerminalMode::Pty {
-        let run_id = process
-            .current_run
-            .expect("the fixture's terminal Processes keep running");
-        let view = consoles
-            .view(selected as u32, run_id)
-            .expect("the fixture's terminal Processes have live consoles");
-        view.with(|session| {
-            // Esc first: a scroll-mode pane lands in the command UI, and
-            // the press is a no-op anywhere else, so the leader below
-            // reaches the command UI from every mode.
-            console.route_pane_key(
-                ConsolePaneKind::Terminal,
-                process.input_focused,
-                key(KeyCode::Esc),
-                Some(session),
-                &mut pipe_scroll[selected],
-                PAGE_ROWS,
-            );
-            console.route_pane_key(
-                ConsolePaneKind::Terminal,
-                process.input_focused,
-                leader(),
-                Some(session),
-                &mut pipe_scroll[selected],
-                PAGE_ROWS,
-            );
-            console.route_pane_key(
-                ConsolePaneKind::Terminal,
-                process.input_focused,
-                key(move_key),
-                Some(session),
-                &mut pipe_scroll[selected],
-                PAGE_ROWS,
-            );
-        });
+        // A live terminal routes through its session; a Process whose Run
+        // is stopped or being cleaned up routes through the empty pane
+        // path, exactly like the app's pane kind selection.
+        let live = matches!(process.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+            .then(|| process.current_run)
+            .flatten()
+            .and_then(|run_id| consoles.view(selected as u32, run_id));
+        // Esc first: a scroll-mode pane lands in the command UI, and the
+        // press is a no-op anywhere else, so the leader below reaches the
+        // command UI from every mode.
+        let keys = [
+            KeyEvent::from(KeyCode::Esc),
+            leader(),
+            KeyEvent::from(move_key),
+        ];
+        match live {
+            Some(view) => {
+                view.with(|session| {
+                    for key_event in keys {
+                        console.route_pane_key(
+                            ConsolePaneKind::Terminal,
+                            process.input_focused,
+                            key_event,
+                            Some(session),
+                            &mut pipe_scroll[selected],
+                            PAGE_ROWS,
+                        );
+                    }
+                });
+            }
+            None => {
+                for key_event in keys {
+                    console.route_pane_key(
+                        ConsolePaneKind::Empty,
+                        process.input_focused,
+                        key_event,
+                        None,
+                        &mut pipe_scroll[selected],
+                        PAGE_ROWS,
+                    );
+                }
+            }
+        }
     } else {
         outputs
             .for_process(selected as u32)
@@ -622,6 +683,16 @@ fn max_tick(text: &str, prefix: &str) -> Option<u32> {
         .max()
 }
 
+/// The most recent `prefix NNNN` counter visible in a flattened module,
+/// regardless of older counters retained from earlier Runs.
+fn last_tick(text: &str, prefix: &str) -> Option<u32> {
+    text.match_indices(prefix).last().and_then(|(position, _)| {
+        let rest = &text[position + prefix.len()..];
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        digits.parse().ok()
+    })
+}
+
 fn module_text(outputs: &crate::output::OutputViews, index: usize) -> String {
     let module = outputs
         .for_process(index as u32)
@@ -674,7 +745,7 @@ fn shutdown(supervisor: SupervisorHandle, proof_ok: bool) -> Result<()> {
     Ok(())
 }
 
-fn wait_for(
+pub(crate) fn wait_for(
     supervisor: &SupervisorHandle,
     limit: Duration,
     done: impl Fn(&crate::supervisor::ProjectSnapshot) -> bool,

@@ -4,6 +4,8 @@ mod console;
 mod fixtures;
 mod geometry;
 pub mod interaction_fixture;
+mod lifecycle;
+mod lifecycle_fixture;
 pub mod model;
 mod mouse_fixture;
 mod output;

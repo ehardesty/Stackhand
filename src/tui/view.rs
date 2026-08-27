@@ -145,6 +145,7 @@ pub fn render_project(
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
     view: ConsoleViewState,
+    selected_header: &str,
 ) -> Rect {
     let area = frame.area();
     let (list, console_pane, footer) = project_layout(area, rows.len());
@@ -166,7 +167,15 @@ pub fn render_project(
             .block(Block::new().borders(Borders::ALL).title(" Processes ")),
         list,
     );
-    frame.render_widget(Block::bordered().title(" Console "), console_pane);
+    // The header names the selected Process and its live Run identity; it
+    // is a projection of the immutable Supervisor snapshot, never stored
+    // UI state.
+    let header = if selected_header.is_empty() {
+        " Console ".to_string()
+    } else {
+        format!(" Console · {selected_header} ")
+    };
+    frame.render_widget(Block::bordered().title(header), console_pane);
 
     let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
     if let Some(lines) = pipe_lines {
@@ -343,7 +352,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_project(frame, rows, None, None, ConsoleViewState::default());
+                render_project(frame, rows, None, None, ConsoleViewState::default(), "");
             })
             .unwrap();
         terminal.backend().buffer().clone()

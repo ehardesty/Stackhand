@@ -104,6 +104,10 @@ pub(super) struct Entry {
     /// Present only while the current Run of a probed Service is alive and
     /// still awaiting its first passing attempt.
     pub(super) readiness: Option<ReadinessTracking>,
+    /// The previous Run's cleanup finished unconfirmed: its Run identity
+    /// stays held so a manual Stop can retry the bounded cleanup, and no
+    /// new Run may replace it until that retry confirms.
+    pub(super) cleanup_unconfirmed: bool,
 }
 
 impl Entry {
@@ -119,6 +123,7 @@ impl Entry {
             blocked: None,
             completed: false,
             readiness: None,
+            cleanup_unconfirmed: false,
         }
     }
 }
@@ -174,6 +179,11 @@ impl Core {
                     self.stop_at(index);
                 }
             }
+            Command::Restart(name) => {
+                if let Some(index) = self.named_index(&name) {
+                    self.restart_at(index);
+                }
+            }
         }
     }
 
@@ -211,6 +221,18 @@ impl Core {
 
     fn stop_at(&mut self, index: usize) {
         let entry = &mut self.entries[index];
+        // An unconfirmed cleanup holds its Run identity: Stop retries the
+        // bounded cleanup for that same Run, and only a confirmed
+        // completion releases it.
+        if entry.cleanup_unconfirmed {
+            let run_id = entry
+                .current_run
+                .expect("an unconfirmed cleanup holds its Run identity");
+            entry.lifecycle = Lifecycle::Stopping;
+            entry.readiness = None;
+            self.seam.stop(entry.process_id, run_id, &self.events);
+            return;
+        }
         if entry.desired != DesiredState::Running {
             return;
         }
@@ -240,6 +262,13 @@ impl Core {
             return;
         };
         if Some(event.run_id()) != self.entries[index].current_run {
+            return;
+        }
+        // While a cleanup retry is held, only the confirming completion of
+        // the held Run is meaningful; stale reports for it stay stale.
+        if self.entries[index].cleanup_unconfirmed
+            && !matches!(event, SeamEvent::ShutdownComplete { .. })
+        {
             return;
         }
         match event {
@@ -310,19 +339,31 @@ impl Core {
                 confirmed, detail, ..
             } => {
                 let entry = &mut self.entries[index];
-                entry.current_run = None;
-                entry.metrics = None;
-                entry.readiness = None;
-                // A One-shot that completed successfully stays Done instead
-                // of falling back to Stopped with its cleanup result.
-                if entry.lifecycle != Lifecycle::Done {
-                    entry.lifecycle = Lifecycle::Stopped;
-                }
                 if !confirmed {
+                    // Hold the Run identity: the cleanup is unconfirmed, so
+                    // a manual Stop can retry it and no replacement Run
+                    // may start until the retry confirms.
+                    entry.cleanup_unconfirmed = true;
                     entry.failure = Some(FailureSummary {
                         detail: detail
                             .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
                     });
+                    if entry.lifecycle != Lifecycle::Done {
+                        entry.lifecycle = Lifecycle::Stopped;
+                    }
+                    entry.metrics = None;
+                    entry.readiness = None;
+                    self.evaluate();
+                    return;
+                }
+                entry.current_run = None;
+                entry.metrics = None;
+                entry.readiness = None;
+                entry.cleanup_unconfirmed = false;
+                // A One-shot that completed successfully stays Done instead
+                // of falling back to Stopped with its cleanup result.
+                if entry.lifecycle != Lifecycle::Done {
+                    entry.lifecycle = Lifecycle::Stopped;
                 }
                 self.evaluate();
             }
@@ -517,6 +558,7 @@ fn shell_program(shell_env: Option<&OsStr>) -> OsString {
 pub enum Command {
     Start(String),
     Stop(String),
+    Restart(String),
     StartAutostart,
     StopAll,
 }

@@ -26,6 +26,28 @@ impl Core {
         self.evaluate();
     }
 
+    /// Restart one Process: keep Desired State Running, stop the active
+    /// Run without touching that desire, and let the scheduler start the
+    /// next Run only after the bounded cleanup reports completion. While
+    /// the previous cleanup is unconfirmed the request stays pending; its
+    /// visible failure names the held Run and Stop retries the cleanup.
+    pub(super) fn restart_at(&mut self, index: usize) {
+        if !self.is_enabled(index) {
+            return;
+        }
+        self.require_running(index);
+        let entry = &mut self.entries[index];
+        if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
+            // A stopping Run releases its identity on ShutdownComplete;
+            // that pass starts the replacement through the scheduler.
+            entry.lifecycle = Lifecycle::Stopping;
+            entry.blocked = None;
+            entry.readiness = None;
+            self.seam.stop(entry.process_id, run_id, &self.events);
+        }
+        self.evaluate();
+    }
+
     /// Mark one Process and its enabled Dependencies, transitively, as
     /// Desired State Running. Disabled Dependencies stay untouched.
     fn require_running(&mut self, index: usize) {
@@ -67,6 +89,9 @@ impl Core {
         entry.failure = None;
         entry.metrics = None;
         entry.blocked = None;
+        // A new Run invalidates any earlier completion of this Process; the
+        // condition is satisfied only when this Run completes.
+        entry.completed = false;
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }

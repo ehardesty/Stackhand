@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
-use crate::console::{ConsoleInteraction, PipeScroll, SelectionMove};
+use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
 use crate::supervisor::Lifecycle;
@@ -107,6 +107,17 @@ fn run_event_loop(
             console.clear_pane_warning();
             dirty = true;
         }
+        for request in console.take_lifecycle_commands() {
+            // Lifecycle commands target the selected Process by name and
+            // never touch the terminal session; the Supervisor owns the
+            // resulting Run changes.
+            let name = snapshot.processes[selected].name.clone();
+            supervisor.command(match request {
+                LifecycleCommand::Start => Command::Start(name),
+                LifecycleCommand::Stop => Command::Stop(name),
+                LifecycleCommand::Restart => Command::Restart(name),
+            });
+        }
         let selected_process = &snapshot.processes[selected];
         let pane = selected_pane(consoles, outputs, selected, selected_process);
         match &pane {
@@ -167,7 +178,14 @@ fn run_event_loop(
         {
             dirty = false;
             let rows = process_rows(&snapshot, selected);
-            let pane = render_frame(outer, &rows, terminal_snapshot, pipe_lines, console.view())?;
+            let pane = render_frame(
+                outer,
+                &rows,
+                terminal_snapshot,
+                pipe_lines,
+                console.view(),
+                &selected_header(&snapshot.processes[selected]),
+            )?;
             console_pane = pane;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
             outer.set_cursor_shape(cursor)?;
@@ -398,12 +416,25 @@ fn short_reason(detail: &str) -> String {
     truncated
 }
 
+/// Project the selected Process into the console pane's header: name, the
+/// live Run identity when one exists, and the concise status label. The
+/// header is a projection of the immutable Supervisor snapshot.
+fn selected_header(process: &ProcessSnapshot) -> String {
+    let mut header = process.name.clone();
+    if let Some(run_id) = process.current_run {
+        header.push_str(&format!(" · run {run_id}"));
+    }
+    header.push_str(&format!(" · {}", status_label(process)));
+    header
+}
+
 fn render_frame(
     outer: &mut OuterTerminal,
     rows: &[ProcessRowView],
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[crate::tui::PipeLine]>,
     view: crate::tui::ConsoleViewState,
+    selected_header: &str,
 ) -> Result<ratatui::layout::Rect> {
     let mut pane = None;
     outer
@@ -415,6 +446,7 @@ fn render_frame(
                 console_snapshot,
                 pipe_lines,
                 view,
+                selected_header,
             ));
         })
         .map_err(|error| anyhow!("render failed: {error}"))?;
