@@ -6,7 +6,7 @@ use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
 use libghostty_vt::selection::{Adjustment, FormatOptions, Selection};
-use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace, Terminal};
+use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace, ScrollViewport, Terminal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionPoint {
@@ -178,6 +178,22 @@ impl SelectionController {
             self.endpoint_active = false;
             return self.toggle_keyboard_endpoint(terminal);
         };
+        let cursor_point = tracked_viewport_point(terminal, cursor)?;
+        let scroll = match (direction, cursor_point) {
+            (SelectionDirection::Up, Some(SelectionPoint { surface_row: 0, .. })) => -1,
+            (SelectionDirection::Down, Some(SelectionPoint { surface_row, .. }))
+                if surface_row == i32::from(terminal.rows()?.saturating_sub(1)) =>
+            {
+                1
+            }
+            _ => 0,
+        };
+        if scroll != 0 {
+            terminal.scroll_viewport(ScrollViewport::Delta(scroll));
+            if tracked_viewport_point(terminal, cursor)? == cursor_point {
+                return Ok(());
+            }
+        }
         let start = anchor
             .snapshot(terminal)?
             .ok_or(libghostty_vt::Error::InvalidValue)?;

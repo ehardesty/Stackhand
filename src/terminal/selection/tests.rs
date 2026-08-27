@@ -124,6 +124,46 @@ fn keyboard_endpoint_extension_uses_ghostty_cell_semantics_and_boundaries() {
 }
 
 #[test]
+fn keyboard_selection_scrolls_into_history_at_the_top_edge() {
+    use libghostty_vt::terminal::ScrollViewport;
+
+    let mut terminal = terminal(12, 3);
+    for index in 0..10 {
+        terminal.vt_write(format!("line-{index}\r\n").as_bytes());
+    }
+    terminal.scroll_viewport(ScrollViewport::Delta(-3));
+    let mut selection = SelectionController::new().unwrap();
+    selection.enter_keyboard_navigation(&mut terminal).unwrap();
+    selection
+        .move_keyboard_cursor(&mut terminal, SelectionDirection::Up)
+        .unwrap();
+    selection
+        .move_keyboard_cursor(&mut terminal, SelectionDirection::Up)
+        .unwrap();
+    selection.toggle_keyboard_endpoint(&mut terminal).unwrap();
+
+    selection
+        .move_keyboard_cursor(&mut terminal, SelectionDirection::Up)
+        .unwrap();
+
+    assert_eq!(
+        selection.keyboard_cursor(&terminal).unwrap(),
+        Some(SelectionPoint {
+            col: 0,
+            surface_row: 0,
+        }),
+        "the endpoint stays at the top while the viewport scrolls into history"
+    );
+    assert!(
+        selection
+            .text(&terminal)
+            .unwrap()
+            .is_some_and(|text| text.lines().count() >= 2),
+        "the selection extends onto the newly visible history row"
+    );
+}
+
+#[test]
 fn mouse_selection_can_be_extended_with_keyboard_navigation() {
     let mut terminal = terminal(20, 3);
     terminal.vt_write(b"alpha beta");

@@ -74,6 +74,7 @@ pub(crate) struct ConsoleInteraction {
     lifecycle_requests: Vec<LifecycleCommand>,
     selection_clock: Instant,
     last_stackhand_press: Option<(u16, u16, Duration)>,
+    copy_return_mode: ConsoleViewMode,
 }
 
 impl Default for ConsoleInteraction {
@@ -87,6 +88,7 @@ impl Default for ConsoleInteraction {
             lifecycle_requests: Vec::new(),
             selection_clock: Instant::now(),
             last_stackhand_press: None,
+            copy_return_mode: ConsoleViewMode::ProcessList,
         }
     }
 }
@@ -374,6 +376,9 @@ impl ConsoleInteraction {
         let starts_copy = route.event.stackhand_owned
             && (matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) || repeated_press);
         let enters_copy = starts_copy && self.view.mode != ConsoleViewMode::Copy;
+        if enters_copy {
+            self.copy_return_mode = self.view.mode;
+        }
         if starts_copy {
             self.view.mode = ConsoleViewMode::Copy;
             self.view.warning = None;
@@ -431,6 +436,7 @@ impl ConsoleInteraction {
             ProcessCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
             ProcessCommand::EnterCopy => {
                 session.start_keyboard_selection();
+                self.copy_return_mode = self.view.mode;
                 self.view.mode = ConsoleViewMode::Copy;
                 self.view.following = false;
             }
@@ -507,8 +513,11 @@ impl ConsoleInteraction {
                 self.view.following = false;
                 true
             }
-            KeyCode::Esc => {
-                self.focus_process_list(Some(session));
+            KeyCode::Char('q') | KeyCode::Esc => {
+                session.clear_selection();
+                self.view.mode = self.copy_return_mode;
+                self.view.stackhand_mouse_gesture = false;
+                self.last_stackhand_press = None;
                 true
             }
             _ => false,

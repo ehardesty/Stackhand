@@ -211,7 +211,7 @@ fn copy_mode_supports_vim_navigation_and_copy_aliases() {
     ] {
         assert!(interaction.handle_key(key(code), &handle, 20), "{code:?}");
     }
-    assert!(interaction.handle_key(key(KeyCode::Esc), &handle, 20));
+    assert!(interaction.handle_key(key(KeyCode::Char('q')), &handle, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
 
     drop(peer);
@@ -251,6 +251,12 @@ fn console_click_focuses_and_drag_enters_copy_mode() {
     };
     assert!(interaction.handle_mouse(release, area, false, &handle));
     assert!(!interaction.mouse_gesture_active());
+    assert!(interaction.handle_key(key(KeyCode::Esc), &handle, 20));
+    assert_eq!(
+        interaction.view().mode,
+        ConsoleViewMode::Console,
+        "leaving a mouse-started copy returns to console focus"
+    );
 
     interaction.focus_console(Some(&handle));
     assert!(interaction.handle_mouse(mouse, area, false, &handle));

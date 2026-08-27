@@ -318,12 +318,12 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             "j/k or ↑↓: select · s: start · x: stop · r: restart · v: copy · Ctrl-A: console · q: quit"
         }
         ConsoleViewMode::Console => match view.pane {
-            ConsolePaneKind::Terminal => "keys: child · Ctrl-A: Process list · Ctrl-Q: quit",
+            ConsolePaneKind::Terminal => "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit",
             ConsolePaneKind::Pipe => "read-only output · Ctrl-A: Process list · Ctrl-Q: quit",
             ConsolePaneKind::Empty => "no active Run · Ctrl-A: Process list · Ctrl-Q: quit",
         },
         ConsoleViewMode::Copy => {
-            "h/j/k/l or arrows: move · v: begin selection · c/y: copy · a: all · Esc: Process list"
+            "h/j/k/l or arrows: move · v: select/unselect · c/y: copy · a: all · q/Esc: exit"
         }
     };
     let tail = if view.following {
@@ -645,6 +645,10 @@ mod tests {
         );
         assert!(
             console_footer.contains("FOCUS: CONSOLE"),
+            "{console_footer}"
+        );
+        assert!(
+            console_footer.contains("Ctrl-A, then v: copy"),
             "{console_footer}"
         );
         assert!(console_footer.contains("LIVE"), "{console_footer}");
