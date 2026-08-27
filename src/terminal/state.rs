@@ -93,6 +93,11 @@ impl TerminalState {
                 self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
                 return Ok(None);
             }
+            TerminalCommand::ScrollBatch(scroll) => {
+                self.terminal
+                    .scroll_viewport(ScrollViewport::Delta(scroll.take()));
+                return Ok(None);
+            }
             TerminalCommand::SelectionAll => {
                 self.selection.select_all(&self.terminal)?;
                 return Ok(None);

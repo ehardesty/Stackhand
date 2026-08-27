@@ -275,6 +275,94 @@ fn console_click_focuses_and_drag_enters_copy_mode() {
 }
 
 #[test]
+fn a_wheel_burst_does_not_block_the_next_mouse_selection() {
+    let (session, mut peer) = session();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let handle = crate::runtime::handle_for_test(&session, &stopped);
+    let mut interaction = ConsoleInteraction::default();
+    let area = Rect::new(5, 5, 80, 20);
+    let mut output = String::new();
+    for line in 0..2_000 {
+        output.push_str(&format!("medium-log-line-{line:04}\r\n"));
+    }
+    output.push_str("wheel-repro-ready\r\n\x1b[?25l");
+    use std::io::Write as _;
+    let output_bytes = output.len();
+    peer.write_all(output.as_bytes()).unwrap();
+
+    let output_deadline = Instant::now() + Duration::from_secs(2);
+    while session.output_history_metrics().bytes < output_bytes
+        || session.snapshot().cursor.is_some()
+    {
+        assert!(
+            Instant::now() < output_deadline,
+            "log output and hidden cursor state were not applied"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let wheel = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 20,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    };
+    for _ in 0..10_000 {
+        interaction.handle_mouse(wheel, area, false, &handle);
+    }
+
+    interaction.focus_console(Some(&handle));
+    let press = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        ..wheel
+    };
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 30,
+        ..wheel
+    };
+    interaction.handle_mouse(press, area, false, &handle);
+    assert_ne!(
+        interaction.view().warning,
+        Some(ConsoleWarning::InputRejected),
+        "wheel backlog rejected the selection press"
+    );
+    interaction.handle_mouse(drag, area, false, &handle);
+
+    assert_ne!(
+        interaction.view().warning,
+        Some(ConsoleWarning::InputRejected),
+        "wheel backlog rejected the next selection gesture"
+    );
+    let selection_deadline = Instant::now() + Duration::from_millis(500);
+    while session.snapshot().cursor.is_none() {
+        assert!(
+            Instant::now() < selection_deadline,
+            "wheel backlog delayed the visible selection cursor"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let request = session.request_copy();
+    let copied = loop {
+        if let Some(result) = request.poll() {
+            break result.unwrap();
+        }
+        assert!(
+            Instant::now() < selection_deadline,
+            "wheel backlog delayed the selected text"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(
+        copied.as_ref().is_some_and(|text| !text.is_empty()),
+        "the admitted drag must create a real text selection: {copied:?}"
+    );
+
+    drop(peer);
+    session.shutdown().unwrap();
+}
+
+#[test]
 fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
     let warning = copy_warning(Ok(Some("selected".to_string())), |_| {
         Err(anyhow::anyhow!("clipboard unavailable"))

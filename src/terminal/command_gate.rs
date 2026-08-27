@@ -26,6 +26,7 @@ pub enum TerminalCommand {
     },
     Resize(TerminalGeometry),
     Scroll(isize),
+    ScrollBatch(Arc<CoalescedScroll>),
     SelectionAll,
     SelectionClear,
     SelectionKeyboardStart,
@@ -45,7 +46,7 @@ impl TerminalCommand {
             Self::Raw(data) => data.len(),
             Self::Paste { data, .. } => data.len().saturating_add(12),
             Self::Resize(_) => 4,
-            Self::Scroll(_) => std::mem::size_of::<isize>(),
+            Self::Scroll(_) | Self::ScrollBatch(_) => std::mem::size_of::<isize>(),
             Self::SelectionAll
             | Self::SelectionClear
             | Self::SelectionKeyboardStart
@@ -113,8 +114,61 @@ impl CommandStatus {
     }
 }
 
+#[derive(Debug)]
+pub struct CoalescedScroll {
+    state: Mutex<CoalescedScrollState>,
+}
+
+#[derive(Debug)]
+struct CoalescedScrollState {
+    delta: isize,
+    open: bool,
+}
+
+impl CoalescedScroll {
+    fn new(delta: isize) -> Self {
+        Self {
+            state: Mutex::new(CoalescedScrollState { delta, open: true }),
+        }
+    }
+
+    fn add_if_open(&self, delta: isize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.open || (state.delta != 0 && delta != 0 && state.delta.signum() != delta.signum())
+        {
+            return false;
+        }
+        state.delta = state.delta.saturating_add(delta);
+        true
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .open = false;
+    }
+
+    pub(super) fn take(&self) -> isize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.open = false;
+        std::mem::take(&mut state.delta)
+    }
+}
+
+struct CommandSender {
+    sender: Sender<TerminalCommand>,
+    open_scroll: Option<Arc<CoalescedScroll>>,
+}
+
 pub struct CommandGate {
-    sender: Mutex<Option<Sender<TerminalCommand>>>,
+    sender: Mutex<Option<CommandSender>>,
     budget: ByteBudget,
     status: Arc<CommandStatus>,
 }
@@ -130,7 +184,10 @@ impl CommandGate {
         let budget = ByteBudget::new(COMMAND_QUEUE_BYTES);
         (
             Self {
-                sender: Mutex::new(Some(sender)),
+                sender: Mutex::new(Some(CommandSender {
+                    sender,
+                    open_scroll: None,
+                })),
                 budget: budget.clone(),
                 status: Arc::new(CommandStatus::default()),
             },
@@ -139,6 +196,45 @@ impl CommandGate {
     }
 
     pub fn try_send(&self, command: TerminalCommand) -> Result<(), CommandRejection> {
+        let mut guard = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sender) = guard.as_mut() else {
+            self.status.record(CommandEvent::Failed(
+                "terminal command gate is shut down".to_string(),
+            ));
+            return Err(CommandRejection::Stopping);
+        };
+
+        if let TerminalCommand::Scroll(delta) = command {
+            if sender
+                .open_scroll
+                .as_ref()
+                .is_some_and(|scroll| scroll.add_if_open(delta))
+            {
+                return Ok(());
+            }
+            let scroll = Arc::new(CoalescedScroll::new(delta));
+            self.try_send_locked(
+                &sender.sender,
+                TerminalCommand::ScrollBatch(Arc::clone(&scroll)),
+            )?;
+            sender.open_scroll = Some(scroll);
+            return Ok(());
+        }
+
+        if let Some(scroll) = sender.open_scroll.take() {
+            scroll.close();
+        }
+        self.try_send_locked(&sender.sender, command)
+    }
+
+    fn try_send_locked(
+        &self,
+        sender: &Sender<TerminalCommand>,
+        command: TerminalCommand,
+    ) -> Result<(), CommandRejection> {
         let attempted_bytes = command.estimated_bytes();
         let reservation = self.budget.reserve(attempted_bytes).map_err(|error| {
             let error = CommandBackpressure {
@@ -151,18 +247,12 @@ impl CommandGate {
         })?;
         let pending_before = reservation.pending_before();
 
-        let result = self
-            .sender
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|sender| sender.try_send(command));
-        match result {
-            Some(Ok(())) => {
+        match sender.try_send(command) {
+            Ok(()) => {
                 reservation.commit();
                 Ok(())
             }
-            Some(Err(TrySendError::Full(_))) => {
+            Err(TrySendError::Full(_)) => {
                 drop(reservation);
                 let error = CommandBackpressure {
                     attempted_bytes,
@@ -172,17 +262,10 @@ impl CommandGate {
                 self.status.record(CommandEvent::Backpressure(error));
                 Err(CommandRejection::Backpressure(error))
             }
-            Some(Err(TrySendError::Disconnected(_))) => {
+            Err(TrySendError::Disconnected(_)) => {
                 drop(reservation);
                 self.status.record(CommandEvent::Failed(
                     "terminal command owner is not available".to_string(),
-                ));
-                Err(CommandRejection::Stopping)
-            }
-            None => {
-                drop(reservation);
-                self.status.record(CommandEvent::Failed(
-                    "terminal command gate is shut down".to_string(),
                 ));
                 Err(CommandRejection::Stopping)
             }
@@ -194,16 +277,24 @@ impl CommandGate {
     }
 
     pub fn close(&self) {
-        self.sender
+        if let Some(mut sender) = self
+            .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .take()
+            && let Some(scroll) = sender.open_scroll.take()
+        {
+            scroll.close();
+        }
     }
 }
 
 impl CommandReceiver {
     pub fn try_recv(&self) -> Result<TerminalCommand, TryRecvError> {
-        self.receiver.try_recv()
+        match self.receiver.try_recv()? {
+            TerminalCommand::ScrollBatch(scroll) => Ok(TerminalCommand::Scroll(scroll.take())),
+            command => Ok(command),
+        }
     }
 
     pub fn complete(&self, command_bytes: usize) {
@@ -248,6 +339,61 @@ mod tests {
             TerminalCommand::SelectionKeyboardMove(SelectionDirection::Down).estimated_bytes(),
             2
         );
+    }
+
+    #[test]
+    fn adjacent_scroll_commands_share_one_queue_slot() {
+        let (gate, receiver) = CommandGate::new();
+        for _ in 0..10_000 {
+            gate.try_send(TerminalCommand::Scroll(-3)).unwrap();
+        }
+        gate.try_send(TerminalCommand::SelectionAll).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::Scroll(-30_000))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::SelectionAll)
+        ));
+    }
+
+    #[test]
+    fn opposite_scroll_directions_keep_their_order_at_viewport_bounds() {
+        let (gate, receiver) = CommandGate::new();
+        gate.try_send(TerminalCommand::Scroll(1_000_000)).unwrap();
+        gate.try_send(TerminalCommand::Scroll(-3)).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::Scroll(1_000_000))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::Scroll(-3))
+        ));
+    }
+
+    #[test]
+    fn non_scroll_commands_keep_scroll_batches_in_event_order() {
+        let (gate, receiver) = CommandGate::new();
+        gate.try_send(TerminalCommand::Scroll(-3)).unwrap();
+        gate.try_send(TerminalCommand::SelectionAll).unwrap();
+        gate.try_send(TerminalCommand::Scroll(3)).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::Scroll(-3))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::SelectionAll)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TerminalCommand::Scroll(3))
+        ));
     }
 
     #[test]

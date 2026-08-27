@@ -9,6 +9,17 @@ use super::selection::{SelectionController, SelectionPoint};
 
 const WHEEL_SCROLL_LINES: isize = 3;
 
+pub(super) fn stackhand_wheel_delta(event: TerminalMouseEvent) -> Option<isize> {
+    if !event.stackhand_owned {
+        return None;
+    }
+    match event.kind {
+        MouseKind::WheelUp => Some(-WHEEL_SCROLL_LINES),
+        MouseKind::WheelDown => Some(WHEEL_SCROLL_LINES),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
@@ -216,6 +227,23 @@ mod tests {
             stackhand_owned,
             time: Duration::from_millis(10),
         }
+    }
+
+    #[test]
+    fn only_stackhand_owned_vertical_wheels_become_viewport_scrolls() {
+        assert_eq!(
+            stackhand_wheel_delta(event(MouseKind::WheelUp, 0, 0, true)),
+            Some(-WHEEL_SCROLL_LINES)
+        );
+        assert_eq!(
+            stackhand_wheel_delta(event(MouseKind::WheelDown, 0, 0, true)),
+            Some(WHEEL_SCROLL_LINES)
+        );
+        assert_eq!(
+            stackhand_wheel_delta(event(MouseKind::WheelUp, 0, 0, false)),
+            None,
+            "child-owned wheel events must keep their terminal protocol bytes"
+        );
     }
 
     #[test]

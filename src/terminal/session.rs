@@ -10,7 +10,7 @@ use ratatui::layout::Position;
 
 use super::command_gate::{CommandEvent, CommandGate, CommandRejection, TerminalCommand};
 use super::history::OutputHistoryMetrics;
-use super::mouse::TerminalMouseEvent;
+use super::mouse::{TerminalMouseEvent, stackhand_wheel_delta};
 use super::owner::{OwnerEvent, OwnerHandle};
 use super::paste::{self, PasteRejection, PasteRequest};
 pub use super::selection::{SelectionDirection, SelectionPoint};
@@ -161,9 +161,10 @@ impl TerminalSession {
     }
 
     pub fn send_mouse(&self, event: TerminalMouseEvent) -> Result<(), InputRejection> {
-        self.commands
-            .try_send(TerminalCommand::Mouse(event))
-            .map_err(Into::into)
+        let command = stackhand_wheel_delta(event)
+            .map(TerminalCommand::Scroll)
+            .unwrap_or(TerminalCommand::Mouse(event));
+        self.commands.try_send(command).map_err(Into::into)
     }
 
     pub fn send_raw(&self, data: Vec<u8>) -> Result<(), InputRejection> {
