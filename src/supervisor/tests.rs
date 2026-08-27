@@ -49,8 +49,12 @@ fn probed_service(name: &str) -> ProcessSpec {
             host: "127.0.0.1".into(),
             port: 1,
         },
+        initial_delay: Duration::ZERO,
         interval: Duration::from_secs(1),
         timeout: Duration::from_millis(100),
+        success_threshold: 1,
+        failure_threshold: 1,
+        startup_timeout: None,
     });
     spec
 }

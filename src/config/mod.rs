@@ -85,14 +85,30 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn format_yaml_error(error: &serde_yaml::Error) -> String {
+    let detail = error.to_string();
+    let detail = match yaml_replacement_hint(&detail) {
+        Some(hint) => format!("{detail}; {hint}"),
+        None => detail,
+    };
     match error.location() {
         Some(location) => format!(
-            "invalid configuration at line {}, column {}: {}",
+            "invalid configuration at line {}, column {}: {detail}",
             location.line(),
             location.column(),
-            error
         ),
-        None => format!("invalid configuration: {error}"),
+        None => format!("invalid configuration: {detail}"),
+    }
+}
+
+fn yaml_replacement_hint(detail: &str) -> Option<&'static str> {
+    if detail.contains("unknown field `readiness`") {
+        Some("use `ready` instead")
+    } else if detail.contains("unknown field `interval_ms`") {
+        Some("use `interval` instead")
+    } else if detail.contains("unknown field `timeout_ms`") {
+        Some("use `timeout` instead")
+    } else {
+        None
     }
 }
 
@@ -177,7 +193,7 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
             .map(|(index, entry)| build_dependency(&name, index, entry))
             .collect::<Result<Vec<_>, ConfigError>>()?,
     };
-    let readiness = match &process.readiness {
+    let readiness = match &process.ready {
         None => None,
         Some(file) => Some(readiness::build_readiness(&name, file)?),
     };
@@ -283,7 +299,7 @@ struct ProcessFile {
     terminal: Option<String>,
     input: Option<String>,
     depends_on: Option<Vec<serde_yaml::Value>>,
-    readiness: Option<readiness::ReadinessFile>,
+    ready: Option<readiness::ReadinessFile>,
     command: CommandFile,
 }
 

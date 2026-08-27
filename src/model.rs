@@ -124,14 +124,23 @@ pub enum ReadinessProbe {
 }
 
 /// The readiness policy of one Service: which probe decides availability,
-/// how often failing attempts repeat, and how long one attempt may take.
+/// when checks begin, how results are counted, and how long startup may wait.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessConfig {
     pub probe: ReadinessProbe,
-    /// How long after a failed attempt the next one may run.
+    /// How long to wait after spawn before the first attempt.
+    pub initial_delay: Duration,
+    /// How long after an attempt completes before the next one may run.
     pub interval: Duration,
     /// How long one attempt may take before it fails as timed out.
     pub timeout: Duration,
+    /// Consecutive passing attempts required to become ready.
+    pub success_threshold: u32,
+    /// Consecutive failing attempts required after readiness to become
+    /// failing.
+    pub failure_threshold: u32,
+    /// Optional deadline for reaching readiness after spawn.
+    pub startup_timeout: Option<Duration>,
 }
 
 /// One startup Dependency of one Process.

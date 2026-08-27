@@ -4,6 +4,8 @@
 //! authoritative lifecycle owner and keeps the Process/Run identity gate in
 //! one place.
 
+use std::time::Duration;
+
 use crate::model::ProcessKind;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
@@ -51,21 +53,26 @@ impl Core {
         }
         match event {
             SeamEvent::Spawned { root_pid, .. } => {
+                let initial_delay = self.project.processes()[index]
+                    .readiness
+                    .as_ref()
+                    .map_or(Duration::ZERO, |config| config.initial_delay);
                 let probed = self.project.processes()[index].readiness.is_some();
                 let work_id = probed.then(|| self.allocate_work_id(index));
+                let now = self.clock.now();
                 let entry = &mut self.entries[index];
                 entry.root_pid = root_pid.map(|pid| pid.get());
                 if entry.lifecycle == super::core::Lifecycle::Starting {
                     if let Some(work_id) = work_id {
                         // The Run exists but is not available yet; its first
-                        // attempt is due immediately once timers are polled.
+                        // attempt is due after the configured initial delay.
                         entry.readiness = Some(ReadinessTracking {
                             work_id,
                             attempts: 0,
                             next_attempt_id: 1,
                             last_error: None,
                             in_flight: None,
-                            next_attempt_at: self.clock.now(),
+                            next_attempt_at: now + initial_delay,
                         });
                     } else {
                         // A Service without readiness becomes Running at

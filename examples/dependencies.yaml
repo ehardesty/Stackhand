@@ -14,12 +14,12 @@ processes:
   - name: database
     kind: service
     terminal: pipe
-    readiness:
+    ready:
       tcp:
         host: 127.0.0.1
         port: 43122
-      interval_ms: 500
-      timeout_ms: 500
+      interval: 500ms
+      timeout: 500ms
     command:
       program: /bin/sh
       args:

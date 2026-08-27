@@ -6,12 +6,12 @@ processes:
   - name: tcp-listener
     kind: service
     terminal: pipe
-    readiness:
+    ready:
       tcp:
         host: 127.0.0.1
         port: 43123
-      interval_ms: 500
-      timeout_ms: 500
+      interval: 500ms
+      timeout: 500ms
     command:
       program: /bin/sh
       args:
@@ -26,11 +26,11 @@ processes:
   - name: http-listener
     kind: service
     terminal: pipe
-    readiness:
+    ready:
       http:
         url: http://127.0.0.1:43124/health
-      interval_ms: 500
-      timeout_ms: 500
+      interval: 500ms
+      timeout: 500ms
     command:
       program: /bin/sh
       args:

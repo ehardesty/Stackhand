@@ -116,7 +116,7 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
          \x20     args: [\"60\"]\n\
          \x20 - name: tcp-ready\n\
          \x20   kind: service\n\
-         \x20   readiness:\n\
+         \x20   ready:\n\
          \x20     tcp:\n\
          \x20       host: 127.0.0.1\n\
          \x20       port: {tcp_port}\n\
@@ -132,7 +132,7 @@ fn fixture_config(tcp_port: u16, http_port: u16) -> String {
          \x20     args: [\"60\"]\n\
          \x20 - name: http-ready\n\
          \x20   kind: service\n\
-         \x20   readiness:\n\
+         \x20   ready:\n\
          \x20     http:\n\
          \x20       url: \"http://127.0.0.1:{http_port}/healthz\"\n\
          \x20   terminal: pipe\n\
