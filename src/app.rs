@@ -82,6 +82,7 @@ fn run_event_loop(
     // One scroll view per Process, so scrolling or re-following one pane
     // never changes another Process's view. Resized with the snapshot.
     let mut pipe_scroll: Vec<Option<PipeScroll>> = Vec::new();
+    let mut last_project_snapshot: Option<ProjectSnapshot> = None;
     let mut dirty = true;
 
     loop {
@@ -94,6 +95,13 @@ fn run_event_loop(
         if snapshot.processes.is_empty() {
             bail!("this Project has no Processes");
         }
+        if last_project_snapshot.as_ref().is_none_or(|previous| {
+            previous.processes != snapshot.processes
+                || previous.now_ms / 1000 != snapshot.now_ms / 1000
+        }) {
+            dirty = true;
+        }
+        last_project_snapshot = Some(snapshot.clone());
         selected = selected.min(snapshot.processes.len() - 1);
         pipe_scroll.resize(snapshot.processes.len(), None);
         for request in console.take_selection_moves() {
@@ -193,7 +201,7 @@ fn run_event_loop(
                 terminal_snapshot,
                 pipe_lines,
                 console.view(),
-                &selected_header(&snapshot.processes[selected]),
+                &selected_header(&snapshot.processes[selected], snapshot.now_ms),
             )?;
             console_pane = pane;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
@@ -376,9 +384,35 @@ fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowVi
         .map(|(index, process)| ProcessRowView {
             name: process.name.clone(),
             status: status_label(process),
+            cpu: process
+                .metrics
+                .map(|metrics| format_cpu(metrics.cpu_percent)),
+            memory: process.metrics.map(|metrics| format_rss(metrics.rss_kib)),
             selected: index == selected,
         })
         .collect()
+}
+
+/// A compact CPU column: one decimal place at most, no more precision than
+/// the sample claims.
+fn format_cpu(percent: f64) -> String {
+    if percent >= 10.0 {
+        format!("{}%", percent.round())
+    } else {
+        format!("{percent:.1}%")
+    }
+}
+
+/// A compact resident-memory column in powers of 1024.
+fn format_rss(kib: u64) -> String {
+    const MIB: u64 = 1024;
+    const GIB: u64 = 1024 * MIB;
+    match kib {
+        0 => "0".to_string(),
+        value if value < MIB => format!("{kib}K"),
+        value if value < GIB => format!("{}M", value / MIB),
+        value => format!("{:.1}G", value as f64 / GIB as f64),
+    }
 }
 
 /// Project structured lifecycle state into the concise row label. The label
@@ -426,15 +460,56 @@ fn short_reason(detail: &str) -> String {
 }
 
 /// Project the selected Process into the console pane's header: name, the
-/// live Run identity when one exists, and the concise status label. The
-/// header is a projection of the immutable Supervisor snapshot.
-fn selected_header(process: &ProcessSnapshot) -> String {
+/// live Run identity and PID when one exists, the concise status label,
+/// the Run's age and compact metrics when sampled, and the bounded
+/// diagnostic (a blocked reason or failure detail) when one is present.
+/// The header is a projection of the immutable Supervisor snapshot.
+fn selected_header(process: &ProcessSnapshot, now_ms: u64) -> String {
     let mut header = process.name.clone();
     if let Some(run_id) = process.current_run {
         header.push_str(&format!(" · run {run_id}"));
     }
+    if let Some(pid) = process.root_pid {
+        header.push_str(&format!(" · PID {pid}"));
+    }
     header.push_str(&format!(" · {}", status_label(process)));
+    if let Some(started_at_ms) = process.run_started_at_ms {
+        let age_ms = now_ms.saturating_sub(started_at_ms);
+        header.push_str(&format!(" · {}", format_age(age_ms)));
+    }
+    if let Some(metrics) = &process.metrics {
+        header.push_str(&format!(" · {}", format_rss(metrics.rss_kib)));
+        header.push_str(&format!(" · {} CPU", format_cpu(metrics.cpu_percent)));
+    }
+    if process.lifecycle == Lifecycle::Waiting {
+        if let Some(reason) = &process.blocked_reason {
+            header.push_str(&format!(" · {reason}"));
+        }
+    } else if let Some(readiness) = &process.readiness {
+        if let Some(last_error) = &readiness.last_error {
+            header.push_str(&format!(
+                " · readiness attempt {}: {}",
+                readiness.attempts,
+                short_reason(last_error)
+            ));
+        }
+    } else if process.lifecycle != Lifecycle::Stopping
+        && let Some(failure) = &process.failure
+    {
+        header.push_str(&format!(" · {}", short_reason(&failure.detail)));
+    }
     header
+}
+
+/// A compact Run age: seconds under a minute, then whole minutes.
+fn format_age(age_ms: u64) -> String {
+    let seconds = age_ms / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        let minutes = seconds / 60;
+        format!("{minutes}m{}s", seconds % 60)
+    }
 }
 
 fn render_frame(
@@ -499,6 +574,17 @@ fn is_quit(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_and_age_labels_use_compact_units() {
+        assert_eq!(format_cpu(3.24), "3.2%");
+        assert_eq!(format_cpu(12.4), "12%");
+        assert_eq!(format_rss(768), "768K");
+        assert_eq!(format_rss(180 * 1024), "180M");
+        assert_eq!(format_rss(1024 * 1024), "1.0G");
+        assert_eq!(format_age(59_000), "59s");
+        assert_eq!(format_age(61_000), "1m1s");
+    }
 
     #[test]
     fn rapid_resize_uses_only_the_last_valid_geometry() {

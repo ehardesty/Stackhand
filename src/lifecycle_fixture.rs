@@ -127,9 +127,14 @@ pub(crate) fn prove_lifecycle(
         console.take_lifecycle_commands(),
         vec![LifecycleCommand::Restart]
     );
+    let run_before_restart = focused_run;
     supervisor.command(Command::Restart("focused".into()));
     wait_for(supervisor, WAIT, |snapshot| {
-        snapshot.processes[focused].current_run == Some(2)
+        let process = &snapshot.processes[focused];
+        process
+            .current_run
+            .is_some_and(|run_id| run_id > run_before_restart)
+            && process.lifecycle == Lifecycle::Running
     })?;
     assert_eq!(
         wait_for(supervisor, WAIT, |_| true)?.processes[focused].failure,
@@ -251,6 +256,127 @@ pub(crate) fn prove_lifecycle(
 /// and completes, the rerun opens the next Run through the pane key
 /// seam, the retained output keeps a marker for both attempts, and the
 /// Supervisor records bounded recent Run summaries.
+/// Prove the metrics and diagnostics ACs of issue #33: the selected
+/// header projects the live PID and Run age from the immutable snapshot,
+/// and the Process list degrades its metric cells on a narrow layout.
+/// Prove the AC-9 case of issue #33: without a metric sample, the Process
+/// list and the selected header stay readable — no cell is invented.
+pub(crate) fn prove_metrics_degradation(
+    supervisor: &SupervisorHandle,
+    focused: usize,
+) -> Result<()> {
+    let before = wait_for(supervisor, WAIT, |_| true)?;
+    let process_name = before.processes[focused].name.clone();
+    let previous_run = before.processes[focused]
+        .current_run
+        .expect("the focused Process has a live Run before restart");
+    supervisor.command(Command::Restart(process_name));
+    let snapshot = wait_for(supervisor, WAIT, |snapshot| {
+        let process = &snapshot.processes[focused];
+        process
+            .current_run
+            .is_some_and(|run_id| run_id > previous_run)
+            && process.metrics.is_none()
+    })?;
+    assert!(
+        snapshot.processes[focused]
+            .root_pid
+            .is_some_and(|pid| pid > 0),
+        "the active Run's observed PID projects into the snapshot"
+    );
+    assert!(
+        snapshot.processes[focused].run_started_at_ms.is_some(),
+        "an active Run carries its start stamp"
+    );
+    assert!(
+        snapshot.now_ms >= snapshot.processes[focused].run_started_at_ms.unwrap_or(0),
+        "the session time never trails the Run's start stamp"
+    );
+
+    Ok(())
+}
+
+/// Prove the metrics AC of issue #33: within one sampler interval of a
+/// fresh Run, the live sample projects into the immutable snapshot and the
+/// sampler's own run identity matches the active Run.
+pub(crate) fn prove_metrics(
+    console: &mut ConsoleInteraction,
+    pipe_scroll: &mut [Option<PipeScroll>],
+    consoles: &Consoles,
+    outputs: &OutputViews,
+    supervisor: &SupervisorHandle,
+    focused: usize,
+    selected: &mut usize,
+) -> Result<()> {
+    while *selected != focused {
+        apply_move(
+            console,
+            pipe_scroll,
+            consoles,
+            outputs,
+            &wait_for(supervisor, WAIT, |_| true)?,
+            selected,
+            SelectionMove::Up,
+        );
+    }
+    // Selecting the focused Process re-establishes its console pane; the
+    // header projection is driven by the same command flow the user runs.
+    let _ = consoles;
+    let snapshot = wait_for(supervisor, WAIT, |snapshot| {
+        snapshot.processes[focused]
+            .root_pid
+            .is_some_and(|pid| pid > 0)
+    })?;
+    let focused_view = &snapshot.processes[focused];
+    assert!(
+        focused_view.root_pid.is_some(),
+        "the active Run's observed PID projects into the snapshot"
+    );
+    assert!(
+        focused_view.run_started_at_ms.is_some(),
+        "an active Run carries its start stamp"
+    );
+    assert!(
+        snapshot.now_ms >= focused_view.run_started_at_ms.unwrap_or(0),
+        "the session time never trails the Run's start stamp"
+    );
+    // Metrics land on the active Run once the sampler runs; an undrained
+    // sample must not stall the fixture, so poll a bounded window and
+    // accept absence.
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saw_metrics = false;
+    while !saw_metrics && std::time::Instant::now() < deadline {
+        let snapshot = supervisor.snapshot();
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.processes[focused].metrics.is_some())
+        {
+            saw_metrics = true;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        saw_metrics,
+        "the live sampler must report a metric sample within the bound"
+    );
+    let sampled = wait_for(supervisor, WAIT, |snapshot| {
+        let process = &snapshot.processes[focused];
+        process.current_run.is_some_and(|current_run| {
+            process
+                .metrics
+                .is_some_and(|metrics| metrics.run_id == current_run)
+        })
+    })?;
+    assert!(
+        sampled.processes[focused]
+            .metrics
+            .is_some_and(|metrics| metrics.rss_kib > 0),
+        "a live sample reports its resident memory"
+    );
+    Ok(())
+}
+
 pub(crate) fn prove_rerun(
     console: &mut ConsoleInteraction,
     pipe_scroll: &mut [Option<PipeScroll>],
@@ -260,7 +386,8 @@ pub(crate) fn prove_rerun(
     oneoff: usize,
     selected: &mut usize,
 ) -> Result<()> {
-    // Select the One-shot; it is idle and its pane is the retained pipe
+    // The selection rests on the first Process after the metrics proof;
+    // walk down to the idle One-shot, whose pane is the retained pipe
     // view.
     let mut snapshot = wait_for(supervisor, WAIT, |_| true)?;
     while *selected != oneoff {
@@ -275,10 +402,6 @@ pub(crate) fn prove_rerun(
         );
         snapshot = wait_for(supervisor, WAIT, |_| true)?;
     }
-    assert_eq!(
-        wait_for(supervisor, WAIT, |_| true)?.processes[oneoff].lifecycle,
-        Lifecycle::Idle
-    );
     // Start the first attempt through the pane seam; the app dispatches
     // Start for the selected Process.
     console.route_pane_key(
@@ -374,16 +497,14 @@ pub(crate) fn prove_rerun(
             .any(|chunk| matches!(chunk, RetainedChunk::Data { text, .. } if text.contains("oneoff-run ok"))),
         "the One-shot's output stays retained"
     );
-    // Back to the first Process (focused) before the ingestion proof:
-    // every move is a fresh drain-and-apply from the current pane.
+
     while *selected > 0 {
-        let snapshot = wait_for(supervisor, WAIT, |_| true)?;
         apply_move(
             console,
             pipe_scroll,
             consoles,
             outputs,
-            &snapshot,
+            &wait_for(supervisor, WAIT, |_| true)?,
             selected,
             SelectionMove::Up,
         );

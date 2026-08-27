@@ -138,6 +138,14 @@ impl Harness {
         self.drain();
     }
 
+    /// Start the runtime's spawn reporting: from now on every start sends
+    /// its `Spawned` report straight through the core's event path, and
+    /// `command`'s drain delivers it before the test reads the next
+    /// snapshot.
+    fn report_spawns(&mut self) {
+        self.runtime.set_report_spawn(true);
+    }
+
     fn event(&mut self, event: SeamEvent) {
         self.core.event(event);
     }
@@ -557,6 +565,7 @@ fn unknown_commands_are_ignored() {
 #[cfg(test)]
 mod readiness;
 
+mod diagnostics;
 mod one_shot_lifecycle;
 mod one_shot_rerun;
 

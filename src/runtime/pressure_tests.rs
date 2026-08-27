@@ -73,7 +73,9 @@ fn dropped_output_never_blocks_a_cleanup_confirmation() {
     // The output queue is never drained while the producer floods, so the
     // readers must drop bytes under backpressure. A stop must still
     // confirm the cleanup: bounded drops are expected, not I/O failures.
-    let script = "trap '' INT; i=0; while :; do printf 'flood-%06d\\n' \"$i\"; i=$((i+1)); done";
+    // `yes` floods far faster than the 16 MiB queue drains, so the
+    // first-drop report is a bounded, deterministic wait.
+    let script = "trap '' INT; exec yes stackhand-flood";
     let mut fixture = start_pipe(
         SpawnCommand::new("/bin/sh").arg("-c").arg(script),
         quick_ladder(200, 200),
@@ -85,9 +87,9 @@ fn dropped_output_never_blocks_a_cleanup_confirmation() {
     while !saw_drop_report && Instant::now() < deadline {
         match fixture.events.try_recv() {
             Ok(RunEvent {
-                kind: RunEventKind::IoFailed(detail),
+                kind: RunEventKind::OutputDropped { .. },
                 ..
-            }) if detail.contains("sink is full") => saw_drop_report = true,
+            }) => saw_drop_report = true,
             Ok(_) => {}
             Err(mpsc::TryRecvError::Empty) => {
                 std::thread::sleep(Duration::from_millis(10));

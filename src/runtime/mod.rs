@@ -18,6 +18,8 @@ mod run;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
+mod sampler_fixture;
+#[cfg(test)]
 mod shutdown_tests;
 #[cfg(test)]
 pub(crate) use terminal_handle::handle_for_test;

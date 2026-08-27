@@ -16,6 +16,7 @@ use crate::runtime::{
     RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
     root_exit_pending,
 };
+use crate::supervisor::FailureKind;
 use crate::supervisor::seam::{RunSeam, SeamEvent, SeamSender, StartIntent};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 
@@ -155,6 +156,7 @@ impl RunSeam for RealRunSeam {
                     events.send(SeamEvent::Failed {
                         process_id: intent.process_id,
                         run_id: intent.run_id,
+                        kind: FailureKind::Configuration,
                         detail: format!("spawn failed: {error}"),
                     });
                 }
@@ -200,6 +202,7 @@ impl RunSeam for RealRunSeam {
             None => events.send(SeamEvent::Failed {
                 process_id,
                 run_id,
+                kind: FailureKind::Spawn,
                 detail: "stop requested for a Run that is not active".to_string(),
             }),
         }
@@ -321,14 +324,20 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
         RunEventKind::Failed(detail) => SeamEvent::Failed {
             process_id,
             run_id,
+            kind: FailureKind::Spawn,
             detail,
         },
-        // A bounded output drop is not a Run failure. The Run keeps draining
-        // the operating-system pipe; what is lost is already observable in
-        // the retained module's truncation metadata. Turning a queue-full
-        // drop into a fatal control-plane event would make a noisy Process
-        // kill itself.
-        RunEventKind::IoFailed(_) => return,
+        // Bounded backpressure is metadata, not a failure. The Run keeps
+        // draining the operating-system pipe; what is lost is observable in
+        // the retained module's truncation metadata.
+        RunEventKind::OutputDropped { .. } => return,
+        // A hard output-path failure (a read error, or the sink closing
+        // early) is a bounded, first-report-only Run-level failure.
+        RunEventKind::IoFailed(detail) => SeamEvent::OutputFailure {
+            process_id,
+            run_id,
+            detail,
+        },
         RunEventKind::Metrics(metrics) => SeamEvent::Metrics {
             process_id,
             run_id,

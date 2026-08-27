@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::runtime::{ProcessId, RunId};
+use crate::supervisor::FailureKind;
 use crate::supervisor::clock::Clock;
 use crate::supervisor::seam::{
     ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
@@ -35,6 +36,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) fail_spawn: AtomicBool,
     /// When set, stop reports unconfirmed cleanup.
     pub(crate) fail_cleanup: AtomicBool,
+    /// When set, every start also reports the spawn through the seam.
+    pub(crate) report_spawn: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -44,6 +47,10 @@ impl FakeRuntime {
 
     pub(crate) fn set_fail_spawn(&self, value: bool) {
         self.fail_spawn.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_report_spawn(&self, value: bool) {
+        self.report_spawn.store(value, Ordering::Release);
     }
 
     pub(crate) fn intents(&self) -> Vec<Intent> {
@@ -71,7 +78,16 @@ impl RunSeam for FakeRuntime {
             events.send(SeamEvent::Failed {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
+                kind: FailureKind::Configuration,
                 detail: "scripted spawn failure".to_string(),
+            });
+            return;
+        }
+        if self.report_spawn.load(Ordering::Acquire) {
+            events.send(SeamEvent::Spawned {
+                process_id: intent.process_id,
+                run_id: intent.run_id,
+                root_pid: Some(crate::runtime::OsPid::new(1)),
             });
         }
     }

@@ -125,6 +125,11 @@ pub enum RunEventKind {
     },
     /// One owned I/O task failed. Carries no output bytes.
     IoFailed(String),
+    /// Bounded backpressure: output bytes were dropped because the
+    /// caller's queue was full. Metadata, not a failure.
+    OutputDropped {
+        bytes: usize,
+    },
     /// One bounded aggregate Process Tree sample. At most one is emitted
     /// per configured interval.
     Metrics(RunMetrics),

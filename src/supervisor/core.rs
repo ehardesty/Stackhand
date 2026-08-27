@@ -16,6 +16,7 @@ use crate::supervisor::clock::Clock;
 use crate::supervisor::seam::{
     ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
 };
+use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
 
 /// The user's current intent for a Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub enum Lifecycle {
 /// One bounded metrics sample from the current Run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MetricsMetadata {
+    /// The Run this sample belongs to; a sample never crosses Run boundaries.
+    pub run_id: u64,
     pub cpu_percent: f64,
     pub rss_kib: u64,
 }
@@ -102,10 +105,27 @@ pub enum RunTrigger {
 /// The bounded size of every Process's retained Run summary window.
 pub const RECENT_RUNS: usize = 8;
 
-/// One bounded failure summary. Structured kinds arrive with One-shot and
-/// shutdown work; Milestone 1 starts with a bounded diagnostic string.
+/// The structured class of a bounded failure summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The configured command could not be started.
+    Configuration,
+    /// The Run's spawn worker failed after the Run was admitted.
+    Spawn,
+    /// The Process ended with a failed exit.
+    ProcessExit,
+    /// A readiness probe failure ended the Run.
+    Readiness,
+    /// The Run's output path failed.
+    Output,
+    /// The bounded cleanup did not fully confirm.
+    Shutdown,
+}
+
+/// One bounded failure summary: a structured kind and a bounded detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailureSummary {
+    pub kind: FailureKind,
     pub detail: String,
 }
 
@@ -172,6 +192,8 @@ pub(super) struct Entry {
     pub(super) pending_trigger: RunTrigger,
     /// What started the current Run.
     pub(super) run_trigger: RunTrigger,
+    /// The spawned root PID of the current Run, when observed.
+    pub(super) root_pid: Option<u32>,
 }
 
 impl Entry {
@@ -194,6 +216,7 @@ impl Entry {
             natural_exit_code: None,
             pending_trigger: RunTrigger::Dependency,
             run_trigger: RunTrigger::Dependency,
+            root_pid: None,
         }
     }
 
@@ -416,9 +439,10 @@ impl Core {
             return;
         }
         match event {
-            SeamEvent::Spawned { .. } => {
+            SeamEvent::Spawned { root_pid, .. } => {
                 let probed = self.project.processes()[index].readiness.is_some();
                 let entry = &mut self.entries[index];
+                entry.root_pid = root_pid.map(|pid| pid.get());
                 if entry.lifecycle == Lifecycle::Starting {
                     if probed {
                         // The Run exists but is not available yet; its first
@@ -496,6 +520,7 @@ impl Core {
                     // may start until the retry confirms.
                     entry.cleanup_unconfirmed = true;
                     entry.failure = Some(FailureSummary {
+                        kind: FailureKind::Shutdown,
                         detail: detail
                             .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
                     });
@@ -509,6 +534,7 @@ impl Core {
                 }
                 entry.record_finished_run(now_ms);
                 entry.current_run = None;
+                entry.root_pid = None;
                 entry.metrics = None;
                 entry.readiness = None;
                 entry.cleanup_unconfirmed = false;
@@ -519,14 +545,15 @@ impl Core {
                 }
                 self.evaluate();
             }
-            SeamEvent::Failed { detail, .. } => {
+            SeamEvent::Failed { kind, detail, .. } => {
                 let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
-                entry.failure = Some(FailureSummary { detail });
+                entry.failure = Some(FailureSummary { kind, detail });
                 // A failed adapter report ends the Run identity and reverts
                 // the Process to stopped so it can be started again.
                 entry.record_finished_run(now_ms);
                 entry.current_run = None;
+                entry.root_pid = None;
                 entry.desired = DesiredState::Stopped;
                 entry.lifecycle = Lifecycle::Stopped;
                 entry.metrics = None;
@@ -534,14 +561,29 @@ impl Core {
                 self.evaluate();
             }
             SeamEvent::Metrics {
+                run_id,
                 cpu_percent,
                 rss_kib,
                 ..
             } => {
+                // The stale-event gate already matched the Run; the stamp
+                // keeps the sample attributable to exactly that Run.
                 self.entries[index].metrics = Some(MetricsMetadata {
+                    run_id: run_id.get(),
                     cpu_percent,
                     rss_kib,
                 });
+            }
+            SeamEvent::OutputFailure { detail, .. } => {
+                // Output-path failure: record it without flipping a healthy
+                // Run's lifecycle, and never clobber a real failure.
+                let entry = &mut self.entries[index];
+                if entry.failure.is_none() {
+                    entry.failure = Some(FailureSummary {
+                        kind: FailureKind::Output,
+                        detail,
+                    });
+                }
             }
         }
     }
@@ -562,6 +604,7 @@ impl Core {
                 entry.lifecycle = Lifecycle::Running;
                 entry.completed = false;
                 entry.failure = Some(FailureSummary {
+                    kind: FailureKind::ProcessExit,
                     detail: match other {
                         Some(exit_code) => format!("exited with code {exit_code}"),
                         None => "exited without an exit code".to_string(),
@@ -582,6 +625,7 @@ impl Core {
         let entry = &mut self.entries[index];
         if entry.desired == DesiredState::Running {
             entry.failure = Some(FailureSummary {
+                kind: FailureKind::ProcessExit,
                 detail: match code {
                     Some(code) => format!("exited unexpectedly with code {code}"),
                     None => "exited unexpectedly".to_string(),
@@ -673,6 +717,7 @@ impl Core {
     }
 
     pub(crate) fn snapshot(&self) -> ProjectSnapshot {
+        let now_ms = self.now_ms();
         let processes = self
             .project
             .processes()
@@ -688,6 +733,8 @@ impl Core {
                 lifecycle: entry.lifecycle,
                 terminal_mode: spec.terminal_mode,
                 current_run: entry.current_run.map(RunId::get),
+                root_pid: entry.root_pid,
+                run_started_at_ms: entry.run_started_at_ms,
                 failure: entry.failure.clone(),
                 metrics: entry.metrics,
                 blocked_reason: entry.blocked.clone(),
@@ -698,7 +745,7 @@ impl Core {
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })
             .collect();
-        ProjectSnapshot { processes }
+        ProjectSnapshot { processes, now_ms }
     }
 }
 
@@ -718,56 +765,6 @@ pub enum Command {
     Rerun(String),
     StartAutostart,
     StopAll,
-}
-
-/// An immutable view of the whole Project at one moment. Rendering and
-/// callers can hold and inspect this freely; it cannot mutate lifecycle
-/// state.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProjectSnapshot {
-    pub processes: Vec<ProcessSnapshot>,
-}
-
-impl ProjectSnapshot {
-    pub fn named(&self, name: &str) -> Option<&ProcessSnapshot> {
-        self.processes.iter().find(|p| p.name == name)
-    }
-}
-
-/// One bounded readiness progress view of the current Run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadinessStatus {
-    /// Attempts dispatched for the current Run so far.
-    pub attempts: u32,
-    /// The most recent failing attempt's bounded diagnostic, when any.
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProcessSnapshot {
-    pub name: String,
-    pub kind: ProcessKind,
-    pub enabled: bool,
-    pub autostart: bool,
-    /// Whether this Process accepts focused child input when selected.
-    pub input_focused: bool,
-    pub desired: DesiredState,
-    pub lifecycle: Lifecycle,
-    /// The terminal transport of the Process; the TUI routes the selected
-    /// view to the terminal session or the retained output accordingly.
-    pub terminal_mode: crate::model::TerminalMode,
-    /// The numeric identity of the current Run, when one exists.
-    pub current_run: Option<u64>,
-    pub failure: Option<FailureSummary>,
-    pub metrics: Option<MetricsMetadata>,
-    /// Why this Process has not started although Desired State is Running:
-    /// a bounded "dependency: condition" (or "dependency: disabled") reason.
-    pub blocked_reason: Option<String>,
-    /// Readiness progress while the current Run of a probed Service is still
-    /// becoming available; `None` without a probe or once it passed or ended.
-    pub readiness: Option<ReadinessStatus>,
-    /// The bounded recent finished-Run summaries, newest first.
-    pub recent_runs: Vec<RunSummary>,
 }
 
 #[cfg(test)]

@@ -170,6 +170,7 @@ fn terminal_operation_across_process_selection() {
     // Stop, start, and restart target the selected Service through the
     // Supervisor; a clean stop and restart leave no failure behind.
     assert!(stdout.contains("interaction-lifecycle-ok"), "{stdout}");
+    assert!(stdout.contains("interaction-metrics-ok"), "{stdout}");
     // A One-shot rerun opens the next Run, keeps both attempts' output
     // markers, and records bounded recent Run summaries.
     assert!(stdout.contains("interaction-rerun-ok"), "{stdout}");

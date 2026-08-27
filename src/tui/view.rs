@@ -66,6 +66,10 @@ impl Default for ConsoleViewState {
 pub struct ProcessRowView {
     pub name: String,
     pub status: String,
+    /// Compact aggregate CPU percentage, when the current Run has one.
+    pub cpu: Option<String>,
+    /// Compact aggregate resident memory, when the current Run has one.
+    pub memory: Option<String>,
     pub selected: bool,
 }
 
@@ -159,7 +163,7 @@ pub fn render_project(
             } else {
                 Style::default()
             };
-            ratatui::text::Line::styled(format!(" {} · {} ", row.name, row.status), style)
+            ratatui::text::Line::styled(row_line(row, list.width.saturating_sub(2) as usize), style)
         })
         .collect();
     frame.render_widget(
@@ -212,6 +216,25 @@ static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
         cursor: None,
         mouse_tracking: false,
     });
+
+/// One Process row as text. The compact metric cells stay optional: when
+/// the terminal is too narrow for them, the row degrades to name and
+/// status instead of pushing the essential fields out.
+fn row_line(row: &ProcessRowView, usable_width: usize) -> String {
+    let base = format!(" {} · {} ", row.name, row.status);
+    let Some(cpu) = &row.cpu else {
+        return base;
+    };
+    let Some(memory) = &row.memory else {
+        return base;
+    };
+    let full = format!("{base} · {cpu} {memory}");
+    if full.chars().count() <= usable_width {
+        full
+    } else {
+        base
+    }
+}
 
 fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
     let source = snapshot.buffer.area();
@@ -341,6 +364,24 @@ mod tests {
         ProcessRowView {
             name: name.to_string(),
             status: status.to_string(),
+            cpu: None,
+            memory: None,
+            selected,
+        }
+    }
+
+    fn row_with_metrics(
+        name: &str,
+        status: &str,
+        cpu: &str,
+        memory: &str,
+        selected: bool,
+    ) -> ProcessRowView {
+        ProcessRowView {
+            name: name.to_string(),
+            status: status.to_string(),
+            cpu: Some(cpu.to_string()),
+            memory: Some(memory.to_string()),
             selected,
         }
     }
@@ -348,7 +389,11 @@ mod tests {
     /// Render one frame into a test buffer for assertions. Small but tall
     /// enough that three Process rows stay inside the capped list band.
     fn rendered(rows: &[ProcessRowView]) -> ratatui::buffer::Buffer {
-        let backend = ratatui::backend::TestBackend::new(60, 18);
+        render_rows_at(rows, 60, 18)
+    }
+
+    fn render_rows_at(rows: &[ProcessRowView], width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -392,6 +437,47 @@ mod tests {
         let db_reversed = buffer[(1, 2)].modifier.contains(Modifier::REVERSED);
         assert!(!web_reversed);
         assert!(db_reversed);
+    }
+
+    #[test]
+    fn metric_cells_render_when_they_fit_the_width() {
+        let rows = [
+            row_with_metrics("web", "Ready", "3.2%", "184M", true),
+            row_with_metrics("worker", "Ready", "12%", "2G", false),
+        ];
+        let text = buffer_text(&rendered(&rows));
+        assert!(text.contains("3.2%"), "{text:?}");
+        assert!(text.contains("184M"), "{text:?}");
+        assert!(text.contains("12%"), "{text:?}");
+    }
+
+    #[test]
+    fn metric_cells_degrade_on_a_narrow_layout() {
+        let rows = [
+            row_with_metrics("web", "Ready", "3.2%", "184M", true),
+            row_with_metrics("worker", "Waiting (setup: started)", "12%", "2G", false),
+        ];
+        // A narrow terminal keeps the essential name and status; the
+        // optional metric cells drop out instead of crowding them off.
+        let text = buffer_text(&render_rows_at(&rows, 20, 18));
+        assert!(text.contains("web"), "{text:?}");
+        assert!(text.contains("Ready"), "{text:?}");
+        assert!(
+            !text.contains("3.2%"),
+            "the metric cell must degrade: {text:?}"
+        );
+        assert!(
+            !text.contains("184M"),
+            "the memory cell must degrade: {text:?}"
+        );
+    }
+
+    #[test]
+    fn missing_metrics_render_without_metric_cells() {
+        let rows = [row("web", "Ready", true), row("worker", "Stopped", false)];
+        let text = buffer_text(&render_rows_at(&rows, 40, 18));
+        assert!(text.contains("web"), "{text:?}");
+        assert!(text.contains("Stopped"), "{text:?}");
     }
 
     #[test]

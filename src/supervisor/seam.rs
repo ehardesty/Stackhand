@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::geometry::TerminalGeometry;
 use crate::model::ReadinessProbe;
 use crate::runtime::{OsPid, ProcessId, RunId};
+use crate::supervisor::FailureKind;
 
 /// Where adapters deliver typed events back to the Supervisor. Every
 /// Run-scoped event carries both identities so the Supervisor can reject
@@ -61,6 +62,14 @@ pub enum SeamEvent {
     Failed {
         process_id: ProcessId,
         run_id: RunId,
+        kind: FailureKind,
+        detail: String,
+    },
+    /// The Run's output path failed. Bounded: the reader reports the first
+    /// failure of each stream only.
+    OutputFailure {
+        process_id: ProcessId,
+        run_id: RunId,
         detail: String,
     },
     /// One aggregate Process Tree sample for the current Run.
@@ -88,6 +97,7 @@ impl SeamEvent {
             | Self::Exited { process_id, .. }
             | Self::ShutdownComplete { process_id, .. }
             | Self::Failed { process_id, .. }
+            | Self::OutputFailure { process_id, .. }
             | Self::Metrics { process_id, .. }
             | Self::Readiness { process_id, .. } => *process_id,
         }
@@ -99,6 +109,7 @@ impl SeamEvent {
             | Self::Exited { run_id, .. }
             | Self::ShutdownComplete { run_id, .. }
             | Self::Failed { run_id, .. }
+            | Self::OutputFailure { run_id, .. }
             | Self::Metrics { run_id, .. }
             | Self::Readiness { run_id, .. } => *run_id,
         }

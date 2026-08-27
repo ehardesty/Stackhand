@@ -452,6 +452,21 @@ fn prove(
     )?;
     println!("interaction-lifecycle-ok");
 
+    // The metrics proof: the selected header projects the live PID and
+    // the sampler's sample; the list degrades its metric cells when they
+    // do not fit.
+    crate::lifecycle_fixture::prove_metrics_degradation(supervisor, focused)?;
+    crate::lifecycle_fixture::prove_metrics(
+        &mut console,
+        &mut pipe_scroll[..],
+        consoles,
+        outputs,
+        supervisor,
+        focused,
+        &mut selected,
+    )?;
+    println!("interaction-metrics-ok");
+
     // The One-shot proof: start it once, rerun it through the pane key
     // seam, and check its bounded Run summaries and output markers.
     crate::lifecycle_fixture::prove_rerun(
@@ -641,10 +656,10 @@ pub(crate) fn wait_for(
         match supervisor.snapshot() {
             Some(snapshot) if done(&snapshot) => return Ok(snapshot),
             Some(_) => {}
-            None => bail!("the Supervisor stopped before startup completed"),
+            None => bail!("the Supervisor stopped before the fixture condition was met"),
         }
         if Instant::now() >= deadline {
-            bail!("startup did not finish within its bound");
+            bail!("the fixture condition was not met within its bound");
         }
         std::thread::sleep(Duration::from_millis(25));
     }

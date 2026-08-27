@@ -419,12 +419,11 @@ fn spawn_stream_reader(
                         );
                         if !drop_reported {
                             drop_reported = true;
-                            let detail = format!(
-                                "{stream_kind:?} output sink is full; bytes dropped under the bounded output queue"
-                            );
                             let _ = events.send(RunEvent {
                                 run_id,
-                                kind: RunEventKind::IoFailed(detail),
+                                kind: RunEventKind::OutputDropped {
+                                    bytes: chunk.data.len(),
+                                },
                             });
                         }
                         true

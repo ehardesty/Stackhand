@@ -30,16 +30,18 @@ mod probe;
 mod runtime;
 mod schedule;
 mod seam;
+mod snapshot;
 #[cfg(test)]
 mod support;
 #[cfg(test)]
 mod tests;
 
 pub use core::{
-    Command, DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ProcessSnapshot,
-    ProjectSnapshot, RECENT_RUNS, ReadinessStatus, RunExitDisposition, RunSummary, RunTrigger,
+    Command, DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
+    RunExitDisposition, RunSummary, RunTrigger,
 };
 pub use runtime::{ConsoleView, Consoles};
+pub use snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.
 pub use crate::output::{
