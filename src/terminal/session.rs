@@ -271,6 +271,10 @@ impl TerminalSession {
         self.owner.is_dirty()
     }
 
+    pub fn mouse_tracking(&self) -> bool {
+        self.owner.mouse_tracking()
+    }
+
     pub fn output_history_metrics(&self) -> OutputHistoryMetrics {
         self.owner.history_metrics()
     }
@@ -500,6 +504,30 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn mouse_tracking_state_is_available_without_cloning_a_render_snapshot() {
+        let (reader, mut peer) = UnixStream::pair().unwrap();
+        let io = PtyIo {
+            reader: Box::new(reader),
+            writer: Box::new(io::sink()),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let session = TerminalSession::spawn(io, TerminalGeometry::DEFAULT, || {}).unwrap();
+
+        peer.write_all(b"\x1b[?1000h").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session.mouse_tracking() {
+            assert!(
+                Instant::now() < deadline,
+                "mouse tracking state was not published"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        drop(peer);
+        session.shutdown().unwrap();
     }
 
     #[test]

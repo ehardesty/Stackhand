@@ -20,7 +20,7 @@ use crate::tui::{
     render_project,
 };
 
-use self::input_batch::collect_input_batch;
+use self::input_batch::{coalesce_adjacent_events, collect_input_batch};
 
 mod input_batch;
 
@@ -256,9 +256,7 @@ fn run_event_loop(
                     return true;
                 }
                 match &pane {
-                    SelectedPane::Terminal(view) => !view
-                        .snapshot()
-                        .is_some_and(|snapshot| snapshot.mouse_tracking),
+                    SelectedPane::Terminal(view) => !view.mouse_tracking(),
                     SelectedPane::Pipe(_) | SelectedPane::Empty => true,
                 }
             },
@@ -271,8 +269,16 @@ fn run_event_loop(
             },
         )?;
         pending_input_event = deferred_event;
+        let can_coalesce_wheels = mode != crate::tui::ConsoleViewMode::Console
+            || !selected_process.input_focused
+            || !matches!(&pane, SelectedPane::Terminal(_));
+        let input_actions = if can_coalesce_wheels {
+            coalesce_adjacent_events(input_events)
+        } else {
+            input_events.into_iter().map(|event| (event, 1)).collect()
+        };
 
-        for input_event in input_events {
+        for (input_event, repeats) in input_actions {
             match input_event {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press && is_quit(key, console.view()) =>
@@ -364,17 +370,15 @@ fn run_event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let current_console_snapshot = match &pane {
-                        SelectedPane::Terminal(view) => view.snapshot(),
-                        SelectedPane::Pipe(_) | SelectedPane::Empty => None,
-                    };
+                    let child_tracks_mouse = selected_process.input_focused
+                        && matches!(&pane, SelectedPane::Terminal(view) if view.mouse_tracking());
                     if handle_app_mouse(
                         &mut console,
                         mouse,
                         &pane,
                         &mut selected,
-                        selected_process.input_focused,
-                        current_console_snapshot.as_ref(),
+                        child_tracks_mouse,
+                        repeats,
                         &mut pipe_scroll,
                     ) {
                         dirty = true;
@@ -399,8 +403,8 @@ fn handle_app_mouse(
     mouse: MouseEvent,
     pane: &SelectedPane,
     selected: &mut usize,
-    input_focused: bool,
-    console_snapshot: Option<&OwnedTerminalSnapshot>,
+    child_tracks_mouse: bool,
+    repeats: usize,
     pipe_scroll: &mut [Option<PipeScroll>],
 ) -> bool {
     let process_count = pipe_scroll.len();
@@ -415,10 +419,13 @@ fn handle_app_mouse(
         && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         && let SelectedPane::Terminal(view) = pane
     {
-        let child_tracking =
-            input_focused && console_snapshot.is_some_and(|snapshot| snapshot.mouse_tracking);
         return view
-            .with(|session| console.handle_mouse(mouse, console_inner, child_tracking, session))
+            .with(|session| {
+                (0..repeats).fold(false, |changed, _| {
+                    console.handle_mouse(mouse, console_inner, child_tracks_mouse, session)
+                        || changed
+                })
+            })
             .unwrap_or(false);
     }
 
@@ -439,9 +446,11 @@ fn handle_app_mouse(
                     console.clear_pane_warning();
                 }
             }
-            MouseEventKind::ScrollUp => *selected = (*selected).saturating_sub(1),
+            MouseEventKind::ScrollUp => *selected = (*selected).saturating_sub(repeats),
             MouseEventKind::ScrollDown => {
-                *selected = (*selected + 1).min(process_count.saturating_sub(1));
+                *selected = selected
+                    .saturating_add(repeats)
+                    .min(process_count.saturating_sub(1));
             }
             _ => {}
         }
@@ -457,17 +466,19 @@ fn handle_app_mouse(
                 if mouse_starts_console_focus(mouse.kind, console.view().mode) {
                     console.focus_console(Some(session));
                 }
-                let child_tracking = input_focused
-                    && console_snapshot.is_some_and(|snapshot| snapshot.mouse_tracking);
-                console.handle_mouse(mouse, console_inner, child_tracking, session)
+                (0..repeats).fold(false, |changed, _| {
+                    console.handle_mouse(mouse, console_inner, child_tracks_mouse, session)
+                        || changed
+                })
             })
             .unwrap_or(false),
         SelectedPane::Pipe(_) => {
             if mouse_starts_console_focus(mouse.kind, console.view().mode) {
                 console.focus_console(None);
             }
-            console.handle_read_only_mouse(mouse, &mut pipe_scroll[*selected])
-                || mouse_changes_focus(mouse.kind)
+            (0..repeats).fold(false, |changed, _| {
+                console.handle_read_only_mouse(mouse, &mut pipe_scroll[*selected]) || changed
+            }) || mouse_changes_focus(mouse.kind)
         }
         SelectedPane::Empty => {
             if mouse_changes_focus(mouse.kind) {

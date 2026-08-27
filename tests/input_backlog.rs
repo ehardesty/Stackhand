@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,12 +23,12 @@ fn wheel_burst_does_not_hold_later_keyboard_input_behind_redraws() {
         &config,
         r#"version: 1
 processes:
-  - name: idle
+  - name: scrolling
     kind: service
-    autostart: false
-    terminal: pipe
+    terminal: pty
     command:
-      program: /bin/true
+      program: /bin/sh
+      args: ["-c", "i=0; while :; do if [ $((i % 100)) -eq 0 ]; then echo scroll-ready; fi; echo line-$i; i=$((i+1)); sleep 0.005; done"]
 "#,
     )
     .unwrap();
@@ -47,12 +47,36 @@ processes:
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
     let drain = thread::spawn(move || {
-        let mut sink = std::io::sink();
-        let _ = std::io::copy(&mut reader, &mut sink);
+        let mut recent = Vec::new();
+        let mut buffer = [0; 8 * 1_024];
+        let mut reported_ready = false;
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            recent.extend_from_slice(&buffer[..count]);
+            if !reported_ready
+                && recent
+                    .windows(b"scroll-ready".len())
+                    .any(|window| window == b"scroll-ready")
+            {
+                let _ = ready_tx.send(());
+                reported_ready = true;
+            }
+            if recent.len() > 2 * b"scroll-ready".len() {
+                recent.drain(..recent.len() - b"scroll-ready".len());
+            }
+        }
     });
     let mut writer = pair.master.take_writer().unwrap();
-    thread::sleep(Duration::from_secs(1));
+    if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(4)) {
+        let _ = child.kill();
+        let _ = drain.join();
+        let _ = fs::remove_file(&config);
+        panic!("active PTY pane did not render its readiness marker: {error}");
+    }
 
     let (delivered_tx, delivered_rx) = mpsc::channel();
     let input = thread::spawn(move || {

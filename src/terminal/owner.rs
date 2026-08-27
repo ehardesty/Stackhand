@@ -26,6 +26,7 @@ pub const OUTPUT_QUEUE_SLOTS: usize = 64;
 pub const OUTPUT_READ_BUFFER_BYTES: usize = 4_096;
 pub const OUTPUT_WORK_BUDGET: usize = 32;
 const OUTPUT_SLICE_WORK_BUDGET: usize = 2;
+const INPUT_WORK_BUDGET: usize = super::command_gate::COMMAND_QUEUE_SLOTS;
 const EFFECT_BUFFER_BYTES: usize = 256 * 1_024;
 const OWNER_EVENT_SLOTS: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -48,6 +49,7 @@ pub struct OwnedRender {
 struct SharedOwner {
     render: Mutex<OwnedRender>,
     dirty: AtomicBool,
+    mouse_tracking: AtomicBool,
     alive: AtomicBool,
     shutdown: AtomicBool,
     events: Mutex<VecDeque<OwnerEvent>>,
@@ -127,6 +129,7 @@ impl OwnerHandle {
                 mouse_tracking: false,
             }),
             dirty: AtomicBool::new(true),
+            mouse_tracking: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
@@ -170,6 +173,10 @@ impl OwnerHandle {
 
     pub fn is_dirty(&self) -> bool {
         self.shared.dirty.load(Ordering::Acquire)
+    }
+
+    pub fn mouse_tracking(&self) -> bool {
+        self.shared.mouse_tracking.load(Ordering::Acquire)
     }
 
     pub fn is_alive(&self) -> bool {
@@ -365,7 +372,9 @@ fn run_owner(
         }
 
         if pending_effect.is_none() {
-            did_work |= service_input(&mut state, &writer, &commands, &mut pending_input)?;
+            // Scroll bursts change terminal state many times but need only one
+            // published frame. The queue bound also bounds this work turn.
+            did_work |= service_input_batch(&mut state, &writer, &commands, &mut pending_input)?;
         }
 
         let now = Instant::now();
@@ -411,6 +420,23 @@ fn service_effect(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn service_input_batch(
+    state: &mut TerminalState,
+    writer: &BoundedPtyWriter,
+    commands: &CommandReceiver,
+    pending_input: &mut Option<PendingInput>,
+) -> Result<bool> {
+    let mut did_work = false;
+    for _ in 0..INPUT_WORK_BUDGET {
+        let serviced = service_input(state, writer, commands, pending_input)?;
+        did_work |= serviced;
+        if !serviced || pending_input.is_some() {
+            break;
+        }
+    }
+    Ok(did_work)
 }
 
 fn service_input(
@@ -482,6 +508,9 @@ fn render(state: &mut TerminalState, shared: &SharedOwner) {
     owned.buffer.reset();
     owned.cursor = state.render(&mut owned.buffer).unwrap_or(None);
     owned.mouse_tracking = state.mouse_tracking();
+    shared
+        .mouse_tracking
+        .store(owned.mouse_tracking, Ordering::Release);
     shared.dirty.store(true, Ordering::Release);
 }
 

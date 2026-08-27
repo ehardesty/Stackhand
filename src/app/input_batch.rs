@@ -78,6 +78,29 @@ fn wheel_surface(
     }
 }
 
+pub(super) fn coalesce_adjacent_events(events: Vec<Event>) -> Vec<(Event, usize)> {
+    let mut coalesced: Vec<(Event, usize)> = Vec::with_capacity(events.len());
+    for event in events {
+        if matches!(
+            event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight,
+                ..
+            })
+        ) && let Some((previous, repeats)) = coalesced.last_mut()
+            && *previous == event
+        {
+            *repeats += 1;
+        } else {
+            coalesced.push((event, 1));
+        }
+    }
+    coalesced
+}
+
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
@@ -160,6 +183,15 @@ mod tests {
 
         assert_eq!(batch.len(), 1);
         assert_eq!(deferred, Some(next_wheel));
+    }
+
+    #[test]
+    fn adjacent_equal_wheels_become_one_scroll_action() {
+        let quit = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+
+        let actions = coalesce_adjacent_events(vec![wheel(), wheel(), quit.clone()]);
+
+        assert_eq!(actions, vec![(wheel(), 2), (quit, 1)]);
     }
 
     #[test]

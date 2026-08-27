@@ -141,6 +141,10 @@ impl TerminalHandle<'_> {
         self.session.is_dirty()
     }
 
+    pub fn mouse_tracking(&self) -> bool {
+        self.session.mouse_tracking()
+    }
+
     pub fn output_history_metrics(&self) -> OutputHistoryMetrics {
         self.session.output_history_metrics()
     }

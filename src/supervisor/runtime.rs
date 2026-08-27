@@ -612,6 +612,10 @@ impl ConsoleView {
         self.with(|handle| handle.is_dirty()).unwrap_or(false)
     }
 
+    pub fn mouse_tracking(&self) -> bool {
+        self.with(|handle| handle.mouse_tracking()).unwrap_or(false)
+    }
+
     pub fn poll_event(&self) -> Option<TerminalEvent> {
         self.with(|handle| handle.poll_event())?
     }
