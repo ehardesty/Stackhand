@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
-    InputPolicy, ProcessKind, ProcessSpec, TerminalMode,
+    InputPolicy, ProcessKind, ProcessSpec, ShellConfig, TerminalMode,
 };
 
 /// Load and validate the Project at `path`. Relative working directories
@@ -31,12 +31,13 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
             file.version
         )));
     }
+    let shell = build_shell(file.settings.as_ref())?;
     let processes = file
         .processes
         .iter()
         .map(|process| build_spec(process, base_dir))
         .collect::<Result<Vec<_>, ConfigError>>()?;
-    EffectiveProject::new(processes).map_err(|error| match error {
+    EffectiveProject::with_shell(processes, shell).map_err(|error| match error {
         crate::model::ProjectError::DuplicateName(name) => {
             config_error(anyhow::anyhow!("duplicate Process name '{name}'"))
         }
@@ -110,6 +111,27 @@ fn yaml_replacement_hint(detail: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigError> {
+    let Some(shell) = settings.and_then(|settings| settings.shell.as_ref()) else {
+        return Ok(ShellConfig::default());
+    };
+    if shell.program.trim().is_empty() {
+        return Err(ConfigError {
+            message: "settings.shell.program must not be empty".to_string(),
+        });
+    }
+    let args = shell.args.clone().unwrap_or_else(|| vec!["-c".to_string()]);
+    if args.is_empty() {
+        return Err(ConfigError {
+            message: "settings.shell.args must contain the arguments needed to evaluate a shell expression".to_string(),
+        });
+    }
+    Ok(ShellConfig {
+        program: std::ffi::OsString::from(&shell.program),
+        args: args.into_iter().map(std::ffi::OsString::from).collect(),
+    })
 }
 
 fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, ConfigError> {
@@ -285,6 +307,20 @@ struct ConfigFile {
     version: u64,
     #[serde(default)]
     processes: Vec<ProcessFile>,
+    settings: Option<SettingsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsFile {
+    shell: Option<ShellFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellFile {
+    program: String,
+    args: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +407,48 @@ mod tests {
         assert_eq!(web.autostart, Autostart::Yes);
         assert_eq!(web.terminal_mode, TerminalMode::Pipe);
         assert_eq!(web.input_policy, InputPolicy::Disabled);
+    }
+
+    #[test]
+    fn project_shell_defaults_to_sh_without_login_flags() {
+        let project = write_and_load(
+            "shell-default",
+            "version: 1\nprocesses:\n  - name: web\n    command: {shell: 'printf shell-ok'}\n",
+        )
+        .expect("the default shell is valid");
+        assert_eq!(project.shell().program, std::ffi::OsString::from("/bin/sh"));
+        assert_eq!(project.shell().args, [std::ffi::OsString::from("-c")]);
+    }
+
+    #[test]
+    fn project_shell_accepts_an_explicit_launcher_and_argument_list() {
+        let project = write_and_load(
+            "shell-explicit",
+            "version: 1\nsettings:\n  shell:\n    program: /bin/bash\n    args: [-c]\nprocesses:\n  - name: web\n    command: {shell: 'printf shell-ok'}\n",
+        )
+        .expect("the explicit shell is valid");
+        assert_eq!(
+            project.shell().program,
+            std::ffi::OsString::from("/bin/bash")
+        );
+        assert_eq!(project.shell().args, [std::ffi::OsString::from("-c")]);
+    }
+
+    #[test]
+    fn unusable_project_shell_settings_are_rejected() {
+        let empty_program = write_and_load(
+            "shell-empty-program",
+            "version: 1\nsettings:\n  shell:\n    program: ''\n    args: [-c]\nprocesses: []\n",
+        )
+        .expect_err("an empty shell program must fail");
+        assert!(empty_program.message.contains("program must not be empty"));
+
+        let empty_args = write_and_load(
+            "shell-empty-args",
+            "version: 1\nsettings:\n  shell:\n    program: /bin/sh\n    args: []\nprocesses: []\n",
+        )
+        .expect_err("empty shell args must fail");
+        assert!(empty_args.message.contains("args must contain"));
     }
 
     #[test]

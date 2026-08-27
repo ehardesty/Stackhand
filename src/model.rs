@@ -200,6 +200,24 @@ pub enum ProjectError {
     DependencyCycle(Vec<String>),
 }
 
+/// The launcher used for shell-expression commands in one Project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellConfig {
+    /// The interpreter executable, for example `/bin/sh` or `/bin/bash`.
+    pub program: OsString,
+    /// Arguments placed before the shell expression.
+    pub args: Vec<OsString>,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c")],
+        }
+    }
+}
+
 /// The validated set of Processes for one Stackhand session. Process order
 /// is configuration order and stays stable for the session.
 #[derive(Clone, Default)]
@@ -208,6 +226,7 @@ pub struct EffectiveProject {
     positions: HashMap<String, usize>,
     /// Each inner list follows its Process's configured Dependency order.
     dependency_indices: Vec<Vec<usize>>,
+    shell: ShellConfig,
 }
 
 impl std::fmt::Debug for EffectiveProject {
@@ -220,9 +239,16 @@ impl std::fmt::Debug for EffectiveProject {
 }
 
 impl EffectiveProject {
-    /// Build one Project, rejecting duplicate Process names and invalid
-    /// Dependency graphs before any Process can start.
+    /// Build one Project with the macOS prototype shell fallback.
     pub fn new(processes: Vec<ProcessSpec>) -> Result<Self, ProjectError> {
+        Self::with_shell(processes, ShellConfig::default())
+    }
+
+    /// Build one Project with a validated shell launcher.
+    pub fn with_shell(
+        processes: Vec<ProcessSpec>,
+        shell: ShellConfig,
+    ) -> Result<Self, ProjectError> {
         let mut positions = HashMap::with_capacity(processes.len());
         for (index, spec) in processes.iter().enumerate() {
             if positions.insert(spec.name.clone(), index).is_some() {
@@ -273,11 +299,17 @@ impl EffectiveProject {
             processes,
             positions,
             dependency_indices,
+            shell,
         })
     }
 
     pub fn processes(&self) -> &[ProcessSpec] {
         &self.processes
+    }
+
+    /// Return the Project's shell launcher for shell-expression commands.
+    pub fn shell(&self) -> &ShellConfig {
+        &self.shell
     }
 
     /// Resolve a user-facing Process name to its stable session position.

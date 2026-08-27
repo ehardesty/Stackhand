@@ -354,7 +354,7 @@ Use `shell` for a shell expression:
 shell: "source .venv/bin/activate && exec python scripts/run_local_worker.py"
 ```
 
-The project has an explicit shell setting. On macOS/Linux, the default may be `/bin/sh -lc`, but commands requiring Bash behavior should configure Bash rather than relying on the user's login shell.
+The project has an explicit shell setting. The macOS prototype fallback is `/bin/sh -c`; commands requiring Bash behavior should configure Bash rather than relying on the user's login shell.
 
 For example:
 

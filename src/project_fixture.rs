@@ -40,7 +40,8 @@ const CONSOLE_PROOFS: &[(&str, &str)] = &[
     ("hello", "fixture-marker"),
     // Inline environment reaches the child.
     ("hello", ENV_PROOF),
-    // Shell command text runs through the user's shell as one pipeline.
+    // Shell command text runs through the Project's shell launcher as one
+    // pipeline.
     ("shelled", PIPELINE_PROOF),
 ];
 

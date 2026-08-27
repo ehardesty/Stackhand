@@ -154,7 +154,10 @@ fn one_configured_service_runs_end_to_end() {
     let config_path = dir.join("stackhand.yaml");
     fs::write(&config_path, fixture_config(tcp_port, http_port)).expect("config writes");
 
+    // An invalid login-shell setting must not affect the Project's /bin/sh
+    // fallback for its shell expression.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
+        .env("SHELL", "/path/that/does/not/exist")
         .arg("--fixture-project")
         .arg(&config_path)
         .output()

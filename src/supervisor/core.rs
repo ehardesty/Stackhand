@@ -13,7 +13,7 @@ use crate::geometry::TerminalGeometry;
 use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
-use crate::supervisor::command::{Command, shell_program};
+use crate::supervisor::command::Command;
 use crate::supervisor::seam::{
     AttemptId, ProbeIntent, ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId,
 };
@@ -391,15 +391,16 @@ impl Core {
 
     pub(super) fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
         let spec = &self.project.processes()[index];
-        // Shell command text reaches the child through the user's own shell
-        // so its syntax means what configuration promised; direct commands
-        // never gain shell parsing.
+        // Shell command text reaches the child through the Project's
+        // configured launcher; direct commands never gain shell parsing.
         let (program, args) = match &spec.command {
             crate::model::CommandForm::Direct { program, args } => (program.clone(), args.clone()),
-            crate::model::CommandForm::Shell { text } => (
-                shell_program(std::env::var_os("SHELL").as_deref()),
-                vec![OsString::from("-c"), OsString::from(text)],
-            ),
+            crate::model::CommandForm::Shell { text } => {
+                let shell = self.project.shell();
+                let mut args = shell.args.clone();
+                args.push(OsString::from(text));
+                (shell.program.clone(), args)
+            }
         };
         StartIntent {
             process_id: self.entries[index].process_id,

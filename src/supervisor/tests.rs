@@ -11,7 +11,7 @@ use super::support::{FakeClock, FakeProbes, FakeRuntime, Intent};
 use super::{Command, Core, DesiredState, Lifecycle, ProcessSnapshot, SeamEvent, SeamSender};
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
-    ProcessKind, ProcessSpec, ReadinessConfig, ReadinessProbe, TerminalMode,
+    ProcessKind, ProcessSpec, ReadinessConfig, ReadinessProbe, ShellConfig, TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
@@ -203,6 +203,37 @@ fn readiness(process: &str, run: u64, passing: bool, diagnostic: Option<String>)
         passing,
         diagnostic,
     }
+}
+
+#[test]
+fn shell_intent_uses_the_project_launcher_and_appends_the_expression() {
+    let mut process = simple("api", ProcessKind::Service, Enabled::Yes, Autostart::No);
+    process.command = CommandForm::Shell {
+        text: "printf shell-ok".to_string(),
+    };
+    let project = EffectiveProject::with_shell(
+        vec![process],
+        ShellConfig {
+            program: "/bin/fish".into(),
+            args: vec!["--private", "-c"]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        },
+    )
+    .expect("the shell test project is valid");
+    let harness = Harness::new(project);
+    let intent = harness.core.build_intent(0, RunId::new(1));
+
+    assert_eq!(intent.program, std::ffi::OsString::from("/bin/fish"));
+    assert_eq!(
+        intent.args,
+        [
+            std::ffi::OsString::from("--private"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("printf shell-ok"),
+        ]
+    );
 }
 
 fn process_index(name: &str) -> u32 {

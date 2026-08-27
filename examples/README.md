@@ -4,10 +4,9 @@ These Projects show the behavior that the current macOS prototype supports.
 They use standard shell tools. The readiness example also uses `nc`, which is
 included with macOS.
 
-The examples run POSIX command text through an explicit `/bin/sh` direct
-command. They do not depend on your login shell. The current `shell:` form uses
-`$SHELL`, so its syntax can differ when your login shell is Fish, Zsh, or
-another shell.
+The examples run POSIX command text through explicit command forms. They do not
+depend on your login shell. A `shell` expression uses the Project's configured
+launcher, or the macOS fallback `/bin/sh -c` when no launcher is configured.
 
 Run an example from the repository root:
 
