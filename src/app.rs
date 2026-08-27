@@ -111,11 +111,20 @@ fn run_event_loop(
             // Lifecycle commands target the selected Process by name and
             // never touch the terminal session; the Supervisor owns the
             // resulting Run changes.
-            let name = snapshot.processes[selected].name.clone();
+            let selected_process = &snapshot.processes[selected];
+            let name = selected_process.name.clone();
             supervisor.command(match request {
                 LifecycleCommand::Start => Command::Start(name),
                 LifecycleCommand::Stop => Command::Stop(name),
-                LifecycleCommand::Restart => Command::Restart(name),
+                // `r` restarts a Service and reruns a One-shot; the
+                // Supervisor guards each command to its own kind.
+                LifecycleCommand::Restart => {
+                    if selected_process.kind == crate::model::ProcessKind::OneShot {
+                        Command::Rerun(name)
+                    } else {
+                        Command::Restart(name)
+                    }
+                }
             });
         }
         let selected_process = &snapshot.processes[selected];

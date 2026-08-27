@@ -37,7 +37,7 @@ mod tests;
 
 pub use core::{
     Command, DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ProcessSnapshot,
-    ProjectSnapshot, ReadinessStatus,
+    ProjectSnapshot, RECENT_RUNS, ReadinessStatus, RunExitDisposition, RunSummary, RunTrigger,
 };
 pub use runtime::{ConsoleView, Consoles};
 // The data-plane retained-output view is built alongside the Supervisor, so

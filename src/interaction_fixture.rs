@@ -50,7 +50,12 @@ fn prove(
         snapshot
             .processes
             .iter()
-            .all(|process| process.lifecycle == Lifecycle::Running)
+            .all(|process| match process.name.as_str() {
+                "focused" | "mute" | "piped" => process.lifecycle == Lifecycle::Running,
+                // The One-shot stays Idle until the rerun proof starts it.
+                "oneoff" => process.lifecycle == Lifecycle::Idle,
+                other => panic!("the fixture contract changed: {other}"),
+            })
     })?;
     let index = |name: &str| -> usize {
         snapshot
@@ -62,6 +67,7 @@ fn prove(
     let focused = index("focused");
     let mute = index("mute");
     let piped = index("piped");
+    let oneoff = index("oneoff");
     let run_of = |process: &ProcessSnapshot| {
         process
             .current_run
@@ -446,70 +452,33 @@ fn prove(
     )?;
     println!("interaction-lifecycle-ok");
 
-    // Moving selection around must not stop output ingestion for any
-    // Process: the move is routed through the currently selected pane and
-    // applied only from the drained request, clamped at the list ends, and
-    // every tick counter keeps climbing. The restarts above opened new
-    // Runs, so the proof follows each Process's current Run view.
-    let ingest_snapshot = wait_for(supervisor, WAIT, |_| true)?;
-    let focused_live = consoles
-        .view(
-            focused as u32,
-            ingest_snapshot.processes[focused]
-                .current_run
-                .expect("the restarted Process keeps a live Run"),
-        )
-        .expect("the restarted Process has a live console");
-    let mute_live = consoles
-        .view(
-            mute as u32,
-            ingest_snapshot.processes[mute]
-                .current_run
-                .expect("the restarted Process keeps a live Run"),
-        )
-        .expect("the restarted Process has a live console");
-    let base_focused = wait_for_tick(&focused_live, "tick-", 2)?;
-    let base_mute = wait_for_tick(&mute_live, "tick-", 2)?;
-    // The pipe module retains chunks from earlier Runs, whose counters sit
-    // above the restarted counter, so progress is proven at the tail.
-    wait_for_module_tick(outputs, piped, "pipe-tick-", 2)?;
-    let base_piped = last_tick(&module_text(outputs, piped), "pipe-tick-").unwrap_or(0);
-    let moves = [
-        SelectionMove::Down,
-        SelectionMove::Down,
-        SelectionMove::Down,
-        SelectionMove::Up,
-        SelectionMove::Up,
-    ];
-    let expected = [mute, piped, piped, mute, focused];
-    for (direction, expected_selected) in moves.iter().zip(expected.iter()) {
-        apply_move(
-            &mut console,
-            &mut pipe_scroll,
-            consoles,
-            outputs,
-            &ingest_snapshot,
-            &mut selected,
-            *direction,
-        );
-        assert_eq!(
-            selected, *expected_selected,
-            "the selection must move and clamp exactly like the app"
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    assert!(
-        max_tick(&console_text(&focused_live), "tick-").unwrap_or(0) > base_focused,
-        "selection moves stopped ingestion into the focused terminal"
-    );
-    assert!(
-        max_tick(&console_text(&mute_live), "tick-").unwrap_or(0) > base_mute,
-        "selection moves stopped ingestion into the muted terminal"
-    );
-    assert!(
-        last_tick(&module_text(outputs, piped), "pipe-tick-").unwrap_or(0) > base_piped,
-        "selection moves stopped ingestion into the pipe module"
-    );
+    // The One-shot proof: start it once, rerun it through the pane key
+    // seam, and check its bounded Run summaries and output markers.
+    crate::lifecycle_fixture::prove_rerun(
+        &mut console,
+        &mut pipe_scroll[..],
+        consoles,
+        outputs,
+        supervisor,
+        oneoff,
+        &mut selected,
+    )?;
+    println!("interaction-rerun-ok");
+
+    crate::ingest_fixture::prove_ingest(
+        &mut console,
+        &mut pipe_scroll[..],
+        consoles,
+        outputs,
+        supervisor,
+        crate::ingest_fixture::FixtureIndexes {
+            focused,
+            mute,
+            piped,
+            oneoff,
+        },
+        &mut selected,
+    )?;
     println!("interaction-ingest-ok");
     Ok(())
 }
@@ -639,89 +608,6 @@ fn move_selection_key(
     }
 }
 
-fn wait_for_module_tick(
-    outputs: &crate::output::OutputViews,
-    piped: usize,
-    prefix: &str,
-    minimum: u32,
-) -> Result<u32> {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let value = max_tick(&module_text(outputs, piped), prefix).unwrap_or(0);
-        if value >= minimum {
-            return Ok(value);
-        }
-        if Instant::now() >= deadline {
-            bail!("the pipe module never reached {prefix}{minimum}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_tick(view: &crate::supervisor::ConsoleView, prefix: &str, minimum: u32) -> Result<u32> {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let value = max_tick(&console_text(view), prefix).unwrap_or(0);
-        if value >= minimum {
-            return Ok(value);
-        }
-        if Instant::now() >= deadline {
-            bail!("the console never reached {prefix}{minimum}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// The highest `prefix NNNN` counter visible in a flattened view.
-fn max_tick(text: &str, prefix: &str) -> Option<u32> {
-    text.match_indices(prefix)
-        .filter_map(|(position, _)| {
-            let rest = &text[position + prefix.len()..];
-            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            digits.parse().ok()
-        })
-        .max()
-}
-
-/// The most recent `prefix NNNN` counter visible in a flattened module,
-/// regardless of older counters retained from earlier Runs.
-fn last_tick(text: &str, prefix: &str) -> Option<u32> {
-    text.match_indices(prefix).last().and_then(|(position, _)| {
-        let rest = &text[position + prefix.len()..];
-        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-        digits.parse().ok()
-    })
-}
-
-fn module_text(outputs: &crate::output::OutputViews, index: usize) -> String {
-    let module = outputs
-        .for_process(index as u32)
-        .expect("the fixture defines the pipe Process");
-    module
-        .snapshot()
-        .chunks
-        .iter()
-        .filter_map(|chunk| match chunk {
-            crate::output::RetainedChunk::Data { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn console_text(view: &crate::supervisor::ConsoleView) -> String {
-    view.snapshot()
-        .map(|snapshot| {
-            snapshot
-                .buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn shutdown(supervisor: SupervisorHandle, proof_ok: bool) -> Result<()> {
     supervisor.command(Command::StopAll);
     let snapshot = wait_for(&supervisor, SHUTDOWN_WAIT, |snapshot| {
@@ -761,6 +647,74 @@ pub(crate) fn wait_for(
             bail!("startup did not finish within its bound");
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+pub(crate) fn module_text(outputs: &crate::output::OutputViews, index: usize) -> String {
+    let module = outputs
+        .for_process(index as u32)
+        .expect("the fixture defines the pipe Process");
+    module
+        .snapshot()
+        .chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            crate::output::RetainedChunk::Data { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn console_text(view: &crate::supervisor::ConsoleView) -> String {
+    view.snapshot()
+        .map(|snapshot| {
+            snapshot
+                .buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The highest `prefix NNNN` counter visible in a flattened view.
+pub(crate) fn max_tick(text: &str, prefix: &str) -> Option<u32> {
+    text.match_indices(prefix)
+        .filter_map(|(position, _)| {
+            let rest = &text[position + prefix.len()..];
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            digits.parse().ok()
+        })
+        .max()
+}
+
+/// The most recent `prefix NNNN` counter visible in a flattened module,
+/// regardless of older counters retained from earlier Runs.
+pub(crate) fn last_tick(text: &str, prefix: &str) -> Option<u32> {
+    text.match_indices(prefix).last().and_then(|(position, _)| {
+        let rest = &text[position + prefix.len()..];
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        digits.parse().ok()
+    })
+}
+
+pub(crate) fn wait_for_tick(
+    view: &crate::supervisor::ConsoleView,
+    prefix: &str,
+    minimum: u32,
+) -> Result<u32> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let value = max_tick(&console_text(view), prefix).unwrap_or(0);
+        if value >= minimum {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            bail!("the console never reached {prefix}{minimum}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

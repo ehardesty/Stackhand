@@ -3,6 +3,7 @@ mod config;
 mod console;
 mod fixtures;
 mod geometry;
+mod ingest_fixture;
 pub mod interaction_fixture;
 mod lifecycle;
 mod lifecycle_fixture;

@@ -69,6 +69,53 @@ fn drain_stdout(fixture: &mut PipeRunFixture) -> String {
 }
 
 #[test]
+fn dropped_output_never_blocks_a_cleanup_confirmation() {
+    // The output queue is never drained while the producer floods, so the
+    // readers must drop bytes under backpressure. A stop must still
+    // confirm the cleanup: bounded drops are expected, not I/O failures.
+    let script = "trap '' INT; i=0; while :; do printf 'flood-%06d\\n' \"$i\"; i=$((i+1)); done";
+    let mut fixture = start_pipe(
+        SpawnCommand::new("/bin/sh").arg("-c").arg(script),
+        quick_ladder(200, 200),
+    );
+    // The queue is deliberately left undrained while the producer floods.
+    // The first-drop report is the signal that backpressure drops started.
+    let mut saw_drop_report = false;
+    let deadline = Instant::now() + WAIT;
+    while !saw_drop_report && Instant::now() < deadline {
+        match fixture.events.try_recv() {
+            Ok(RunEvent {
+                kind: RunEventKind::IoFailed(detail),
+                ..
+            }) if detail.contains("sink is full") => saw_drop_report = true,
+            Ok(_) => {}
+            Err(mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    assert!(
+        saw_drop_report,
+        "the undrained queue must have reported a bounded drop within the bound"
+    );
+    let outcome = fixture.run.shutdown().expect("ladder completed");
+    assert!(
+        outcome.dropped_output_bytes > 0,
+        "the undrained queue must have dropped flood bytes"
+    );
+    assert!(
+        outcome.io_failures.is_empty(),
+        "bounded drops are not I/O failures: {:?}",
+        outcome.io_failures
+    );
+    assert!(
+        outcome.cleanup_confirmed,
+        "drops must not block the confirmation: {outcome:?}"
+    );
+}
+
+#[test]
 fn high_output_pipe_and_pty_ingest_through_complete_shutdown_ladder() {
     // Ignores interrupt so the full interrupt→terminate ladder runs while
     // the writer keeps producing. Output is fixed-size so no-loss is exact.

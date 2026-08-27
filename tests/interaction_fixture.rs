@@ -39,10 +39,14 @@ const MUTE_SCRIPT: &str = "trap '' INT; stty raw -echo; printf 'mute-ready\\r\\n
 const PIPED_SCRIPT: &str =
     "i=0; while :; do printf 'pipe-tick-%04d\\n' $i; i=$((i+1)); sleep 0.1; done";
 
+/// A pipe One-shot: one line per attempt, then a clean exit.
+const ONEOFF_SCRIPT: &str = "printf 'oneoff-run ok\\n'";
+
 fn fixture_config() -> String {
     let focused = FOCUSED_SCRIPT.replace('"', "\\\"");
     let mute = MUTE_SCRIPT.replace('"', "\\\"");
     let piped = PIPED_SCRIPT.replace('"', "\\\"");
+    let oneoff = ONEOFF_SCRIPT.replace('"', "\\\"");
     format!(
         "version: 1\n\
          processes:\n\
@@ -64,7 +68,14 @@ fn fixture_config() -> String {
          \x20   terminal: pipe\n\
          \x20   command:\n\
          \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{piped}\"]\n",
+         \x20     args: [\"-c\", \"{piped}\"]\n\
+         \x20 - name: oneoff\n\
+         \x20   kind: one-shot\n\
+         \x20   terminal: pipe\n\
+         \x20   autostart: false\n\
+         \x20   command:\n\
+         \x20     program: /bin/sh\n\
+         \x20     args: [\"-c\", \"{oneoff}\"]\n",
     )
 }
 
@@ -159,6 +170,9 @@ fn terminal_operation_across_process_selection() {
     // Stop, start, and restart target the selected Service through the
     // Supervisor; a clean stop and restart leave no failure behind.
     assert!(stdout.contains("interaction-lifecycle-ok"), "{stdout}");
+    // A One-shot rerun opens the next Run, keeps both attempts' output
+    // markers, and records bounded recent Run summaries.
+    assert!(stdout.contains("interaction-rerun-ok"), "{stdout}");
     // Selection moves never stop output ingestion for any Process.
     assert!(stdout.contains("interaction-ingest-ok"), "{stdout}");
     assert!(stdout.contains("interaction-shutdown-ok"), "{stdout}");

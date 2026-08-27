@@ -436,6 +436,7 @@ impl OwnedRun {
         let mut terminal_failure = None;
         let mut worker_join_failures = Vec::new();
         let mut exit_code = None;
+        let mut dropped_output_bytes = 0u64;
 
         if let Some(inner) = self.inner.take() {
             match inner {
@@ -443,6 +444,7 @@ impl OwnedRun {
                     if settled_before_finalize {
                         let finalized = pipe.finalize_bounded(final_deadline);
                         exit_code = finalized.exit_code;
+                        dropped_output_bytes = finalized.dropped_bytes;
                         io_failures.extend(finalized.io_failures);
                         worker_join_failures.extend(finalized.worker_failures);
                         if finalized.root_reaped {
@@ -475,6 +477,7 @@ impl OwnedRun {
                             "output EOF was not confirmed before finalization".to_string(),
                         ));
                         io_failures.extend(pipe.io_failures());
+                        dropped_output_bytes = pipe.dropped_bytes();
                     }
                 }
                 RunInner::Pty {
@@ -570,6 +573,7 @@ impl OwnedRun {
             terminal_failure,
             final_metrics,
             worker_join_failures,
+            dropped_output_bytes,
         };
         self.emit(RunEventKind::Exited { code: exit_code });
         self.emit(match cleanup_confirmed {

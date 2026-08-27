@@ -98,6 +98,10 @@ pub struct RunOutcome {
     pub remaining_pids: Vec<crate::runtime::OsPid>,
     pub io_failures: Vec<String>,
     pub terminal_failure: Option<String>,
+    /// Bytes dropped by the Run's output readers because the caller's
+    /// bounded output queue was full. Bounded backpressure is expected
+    /// under a noisy producer and never blocks a cleanup confirmation.
+    pub dropped_output_bytes: u64,
     pub worker_join_failures: Vec<String>,
     /// The last valid sample retained when the sampler stopped with the
     /// Run, if sampling was enabled and produced at least one snapshot.

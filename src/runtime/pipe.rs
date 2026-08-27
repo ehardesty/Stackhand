@@ -165,6 +165,10 @@ pub(crate) struct PipeRun {
     child: Option<Child>,
     readers: Vec<JoinHandle<()>>,
     io_failures: Arc<Mutex<Vec<String>>>,
+    /// Bytes dropped because the caller's bounded output queue was full.
+    /// Dropped bytes are bounded backpressure, not hard I/O failures, so
+    /// they never block a cleanup confirmation.
+    dropped_bytes: Arc<AtomicUsize>,
 }
 
 pub(crate) struct PipeFinalize {
@@ -173,6 +177,7 @@ pub(crate) struct PipeFinalize {
     pub readers_joined: bool,
     pub io_failures: Vec<String>,
     pub worker_failures: Vec<String>,
+    pub dropped_bytes: u64,
 }
 
 impl PipeRun {
@@ -209,6 +214,7 @@ impl PipeRun {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let io_failures = Arc::new(Mutex::new(Vec::new()));
+        let dropped_bytes = Arc::new(AtomicUsize::new(0));
         let mut readers = Vec::new();
 
         if let Some(stdout) = stdout {
@@ -219,6 +225,7 @@ impl PipeRun {
                 &output,
                 &events,
                 Arc::clone(&io_failures),
+                Arc::clone(&dropped_bytes),
             ));
         }
         if let Some(stderr) = stderr {
@@ -229,6 +236,7 @@ impl PipeRun {
                 &output,
                 &events,
                 Arc::clone(&io_failures),
+                Arc::clone(&dropped_bytes),
             ));
         }
 
@@ -236,6 +244,7 @@ impl PipeRun {
             child: Some(child),
             readers,
             io_failures,
+            dropped_bytes,
         })
     }
 
@@ -299,6 +308,7 @@ impl PipeRun {
             readers_joined,
             io_failures: self.io_failures(),
             worker_failures,
+            dropped_bytes: self.dropped_bytes(),
         }
     }
 
@@ -364,6 +374,11 @@ impl PipeRun {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    /// Bytes the readers dropped because the bounded output queue was full.
+    pub(crate) fn dropped_bytes(&self) -> u64 {
+        self.dropped_bytes.load(Ordering::Relaxed) as u64
+    }
 }
 
 fn spawn_stream_reader(
@@ -373,6 +388,7 @@ fn spawn_stream_reader(
     output: &OutputSink,
     events: &EventSink,
     io_failures: Arc<Mutex<Vec<String>>>,
+    dropped_bytes: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     let output = output.clone();
     let events = events.clone();
@@ -384,7 +400,11 @@ fn spawn_stream_reader(
         .name(name.to_string())
         .spawn(move || {
             let mut buffer = vec![0u8; READ_BUFFER_BYTES];
-            let emit = |data: Vec<u8>| -> bool {
+            // One first-drop report per stream: bounded backpressure is
+            // expected under a noisy producer, so only the first drop goes
+            // through the low-volume event path.
+            let mut drop_reported = false;
+            let mut emit = |data: Vec<u8>| -> bool {
                 let chunk = RunOutput {
                     run_id,
                     stream: stream_kind,
@@ -393,11 +413,15 @@ fn spawn_stream_reader(
                 match output.try_send(chunk) {
                     Ok(()) => true,
                     Err(OutputSendError::Full(chunk)) => {
-                        let detail = format!(
-                            "{stream_kind:?} output sink is full; dropped {} bytes",
-                            chunk.data.len()
+                        dropped_bytes.fetch_add(
+                            chunk.data.len(),
+                            Ordering::Relaxed,
                         );
-                        if record_io_failure(&io_failures, detail.clone()) {
+                        if !drop_reported {
+                            drop_reported = true;
+                            let detail = format!(
+                                "{stream_kind:?} output sink is full; bytes dropped under the bounded output queue"
+                            );
                             let _ = events.send(RunEvent {
                                 run_id,
                                 kind: RunEventKind::IoFailed(detail),

@@ -4,6 +4,7 @@
 //! reach it through semantic commands, typed seam events, and immutable
 //! snapshots — the same surface the serializing task wrapper drives.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +54,54 @@ pub struct MetricsMetadata {
     pub rss_kib: u64,
 }
 
+/// The disposition of a finished Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunExitDisposition {
+    /// The user stopped the Run before it completed.
+    Stopped,
+    /// A One-shot Run ended with its configured success exit code.
+    Success,
+    /// The Run ended in a failed result.
+    Failed { code: Option<i32> },
+}
+
+/// One bounded summary of a finished Run. The Supervisor retains a small
+/// recent window per Process; it is metadata, not an audit log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub run_id: u64,
+    /// Milliseconds after session start when the Run began.
+    pub started_at_ms: u64,
+    /// Milliseconds after session start when the Run ended.
+    pub ended_at_ms: u64,
+    pub exit: RunExitDisposition,
+    /// Whether a user stop intentionally ended the Run.
+    pub intentional_stop: bool,
+    /// The bounded failure reason, present when the Run did not complete.
+    pub failure: Option<String>,
+    /// What started this Run.
+    pub trigger: RunTrigger,
+}
+
+/// What started a Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTrigger {
+    /// The Supervisor started the Process at session start.
+    Autostart,
+    /// The user started the selected Process.
+    Manual,
+    /// The user restarted the selected Service.
+    Restart,
+    /// The user reran the selected One-shot.
+    Rerun,
+    /// The scheduler started a Process because the user marked a
+    /// dependent Process Running.
+    Dependency,
+}
+
+/// The bounded size of every Process's retained Run summary window.
+pub const RECENT_RUNS: usize = 8;
+
 /// One bounded failure summary. Structured kinds arrive with One-shot and
 /// shutdown work; Milestone 1 starts with a bounded diagnostic string.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +118,8 @@ pub(crate) struct Core {
     pub(super) seam: Box<dyn RunSeam>,
     pub(super) probes: Box<dyn ProbeSeam>,
     clock: Arc<dyn Clock>,
+    /// The session start point every Run summary's millisecond stamps use.
+    epoch: Instant,
     pub(super) events: SeamSender,
 }
 
@@ -108,6 +159,19 @@ pub(super) struct Entry {
     /// stays held so a manual Stop can retry the bounded cleanup, and no
     /// new Run may replace it until that retry confirms.
     pub(super) cleanup_unconfirmed: bool,
+    /// The bounded recent finished-Run summaries, oldest first.
+    pub(super) runs: VecDeque<RunSummary>,
+    /// When the current Run began, in session milliseconds.
+    pub(super) run_started_at_ms: Option<u64>,
+    /// Whether the user asked the current Run to stop before it completed.
+    pub(super) stop_intended: bool,
+    /// The natural exit code of the current Run, when it exited on its own.
+    pub(super) natural_exit_code: Option<i32>,
+    /// What will start the next Run: the latest command that marked the
+    /// Desired State Running, or a restart/rerun request pending cleanup.
+    pub(super) pending_trigger: RunTrigger,
+    /// What started the current Run.
+    pub(super) run_trigger: RunTrigger,
 }
 
 impl Entry {
@@ -124,7 +188,60 @@ impl Entry {
             completed: false,
             readiness: None,
             cleanup_unconfirmed: false,
+            runs: VecDeque::new(),
+            run_started_at_ms: None,
+            stop_intended: false,
+            natural_exit_code: None,
+            pending_trigger: RunTrigger::Dependency,
+            run_trigger: RunTrigger::Dependency,
         }
+    }
+
+    /// Record the bounded finished-Run summary for the Run that just ended
+    /// through a confirmed cleanup. The caller must invoke it before
+    /// clearing the Run's identity; the summary window keeps its older
+    /// entries.
+    fn record_finished_run(&mut self, now_ms: u64) {
+        let Some(started_at_ms) = self.run_started_at_ms.take() else {
+            return;
+        };
+        let Some(run_id) = self.current_run else {
+            return;
+        };
+        let exit = if self.lifecycle == Lifecycle::Done {
+            RunExitDisposition::Success
+        } else if self.stop_intended {
+            RunExitDisposition::Stopped
+        } else {
+            RunExitDisposition::Failed {
+                code: self.natural_exit_code,
+            }
+        };
+        let failure = if self.lifecycle == Lifecycle::Done {
+            None
+        } else {
+            self.failure
+                .as_ref()
+                .map(|failure| failure.detail.clone())
+                .or_else(|| {
+                    self.natural_exit_code
+                        .map(|code| format!("exited with code {code}"))
+                })
+        };
+        self.runs.push_back(RunSummary {
+            run_id: run_id.get(),
+            started_at_ms,
+            ended_at_ms: now_ms,
+            exit,
+            intentional_stop: self.stop_intended,
+            failure,
+            trigger: self.run_trigger,
+        });
+        if self.runs.len() > RECENT_RUNS {
+            self.runs.pop_front();
+        }
+        self.stop_intended = false;
+        self.natural_exit_code = None;
     }
 }
 
@@ -144,6 +261,7 @@ impl Core {
             .enumerate()
             .map(|(index, _)| Entry::new(ProcessId::new(index as u32)))
             .collect();
+        let epoch = clock.now();
         Self {
             project,
             entries,
@@ -151,15 +269,24 @@ impl Core {
             seam,
             probes,
             clock,
+            epoch,
             events,
         }
+    }
+
+    /// The current clock reading in session milliseconds.
+    pub(super) fn now_ms(&self) -> u64 {
+        self.clock
+            .now()
+            .saturating_duration_since(self.epoch)
+            .as_millis() as u64
     }
 
     pub(crate) fn command(&mut self, command: Command) {
         match command {
             Command::Start(name) => {
                 if let Some(index) = self.named_index(&name) {
-                    self.start_at(index);
+                    self.start_at(index, RunTrigger::Manual);
                 }
             }
             Command::Stop(name) => {
@@ -170,7 +297,7 @@ impl Core {
             Command::StartAutostart => {
                 for index in 0..self.entries.len() {
                     if matches!(self.project.processes()[index].autostart, Autostart::Yes) {
-                        self.start_at(index);
+                        self.start_at(index, RunTrigger::Autostart);
                     }
                 }
             }
@@ -181,10 +308,26 @@ impl Core {
             }
             Command::Restart(name) => {
                 if let Some(index) = self.named_index(&name) {
-                    self.restart_at(index);
+                    self.restart_at(index, RunTrigger::Restart);
+                }
+            }
+            Command::Rerun(name) => {
+                if let Some(index) = self.named_index(&name) {
+                    self.rerun_at(index);
                 }
             }
         }
+    }
+
+    /// Rerun one enabled One-shot: invalidate its prior completion, stop
+    /// the active Run when one exists, and let the scheduler open the next
+    /// Run after cleanup.
+    pub(super) fn rerun_at(&mut self, index: usize) {
+        let spec = &self.project.processes()[index];
+        if !matches!(spec.kind, ProcessKind::OneShot) || !self.is_enabled(index) {
+            return;
+        }
+        self.restart_at(index, RunTrigger::Rerun);
     }
 
     /// Resolve one configured Process name to its stable session position.
@@ -249,6 +392,7 @@ impl Core {
         entry.desired = DesiredState::Stopped;
         entry.lifecycle = Lifecycle::Stopping;
         entry.blocked = None;
+        entry.stop_intended = true;
         // Pending readiness belongs to the ending Run; its tracking ends
         // here and any in-flight attempt's result is rejected by the gate.
         entry.readiness = None;
@@ -327,7 +471,13 @@ impl Core {
                 // ShutdownComplete; the observed code never becomes a
                 // completion or a failure there.
                 let stopping_intentionally = self.entries[index].lifecycle == Lifecycle::Stopping;
-                if !stopping_intentionally {
+                if stopping_intentionally {
+                    // The intentional stop's own completion report finalizes
+                    // the Run; the observed code is not a result there.
+                } else {
+                    // Record the natural exit before projecting it: the code
+                    // becomes the finished-Run summary's disposition.
+                    self.entries[index].natural_exit_code = code;
                     match self.project.processes()[index].kind {
                         ProcessKind::OneShot => self.complete_one_shot(index, code),
                         ProcessKind::Service => self.observe_service_exit(index, code),
@@ -338,6 +488,7 @@ impl Core {
             SeamEvent::ShutdownComplete {
                 confirmed, detail, ..
             } => {
+                let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
                 if !confirmed {
                     // Hold the Run identity: the cleanup is unconfirmed, so
@@ -356,6 +507,7 @@ impl Core {
                     self.evaluate();
                     return;
                 }
+                entry.record_finished_run(now_ms);
                 entry.current_run = None;
                 entry.metrics = None;
                 entry.readiness = None;
@@ -368,10 +520,12 @@ impl Core {
                 self.evaluate();
             }
             SeamEvent::Failed { detail, .. } => {
+                let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
                 entry.failure = Some(FailureSummary { detail });
                 // A failed adapter report ends the Run identity and reverts
                 // the Process to stopped so it can be started again.
+                entry.record_finished_run(now_ms);
                 entry.current_run = None;
                 entry.desired = DesiredState::Stopped;
                 entry.lifecycle = Lifecycle::Stopped;
@@ -541,6 +695,7 @@ impl Core {
                     attempts: tracking.attempts,
                     last_error: tracking.last_error.clone(),
                 }),
+                recent_runs: entry.runs.iter().rev().cloned().collect(),
             })
             .collect();
         ProjectSnapshot { processes }
@@ -559,6 +714,8 @@ pub enum Command {
     Start(String),
     Stop(String),
     Restart(String),
+    /// Rerun one enabled One-shot; a no-op for every other Process.
+    Rerun(String),
     StartAutostart,
     StopAll,
 }
@@ -609,6 +766,8 @@ pub struct ProcessSnapshot {
     /// Readiness progress while the current Run of a probed Service is still
     /// becoming available; `None` without a probe or once it passed or ended.
     pub readiness: Option<ReadinessStatus>,
+    /// The bounded recent finished-Run summaries, newest first.
+    pub recent_runs: Vec<RunSummary>,
 }
 
 #[cfg(test)]

@@ -14,15 +14,16 @@
 use super::core::{Core, DesiredState, Lifecycle};
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
+use crate::supervisor::RunTrigger;
 
 impl Core {
     /// Start one Process: mark it and its required enabled Dependencies,
     /// transitively, as Desired State Running, then evaluate what can start.
-    pub(super) fn start_at(&mut self, index: usize) {
+    pub(super) fn start_at(&mut self, index: usize, trigger: RunTrigger) {
         if !self.is_enabled(index) {
             return;
         }
-        self.require_running(index);
+        self.require_running(index, trigger);
         self.evaluate();
     }
 
@@ -31,26 +32,31 @@ impl Core {
     /// next Run only after the bounded cleanup reports completion. While
     /// the previous cleanup is unconfirmed the request stays pending; its
     /// visible failure names the held Run and Stop retries the cleanup.
-    pub(super) fn restart_at(&mut self, index: usize) {
+    pub(super) fn restart_at(&mut self, index: usize, trigger: RunTrigger) {
         if !self.is_enabled(index) {
             return;
         }
-        self.require_running(index);
+        self.entries[index].pending_trigger = trigger;
+        self.require_running(index, trigger);
         let entry = &mut self.entries[index];
         if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
             // A stopping Run releases its identity on ShutdownComplete;
-            // that pass starts the replacement through the scheduler.
+            // that pass starts the replacement through the scheduler. The
+            // stop is intentional: its summary must not read as a failure.
             entry.lifecycle = Lifecycle::Stopping;
             entry.blocked = None;
             entry.readiness = None;
+            entry.stop_intended = true;
             self.seam.stop(entry.process_id, run_id, &self.events);
         }
         self.evaluate();
     }
 
     /// Mark one Process and its enabled Dependencies, transitively, as
-    /// Desired State Running. Disabled Dependencies stay untouched.
-    fn require_running(&mut self, index: usize) {
+    /// Desired State Running. Disabled Dependencies stay untouched. The
+    /// target keeps the command's trigger; a Dependency started on its
+    /// behalf is recorded as started by the user's dependent.
+    fn require_running(&mut self, index: usize, trigger: RunTrigger) {
         if !self.is_enabled(index) {
             return;
         }
@@ -59,9 +65,10 @@ impl Core {
             return;
         }
         entry.desired = DesiredState::Running;
+        entry.pending_trigger = trigger;
         let dependencies = self.dependency_indices(index);
         for dependency in dependencies {
-            self.require_running(dependency);
+            self.require_running(dependency, RunTrigger::Dependency);
         }
     }
 
@@ -78,6 +85,7 @@ impl Core {
     }
 
     fn begin_desired_run(&mut self, index: usize) {
+        let now_ms = self.now_ms();
         let entry = &mut self.entries[index];
         if entry.current_run.is_some() || entry.desired != DesiredState::Running {
             return;
@@ -92,6 +100,10 @@ impl Core {
         // A new Run invalidates any earlier completion of this Process; the
         // condition is satisfied only when this Run completes.
         entry.completed = false;
+        entry.run_started_at_ms = Some(now_ms);
+        entry.stop_intended = false;
+        entry.natural_exit_code = None;
+        entry.run_trigger = entry.pending_trigger;
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }
@@ -165,7 +177,7 @@ impl Core {
         entry.lifecycle == Lifecycle::Done || entry.completed
     }
 
-    fn is_enabled(&self, index: usize) -> bool {
+    pub(super) fn is_enabled(&self, index: usize) -> bool {
         matches!(self.project.processes()[index].enabled, Enabled::Yes)
     }
 

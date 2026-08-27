@@ -558,6 +558,7 @@ fn unknown_commands_are_ignored() {
 mod readiness;
 
 mod one_shot_lifecycle;
+mod one_shot_rerun;
 
 mod service_lifecycle;
 
