@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use serde_yaml::Value;
 
 use super::ConfigError;
 use super::file::ProcessFile;
@@ -43,14 +45,24 @@ pub(super) fn load_files(
     Ok(values)
 }
 
+/// The resolved changes to one child environment. Values not listed in
+/// `removals` remain inherited from the Supervisor's parent process.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ResolvedEnvironment {
+    pub(super) values: Vec<(String, String)>,
+    pub(super) removals: Vec<String>,
+}
+
 /// Assemble one Process environment from Project files, Process files, and
-/// inline values. Each later layer replaces an earlier value.
+/// inline values. Each later layer replaces an earlier value. Null inline
+/// values are retained as removals so the runtime can remove them from the
+/// inherited parent environment.
 pub(super) fn build_process_environment(
     process: &ProcessFile,
     name: &str,
     base_dir: &Path,
     project_environment: &BTreeMap<String, String>,
-) -> Result<Vec<(String, String)>, ConfigError> {
+) -> Result<ResolvedEnvironment, ConfigError> {
     let owner = format!("Process '{name}'");
     let process_environment = load_files(
         base_dir,
@@ -59,19 +71,100 @@ pub(super) fn build_process_environment(
     )?;
     let mut environment = project_environment.clone();
     environment.extend(process_environment);
+    let mut removals = BTreeSet::new();
     if let Some(entries) = process.environment.as_ref() {
         for (key, value) in entries {
             match value {
                 Some(value) => {
                     environment.insert(key.clone(), value.clone());
+                    removals.remove(key);
                 }
                 None => {
                     environment.remove(key);
+                    removals.insert(key.clone());
                 }
             }
         }
     }
-    Ok(environment.into_iter().collect())
+    Ok(ResolvedEnvironment {
+        values: environment.into_iter().collect(),
+        removals: removals.into_iter().collect(),
+    })
+}
+
+/// Validate environment maps before typed deserialization so diagnostics do
+/// not echo a malformed environment value.
+pub(super) fn validate_shapes(document: &Value, source: &str) -> Result<(), ConfigError> {
+    let Some(processes) = document
+        .as_mapping()
+        .and_then(|root| root.get(Value::String("processes".to_string())))
+        .and_then(Value::as_mapping)
+    else {
+        return Ok(());
+    };
+    validate_processes(processes, source)
+}
+
+/// Validate a name-keyed Process mapping from a profile or local override.
+pub(super) fn validate_process_overrides(
+    processes: &Value,
+    source: &str,
+) -> Result<(), ConfigError> {
+    let Some(processes) = processes.as_mapping() else {
+        return Ok(());
+    };
+    validate_processes(processes, source)
+}
+
+fn validate_processes(processes: &serde_yaml::Mapping, source: &str) -> Result<(), ConfigError> {
+    for (name, process) in processes {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        validate_values(process, name, source)?;
+    }
+    Ok(())
+}
+
+fn validate_values(value: &Value, process_name: &str, source: &str) -> Result<(), ConfigError> {
+    match value {
+        Value::Mapping(mapping) => {
+            if let Some(environment) = mapping.get(Value::String("environment".to_string())) {
+                match environment {
+                    Value::Mapping(entries) => {
+                        for (name, value) in entries {
+                            let name = name.as_str().unwrap_or("<non-string>");
+                            if !value.is_null() && value.as_str().is_none() {
+                                return Err(ConfigError {
+                                    message: format!(
+                                        "Process '{process_name}': {source} environment variable '{name}' must be a string or null"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Value::Null => {}
+                    _ => {
+                        return Err(ConfigError {
+                            message: format!(
+                                "Process '{process_name}': {source} environment must be a mapping"
+                            ),
+                        });
+                    }
+                }
+            }
+            for child in mapping.values() {
+                validate_values(child, process_name, source)?;
+            }
+        }
+        Value::Sequence(values) => {
+            for child in values {
+                validate_values(child, process_name, source)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Tagged(_) => {}
+    }
+    Ok(())
 }
 
 /// Resolve one environment-file path against the base Project directory.

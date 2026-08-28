@@ -74,6 +74,79 @@ REPEATED=new
 }
 
 #[test]
+fn invalid_inline_environment_diagnostics_exclude_the_value() {
+    let directory = unique_directory("inline-error");
+    let secret = "inline-secret-sentinel";
+    let config = directory.join("stackhand.yaml");
+    fs::write(
+        &config,
+        format!(
+            "version: 1\nprocesses:\n  child:\n    environment:\n      SECRET_VALUE: [{secret}]\n    command: [/bin/true]\n"
+        ),
+    )
+    .expect("configuration writes");
+
+    let error = load(&config).expect_err("non-string inline environment values fail");
+    assert!(error.message.contains("Process 'child'"), "{error}");
+    assert!(error.message.contains("base Project"), "{error}");
+    assert!(error.message.contains("SECRET_VALUE"), "{error}");
+    assert!(!error.message.contains(secret), "{error}");
+
+    fs::remove_dir_all(directory).ok();
+}
+
+#[test]
+fn profile_and_local_environment_errors_name_their_source_without_values() {
+    let directory = unique_directory("layered-errors");
+    let config = directory.join("stackhand.yaml");
+    let profile_secret = "profile-secret-sentinel";
+    fs::write(
+        &config,
+        format!(
+            "version: 1\nprocesses:\n  child:\n    command: [/bin/true]\nprofiles:\n  profile:\n    overrides:\n      child:\n        environment:\n          SECRET_VALUE: [{profile_secret}]\n"
+        ),
+    )
+    .expect("profile configuration writes");
+
+    let profile_error = resolve(ResolutionRequest::explicit_with_profiles(
+        &config,
+        vec!["profile".to_string()],
+    ))
+    .expect_err("invalid profile environment values fail");
+    assert!(profile_error.message.contains("profile 'profile'"));
+    assert!(profile_error.message.contains("SECRET_VALUE"));
+    assert!(!profile_error.message.contains(profile_secret));
+
+    fs::write(
+        &config,
+        "version: 1\nprocesses:\n  child:\n    command: [/bin/true]\n",
+    )
+    .expect("base configuration writes");
+    let local_secret = "local-secret-sentinel";
+    let local = directory.join("stackhand.local.yaml");
+    fs::write(
+        &local,
+        format!("processes:\n  child:\n    environment:\n      SECRET_VALUE: [{local_secret}]\n"),
+    )
+    .expect("local configuration writes");
+
+    let local_error = resolve(ResolutionRequest::Discover {
+        start_dir: Some(directory.clone()),
+        profiles: Vec::new(),
+    })
+    .expect_err("invalid local environment values fail");
+    assert!(
+        local_error
+            .message
+            .contains(&format!("local override '{}'", local.display()))
+    );
+    assert!(local_error.message.contains("SECRET_VALUE"));
+    assert!(!local_error.message.contains(local_secret));
+
+    fs::remove_dir_all(directory).ok();
+}
+
+#[test]
 fn later_environment_files_replace_earlier_values() {
     let directory = unique_directory("order");
     fs::write(directory.join("first.env"), "SHARED=first\nFIRST=first\n")
@@ -270,6 +343,111 @@ processes:
         )
     );
     assert!(!command_substitution_marker.exists());
+
+    fs::remove_dir_all(directory).ok();
+}
+
+#[test]
+fn layered_environment_precedence_and_removal_reach_a_real_child() {
+    let directory = unique_directory("layered");
+    fs::write(
+        directory.join("project.env"),
+        "LAYERED=project-file\nPROJECT_ONLY=project\nREMOVE_PROJECT=project\n",
+    )
+    .expect("project environment file writes");
+    fs::write(
+        directory.join("process.env"),
+        "LAYERED=process-file\nPROCESS_ONLY=process\nREMOVE_PROCESS=process\n",
+    )
+    .expect("Process environment file writes");
+    let config = directory.join("stackhand.yaml");
+    fs::write(
+        &config,
+        r#"version: 1
+env_files: [project.env]
+processes:
+  child:
+    env_files: [process.env]
+    environment:
+      LAYERED: base
+      BASE_ONLY: base
+      REMOVE_PARENT: null
+      REMOVE_BASE: base
+    command: [/bin/sh, -c, 'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$LAYERED" "$PROJECT_ONLY" "$PROCESS_ONLY" "$BASE_ONLY" "$PROFILE_ONLY" "$LOCAL_ONLY" "$PARENT_ONLY" "${REMOVE_PARENT-unset}" "${REMOVE_PROJECT-unset}" "${REMOVE_PROCESS-unset}" "${REMOVE_BASE-unset}" "${REMOVE_PROFILE-unset}"']
+profiles:
+  profile:
+    overrides:
+      child:
+        environment:
+          LAYERED: profile
+          REMOVE_PROJECT: null
+          REMOVE_BASE: null
+          REMOVE_PROFILE: profile
+          PROFILE_ONLY: profile
+"#,
+    )
+    .expect("layered configuration writes");
+    fs::write(
+        directory.join("stackhand.local.yaml"),
+        r#"processes:
+  child:
+    environment:
+      LAYERED: local
+      REMOVE_PROCESS: null
+      REMOVE_PROFILE: null
+      LOCAL_ONLY: local
+"#,
+    )
+    .expect("local override writes");
+
+    let resolution = resolve(ResolutionRequest::Discover {
+        start_dir: Some(directory.clone()),
+        profiles: vec!["profile".to_string()],
+    })
+    .expect("layered configuration resolves");
+    let process = &resolution.project().processes()[0];
+    assert_eq!(
+        process.env,
+        vec![
+            ("BASE_ONLY".to_string(), "base".to_string()),
+            ("LAYERED".to_string(), "local".to_string()),
+            ("LOCAL_ONLY".to_string(), "local".to_string()),
+            ("PROCESS_ONLY".to_string(), "process".to_string()),
+            ("PROFILE_ONLY".to_string(), "profile".to_string()),
+            ("PROJECT_ONLY".to_string(), "project".to_string()),
+        ]
+    );
+    assert_eq!(
+        process.env_remove,
+        vec![
+            "REMOVE_BASE".to_string(),
+            "REMOVE_PARENT".to_string(),
+            "REMOVE_PROCESS".to_string(),
+            "REMOVE_PROFILE".to_string(),
+            "REMOVE_PROJECT".to_string(),
+        ]
+    );
+
+    let CommandForm::Direct { program, args } = &process.command else {
+        panic!("the layered fixture uses a direct command");
+    };
+    let mut command = StdCommand::new(program);
+    command.args(args).current_dir(&process.working_dir);
+    command.env("LAYERED", "parent");
+    command.env("REMOVE_PARENT", "parent");
+    command.env("PARENT_ONLY", "parent");
+    for (key, value) in &process.env {
+        command.env(key, value);
+    }
+    for key in &process.env_remove {
+        command.env_remove(key);
+    }
+    let output = command.output().expect("layered real child starts");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("child output is UTF-8"),
+        "local|project|process|base|profile|local|parent|unset|unset|unset|unset|unset"
+    );
 
     fs::remove_dir_all(directory).ok();
 }

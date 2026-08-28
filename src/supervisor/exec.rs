@@ -144,6 +144,9 @@ fn exec_command(intent: &ProbeIntent) -> Result<(SpawnCommand, Vec<i32>), String
         spawn = spawn.arg(arg);
     }
     spawn = spawn.with_current_dir(working_dir.as_ref().unwrap_or(&context.working_dir).clone());
+    for key in &context.env_remove {
+        spawn = spawn.without_env(key.clone());
+    }
     for (key, value) in context.env.iter().chain(env) {
         spawn = spawn.with_env(key.clone(), value.clone());
     }
@@ -268,6 +271,7 @@ mod tests {
             exec_context: Some(ExecContext {
                 working_dir: std::env::temp_dir(),
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 shell: crate::model::ShellConfig::default(),
             }),
             scope: ProbeScope::Readiness,

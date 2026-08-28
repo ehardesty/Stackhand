@@ -31,6 +31,7 @@ fn one_shot_project(command: CommandForm) -> EffectiveProject {
         command,
         working_dir: std::env::temp_dir(),
         env: Vec::new(),
+        env_remove: Vec::new(),
         terminal_mode: TerminalMode::Pipe,
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
@@ -48,6 +49,7 @@ fn intent(program: &str, args: &[&str]) -> StartIntent {
         args: args.iter().map(OsString::from).collect(),
         working_dir: std::env::temp_dir(),
         env: Vec::new(),
+        env_remove: Vec::new(),
         initial_geometry: TerminalGeometry::DEFAULT,
         pty: false,
         log_matchers: Vec::new(),
@@ -82,6 +84,7 @@ fn real_log_project(marker_file: &std::path::Path) -> EffectiveProject {
             "STACKHAND_LOG_RUN".to_string(),
             marker_file.to_string_lossy().into_owned(),
         )],
+        env_remove: Vec::new(),
         terminal_mode: TerminalMode::Pipe,
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
@@ -156,6 +159,51 @@ fn natural_completion_reports_one_finished_run_after_spawn() {
     assert!(!finished.intentional_stop);
     assert!(finished.cleanup_confirmed);
     assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn real_pipe_run_removes_an_inherited_environment_key() {
+    assert!(
+        std::env::var_os("HOME").is_some(),
+        "test needs an inherited HOME"
+    );
+    let outputs = Arc::new(OutputViews::new(1));
+    let seam = RealRunSeam::new(Arc::clone(&outputs));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let events = SeamSender::new(tx);
+    let mut start = intent(
+        "/bin/sh",
+        &[
+            "-c",
+            "if [ -n \"${HOME-}\" ]; then printf present; else printf removed; fi",
+        ],
+    );
+    start.env_remove.push("HOME".to_string());
+
+    seam.start(start.clone(), &events);
+    let (_, finished) = receive_finished(&rx);
+    assert!(finished.cleanup_confirmed, "{finished:?}");
+
+    let output = outputs
+        .for_process_id(start.process_id)
+        .expect("the Process output exists");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = output.snapshot();
+        if snapshot.chunks.iter().any(|chunk| {
+            matches!(
+                chunk,
+                crate::output::RetainedChunk::Data { text, .. } if text.contains("removed")
+            )
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child retained the wrong environment: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]

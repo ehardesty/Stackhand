@@ -417,22 +417,29 @@ Common fields include:
 
 ### 15.5 Environment precedence
 
-For one process run, environment is assembled in this order:
+For one Process Run, environment changes are applied in this order:
 
 ```text
 parent process environment
-  < project env files, in listed order
-  < process env files, in listed order
-  < base process environment
-  < profile/local/CLI merged environment
+  < Project env files, in listed order
+  < Process env files, in listed order
+  < base Process environment
+  < each selected profile's inline environment, in CLI order
+  < local override inline environment
+  < future CLI inline environment
 ```
 
-A YAML `null` value removes an inherited variable from the final child environment:
+A later value replaces an earlier value for the same key. A YAML `null` value
+removes the key from the inherited environment and from every earlier layer.
+It does not print the removed or replacement value in diagnostics.
 
 ```yaml
 environment:
   SOME_INHERITED_SECRET: null
 ```
+
+The resolver passes explicit values to the child and passes removals to the
+process launcher. Other parent variables remain inherited.
 
 ### 15.6 Environment files
 

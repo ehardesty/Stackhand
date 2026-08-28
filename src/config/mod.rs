@@ -25,7 +25,7 @@ use serde_yaml::Value;
 
 use anyhow::Context;
 
-use self::env::{build_process_environment, load_files};
+use self::env::{build_process_environment, load_files, validate_shapes};
 use self::file::{
     CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
     TerminalFile,
@@ -208,7 +208,7 @@ fn load_file_with_local(
             "unsupported schema version {version}: this Stackhand reads version 1"
         )));
     }
-    reject_base_environment_nulls(&document)?;
+    validate_shapes(&document, "base Project")?;
     let file: ConfigFile = if profiles.is_empty() && local_path.is_none() {
         serde_yaml::from_str(&text)
             .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?
@@ -221,10 +221,18 @@ fn load_file_with_local(
             let local_document: Value = serde_yaml::from_str(&local_text).map_err(|error| {
                 config_error(anyhow::anyhow!(format_local_yaml_error(local_path, &error)))
             })?;
+            if let Some(processes) = local_document
+                .as_mapping()
+                .and_then(|root| root.get(Value::String("processes".to_string())))
+            {
+                let source = format!("local override '{}'", local_path.display());
+                self::env::validate_process_overrides(processes, &source)?;
+            }
             apply_local_override(&mut document, &local_document).map_err(|error| ConfigError {
                 message: format!("local override '{}': {error}", local_path.display()),
             })?;
         }
+        validate_shapes(&document, "merged Project")?;
         let merged = serde_yaml::to_string(&document)
             .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
         serde_yaml::from_str(&merged)
@@ -297,54 +305,6 @@ fn read_version(document: &Value) -> Result<u64, ConfigError> {
     serde_yaml::from_value(version.clone()).map_err(|error| ConfigError {
         message: format!("configuration version must be an unsigned integer: {error}"),
     })
-}
-
-fn reject_base_environment_nulls(document: &Value) -> Result<(), ConfigError> {
-    let Some(processes) = document
-        .as_mapping()
-        .and_then(|root| root.get(Value::String("processes".to_string())))
-        .and_then(Value::as_mapping)
-    else {
-        return Ok(());
-    };
-    for (name, process) in processes {
-        let Some(name) = name.as_str() else {
-            continue;
-        };
-        reject_environment_nulls(process, name)?;
-    }
-    Ok(())
-}
-
-fn reject_environment_nulls(value: &Value, process_name: &str) -> Result<(), ConfigError> {
-    match value {
-        Value::Mapping(mapping) => {
-            if let Some(environment) = mapping.get(Value::String("environment".to_string()))
-                && let Some(entries) = environment.as_mapping()
-            {
-                for (name, value) in entries {
-                    if value.is_null() {
-                        let name = name.as_str().unwrap_or("<non-string>");
-                        return Err(ConfigError {
-                            message: format!(
-                                "Process '{process_name}': environment variable '{name}' must be a string"
-                            ),
-                        });
-                    }
-                }
-            }
-            for child in mapping.values() {
-                reject_environment_nulls(child, process_name)?;
-            }
-        }
-        Value::Sequence(values) => {
-            for child in values {
-                reject_environment_nulls(child, process_name)?;
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Tagged(_) => {}
-    }
-    Ok(())
 }
 
 fn discover_local_override(base: &Path) -> Option<PathBuf> {
@@ -720,7 +680,7 @@ fn build_spec(
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
     let restart = build_restart(&name, process.restart.as_ref())?;
-    let env = build_process_environment(process, &name, base_dir, project_environment)?;
+    let environment = build_process_environment(process, &name, base_dir, project_environment)?;
     Ok(ProcessSpec {
         name,
         kind,
@@ -730,7 +690,8 @@ fn build_spec(
         restart,
         command: command_form,
         working_dir,
-        env,
+        env: environment.values,
+        env_remove: environment.removals,
         terminal_mode,
         input_policy,
         dependencies,

@@ -277,6 +277,32 @@ fn config_validate_does_not_select_a_profile_without_the_option() {
 }
 
 #[test]
+fn config_validate_does_not_print_environment_values() {
+    let root = unique_directory("environment-redaction");
+    let config = root.join("project.yaml");
+    let environment = root.join("project.env");
+    const SECRET: &str = "config-validation-secret-sentinel";
+    fs::write(&environment, format!("BAD-KEY={SECRET}\n"))
+        .expect("invalid environment file writes");
+    fs::write(
+        &config,
+        "version: 1\nenv_files: [project.env]\nprocesses:\n  web:\n    command: [/bin/true]\n",
+    )
+    .expect("configuration writes");
+
+    let invalid = run_validate(&root, Some(&config));
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert!(!String::from_utf8_lossy(&invalid.stdout).contains(SECRET));
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains(SECRET));
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("BAD-KEY")
+            && String::from_utf8_lossy(&invalid.stderr).contains("line 1")
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn config_validate_applies_repeated_profiles_in_cli_order() {
     let root = unique_directory("profile-order");
     let config = root.join("project.yaml");

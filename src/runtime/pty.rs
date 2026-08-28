@@ -21,6 +21,7 @@ pub struct SpawnCommand {
     args: Vec<OsString>,
     current_dir: Option<std::path::PathBuf>,
     envs: Vec<(OsString, OsString)>,
+    env_removals: Vec<OsString>,
 }
 
 impl SpawnCommand {
@@ -30,6 +31,7 @@ impl SpawnCommand {
             args: Vec::new(),
             current_dir: None,
             envs: Vec::new(),
+            env_removals: Vec::new(),
         }
     }
 
@@ -56,12 +58,21 @@ impl SpawnCommand {
         self
     }
 
+    pub fn without_env(mut self, key: impl Into<OsString>) -> Self {
+        self.env_removals.push(key.into());
+        self
+    }
+
     pub(crate) fn current_dir(&self) -> Option<&std::path::Path> {
         self.current_dir.as_deref()
     }
 
     pub(crate) fn envs(&self) -> &[(OsString, OsString)] {
         &self.envs
+    }
+
+    pub(crate) fn env_removals(&self) -> &[OsString] {
+        &self.env_removals
     }
 }
 
@@ -112,6 +123,9 @@ impl PtyProcess {
         }
         if let Some(dir) = &command.current_dir {
             builder.cwd(dir);
+        }
+        for key in command.env_removals {
+            builder.env_remove(key);
         }
         for (key, value) in command.envs {
             builder.env(key, value);

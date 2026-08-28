@@ -184,6 +184,9 @@ impl PipeRun {
         if let Some(dir) = command.current_dir() {
             cmd.current_dir(dir);
         }
+        for key in command.env_removals() {
+            cmd.env_remove(key);
+        }
         for (key, value) in command.envs() {
             cmd.env(key, value);
         }

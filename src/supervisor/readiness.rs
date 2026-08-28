@@ -252,6 +252,7 @@ impl Core {
         let exec_context = matches!(&probe, ReadinessProbe::Exec { .. }).then(|| ExecContext {
             working_dir: self.project.processes()[index].working_dir.clone(),
             env: self.project.processes()[index].env.clone(),
+            env_remove: self.project.processes()[index].env_remove.clone(),
             shell: self.project.shell().clone(),
         });
         let process_id = self.entries[index].process_id;

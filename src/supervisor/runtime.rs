@@ -407,6 +407,9 @@ fn build_command(intent: &StartIntent) -> SpawnCommand {
         command = command.arg(arg.clone());
     }
     command = command.with_current_dir(intent.working_dir.clone());
+    for key in &intent.env_remove {
+        command = command.without_env(key.clone());
+    }
     for (key, value) in &intent.env {
         command = command.with_env(key.clone(), value.clone());
     }

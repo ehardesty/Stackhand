@@ -304,8 +304,8 @@ profiles:
 }
 
 #[test]
-fn base_environment_nulls_are_rejected_before_profile_merge() {
-    let error = write_and_load_with_profiles(
+fn base_environment_nulls_remove_inherited_environment_values() {
+    let project = write_and_load_with_profiles(
         "base-null-environment",
         "version: 1
 processes:
@@ -322,13 +322,9 @@ profiles:
 ",
         &[],
     )
-    .expect_err("base environment values must be strings");
-    assert!(
-        error
-            .message
-            .contains("environment variable 'MISSING' must be a string"),
-        "{error}"
-    );
+    .expect("base environment nulls are removal instructions");
+    assert!(project.processes()[0].env.is_empty());
+    assert_eq!(project.processes()[0].env_remove, ["MISSING"]);
 }
 
 #[test]

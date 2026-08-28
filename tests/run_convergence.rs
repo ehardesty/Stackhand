@@ -117,6 +117,7 @@ fn service(
         command,
         working_dir: std::env::temp_dir(),
         env: Vec::new(),
+        env_remove: Vec::new(),
         terminal_mode: TerminalMode::Pipe,
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),

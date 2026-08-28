@@ -264,7 +264,10 @@ pub struct ProcessSpec {
     /// Absolute working directory. Relative paths are resolved by
     /// configuration before this model exists.
     pub working_dir: PathBuf,
+    /// Environment values that replace inherited values for this Process.
     pub env: Vec<(String, String)>,
+    /// Environment keys removed from the inherited parent environment.
+    pub env_remove: Vec<String>,
     pub terminal_mode: TerminalMode,
     /// Consumed by TUI input routing through ProcessSnapshot.input_focused;
     /// configuration validation covers it in Issue #23.
@@ -536,6 +539,7 @@ mod tests {
             },
             working_dir: std::env::temp_dir(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             terminal_mode: TerminalMode::Pipe,
             input_policy: InputPolicy::Disabled,
             dependencies: Vec::new(),

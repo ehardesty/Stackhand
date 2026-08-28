@@ -196,7 +196,10 @@ pub struct StartIntent {
     /// Absolute working directory. Consumed by the production adapter once
     /// the Run interface accepts it (Issue #22).
     pub working_dir: std::path::PathBuf,
+    /// Values that replace inherited parent environment values.
     pub env: Vec<(String, String)>,
+    /// Keys removed from the inherited parent environment.
+    pub env_remove: Vec<String>,
     /// The PTY geometry of the rendered console pane at request time.
     pub initial_geometry: TerminalGeometry,
     pub pty: bool,
@@ -243,6 +246,7 @@ pub(crate) trait RunSeam: Send {
 pub(crate) struct ExecContext {
     pub(crate) working_dir: PathBuf,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) env_remove: Vec<String>,
     pub(crate) shell: ShellConfig,
 }
 

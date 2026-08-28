@@ -245,6 +245,7 @@ impl Core {
             matches!(&check_config.probe, ReadinessProbe::Exec { .. }).then(|| ExecContext {
                 working_dir: self.project.processes()[index].working_dir.clone(),
                 env: self.project.processes()[index].env.clone(),
+                env_remove: self.project.processes()[index].env_remove.clone(),
                 shell: self.project.shell().clone(),
             });
         if matches!(check_config.probe, ReadinessProbe::Log { .. }) {

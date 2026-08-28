@@ -524,6 +524,7 @@ impl Core {
             args,
             working_dir: spec.working_dir.clone(),
             env: spec.env.clone(),
+            env_remove: spec.env_remove.clone(),
             initial_geometry: self.initial_geometry,
             pty: matches!(spec.terminal_mode, crate::model::TerminalMode::Pty),
             log_matchers,

@@ -1,6 +1,7 @@
 use serde_yaml::{Mapping, Value};
 
 use super::ConfigError;
+use super::env::validate_process_overrides;
 
 /// Apply the explicitly selected profiles to one raw configuration document.
 ///
@@ -114,6 +115,7 @@ fn apply_profile(
         merge_root_field(document, "settings", settings.clone())?;
     }
     if let Some(overrides) = profile.get(yaml_key("overrides")) {
+        validate_process_overrides(overrides, &format!("profile '{requested}'"))?;
         apply_process_overrides(document, overrides, requested)?;
     }
 
