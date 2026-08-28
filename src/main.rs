@@ -1,11 +1,18 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 fn main() -> Result<()> {
     match parse_mode(std::env::args_os().skip(1))? {
-        Mode::Project(path) => stackhand::run_project(&path),
+        Mode::Project(Some(path)) => stackhand::run_project(&path),
+        Mode::Project(None) => stackhand::run_discovered_project(),
+        Mode::ConfigValidate(path) => {
+            let base = stackhand::validate_project(path.as_deref())
+                .map_err(|error| anyhow!("configuration error: {error}"))?;
+            println!("Project configuration is valid: {}", base.display());
+            Ok(())
+        }
         Mode::FixtureProject(path) => stackhand::project_fixture::run(&path),
         Mode::FixtureRoundTrip(text) => stackhand::prototype::run_fixture_round_trip(&text),
         Mode::FixtureInput => stackhand::prototype::run_fixture_input(),
@@ -19,7 +26,8 @@ fn main() -> Result<()> {
 }
 
 enum Mode {
-    Project(PathBuf),
+    Project(Option<PathBuf>),
+    ConfigValidate(Option<PathBuf>),
     FixtureProject(PathBuf),
     FixtureRoundTrip(String),
     FixtureInput,
@@ -33,8 +41,20 @@ enum Mode {
 
 fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
     let Some(first) = args.next() else {
-        bail!("usage: stackhand <project.yaml> (or --fixture-* modes)");
+        return Ok(Mode::Project(None));
     };
+
+    if first == "config" {
+        let command = args.next().context("config requires a subcommand")?;
+        if command != "validate" {
+            bail!("unknown config command: {}", command.to_string_lossy());
+        }
+        let path = args.next().map(PathBuf::from);
+        if args.next().is_some() {
+            bail!("config validate accepts at most one Project path");
+        }
+        return Ok(Mode::ConfigValidate(path));
+    }
 
     if first == "--fixture-project" {
         let path = args
@@ -111,5 +131,5 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
         bail!("only one Project file is accepted");
     }
 
-    Ok(Mode::Project(PathBuf::from(first)))
+    Ok(Mode::Project(Some(PathBuf::from(first))))
 }

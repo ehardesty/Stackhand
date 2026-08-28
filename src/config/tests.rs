@@ -1,6 +1,6 @@
 use super::*;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn write_and_load(label: &str, yaml: &str) -> Result<EffectiveProject, ConfigError> {
     let dir = std::env::temp_dir().join(format!("stackhand-config-{label}"));
@@ -69,6 +69,38 @@ fn explicit_resolution_returns_the_selected_base_source() {
     assert_eq!(resolution.project().processes().len(), 1);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn discovery_uses_the_nearest_base_file_without_git_state() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("stackhand-config-discovery-{unique}"));
+    let nested = root.join("nested").join("deep");
+    fs::create_dir_all(&nested).expect("discovery directories create");
+    let config = "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n";
+    fs::write(root.join(BASE_FILE_NAME), config).expect("root config writes");
+    fs::write(nested.join(BASE_FILE_NAME), config).expect("nested config writes");
+
+    let resolution =
+        resolve(ResolutionRequest::discover_from(&nested)).expect("discovery succeeds");
+    assert_eq!(resolution.sources.base, nested.join(BASE_FILE_NAME));
+
+    let missing_root = std::env::temp_dir().join(format!("stackhand-config-missing-{unique}"));
+    let missing_start = missing_root.join("nested");
+    fs::create_dir_all(&missing_start).expect("missing discovery directory creates");
+    let error = resolve(ResolutionRequest::discover_from(&missing_start))
+        .expect_err("missing base config must fail");
+    assert!(error.message.contains(BASE_FILE_NAME), "{error}");
+    assert!(
+        error.message.contains(&missing_start.display().to_string()),
+        "{error}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&missing_root);
 }
 
 #[test]

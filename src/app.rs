@@ -29,13 +29,22 @@ const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
 /// One shared bound for waiting out every Run's existing shutdown ladder.
 const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
-/// Load the Project, start enabled autostart Processes, and supervise them
-/// interactively until the user quits with a controlled Project shutdown.
+/// Load the explicit Project, start enabled autostart Processes, and
+/// supervise them interactively until the user quits with a controlled
+/// Project shutdown.
 pub fn run_project(config_path: &Path) -> Result<()> {
+    run_resolved(crate::config::ResolutionRequest::explicit(config_path))
+}
+
+/// Discover the nearest base Project, then run it interactively.
+pub fn run_discovered_project() -> Result<()> {
+    run_resolved(crate::config::ResolutionRequest::discover())
+}
+
+fn run_resolved(request: crate::config::ResolutionRequest) -> Result<()> {
     // Invalid configuration starts no Processes and never enters the TUI.
     let resolution =
-        crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
-            .map_err(|error| anyhow!("configuration error: {error}"))?;
+        crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     supervisor.command(Command::StartAutostart);
 

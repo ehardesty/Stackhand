@@ -23,4 +23,5 @@ mod sync_fixture;
 mod terminal;
 mod tui;
 
-pub use app::run_project;
+pub use app::{run_discovered_project, run_project};
+pub use config::validate_project;

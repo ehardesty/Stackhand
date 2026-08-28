@@ -26,19 +26,31 @@ use crate::model::{
 };
 
 const MAX_EXIT_CODE: i32 = 255;
+pub const BASE_FILE_NAME: &str = "stackhand.yaml";
 
 /// One request to resolve a Project before the Supervisor starts.
 #[derive(Clone, Debug)]
-pub struct ResolutionRequest {
-    /// An explicit base Project path. Discovery is intentionally added by a
-    /// later milestone rather than being hidden in this request.
-    pub project_path: PathBuf,
+pub enum ResolutionRequest {
+    /// Use exactly this Project path. No base-file discovery is performed.
+    Explicit(PathBuf),
+    /// Search for the nearest base file. `None` starts at the current
+    /// directory; `Some` is useful for deterministic callers and tests.
+    Discover { start_dir: Option<PathBuf> },
 }
 
 impl ResolutionRequest {
     pub fn explicit(path: impl Into<PathBuf>) -> Self {
-        Self {
-            project_path: path.into(),
+        Self::Explicit(path.into())
+    }
+
+    pub fn discover() -> Self {
+        Self::Discover { start_dir: None }
+    }
+
+    #[cfg(test)]
+    pub fn discover_from(path: impl Into<PathBuf>) -> Self {
+        Self::Discover {
+            start_dir: Some(path.into()),
         }
     }
 }
@@ -53,7 +65,6 @@ pub struct ResolutionSources {
 #[derive(Debug)]
 pub struct ProjectResolution {
     project: EffectiveProject,
-    #[allow(dead_code)]
     pub sources: ResolutionSources,
 }
 
@@ -70,10 +81,12 @@ impl ProjectResolution {
 
 /// Resolve and validate one Project before any Process starts.
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
-    let path = request.project_path;
-    let base = absolute_normalized_path(&path)
-        .with_context(|| format!("could not resolve Project path {}", path.display()))
-        .map_err(config_error)?;
+    let base = match request {
+        ResolutionRequest::Explicit(path) => absolute_normalized_path(&path)
+            .with_context(|| format!("could not resolve Project path {}", path.display()))
+            .map_err(config_error)?,
+        ResolutionRequest::Discover { start_dir } => discover_base(start_dir.as_deref())?,
+    };
     let project = load_file(&base)?;
     Ok(ProjectResolution {
         project,
@@ -87,6 +100,15 @@ pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigEr
 #[allow(dead_code)]
 pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
     resolve(ResolutionRequest::explicit(path)).map(ProjectResolution::into_project)
+}
+
+/// Resolve and validate a Project without starting the Supervisor. When no
+/// path is provided, use the nearest discovered base file.
+pub fn validate_project(explicit_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let request = explicit_path.map_or_else(ResolutionRequest::discover, |path| {
+        ResolutionRequest::explicit(path)
+    });
+    resolve(request).map(|resolution| resolution.sources.base)
 }
 
 fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
@@ -148,6 +170,31 @@ fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
             config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
     })
+}
+
+fn discover_base(start_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let starting_path = match start_dir {
+        Some(path) => absolute_normalized_path(path),
+        None => std::env::current_dir()
+            .map(normalize_path)
+            .map_err(Into::into),
+    }
+    .with_context(|| "could not determine the Project discovery directory")
+    .map_err(config_error)?;
+    let mut directory = starting_path.clone();
+    loop {
+        let candidate = directory.join(BASE_FILE_NAME);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        if !directory.pop() {
+            break;
+        }
+    }
+    Err(config_error(anyhow::anyhow!(
+        "could not find {BASE_FILE_NAME} from starting directory '{}'; checked that directory and each parent",
+        starting_path.display()
+    )))
 }
 
 fn absolute_normalized_path(path: &Path) -> anyhow::Result<PathBuf> {

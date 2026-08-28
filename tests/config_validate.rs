@@ -1,0 +1,156 @@
+use assert_cmd::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_directory(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("stackhand-cli-{label}-{unique}"));
+    fs::create_dir_all(&directory).expect("test directory creates");
+    directory
+}
+
+fn write_valid_project(path: &Path) {
+    fs::write(
+        path,
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n",
+    )
+    .expect("project config writes");
+}
+
+fn run_validate(directory: &Path, path: Option<&Path>) -> std::process::Output {
+    let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
+    command.current_dir(directory).args(["config", "validate"]);
+    if let Some(path) = path {
+        command.arg(path);
+    }
+    command.output().expect("config validate runs")
+}
+
+#[test]
+fn config_validate_discovers_the_nearest_base_file() {
+    let root = unique_directory("discover");
+    let nested = root.join("nested").join("deep");
+    fs::create_dir_all(&nested).expect("nested directories create");
+    write_valid_project(&root.join("stackhand.yaml"));
+    write_valid_project(&nested.join("stackhand.yaml"));
+
+    let output = run_validate(&nested, None);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&nested.join("stackhand.yaml").display().to_string()),
+        "{stdout}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_uses_an_explicit_path_without_discovery() {
+    let root = unique_directory("explicit");
+    let current = root.join("current");
+    let explicit = root.join("other").join("project.yaml");
+    fs::create_dir_all(&current).expect("current directory creates");
+    fs::create_dir_all(explicit.parent().expect("explicit parent exists"))
+        .expect("explicit directory creates");
+    fs::write(
+        current.join("stackhand.yaml"),
+        "version: 2\nprocesses: {}\n",
+    )
+    .expect("discovered config writes");
+    write_valid_project(&explicit);
+
+    let output = run_validate(&current, Some(&explicit));
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&explicit.display().to_string()), "{stdout}");
+    assert!(!stdout.contains(&current.join("stackhand.yaml").display().to_string()));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_reports_a_missing_base_file_and_starting_directory() {
+    let root = unique_directory("missing");
+    let start = root.join("nested");
+    fs::create_dir_all(&start).expect("starting directory creates");
+
+    let output = run_validate(&start, None);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stackhand.yaml"), "{stderr}");
+    assert!(stderr.contains(&start.display().to_string()), "{stderr}");
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_rejects_extra_paths_with_a_failure_status() {
+    let root = unique_directory("extra-paths");
+    let first = root.join("first.yaml");
+    let second = root.join("second.yaml");
+    write_valid_project(&first);
+    write_valid_project(&second);
+
+    let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
+    let output = command
+        .current_dir(&root)
+        .args(["config", "validate"])
+        .arg(&first)
+        .arg(&second)
+        .output()
+        .expect("config validate runs");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("at most one Project path"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_does_not_start_a_process() {
+    let root = unique_directory("invalid");
+    let marker = root.join("started.marker");
+    let config = root.join("project.yaml");
+    let shell = format!(": > {}", marker.display());
+    fs::write(
+        &config,
+        format!("version: 1\nprocesses:\n  web:\n    shell: \"{shell}\"\n"),
+    )
+    .expect("invalid-test config writes");
+
+    let output = run_validate(&root, Some(&config));
+    assert!(output.status.success(), "{output:?}");
+    assert!(!marker.exists(), "config validate started a Process");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&config.display().to_string()),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_keeps_invalid_schema_errors_on_stderr() {
+    let root = unique_directory("invalid-schema");
+    let config = root.join("project.yaml");
+    fs::write(&config, "version: 2\nprocesses: {}\n").expect("invalid config writes");
+
+    let output = run_validate(&root, Some(&config));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported schema version 2"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
