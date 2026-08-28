@@ -91,15 +91,14 @@ fn fixture_config(
     format!(
         r#"version: 1
 processes:
-  - name: started-dependent
+  started-dependent:
     kind: service
     terminal: pipe
     depends_on:
-      - name: started-source
-        condition: started
+      started-source: started
     command:
       shell: {started_dependent}
-  - name: started-source
+  started-source:
     kind: service
     terminal: pipe
     command:
@@ -107,14 +106,13 @@ processes:
       args:
         - "-c"
         - {started_source}
-  - name: hello
+  hello:
     kind: service
     terminal: pty
     input: focused
     working_dir: ./web
     depends_on:
-      - name: all-ready
-        condition: ready
+      all-ready: ready
     env:
       FIXTURE_TOKEN: stackhand-env-ok
     command:
@@ -122,13 +120,13 @@ processes:
       args:
         - "-c"
         - {hello}
-  - name: shelled
+  shelled:
     kind: service
     terminal: pty
     input: focused
     command:
       shell: {shelled}
-  - name: piped
+  piped:
     kind: service
     terminal: pipe
     command:
@@ -136,23 +134,23 @@ processes:
       args:
         - "-c"
         - {piped}
-  - name: noisy
+  noisy:
     kind: service
     terminal: pipe
     command:
       shell: {noisy}
-  - name: manual
+  manual:
     kind: service
     autostart: false
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: off
+  off:
     kind: service
     enabled: false
     command:
       program: /bin/true
-  - name: accepted
+  accepted:
     kind: one-shot
     terminal: pipe
     success_exit_codes: [42]
@@ -161,46 +159,43 @@ processes:
       args:
         - "-c"
         - {accepted}
-  - name: completed-dependent
+  completed-dependent:
     kind: service
     terminal: pipe
     depends_on:
-      - name: accepted
-        condition: completed_successfully
+      accepted: completed_successfully
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: exited-dependent
+  exited-dependent:
     kind: service
     terminal: pipe
     depends_on:
-      - name: exited-source
-        condition: exited
+      exited-source: exited
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: exited-source
+  exited-source:
     kind: one-shot
     terminal: pipe
     command:
       shell: {exited}
-  - name: rerun-dependent
+  rerun-dependent:
     kind: service
     terminal: pipe
     depends_on:
-      - name: rerun-setup
-        condition: completed_successfully
+      rerun-setup: completed_successfully
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: rerun-setup
+  rerun-setup:
     kind: one-shot
     terminal: pipe
     env:
       RERUN_MARKER: {rerun_marker}
     command:
       shell: {rerun}
-  - name: tcp-ready
+  tcp-ready:
     kind: service
     terminal: pipe
     ready:
@@ -212,7 +207,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: http-ready
+  http-ready:
     kind: service
     terminal: pipe
     ready:
@@ -223,7 +218,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: exec-ready
+  exec-ready:
     kind: service
     terminal: pipe
     ready:
@@ -238,7 +233,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: log-ready
+  log-ready:
     kind: service
     terminal: pipe
     ready:
@@ -248,7 +243,7 @@ processes:
       timeout: 500ms
     command:
       shell: {log_ready}
-  - name: all-ready
+  all-ready:
     kind: service
     terminal: pipe
     ready:
@@ -265,16 +260,15 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: ready-dependent
+  ready-dependent:
     kind: service
     terminal: pipe
     depends_on:
-      - name: recovering
-        condition: ready
+      recovering: ready
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: recovering
+  recovering:
     kind: service
     terminal: pipe
     ready:
@@ -286,7 +280,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: liveness-recover
+  liveness-recover:
     kind: service
     terminal: pipe
     liveness:
@@ -297,7 +291,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: liveness-restart
+  liveness-restart:
     kind: service
     terminal: pipe
     restart:
@@ -313,7 +307,7 @@ processes:
     command:
       program: /bin/sleep
       args: ["60"]
-  - name: budget
+  budget:
     kind: service
     terminal: pipe
     restart:
@@ -322,7 +316,7 @@ processes:
       max_restarts: 2
     command:
       shell: {budget}
-  - name: shutdown-restart
+  shutdown-restart:
     kind: service
     terminal: pipe
     restart:
@@ -331,7 +325,7 @@ processes:
       max_restarts: 2
     command:
       shell: {shutdown_restart}
-  - name: startup-timeout
+  startup-timeout:
     kind: service
     terminal: pipe
     ready:

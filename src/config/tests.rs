@@ -295,6 +295,175 @@ processes:
 }
 
 #[test]
+fn keyed_processes_and_dependencies_preserve_order_and_conditions() {
+    let project = write_and_load(
+        "keyed",
+        "version: 1
+processes:
+  web:
+    kind: service
+    depends_on:
+      started-service: started
+      ready-service: ready
+      exited-source: exited
+      completed-source: completed_successfully
+    command: {program: /bin/true}
+  started-service:
+    command: {program: /bin/true}
+  ready-service:
+    command: {program: /bin/true}
+  exited-source:
+    kind: one-shot
+    command: {program: /bin/true}
+  completed-source:
+    kind: one-shot
+    command: {program: /bin/true}
+",
+    )
+    .expect("keyed configuration is valid");
+
+    let names: Vec<_> = project
+        .processes()
+        .iter()
+        .map(|process| process.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "web",
+            "started-service",
+            "ready-service",
+            "exited-source",
+            "completed-source"
+        ]
+    );
+    assert_eq!(
+        project.processes()[0].dependencies,
+        vec![
+            DependencySpec {
+                name: "started-service".to_string(),
+                condition: DependencyCondition::Started,
+            },
+            DependencySpec {
+                name: "ready-service".to_string(),
+                condition: DependencyCondition::Ready,
+            },
+            DependencySpec {
+                name: "exited-source".to_string(),
+                condition: DependencyCondition::Exited,
+            },
+            DependencySpec {
+                name: "completed-source".to_string(),
+                condition: DependencyCondition::CompletedSuccessfully,
+            },
+        ]
+    );
+}
+
+#[test]
+fn keyed_process_map_owns_the_process_name() {
+    let project = write_and_load(
+        "keyed-name",
+        "version: 1
+processes:
+  web:
+    command: {program: /bin/true}
+",
+    )
+    .expect("a keyed Process does not need a nested name");
+    assert_eq!(project.processes()[0].name, "web");
+}
+
+#[test]
+fn keyed_process_name_mismatches_are_rejected() {
+    let error = write_and_load(
+        "keyed-name-mismatch",
+        "version: 1
+processes:
+  web:
+    name: api
+    command: {program: /bin/true}
+",
+    )
+    .expect_err("a keyed Process cannot declare a different name");
+    assert!(
+        error
+            .message
+            .contains("Process map key 'web' does not match its declared name 'api'"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keyed_dependency_name_mismatches_are_rejected() {
+    let error = write_and_load(
+        "keyed-dependency-name-mismatch",
+        "version: 1
+processes:
+  web:
+    depends_on:
+      db:
+        name: cache
+        condition: started
+    command: {program: /bin/true}
+  db:
+    command: {program: /bin/true}
+",
+    )
+    .expect_err("a keyed Dependency cannot declare a different name");
+    assert!(
+        error
+            .message
+            .contains("Dependency map key 'db' does not match its declared name 'cache'"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keyed_dependency_conditions_use_the_same_validation_as_legacy_entries() {
+    let error = write_and_load(
+        "keyed-dependency-condition",
+        "version: 1
+processes:
+  web:
+    depends_on:
+      db: waiting
+    command: {program: /bin/true}
+  db:
+    command: {program: /bin/true}
+",
+    )
+    .expect_err("an unsupported keyed Dependency condition must fail");
+    assert!(
+        error.message.contains("unsupported condition 'waiting'"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn duplicate_keyed_process_names_are_rejected() {
+    let error = write_and_load(
+        "keyed-dup",
+        "version: 1
+processes:
+  web:
+    command: {program: /bin/true}
+  web:
+    command: {program: /bin/true}
+",
+    )
+    .expect_err("duplicate keyed names must fail");
+    assert!(
+        error.message.contains("duplicate Process name 'web'"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn duplicate_names_are_rejected() {
     let error = write_and_load(
             "dup",

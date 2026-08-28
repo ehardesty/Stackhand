@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
@@ -100,8 +101,28 @@ fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
     let shell = build_shell(file.settings.as_ref())?;
     let processes = file
         .processes
-        .iter()
-        .map(|process| build_spec(process, base_dir))
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let ProcessEntry { key, mut process } = entry;
+            let declared_name = process.name.take();
+            let name = match (key, declared_name) {
+                (Some(key), None) => key,
+                (Some(key), Some(declared_name)) if key == declared_name => key,
+                (Some(key), Some(declared_name)) => {
+                    return Err(config_error(anyhow::anyhow!(
+                        "Process map key '{key}' does not match its declared name '{declared_name}'"
+                    )));
+                }
+                (None, Some(name)) => name,
+                (None, None) => {
+                    return Err(config_error(anyhow::anyhow!(
+                        "each Process entry must define a 'name'"
+                    )));
+                }
+            };
+            build_spec(&process, name, base_dir)
+        })
         .collect::<Result<Vec<_>, ConfigError>>()?;
     EffectiveProject::with_shell(processes, shell).map_err(|error| match error {
         crate::model::ProjectError::DuplicateName(name) => {
@@ -317,8 +338,11 @@ fn build_command_form(command: &CommandFile) -> Result<CommandForm, String> {
     }
 }
 
-fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, ConfigError> {
-    let name = process.name.clone();
+fn build_spec(
+    process: &ProcessFile,
+    name: String,
+    base_dir: &Path,
+) -> Result<ProcessSpec, ConfigError> {
     let fail = |message: String| Err(ConfigError { message });
     let kind = match process.kind.as_deref() {
         None | Some("service") => ProcessKind::Service,
@@ -371,6 +395,7 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
     let dependencies = match &process.depends_on {
         None => Vec::new(),
         Some(entries) => entries
+            .entries
             .iter()
             .enumerate()
             .map(|(index, entry)| build_dependency(&name, index, entry))
@@ -411,22 +436,51 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
     })
 }
 
-/// One `depends_on` entry: a plain Process name (`started` condition) or an
-/// explicit `{name, condition}` mapping.
+/// One `depends_on` entry: a legacy sequence entry or a canonical keyed
+/// entry whose map key is the dependency Process name.
 fn build_dependency(
     process_name: &str,
     index: usize,
-    entry: &serde_yaml::Value,
+    entry: &DependencyEntry,
 ) -> Result<DependencySpec, ConfigError> {
-    let fail = |detail: String| {
-        Err(ConfigError {
-            message: format!(
-                "Process '{process_name}': invalid depends_on entry {index}: {detail}"
-            ),
-        })
+    let fail = |detail: String| Err(dependency_error(process_name, index, detail));
+    let (name, condition) = match entry.key.as_deref() {
+        Some(name) => keyed_dependency_parts(name, &entry.value, &fail)?,
+        None => legacy_dependency_parts(&entry.value, &fail)?,
     };
-    let (name, condition) = match entry {
-        serde_yaml::Value::String(name) => (name.clone(), None),
+    let condition = match condition.as_deref() {
+        None | Some("started") => DependencyCondition::Started,
+        Some("ready") => DependencyCondition::Ready,
+        // Kind honesty is enforced later against the full Process list: a
+        // One-shot dependency supports `exited` and
+        // `completed_successfully`, a Service dependency supports `ready`.
+        Some("exited") => DependencyCondition::Exited,
+        Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
+        Some(other) => {
+            return Err(dependency_error(
+                process_name,
+                index,
+                format!(
+                    "unsupported condition '{other}' (this Stackhand supports 'started', 'ready', 'exited', and 'completed_successfully')"
+                ),
+            ));
+        }
+    };
+    Ok(DependencySpec { name, condition })
+}
+
+fn dependency_error(process_name: &str, index: usize, detail: String) -> ConfigError {
+    ConfigError {
+        message: format!("Process '{process_name}': invalid depends_on entry {index}: {detail}"),
+    }
+}
+
+fn legacy_dependency_parts(
+    entry: &serde_yaml::Value,
+    fail: &impl Fn(String) -> Result<(String, Option<String>), ConfigError>,
+) -> Result<(String, Option<String>), ConfigError> {
+    match entry {
+        serde_yaml::Value::String(name) => Ok((name.clone(), None)),
         serde_yaml::Value::Mapping(map) => {
             let mut name = None;
             let mut condition = None;
@@ -447,32 +501,55 @@ fn build_dependency(
                 }
             }
             match name {
-                Some(name) => (name, condition),
-                None => return fail("a mapping entry requires 'name'".to_string()),
+                Some(name) => Ok((name, condition)),
+                None => fail("a mapping entry requires 'name'".to_string()),
             }
         }
-        other => {
-            return fail(format!(
-                "use a Process name or a {{name, condition}} mapping, got {other:?}"
-            ));
+        other => fail(format!(
+            "use a Process name or a {{name, condition}} mapping, got {other:?}"
+        )),
+    }
+}
+
+fn keyed_dependency_parts(
+    name: &str,
+    value: &serde_yaml::Value,
+    fail: &impl Fn(String) -> Result<(String, Option<String>), ConfigError>,
+) -> Result<(String, Option<String>), ConfigError> {
+    match value {
+        serde_yaml::Value::String(condition) => Ok((name.to_string(), Some(condition.clone()))),
+        serde_yaml::Value::Mapping(map) => {
+            let mut declared_name = None;
+            let mut condition = None;
+            for (key, value) in map {
+                let serde_yaml::Value::String(key) = key else {
+                    return fail(format!("mapping keys must be strings, got {key:?}"));
+                };
+                match key.as_str() {
+                    "name" => match value.as_str() {
+                        Some(value) => declared_name = Some(value),
+                        None => return fail("'name' must be a string".to_string()),
+                    },
+                    "condition" => match value.as_str() {
+                        Some(value) => condition = Some(value.to_string()),
+                        None => return fail("'condition' must be a string".to_string()),
+                    },
+                    other => return fail(format!("unknown field '{other}'")),
+                }
+            }
+            if let Some(declared_name) = declared_name
+                && declared_name != name
+            {
+                return fail(format!(
+                    "Dependency map key '{name}' does not match its declared name '{declared_name}'"
+                ));
+            }
+            Ok((name.to_string(), condition))
         }
-    };
-    let condition = match condition.as_deref() {
-        None => DependencyCondition::Started,
-        Some("started") => DependencyCondition::Started,
-        Some("ready") => DependencyCondition::Ready,
-        // Kind honesty is enforced later against the full Process list: a
-        // One-shot dependency supports `exited` and
-        // `completed_successfully`, a Service dependency supports `ready`.
-        Some("exited") => DependencyCondition::Exited,
-        Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
-        Some(other) => {
-            return fail(format!(
-                "unsupported condition '{other}' (this Stackhand supports 'started', 'ready', 'exited', and 'completed_successfully')"
-            ));
-        }
-    };
-    Ok(DependencySpec { name, condition })
+        other => fail(format!(
+            "the condition for Dependency '{name}' must be a string, got {other:?}"
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -480,8 +557,127 @@ fn build_dependency(
 struct ConfigFile {
     version: u64,
     #[serde(default)]
-    processes: Vec<ProcessFile>,
+    processes: ProcessCollection,
     settings: Option<SettingsFile>,
+}
+
+#[derive(Default)]
+struct ProcessCollection {
+    entries: Vec<ProcessEntry>,
+}
+
+struct ProcessEntry {
+    key: Option<String>,
+    process: ProcessFile,
+}
+
+impl<'de> Deserialize<'de> for ProcessCollection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProcessCollectionVisitor;
+
+        impl<'de> Visitor<'de> for ProcessCollectionVisitor {
+            type Value = ProcessCollection;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence or name-keyed mapping of Processes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(process) = sequence.next_element::<ProcessFile>()? {
+                    entries.push(ProcessEntry { key: None, process });
+                }
+                Ok(ProcessCollection { entries })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                let mut names = HashSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !names.insert(name.clone()) {
+                        return Err(de::Error::custom(format!(
+                            "duplicate Process name '{name}'"
+                        )));
+                    }
+                    entries.push(ProcessEntry {
+                        key: Some(name),
+                        process: map.next_value::<ProcessFile>()?,
+                    });
+                }
+                Ok(ProcessCollection { entries })
+            }
+        }
+
+        deserializer.deserialize_any(ProcessCollectionVisitor)
+    }
+}
+
+struct DependencyCollection {
+    entries: Vec<DependencyEntry>,
+}
+
+struct DependencyEntry {
+    key: Option<String>,
+    value: serde_yaml::Value,
+}
+
+impl<'de> Deserialize<'de> for DependencyCollection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DependencyCollectionVisitor;
+
+        impl<'de> Visitor<'de> for DependencyCollectionVisitor {
+            type Value = DependencyCollection;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence or name-keyed mapping of Dependencies")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(value) = sequence.next_element::<serde_yaml::Value>()? {
+                    entries.push(DependencyEntry { key: None, value });
+                }
+                Ok(DependencyCollection { entries })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                let mut names = HashSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !names.insert(name.clone()) {
+                        return Err(de::Error::custom(format!(
+                            "duplicate Dependency name '{name}'"
+                        )));
+                    }
+                    entries.push(DependencyEntry {
+                        key: Some(name),
+                        value: map.next_value::<serde_yaml::Value>()?,
+                    });
+                }
+                Ok(DependencyCollection { entries })
+            }
+        }
+
+        deserializer.deserialize_any(DependencyCollectionVisitor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -500,7 +696,7 @@ struct ShellFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessFile {
-    name: String,
+    name: Option<String>,
     kind: Option<String>,
     enabled: Option<bool>,
     autostart: Option<bool>,
@@ -509,7 +705,7 @@ struct ProcessFile {
     terminal: Option<String>,
     input: Option<String>,
     success_exit_codes: Option<Vec<i32>>,
-    depends_on: Option<Vec<serde_yaml::Value>>,
+    depends_on: Option<DependencyCollection>,
     ready: Option<readiness::ReadinessFile>,
     liveness: Option<readiness::ReadinessFile>,
     restart: Option<RestartFile>,
