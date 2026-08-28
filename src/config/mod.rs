@@ -4,6 +4,7 @@
 //! The resolver applies selected profiles to the canonical base file before
 //! lowering the result into the validated Project model.
 
+mod env;
 mod file;
 mod profile;
 mod readiness;
@@ -17,13 +18,14 @@ mod profile_tests;
 #[cfg(test)]
 mod schema_tests;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
 
 use anyhow::Context;
 
+use self::env::{build_process_environment, load_files};
 use self::file::{
     CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
     TerminalFile,
@@ -229,13 +231,18 @@ fn load_file_with_local(
             .map_err(|error| config_error(anyhow::anyhow!(format_merged_yaml_error(&error))))?
     };
     let shell = build_shell(file.settings.as_ref())?;
+    let project_environment = load_files(
+        base_dir,
+        file.env_files.as_deref().unwrap_or_default(),
+        "Project",
+    )?;
     let processes = file
         .processes
         .entries
         .into_iter()
         .map(|entry| {
             let ProcessEntry { key, process } = entry;
-            build_spec(&process, key, base_dir)
+            build_spec(&process, key, base_dir, &project_environment)
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
     EffectiveProject::with_shell(processes, shell).map_err(|error| match error {
@@ -649,23 +656,11 @@ fn build_terminal_settings(
     Ok((terminal_mode, input_policy))
 }
 
-fn build_environment(process: &ProcessFile) -> Vec<(String, String)> {
-    process
-        .environment
-        .as_ref()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn build_spec(
     process: &ProcessFile,
     name: String,
     base_dir: &Path,
+    project_environment: &BTreeMap<String, String>,
 ) -> Result<ProcessSpec, ConfigError> {
     let fail = |message: String| Err(ConfigError { message });
     let kind = match process.kind.as_deref() {
@@ -725,7 +720,7 @@ fn build_spec(
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
     let restart = build_restart(&name, process.restart.as_ref())?;
-    let env = build_environment(process);
+    let env = build_process_environment(process, &name, base_dir, project_environment)?;
     Ok(ProcessSpec {
         name,
         kind,

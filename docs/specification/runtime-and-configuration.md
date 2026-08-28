@@ -277,6 +277,7 @@ Use YAML with an explicit schema version:
 ```yaml
 version: 1
 
+env_files: []
 processes: {}
 profiles: {}
 settings: {}
@@ -285,8 +286,9 @@ settings: {}
 Version 1 accepts this canonical shape only. It does not translate older
 spellings into it. `processes` and `depends_on` are name-keyed mappings.
 Direct commands use a sequence, and shell commands use a sibling `shell`
-field. Use `cwd`, `environment`, and a terminal mapping with `mode` and
-optional `input`.
+field. Use `cwd`, `env_files`, `environment`, and a terminal mapping with
+`mode` and optional `input`. Project-level `env_files` is a list at the root;
+Process-level `env_files` is a list inside that Process.
 
 The temporary list collections, nested command objects, `working_dir`, `env`,
 top-level `input`, and scalar terminal values are rejected. The validation
@@ -434,7 +436,7 @@ environment:
 
 ### 15.6 Environment files
 
-Support one or more files:
+Support one or more files at the Project or Process level:
 
 ```yaml
 env_files:
@@ -442,7 +444,27 @@ env_files:
   - .env.local
 ```
 
-Missing files are errors by default. A future object form may mark a file optional. Parsing behavior and quoting rules must be documented and tested.
+Relative paths use the base Project directory. Missing files and invalid UTF-8
+are errors before startup. A future object form may mark a file optional.
+
+Each non-blank, non-comment line is one literal assignment:
+
+```text
+KEY=value
+export OTHER=value
+EMPTY=
+SINGLE_QUOTED='spaces, $dollars, and shell characters stay literal'
+DOUBLE_QUOTED="line\nwith\tshort escapes"
+```
+
+Keys use `[A-Za-z_][A-Za-z0-9_]*`; spaces and tabs around a key are
+ignored. Unquoted values trim spaces and tabs at both ends. Single quotes
+preserve every character until the closing quote. NUL characters are rejected
+because the operating system cannot pass them in an environment value.
+Double quotes support only `\\`, `\\"`, `\\n`, `\\r`, and `\\t`. Quotes must
+surround the complete value. There are no inline comments, interpolation,
+command substitution, glob expansion, or shell evaluation. Later entries and
+later files replace earlier values at the same level.
 
 Environment values must not be printed indiscriminately in normal diagnostics.
 

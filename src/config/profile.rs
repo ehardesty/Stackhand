@@ -280,6 +280,10 @@ fn merge_yaml(base: &mut Value, overlay: Value) {
 
 fn merge_mapping(base: &mut Mapping, overlay: Mapping) {
     for (key, value) in overlay {
+        if key == yaml_key("environment") && value.is_mapping() {
+            merge_environment_mapping(base, key, value);
+            continue;
+        }
         if value.is_null() {
             base.remove(&key);
             continue;
@@ -290,6 +294,32 @@ fn merge_mapping(base: &mut Mapping, overlay: Mapping) {
             let mut merged = Value::Mapping(Mapping::new());
             merge_yaml(&mut merged, value);
             base.insert(key, merged);
+        }
+    }
+}
+
+/// Keep environment nulls as tombstones until the effective Process is built.
+/// A profile or local layer must be able to remove a value that came from an
+/// environment file or the parent process, not only a value in the YAML map.
+fn merge_environment_mapping(base: &mut Mapping, key: Value, overlay: Value) {
+    let Value::Mapping(overlay) = overlay else {
+        unreachable!("the environment overlay was checked as a mapping");
+    };
+    let Some(existing) = base.get_mut(&key) else {
+        base.insert(key, Value::Mapping(overlay));
+        return;
+    };
+    let Value::Mapping(existing) = existing else {
+        *existing = Value::Mapping(overlay);
+        return;
+    };
+    for (name, value) in overlay {
+        if value.is_null() {
+            existing.insert(name, Value::Null);
+        } else if let Some(current) = existing.get_mut(&name) {
+            merge_yaml(current, value);
+        } else {
+            existing.insert(name, value);
         }
     }
 }

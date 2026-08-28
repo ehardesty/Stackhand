@@ -15,6 +15,7 @@ use super::readiness::ReadinessFile;
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigFile {
     pub(super) version: u64,
+    pub(super) env_files: Option<Vec<String>>,
     #[serde(default)]
     pub(super) processes: ProcessCollection,
     // The typed parse keeps every profile subject to the top-level schema,
@@ -171,6 +172,7 @@ pub(super) struct ProcessFile {
     pub(super) enabled: Option<bool>,
     pub(super) autostart: Option<bool>,
     pub(super) cwd: Option<String>,
+    pub(super) env_files: Option<Vec<String>>,
     pub(super) environment: Option<std::collections::BTreeMap<String, Option<String>>>,
     pub(super) terminal: Option<TerminalFile>,
     pub(super) success_exit_codes: Option<Vec<i32>>,
