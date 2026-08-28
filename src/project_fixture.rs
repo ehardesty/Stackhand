@@ -48,9 +48,10 @@ const PIPE_PROOFS: &[(&str, &str, crate::runtime::OutputStream)] = &[
 
 /// Run the integrated fixture from one production YAML Project.
 pub fn run(config_path: &Path) -> Result<()> {
-    let project = crate::config::load(config_path)
-        .map_err(|error| anyhow!("configuration error: {error}"))?;
-    let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
+    let resolution =
+        crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
+            .map_err(|error| anyhow!("configuration error: {error}"))?;
+    let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     let output_lifetime = std::sync::Arc::downgrade(&outputs);
     supervisor.command(Command::StartAutostart);
 

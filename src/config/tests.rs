@@ -43,6 +43,25 @@ fn checked_in_example_projects_load() {
 }
 
 #[test]
+fn explicit_resolution_returns_the_selected_base_source() {
+    let dir = std::env::temp_dir().join("stackhand-config-resolution-source");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("resolution directory creates");
+    let path = dir.join("stackhand.yaml");
+    fs::write(
+        &path,
+        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n",
+    )
+    .expect("resolution config writes");
+
+    let resolution = resolve(ResolutionRequest::explicit(&path)).expect("resolution succeeds");
+    assert_eq!(resolution.sources.base, path);
+    assert_eq!(resolution.project().processes().len(), 1);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn one_direct_command_service_loads_with_defaults() {
     let project = write_and_load(
             "ok",
@@ -209,9 +228,7 @@ fn relative_working_directories_resolve_from_the_config_directory() {
             .expect("config writes");
     let project = load(&path).expect("valid config");
     let _ = fs::remove_dir_all(&dir);
-    let expected = std::env::temp_dir()
-        .join("stackhand-config-cwd")
-        .join("web");
+    let expected = dir.join("web");
     assert_eq!(project.processes()[0].working_dir, expected);
 }
 

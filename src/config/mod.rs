@@ -22,9 +22,69 @@ use crate::model::{
 
 const MAX_EXIT_CODE: i32 = 255;
 
-/// Load and validate the Project at `path`. Relative working directories
-/// resolve from the configuration file's directory.
+/// One request to resolve a Project before the Supervisor starts.
+#[derive(Clone, Debug)]
+pub struct ResolutionRequest {
+    /// An explicit base Project path. Discovery is intentionally added by a
+    /// later milestone rather than being hidden in this request.
+    pub project_path: PathBuf,
+}
+
+impl ResolutionRequest {
+    pub fn explicit(path: impl Into<PathBuf>) -> Self {
+        Self {
+            project_path: path.into(),
+        }
+    }
+}
+
+/// The source information selected during one Project resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolutionSources {
+    pub base: PathBuf,
+}
+
+/// One validated Project and the source summary that produced it.
+#[derive(Debug)]
+pub struct ProjectResolution {
+    project: EffectiveProject,
+    #[allow(dead_code)]
+    pub sources: ResolutionSources,
+}
+
+impl ProjectResolution {
+    #[allow(dead_code)]
+    pub fn project(&self) -> &EffectiveProject {
+        &self.project
+    }
+
+    pub fn into_project(self) -> EffectiveProject {
+        self.project
+    }
+}
+
+/// Resolve and validate one Project before any Process starts.
+pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
+    let path = request.project_path;
+    let base = absolute_normalized_path(&path)
+        .with_context(|| format!("could not resolve Project path {}", path.display()))
+        .map_err(config_error)?;
+    let project = load_file(&base)?;
+    Ok(ProjectResolution {
+        project,
+        sources: ResolutionSources { base },
+    })
+}
+
+/// Load and validate the Project at `path` through the shared resolver.
+/// Relative working directories resolve from the configuration file's
+/// directory.
+#[allow(dead_code)]
 pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
+    resolve(ResolutionRequest::explicit(path)).map(ProjectResolution::into_project)
+}
+
+fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))
@@ -79,6 +139,29 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
             config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
     })
+}
+
+fn absolute_normalized_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let current_dir = std::env::current_dir()?;
+    Ok(normalize_path(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    }))
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn config_error(error: anyhow::Error) -> ConfigError {

@@ -27,8 +27,9 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
 }
 
 pub fn run(config_path: &Path) -> Result<()> {
-    let project = crate::config::load(config_path)
-        .map_err(|error| anyhow!("configuration error: {error}"))?;
+    let project = crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
+        .map_err(|error| anyhow!("configuration error: {error}"))?
+        .into_project();
     let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
     supervisor.command(Command::StartAutostart);
 

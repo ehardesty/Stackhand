@@ -33,9 +33,10 @@ const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 /// interactively until the user quits with a controlled Project shutdown.
 pub fn run_project(config_path: &Path) -> Result<()> {
     // Invalid configuration starts no Processes and never enters the TUI.
-    let project = crate::config::load(config_path)
-        .map_err(|error| anyhow!("configuration error: {error}"))?;
-    let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
+    let resolution =
+        crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
+            .map_err(|error| anyhow!("configuration error: {error}"))?;
+    let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     supervisor.command(Command::StartAutostart);
 
     // The TUI remains active while shutdown progresses. This scope restores

@@ -15,8 +15,9 @@ const RESOURCE_SLACK: usize = 2;
 const REAL_PROJECT_CYCLES: usize = 3;
 
 pub fn run(config_path: &Path) -> Result<()> {
-    let project = crate::config::load(config_path)
-        .map_err(|error| anyhow!("configuration error: {error}"))?;
+    let project = crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
+        .map_err(|error| anyhow!("configuration error: {error}"))?
+        .into_project();
     let baseline_fds = open_fd_count()?;
     let baseline_threads = thread_count()?;
 
