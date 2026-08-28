@@ -283,10 +283,10 @@ fn build_exec_probe(
             process_name,
             child_index,
             labels,
-            "exec requires a 'command' mapping",
+            "exec requires a 'command'",
         )
     })?;
-    let command = super::build_command_form(command)
+    let command = super::build_command_form(Some(command), None)
         .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
     let working_dir = file
         .working_dir

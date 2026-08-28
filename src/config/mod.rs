@@ -4,6 +4,7 @@
 //! Profiles, overlays, environment files, and interpolation are deferred;
 //! Milestone 1 supports one base configuration.
 
+mod file;
 mod readiness;
 
 #[cfg(test)]
@@ -13,8 +14,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+
+use self::file::{
+    CommandFile, CommandObject, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile,
+    RestartFile, SettingsFile, TerminalFile,
+};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
@@ -318,24 +322,136 @@ fn build_success_exit_codes(configured: Option<Vec<i32>>) -> Result<Vec<i32>, St
     Ok(codes)
 }
 
-fn build_command_form(command: &CommandFile) -> Result<CommandForm, String> {
+fn build_command_form(
+    command: Option<&CommandFile>,
+    shell: Option<&str>,
+) -> Result<CommandForm, String> {
+    match (command, shell) {
+        (Some(_), Some(_)) => Err("define exactly one of 'command' or 'shell'".to_string()),
+        (Some(CommandFile::Legacy(command)), None) => build_legacy_command(command),
+        (Some(CommandFile::Direct(values)), None) => build_direct_command(values),
+        (None, Some(text)) if text.trim().is_empty() => {
+            Err("shell expression must not be empty".to_string())
+        }
+        (None, Some(text)) => Ok(CommandForm::Shell {
+            text: text.to_string(),
+        }),
+        (None, None) => Err("define exactly one of 'command' or 'shell'".to_string()),
+    }
+}
+
+fn build_legacy_command(command: &CommandObject) -> Result<CommandForm, String> {
     match (&command.program, &command.shell) {
         (Some(program), None) => Ok(CommandForm::Direct {
-            program: std::ffi::OsString::from(program),
-            args: command
-                .args
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect(),
+            program: nonempty_program(program)?,
+            args: build_command_args(command.args.as_deref())?,
         }),
-        (None, Some(shell)) => Ok(CommandForm::Shell {
-            text: shell.clone(),
-        }),
+        (None, Some(shell)) => {
+            if shell.trim().is_empty() {
+                return Err("shell expression must not be empty".to_string());
+            }
+            Ok(CommandForm::Shell {
+                text: shell.clone(),
+            })
+        }
         (Some(_), Some(_)) => Err("define exactly one of 'program' or 'shell'".to_string()),
         (None, None) => Err("define 'program' or 'shell' under 'command'".to_string()),
     }
+}
+
+fn build_direct_command(values: &[serde_yaml::Value]) -> Result<CommandForm, String> {
+    let Some(program) = values.first().and_then(serde_yaml::Value::as_str) else {
+        return Err("command must contain a non-empty program as its first item".to_string());
+    };
+    let program = nonempty_program(program)?;
+    let args = values
+        .iter()
+        .skip(1)
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(std::ffi::OsString::from)
+                .ok_or_else(|| format!("command argument {index} must be a string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CommandForm::Direct { program, args })
+}
+
+fn nonempty_program(program: &str) -> Result<std::ffi::OsString, String> {
+    if program.is_empty() {
+        return Err("command program must not be empty".to_string());
+    }
+    Ok(std::ffi::OsString::from(program))
+}
+
+fn build_command_args(
+    args: Option<&[serde_yaml::Value]>,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    args.unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(std::ffi::OsString::from)
+                .ok_or_else(|| format!("command argument {index} must be a string"))
+        })
+        .collect()
+}
+
+fn build_terminal_settings(
+    terminal: Option<&TerminalFile>,
+    input: Option<&str>,
+) -> Result<(TerminalMode, InputPolicy), String> {
+    let (mode, terminal_input) = match terminal {
+        None => (None, None),
+        Some(TerminalFile::Legacy(mode)) => (Some(mode.as_str()), None),
+        Some(TerminalFile::Settings(settings)) => {
+            (settings.mode.as_deref(), settings.input.as_deref())
+        }
+    };
+    if terminal_input.is_some() && input.is_some() {
+        return Err(
+            "define input in either 'terminal' or the top-level legacy field, not both".to_string(),
+        );
+    }
+    let terminal_mode = match mode {
+        None | Some("pipe") => TerminalMode::Pipe,
+        Some("pty") => TerminalMode::Pty,
+        Some(other) => {
+            return Err(format!(
+                "invalid terminal mode '{other}' (use 'pipe' or 'pty')"
+            ));
+        }
+    };
+    let input_policy = match terminal_input.or(input) {
+        None | Some("disabled") => InputPolicy::Disabled,
+        Some("focused") => InputPolicy::Focused,
+        Some(other) => Err(format!(
+            "invalid input policy '{other}' (use 'focused' or 'disabled')"
+        ))?,
+    };
+    Ok((terminal_mode, input_policy))
+}
+
+fn build_environment(process: &ProcessFile) -> Result<Vec<(String, String)>, String> {
+    if process.env.is_some() && process.environment.is_some() {
+        return Err(
+            "define only one of 'environment' or the top-level legacy 'env' field".to_string(),
+        );
+    }
+    Ok(process
+        .environment
+        .as_ref()
+        .or(process.env.as_ref())
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn build_spec(
@@ -353,11 +469,17 @@ fn build_spec(
             ));
         }
     };
-    let command_form = match build_command_form(&process.command) {
+    let command_form = match build_command_form(process.command.as_ref(), process.shell.as_deref())
+    {
         Ok(command) => command,
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
-    let working_dir = match &process.working_dir {
+    if process.working_dir.is_some() && process.cwd.is_some() {
+        return fail(format!(
+            "Process '{name}': define only one of 'cwd' or 'working_dir'"
+        ));
+    }
+    let working_dir = match process.cwd.as_deref().or(process.working_dir.as_deref()) {
         Some(dir) => {
             let candidate = PathBuf::from(dir);
             if candidate.is_absolute() {
@@ -374,24 +496,11 @@ fn build_spec(
             working_dir.display()
         ));
     }
-    let terminal_mode = match process.terminal.as_deref() {
-        None | Some("pipe") => TerminalMode::Pipe,
-        Some("pty") => TerminalMode::Pty,
-        Some(other) => {
-            return fail(format!(
-                "Process '{name}': invalid terminal mode '{other}' (use 'pipe' or 'pty')"
-            ));
-        }
-    };
-    let input_policy = match process.input.as_deref() {
-        None | Some("disabled") => InputPolicy::Disabled,
-        Some("focused") => InputPolicy::Focused,
-        Some(other) => {
-            return fail(format!(
-                "Process '{name}': invalid input policy '{other}' (use 'focused' or 'disabled')"
-            ));
-        }
-    };
+    let (terminal_mode, input_policy) =
+        match build_terminal_settings(process.terminal.as_ref(), process.input.as_deref()) {
+            Ok(settings) => settings,
+            Err(detail) => return fail(format!("Process '{name}': {detail}")),
+        };
     let dependencies = match &process.depends_on {
         None => Vec::new(),
         Some(entries) => entries
@@ -414,6 +523,10 @@ fn build_spec(
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
     let restart = build_restart(&name, process.restart.as_ref())?;
+    let env = match build_environment(process) {
+        Ok(env) => env,
+        Err(detail) => return fail(format!("Process '{name}': {detail}")),
+    };
     Ok(ProcessSpec {
         name,
         kind,
@@ -423,11 +536,7 @@ fn build_spec(
         restart,
         command: command_form,
         working_dir,
-        env: process
-            .env
-            .as_ref()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default(),
+        env,
         terminal_mode,
         input_policy,
         dependencies,
@@ -550,183 +659,6 @@ fn keyed_dependency_parts(
             "the condition for Dependency '{name}' must be a string, got {other:?}"
         )),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFile {
-    version: u64,
-    #[serde(default)]
-    processes: ProcessCollection,
-    settings: Option<SettingsFile>,
-}
-
-#[derive(Default)]
-struct ProcessCollection {
-    entries: Vec<ProcessEntry>,
-}
-
-struct ProcessEntry {
-    key: Option<String>,
-    process: ProcessFile,
-}
-
-impl<'de> Deserialize<'de> for ProcessCollection {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ProcessCollectionVisitor;
-
-        impl<'de> Visitor<'de> for ProcessCollectionVisitor {
-            type Value = ProcessCollection;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a sequence or name-keyed mapping of Processes")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                while let Some(process) = sequence.next_element::<ProcessFile>()? {
-                    entries.push(ProcessEntry { key: None, process });
-                }
-                Ok(ProcessCollection { entries })
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                let mut names = HashSet::new();
-                while let Some(name) = map.next_key::<String>()? {
-                    if !names.insert(name.clone()) {
-                        return Err(de::Error::custom(format!(
-                            "duplicate Process name '{name}'"
-                        )));
-                    }
-                    entries.push(ProcessEntry {
-                        key: Some(name),
-                        process: map.next_value::<ProcessFile>()?,
-                    });
-                }
-                Ok(ProcessCollection { entries })
-            }
-        }
-
-        deserializer.deserialize_any(ProcessCollectionVisitor)
-    }
-}
-
-struct DependencyCollection {
-    entries: Vec<DependencyEntry>,
-}
-
-struct DependencyEntry {
-    key: Option<String>,
-    value: serde_yaml::Value,
-}
-
-impl<'de> Deserialize<'de> for DependencyCollection {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct DependencyCollectionVisitor;
-
-        impl<'de> Visitor<'de> for DependencyCollectionVisitor {
-            type Value = DependencyCollection;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a sequence or name-keyed mapping of Dependencies")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                while let Some(value) = sequence.next_element::<serde_yaml::Value>()? {
-                    entries.push(DependencyEntry { key: None, value });
-                }
-                Ok(DependencyCollection { entries })
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                let mut names = HashSet::new();
-                while let Some(name) = map.next_key::<String>()? {
-                    if !names.insert(name.clone()) {
-                        return Err(de::Error::custom(format!(
-                            "duplicate Dependency name '{name}'"
-                        )));
-                    }
-                    entries.push(DependencyEntry {
-                        key: Some(name),
-                        value: map.next_value::<serde_yaml::Value>()?,
-                    });
-                }
-                Ok(DependencyCollection { entries })
-            }
-        }
-
-        deserializer.deserialize_any(DependencyCollectionVisitor)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SettingsFile {
-    shell: Option<ShellFile>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShellFile {
-    program: String,
-    args: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessFile {
-    name: Option<String>,
-    kind: Option<String>,
-    enabled: Option<bool>,
-    autostart: Option<bool>,
-    working_dir: Option<String>,
-    env: Option<std::collections::BTreeMap<String, String>>,
-    terminal: Option<String>,
-    input: Option<String>,
-    success_exit_codes: Option<Vec<i32>>,
-    depends_on: Option<DependencyCollection>,
-    ready: Option<readiness::ReadinessFile>,
-    liveness: Option<readiness::ReadinessFile>,
-    restart: Option<RestartFile>,
-    command: CommandFile,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RestartFile {
-    policy: Option<String>,
-    backoff: Option<String>,
-    max_restarts: Option<u32>,
-    on_unhealthy: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CommandFile {
-    program: Option<String>,
-    args: Option<Vec<String>>,
-    shell: Option<String>,
 }
 
 #[cfg(test)]

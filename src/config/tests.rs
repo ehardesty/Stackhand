@@ -650,6 +650,109 @@ fn invalid_depends_on_entries_are_rejected() {
 }
 
 #[test]
+fn canonical_process_fields_lower_into_the_effective_process() {
+    let project = write_and_load(
+        "canonical-process",
+        "version: 1
+processes:
+  web:
+    kind: service
+    cwd: .
+    environment:
+      PORT: \"4000\"
+    terminal:
+      mode: pty
+      input: focused
+    command: [/bin/printf, \"hello world\", \"%s\\n\"]
+",
+    )
+    .expect("canonical Process fields are valid");
+    let web = &project.processes()[0];
+    assert_eq!(
+        web.working_dir,
+        std::env::temp_dir().join("stackhand-config-canonical-process")
+    );
+    assert_eq!(web.env, vec![("PORT".to_string(), "4000".to_string())]);
+    assert_eq!(web.terminal_mode, TerminalMode::Pty);
+    assert_eq!(web.input_policy, InputPolicy::Focused);
+    assert_eq!(
+        web.command,
+        CommandForm::Direct {
+            program: "/bin/printf".into(),
+            args: vec!["hello world".into(), "%s\n".into()],
+        }
+    );
+}
+
+#[test]
+fn canonical_shell_uses_the_project_shell_configuration() {
+    let project = write_and_load(
+        "canonical-shell",
+        "version: 1
+settings:
+  shell:
+    program: /bin/bash
+    args: [-lc]
+processes:
+  web:
+    shell: printf canonical-shell
+",
+    )
+    .expect("canonical shell fields are valid");
+    assert_eq!(
+        project.processes()[0].command,
+        CommandForm::Shell {
+            text: "printf canonical-shell".to_string()
+        }
+    );
+    assert_eq!(
+        project.shell().program,
+        std::ffi::OsString::from("/bin/bash")
+    );
+    assert_eq!(project.shell().args, [std::ffi::OsString::from("-lc")]);
+}
+
+#[test]
+fn canonical_command_and_shell_are_mutually_exclusive() {
+    let error = write_and_load(
+        "canonical-command-shell",
+        "version: 1
+processes:
+  web:
+    command: [/bin/true]
+    shell: echo conflict
+",
+    )
+    .expect_err("a Process must select one command form");
+    assert!(
+        error.message.contains("Process 'web'")
+            && error.message.contains("exactly one")
+            && error.message.contains("command")
+            && error.message.contains("shell"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn invalid_canonical_command_is_rejected_before_startup() {
+    let error = write_and_load(
+        "canonical-command-empty",
+        "version: 1
+processes:
+  web:
+    command: []
+",
+    )
+    .expect_err("a canonical command needs a program");
+    assert!(
+        error.message.contains("Process 'web'") && error.message.contains("command must contain"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn invalid_kinds_terminal_modes_and_input_policies_are_rejected() {
     for (label, field) in [
         ("kind", "kind: cron"),
