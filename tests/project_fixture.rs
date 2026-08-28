@@ -425,7 +425,7 @@ fn one_configured_project_runs_the_complete_milestone_two_path() {
 fn an_unknown_field_starts_nothing_and_fails_clearly() {
     let output = run_invalid_project(
         "unknown-field",
-        "version: 1\nprocesses:\n  - name: hello\n    comand:\n      program: /bin/true\n",
+        "version: 1\nprocesses:\n  hello:\n    comand: true\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -438,10 +438,27 @@ fn an_unknown_field_starts_nothing_and_fails_clearly() {
 }
 
 #[test]
+fn a_temporary_process_collection_starts_nothing_and_names_the_replacement() {
+    let output = run_invalid_project(
+        "temporary-process-list",
+        "version: 1\nprocesses:\n  - name: hello\n    command: [/bin/true]\n",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("processes must be a name-keyed mapping")
+            && stderr.contains("use 'processes: {name: {...}}'"),
+        "diagnostic was not clear: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("fixture-started-ok"), "{stdout}");
+}
+
+#[test]
 fn duplicate_process_names_start_nothing_and_fail_clearly() {
     let output = run_invalid_project(
         "duplicate-name",
-        "version: 1\nprocesses:\n  - name: hello\n    command: {program: /bin/true}\n  - name: hello\n    command: {program: /bin/true}\n",
+        "version: 1\nprocesses:\n  hello:\n    command: [/bin/true]\n  hello:\n    command: [/bin/true]\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -457,7 +474,7 @@ fn duplicate_process_names_start_nothing_and_fail_clearly() {
 fn an_invalid_project_starts_nothing_and_fails_clearly() {
     let output = run_invalid_project(
         "invalid",
-        "version: 2\nprocesses:\n  - name: hello\n    command:\n      program: /bin/true\n",
+        "version: 2\nprocesses:\n  hello:\n    command: [/bin/true]\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -1,8 +1,8 @@
 //! Configuration: one YAML version 1 file becomes one validated
 //! [`EffectiveProject`] or a structured error before any Process starts.
 //!
-//! Profiles, overlays, environment files, and interpolation are deferred;
-//! Milestone 1 supports one base configuration.
+//! Profiles, overlays, and environment files are added by later milestones;
+//! version 1 currently accepts one canonical base configuration.
 
 mod file;
 mod readiness;
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use self::file::{
-    CommandFile, CommandObject, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile,
-    RestartFile, SettingsFile, TerminalFile,
+    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
+    TerminalFile,
 };
 
 use crate::model::{
@@ -108,24 +108,8 @@ fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
         .entries
         .into_iter()
         .map(|entry| {
-            let ProcessEntry { key, mut process } = entry;
-            let declared_name = process.name.take();
-            let name = match (key, declared_name) {
-                (Some(key), None) => key,
-                (Some(key), Some(declared_name)) if key == declared_name => key,
-                (Some(key), Some(declared_name)) => {
-                    return Err(config_error(anyhow::anyhow!(
-                        "Process map key '{key}' does not match its declared name '{declared_name}'"
-                    )));
-                }
-                (None, Some(name)) => name,
-                (None, None) => {
-                    return Err(config_error(anyhow::anyhow!(
-                        "each Process entry must define a 'name'"
-                    )));
-                }
-            };
-            build_spec(&process, name, base_dir)
+            let ProcessEntry { key, process } = entry;
+            build_spec(&process, key, base_dir)
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
     EffectiveProject::with_shell(processes, shell).map_err(|error| match error {
@@ -226,12 +210,29 @@ fn format_yaml_error(error: &serde_yaml::Error) -> String {
 }
 
 fn yaml_replacement_hint(detail: &str) -> Option<&'static str> {
+    let location = detail
+        .split_once(": unknown field")
+        .map(|(location, _)| location)
+        .unwrap_or_default();
+    let process_fields = location
+        .strip_prefix("processes.")
+        .is_some_and(|path| !path.contains('.'));
+    let exec_fields = location.ends_with(".ready.exec") || location.ends_with(".liveness.exec");
+
     if detail.contains("unknown field `readiness`") {
         Some("use `ready` instead")
     } else if detail.contains("unknown field `interval_ms`") {
         Some("use `interval` instead")
     } else if detail.contains("unknown field `timeout_ms`") {
         Some("use `timeout` instead")
+    } else if detail.contains("unknown field `working_dir`") && (process_fields || exec_fields) {
+        Some("use `cwd` instead")
+    } else if detail.contains("unknown field `env`") && (process_fields || exec_fields) {
+        Some("use `environment` instead")
+    } else if detail.contains("unknown field `input`") && process_fields {
+        Some("put `input` under the `terminal` mapping instead")
+    } else if detail.contains("unknown field `name`") && process_fields {
+        Some("put the Process name in the `processes` map key instead")
     } else {
         None
     }
@@ -328,7 +329,6 @@ fn build_command_form(
 ) -> Result<CommandForm, String> {
     match (command, shell) {
         (Some(_), Some(_)) => Err("define exactly one of 'command' or 'shell'".to_string()),
-        (Some(CommandFile::Legacy(command)), None) => build_legacy_command(command),
         (Some(CommandFile::Direct(values)), None) => build_direct_command(values),
         (None, Some(text)) if text.trim().is_empty() => {
             Err("shell expression must not be empty".to_string())
@@ -337,25 +337,6 @@ fn build_command_form(
             text: text.to_string(),
         }),
         (None, None) => Err("define exactly one of 'command' or 'shell'".to_string()),
-    }
-}
-
-fn build_legacy_command(command: &CommandObject) -> Result<CommandForm, String> {
-    match (&command.program, &command.shell) {
-        (Some(program), None) => Ok(CommandForm::Direct {
-            program: nonempty_program(program)?,
-            args: build_command_args(command.args.as_deref())?,
-        }),
-        (None, Some(shell)) => {
-            if shell.trim().is_empty() {
-                return Err("shell expression must not be empty".to_string());
-            }
-            Ok(CommandForm::Shell {
-                text: shell.clone(),
-            })
-        }
-        (Some(_), Some(_)) => Err("define exactly one of 'program' or 'shell'".to_string()),
-        (None, None) => Err("define 'program' or 'shell' under 'command'".to_string()),
     }
 }
 
@@ -385,37 +366,15 @@ fn nonempty_program(program: &str) -> Result<std::ffi::OsString, String> {
     Ok(std::ffi::OsString::from(program))
 }
 
-fn build_command_args(
-    args: Option<&[serde_yaml::Value]>,
-) -> Result<Vec<std::ffi::OsString>, String> {
-    args.unwrap_or_default()
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value
-                .as_str()
-                .map(std::ffi::OsString::from)
-                .ok_or_else(|| format!("command argument {index} must be a string"))
-        })
-        .collect()
-}
-
 fn build_terminal_settings(
     terminal: Option<&TerminalFile>,
-    input: Option<&str>,
 ) -> Result<(TerminalMode, InputPolicy), String> {
     let (mode, terminal_input) = match terminal {
         None => (None, None),
-        Some(TerminalFile::Legacy(mode)) => (Some(mode.as_str()), None),
         Some(TerminalFile::Settings(settings)) => {
             (settings.mode.as_deref(), settings.input.as_deref())
         }
     };
-    if terminal_input.is_some() && input.is_some() {
-        return Err(
-            "define input in either 'terminal' or the top-level legacy field, not both".to_string(),
-        );
-    }
     let terminal_mode = match mode {
         None | Some("pipe") => TerminalMode::Pipe,
         Some("pty") => TerminalMode::Pty,
@@ -425,7 +384,7 @@ fn build_terminal_settings(
             ));
         }
     };
-    let input_policy = match terminal_input.or(input) {
+    let input_policy = match terminal_input {
         None | Some("disabled") => InputPolicy::Disabled,
         Some("focused") => InputPolicy::Focused,
         Some(other) => Err(format!(
@@ -435,23 +394,17 @@ fn build_terminal_settings(
     Ok((terminal_mode, input_policy))
 }
 
-fn build_environment(process: &ProcessFile) -> Result<Vec<(String, String)>, String> {
-    if process.env.is_some() && process.environment.is_some() {
-        return Err(
-            "define only one of 'environment' or the top-level legacy 'env' field".to_string(),
-        );
-    }
-    Ok(process
+fn build_environment(process: &ProcessFile) -> Vec<(String, String)> {
+    process
         .environment
         .as_ref()
-        .or(process.env.as_ref())
         .map(|entries| {
             entries
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 fn build_spec(
@@ -474,12 +427,7 @@ fn build_spec(
         Ok(command) => command,
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
-    if process.working_dir.is_some() && process.cwd.is_some() {
-        return fail(format!(
-            "Process '{name}': define only one of 'cwd' or 'working_dir'"
-        ));
-    }
-    let working_dir = match process.cwd.as_deref().or(process.working_dir.as_deref()) {
+    let working_dir = match process.cwd.as_deref() {
         Some(dir) => {
             let candidate = PathBuf::from(dir);
             if candidate.is_absolute() {
@@ -496,11 +444,10 @@ fn build_spec(
             working_dir.display()
         ));
     }
-    let (terminal_mode, input_policy) =
-        match build_terminal_settings(process.terminal.as_ref(), process.input.as_deref()) {
-            Ok(settings) => settings,
-            Err(detail) => return fail(format!("Process '{name}': {detail}")),
-        };
+    let (terminal_mode, input_policy) = match build_terminal_settings(process.terminal.as_ref()) {
+        Ok(settings) => settings,
+        Err(detail) => return fail(format!("Process '{name}': {detail}")),
+    };
     let dependencies = match &process.depends_on {
         None => Vec::new(),
         Some(entries) => entries
@@ -523,10 +470,7 @@ fn build_spec(
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
     let restart = build_restart(&name, process.restart.as_ref())?;
-    let env = match build_environment(process) {
-        Ok(env) => env,
-        Err(detail) => return fail(format!("Process '{name}': {detail}")),
-    };
+    let env = build_environment(process);
     Ok(ProcessSpec {
         name,
         kind,
@@ -545,27 +489,32 @@ fn build_spec(
     })
 }
 
-/// One `depends_on` entry: a legacy sequence entry or a canonical keyed
-/// entry whose map key is the dependency Process name.
+/// One canonical `depends_on` entry. The map key is the dependency Process
+/// name and its value is the dependency condition.
 fn build_dependency(
     process_name: &str,
     index: usize,
     entry: &DependencyEntry,
 ) -> Result<DependencySpec, ConfigError> {
-    let fail = |detail: String| Err(dependency_error(process_name, index, detail));
-    let (name, condition) = match entry.key.as_deref() {
-        Some(name) => keyed_dependency_parts(name, &entry.value, &fail)?,
-        None => legacy_dependency_parts(&entry.value, &fail)?,
-    };
-    let condition = match condition.as_deref() {
-        None | Some("started") => DependencyCondition::Started,
-        Some("ready") => DependencyCondition::Ready,
+    let condition = entry.value.as_str().ok_or_else(|| {
+        dependency_error(
+            process_name,
+            index,
+            format!(
+                "condition for Dependency '{}' must be a string; use 'dependency-name: condition'",
+                entry.key
+            ),
+        )
+    })?;
+    let condition = match condition {
+        "started" => DependencyCondition::Started,
+        "ready" => DependencyCondition::Ready,
         // Kind honesty is enforced later against the full Process list: a
         // One-shot dependency supports `exited` and
         // `completed_successfully`, a Service dependency supports `ready`.
-        Some("exited") => DependencyCondition::Exited,
-        Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
-        Some(other) => {
+        "exited" => DependencyCondition::Exited,
+        "completed_successfully" => DependencyCondition::CompletedSuccessfully,
+        other => {
             return Err(dependency_error(
                 process_name,
                 index,
@@ -575,89 +524,15 @@ fn build_dependency(
             ));
         }
     };
-    Ok(DependencySpec { name, condition })
+    Ok(DependencySpec {
+        name: entry.key.clone(),
+        condition,
+    })
 }
 
 fn dependency_error(process_name: &str, index: usize, detail: String) -> ConfigError {
     ConfigError {
         message: format!("Process '{process_name}': invalid depends_on entry {index}: {detail}"),
-    }
-}
-
-fn legacy_dependency_parts(
-    entry: &serde_yaml::Value,
-    fail: &impl Fn(String) -> Result<(String, Option<String>), ConfigError>,
-) -> Result<(String, Option<String>), ConfigError> {
-    match entry {
-        serde_yaml::Value::String(name) => Ok((name.clone(), None)),
-        serde_yaml::Value::Mapping(map) => {
-            let mut name = None;
-            let mut condition = None;
-            for (key, value) in map {
-                let serde_yaml::Value::String(key) = key else {
-                    return fail(format!("mapping keys must be strings, got {key:?}"));
-                };
-                match key.as_str() {
-                    "name" => match value.as_str() {
-                        Some(value) => name = Some(value.to_string()),
-                        None => return fail("'name' must be a string".to_string()),
-                    },
-                    "condition" => match value.as_str() {
-                        Some(value) => condition = Some(value.to_string()),
-                        None => return fail("'condition' must be a string".to_string()),
-                    },
-                    other => return fail(format!("unknown field '{other}'")),
-                }
-            }
-            match name {
-                Some(name) => Ok((name, condition)),
-                None => fail("a mapping entry requires 'name'".to_string()),
-            }
-        }
-        other => fail(format!(
-            "use a Process name or a {{name, condition}} mapping, got {other:?}"
-        )),
-    }
-}
-
-fn keyed_dependency_parts(
-    name: &str,
-    value: &serde_yaml::Value,
-    fail: &impl Fn(String) -> Result<(String, Option<String>), ConfigError>,
-) -> Result<(String, Option<String>), ConfigError> {
-    match value {
-        serde_yaml::Value::String(condition) => Ok((name.to_string(), Some(condition.clone()))),
-        serde_yaml::Value::Mapping(map) => {
-            let mut declared_name = None;
-            let mut condition = None;
-            for (key, value) in map {
-                let serde_yaml::Value::String(key) = key else {
-                    return fail(format!("mapping keys must be strings, got {key:?}"));
-                };
-                match key.as_str() {
-                    "name" => match value.as_str() {
-                        Some(value) => declared_name = Some(value),
-                        None => return fail("'name' must be a string".to_string()),
-                    },
-                    "condition" => match value.as_str() {
-                        Some(value) => condition = Some(value.to_string()),
-                        None => return fail("'condition' must be a string".to_string()),
-                    },
-                    other => return fail(format!("unknown field '{other}'")),
-                }
-            }
-            if let Some(declared_name) = declared_name
-                && declared_name != name
-            {
-                return fail(format!(
-                    "Dependency map key '{name}' does not match its declared name '{declared_name}'"
-                ));
-            }
-            Ok((name.to_string(), condition))
-        }
-        other => fail(format!(
-            "the condition for Dependency '{name}' must be a string, got {other:?}"
-        )),
     }
 }
 

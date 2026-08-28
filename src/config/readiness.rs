@@ -278,18 +278,10 @@ fn build_exec_probe(
     base_dir: &Path,
     labels: CheckLabels,
 ) -> Result<ReadinessProbe, ConfigError> {
-    let command = file.command.as_ref().ok_or_else(|| {
-        check_error_for(
-            process_name,
-            child_index,
-            labels,
-            "exec requires a 'command'",
-        )
-    })?;
-    let command = super::build_command_form(Some(command), None)
+    let command = super::build_command_form(file.command.as_ref(), file.shell.as_deref())
         .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
     let working_dir = file
-        .working_dir
+        .cwd
         .as_deref()
         .map(|directory| {
             let path = PathBuf::from(directory);
@@ -311,7 +303,7 @@ fn build_exec_probe(
         })
         .transpose()?;
     let env = file
-        .env
+        .environment
         .as_ref()
         .map(|entries| {
             entries
@@ -498,8 +490,9 @@ struct LogProbeFile {
 #[serde(deny_unknown_fields)]
 struct ExecFile {
     command: Option<super::CommandFile>,
-    working_dir: Option<String>,
-    env: Option<std::collections::BTreeMap<String, String>>,
+    shell: Option<String>,
+    cwd: Option<String>,
+    environment: Option<std::collections::BTreeMap<String, String>>,
     success_exit_codes: Option<Vec<i32>>,
 }
 

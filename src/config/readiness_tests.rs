@@ -198,9 +198,8 @@ fn invalid_readiness_values_are_rejected_clearly() {
         ("empty host", "      tcp: {host: '', port: 1}\n", "host"),
         ("no form", "      tcp: null\n", "exactly one"),
     ] {
-        let yaml = format!(
-            "version: 1\nprocesses:\n  db:\n    command: {{program: /bin/true}}\n    ready:\n{block}"
-        );
+        let yaml =
+            format!("version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n{block}");
         let error = write_and_load(label, &yaml).expect_err("the block must fail");
         assert!(error.message.contains(expected), "{label}: {error}");
     }
@@ -342,7 +341,7 @@ fn all_readiness_rejects_child_startup_deadlines() {
 fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
     let direct = write_and_load(
         "exec-direct",
-        "version: 1\nprocesses:\n  web:\n    cwd: /tmp\n    environment: {BASE: process}\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        command: [/usr/bin/test, \"-f\", \"ready\"]\n        working_dir: /tmp\n        env: {CHECK: probe}\n        success_exit_codes: [0, 2]\n",
+        "version: 1\nprocesses:\n  web:\n    cwd: /tmp\n    environment: {BASE: process}\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        command: [/usr/bin/test, \"-f\", \"ready\"]\n        cwd: /tmp\n        environment: {CHECK: probe}\n        success_exit_codes: [0, 2]\n",
     )
     .expect("valid direct exec readiness");
     let probe = &direct.processes()[0]
@@ -366,7 +365,7 @@ fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
 
     let shell = write_and_load(
         "exec-shell",
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        command: {shell: \"test \\\"$CHECK\\\" = probe\"}\n        env: {CHECK: probe}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        shell: \"test \\\"$CHECK\\\" = probe\"\n        environment: {CHECK: probe}\n",
     )
     .expect("valid shell exec readiness");
     let probe = &shell.processes()[0]
@@ -389,14 +388,46 @@ fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
 }
 
 #[test]
+fn removed_exec_yaml_forms_name_their_canonical_replacements() {
+    let cases = [
+        (
+            "exec-command-map",
+            "        command: {program: /bin/true}\n",
+            "command must be a sequence",
+            "use a sibling 'shell:' field for shell expressions",
+        ),
+        (
+            "exec-working-directory",
+            "        command: [/bin/true]\n        working_dir: /tmp\n",
+            "unknown field `working_dir`",
+            "use `cwd` instead",
+        ),
+        (
+            "exec-environment",
+            "        command: [/bin/true]\n        env: {CHECK: probe}\n",
+            "unknown field `env`",
+            "use `environment` instead",
+        ),
+    ];
+    let base =
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      exec:\n";
+    for (label, block, old_form, replacement) in cases {
+        let error = write_and_load(label, &format!("{base}{block}"))
+            .expect_err("the temporary exec form must fail");
+        assert!(error.message.contains(old_form), "{label}: {error}");
+        assert!(error.message.contains(replacement), "{label}: {error}");
+    }
+}
+
+#[test]
 fn exec_readiness_rejects_missing_invalid_and_unusable_configuration() {
     let base =
         "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      exec:\n";
     let cases = [
-        ("missing-command", "        working_dir: /tmp\n", "requires"),
+        ("missing-command", "        cwd: /tmp\n", "exactly one"),
         (
             "both-command-forms",
-            "        command: {program: /bin/true, shell: 'true'}\n",
+            "        command: [/bin/true]\n        shell: 'true'\n",
             "exactly one",
         ),
         (
@@ -416,7 +447,7 @@ fn exec_readiness_rejects_missing_invalid_and_unusable_configuration() {
         ),
         (
             "missing-working-directory",
-            "        command: [/bin/true]\n        working_dir: /path/that/does/not/exist\n",
+            "        command: [/bin/true]\n        cwd: /path/that/does/not/exist\n",
             "working directory",
         ),
     ];

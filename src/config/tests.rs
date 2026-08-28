@@ -215,14 +215,14 @@ fn project_shell_accepts_an_explicit_launcher_and_argument_list() {
 fn unusable_project_shell_settings_are_rejected() {
     let empty_program = write_and_load(
         "shell-empty-program",
-        "version: 1\nsettings:\n  shell:\n    program: ''\n    args: [-c]\nprocesses: []\n",
+        "version: 1\nsettings:\n  shell:\n    program: ''\n    args: [-c]\nprocesses: {}\n",
     )
     .expect_err("an empty shell program must fail");
     assert!(empty_program.message.contains("program must not be empty"));
 
     let empty_args = write_and_load(
         "shell-empty-args",
-        "version: 1\nsettings:\n  shell:\n    program: /bin/sh\n    args: []\nprocesses: []\n",
+        "version: 1\nsettings:\n  shell:\n    program: /bin/sh\n    args: []\nprocesses: {}\n",
     )
     .expect_err("empty shell args must fail");
     assert!(empty_args.message.contains("args must contain"));
@@ -262,7 +262,7 @@ fn missing_working_directories_are_rejected_with_the_process_name() {
 #[test]
 fn unsupported_versions_are_rejected() {
     let error =
-        write_and_load("version", "version: 2\nprocesses: []\n").expect_err("version 2 must fail");
+        write_and_load("version", "version: 2\nprocesses: {}\n").expect_err("version 2 must fail");
     assert!(error.message.contains("unsupported schema version 2"));
 }
 
@@ -274,6 +274,60 @@ fn unknown_fields_are_rejected() {
     )
     .expect_err("unknown field must fail");
     assert!(error.message.contains("unknown field"), "{}", error.message);
+}
+
+#[test]
+fn removed_yaml_forms_name_their_canonical_replacements() {
+    let cases = [
+        (
+            "process-list",
+            "version: 1\nprocesses:\n  - name: web\n    command: [/bin/true]\n",
+            "processes must be a name-keyed mapping",
+            "use 'processes: {name: {...}}'",
+        ),
+        (
+            "dependency-list",
+            "version: 1\nprocesses:\n  web:\n    depends_on: [db]\n    command: [/bin/true]\n  db:\n    command: [/bin/true]\n",
+            "depends_on must be a name-keyed mapping",
+            "use 'depends_on: {process-name: condition}'",
+        ),
+        (
+            "command-map",
+            "version: 1\nprocesses:\n  web:\n    command: {program: /bin/true}\n",
+            "command must be a sequence",
+            "use 'command: [program, arg1, ...]'",
+        ),
+        (
+            "working-directory",
+            "version: 1\nprocesses:\n  web:\n    working_dir: .\n    command: [/bin/true]\n",
+            "unknown field `working_dir`",
+            "use `cwd` instead",
+        ),
+        (
+            "environment",
+            "version: 1\nprocesses:\n  web:\n    env: {MODE: test}\n    command: [/bin/true]\n",
+            "unknown field `env`",
+            "use `environment` instead",
+        ),
+        (
+            "input",
+            "version: 1\nprocesses:\n  web:\n    input: focused\n    command: [/bin/true]\n",
+            "unknown field `input`",
+            "put `input` under the `terminal` mapping instead",
+        ),
+        (
+            "terminal-scalar",
+            "version: 1\nprocesses:\n  web:\n    terminal: pty\n    command: [/bin/true]\n",
+            "terminal must be a mapping",
+            "use 'terminal: {mode: pipe|pty, input: disabled|focused}'",
+        ),
+    ];
+
+    for (label, yaml, old_form, replacement) in cases {
+        let error = write_and_load(label, yaml).expect_err("the temporary form must fail");
+        assert!(error.message.contains(old_form), "{label}: {error}");
+        assert!(error.message.contains(replacement), "{label}: {error}");
+    }
 }
 
 #[test]
@@ -388,9 +442,9 @@ processes:
 }
 
 #[test]
-fn keyed_process_name_mismatches_are_rejected() {
+fn temporary_nested_process_names_name_the_canonical_map_key() {
     let error = write_and_load(
-        "keyed-name-mismatch",
+        "temporary-process-name",
         "version: 1
 processes:
   web:
@@ -398,20 +452,21 @@ processes:
     command: [/bin/true]
 ",
     )
-    .expect_err("a keyed Process cannot declare a different name");
+    .expect_err("a Process name must not be nested in a keyed Process");
     assert!(
-        error
-            .message
-            .contains("Process map key 'web' does not match its declared name 'api'"),
+        error.message.contains("unknown field `name`")
+            && error
+                .message
+                .contains("put the Process name in the `processes` map key instead"),
         "{}",
         error.message
     );
 }
 
 #[test]
-fn keyed_dependency_name_mismatches_are_rejected() {
+fn temporary_nested_dependency_names_name_the_canonical_map_value() {
     let error = write_and_load(
-        "keyed-dependency-name-mismatch",
+        "temporary-dependency-name",
         "version: 1
 processes:
   web:
@@ -424,18 +479,19 @@ processes:
     command: [/bin/true]
 ",
     )
-    .expect_err("a keyed Dependency cannot declare a different name");
+    .expect_err("a Dependency condition must be a string");
     assert!(
         error
             .message
-            .contains("Dependency map key 'db' does not match its declared name 'cache'"),
+            .contains("condition for Dependency 'db' must be a string")
+            && error.message.contains("use 'dependency-name: condition'"),
         "{}",
         error.message
     );
 }
 
 #[test]
-fn keyed_dependency_conditions_use_the_same_validation_as_legacy_entries() {
+fn keyed_dependency_conditions_use_canonical_validation() {
     let error = write_and_load(
         "keyed-dependency-condition",
         "version: 1
@@ -632,30 +688,29 @@ fn ready_condition_is_valid_only_on_service_dependencies() {
 }
 
 #[test]
-fn invalid_depends_on_entries_are_rejected() {
-    let unknown_field = write_and_load(
-            "deps-field",
-            "version: 1\nprocesses:\n  web:\n    depends_on: [{name: db, when: started}]\n    command: [/bin/true]\n  db:\n    command: [/bin/true]\n",
-        )
-        .expect_err("an unknown field must fail");
-    assert!(unknown_field.message.contains("unknown field 'when'"));
-
-    let missing_name = write_and_load(
-            "deps-noname",
-            "version: 1\nprocesses:\n  web:\n    depends_on: [{condition: started}]\n    command: [/bin/true]\n",
-        )
-        .expect_err("a mapping without a name must fail");
-    assert!(missing_name.message.contains("requires 'name'"));
-
-    let not_a_name = write_and_load(
-        "deps-scalar",
-        "version: 1\nprocesses:\n  web:\n    depends_on: [7]\n    command: [/bin/true]\n",
+fn temporary_dependency_collections_name_the_canonical_mapping() {
+    let error = write_and_load(
+        "temporary-dependency-list",
+        "version: 1
+processes:
+  web:
+    depends_on:
+      - db
+    command: [/bin/true]
+  db:
+    command: [/bin/true]
+",
     )
-    .expect_err("a scalar entry must fail");
+    .expect_err("a Dependency collection must be keyed");
     assert!(
-        not_a_name
+        error
             .message
-            .contains("Process name or a {name, condition} mapping")
+            .contains("depends_on must be a name-keyed mapping")
+            && error
+                .message
+                .contains("use 'depends_on: {process-name: condition}'"),
+        "{}",
+        error.message
     );
 }
 

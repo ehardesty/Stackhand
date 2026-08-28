@@ -282,6 +282,16 @@ profiles: {}
 settings: {}
 ```
 
+Version 1 accepts this canonical shape only. It does not translate older
+spellings into it. `processes` and `depends_on` are name-keyed mappings.
+Direct commands use a sequence, and shell commands use a sibling `shell`
+field. Use `cwd`, `environment`, and a terminal mapping with `mode` and
+optional `input`.
+
+The temporary list collections, nested command objects, `working_dir`, `env`,
+top-level `input`, and scalar terminal values are rejected. The validation
+message names the canonical replacement to use.
+
 The final filename remains open. Examples in this document use:
 
 ```text
