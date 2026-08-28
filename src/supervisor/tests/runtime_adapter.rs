@@ -195,7 +195,7 @@ fn stop_after_reservation_has_one_owner_and_one_finished_run() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     let (received, finished) = receive_finished(&rx);
@@ -276,6 +276,53 @@ fn project_shutdown_stop_racing_a_published_completion_is_a_no_op() {
 }
 
 #[test]
+fn project_shutdown_tightens_a_pending_manual_stop_deadline() {
+    let after_spawn = TestPause::new();
+    let seam = RealRunSeam::with_test_hooks(
+        Arc::new(OutputViews::new(1)),
+        AdapterTestHooks {
+            after_spawn: Some(after_spawn.clone()),
+            ..Default::default()
+        },
+    );
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut core = Core::new(
+        one_shot_project(CommandForm::Shell {
+            text: "trap '' INT TERM; while :; do sleep 1; done".to_string(),
+        }),
+        Box::new(seam),
+        Box::new(NoProbes),
+        Arc::new(SystemClock),
+        SeamSender::new(tx),
+        TerminalGeometry::DEFAULT,
+    );
+
+    core.command(Command::Start("setup".to_string()));
+    after_spawn.wait_until_reached();
+    core.command(Command::Stop("setup".to_string()));
+    core.command(Command::Shutdown {
+        deadline: Instant::now() + Duration::from_millis(250),
+    });
+
+    after_spawn.resume();
+    let released = Instant::now();
+    let (received, finished) = receive_finished(&rx);
+    assert!(
+        released.elapsed() < Duration::from_secs(2),
+        "pending manual stop ignored the Project deadline: {finished:?}"
+    );
+    assert!(finished.cleanup_confirmed, "{finished:?}");
+    for event in received {
+        core.event(event);
+    }
+    assert!(
+        core.snapshot()
+            .shutdown
+            .is_some_and(|shutdown| shutdown.complete && shutdown.failures.is_empty())
+    );
+}
+
+#[test]
 fn stop_during_spawn_retains_one_marker_and_early_pipe_output() {
     const SENTINEL: &str = "stackhand-stop-during-spawn-sentinel";
 
@@ -321,7 +368,7 @@ fn stop_during_spawn_retains_one_marker_and_early_pipe_output() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     after_spawn.resume();
@@ -388,7 +435,7 @@ fn real_pipe_run_reports_a_live_log_match() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     let (_, finished) = receive_finished(&rx);
@@ -420,7 +467,7 @@ fn real_pipe_without_matching_output_emits_no_log_match() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     let (_, finished) = receive_finished(&rx);
@@ -527,7 +574,7 @@ fn real_pty_run_reports_a_live_log_match() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     let (_, finished) = receive_finished(&rx);
@@ -578,7 +625,7 @@ fn real_pipe_log_match_is_not_limited_by_retained_history() {
     seam.stop(
         start.process_id,
         start.run_id,
-        Some(Duration::from_secs(2)),
+        Some(Instant::now() + Duration::from_secs(2)),
         &events,
     );
     let (_, finished) = receive_finished(&rx);

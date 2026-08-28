@@ -58,7 +58,7 @@ impl TestPause {
 
 #[derive(Clone, Copy)]
 pub(super) struct StopRequest {
-    pub(super) remaining: Option<Duration>,
+    pub(super) deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +70,14 @@ pub(super) enum FinishCause {
 impl FinishCause {
     pub(super) fn intentional_stop(self) -> bool {
         matches!(self, Self::Stop(_))
+    }
+}
+
+fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
     }
 }
 
@@ -182,21 +190,34 @@ impl RunRecord {
         self.wake.notify_all();
     }
 
-    pub(super) fn request_stop(&self, remaining: Option<Duration>) {
-        let request = StopRequest { remaining };
+    pub(super) fn request_stop(&self, deadline: Option<Instant>) {
         let mut coordination = self
             .coordination
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = earliest_deadline(deadline, coordination.project_deadline);
+        let request = StopRequest { deadline };
         let state = std::mem::replace(&mut coordination.state, RunState::Finishing);
         coordination.state = match state {
             RunState::Spawning => RunState::StopBeforeSpawn(request),
-            RunState::StopBeforeSpawn(_) => RunState::StopBeforeSpawn(request),
+            RunState::StopBeforeSpawn(previous) => RunState::StopBeforeSpawn(StopRequest {
+                deadline: earliest_deadline(previous.deadline, request.deadline),
+            }),
             RunState::Active(run) | RunState::Unconfirmed(run) => RunState::Pending {
                 run,
                 cause: FinishCause::Stop(request),
             },
-            state @ (RunState::Pending { .. } | RunState::Finishing | RunState::Finished) => state,
+            RunState::Pending {
+                run,
+                cause: FinishCause::Stop(previous),
+            } => RunState::Pending {
+                run,
+                cause: FinishCause::Stop(StopRequest {
+                    deadline: earliest_deadline(previous.deadline, request.deadline),
+                }),
+            },
+            state @ (RunState::Finishing | RunState::Finished) => state,
+            state @ RunState::Pending { .. } => state,
         };
         self.wake.notify_one();
     }
@@ -228,12 +249,11 @@ impl RunRecord {
         }
     }
 
-    pub(super) fn project_remaining(&self) -> Option<Duration> {
+    pub(super) fn project_deadline(&self) -> Option<Instant> {
         self.coordination
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .project_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     pub(super) fn finish(&self, run: OwnedRun, cleanup_confirmed: bool) {

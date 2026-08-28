@@ -8,6 +8,8 @@ use anyhow::{Result, anyhow, bail};
 use crate::supervisor::{Command, Lifecycle};
 
 const SMOKE_WAIT: Duration = Duration::from_secs(30);
+const RESOURCE_CONVERGENCE_WAIT: Duration = Duration::from_secs(10);
+const RESOURCE_POLL: Duration = Duration::from_millis(25);
 const REAL_PROJECT_CYCLES: usize = 3;
 
 pub fn run(config_path: &Path) -> Result<()> {
@@ -19,9 +21,8 @@ pub fn run(config_path: &Path) -> Result<()> {
     for _ in 0..REAL_PROJECT_CYCLES {
         run_cycle(project.clone())?;
     }
-    std::thread::sleep(Duration::from_millis(100));
-    assert_resource_convergence("file descriptors", baseline_fds, open_fd_count())?;
-    assert_resource_convergence("threads", baseline_threads, thread_count())?;
+    wait_for_resource_convergence("file descriptors", baseline_fds, open_fd_count)?;
+    wait_for_resource_convergence("threads", baseline_threads, thread_count)?;
     println!("real-project-cycles-ok");
     println!("real-project-smoke-ok");
     Ok(())
@@ -94,17 +95,27 @@ fn run_cycle(project: crate::model::EffectiveProject) -> Result<()> {
     Ok(())
 }
 
-fn assert_resource_convergence(
+fn wait_for_resource_convergence(
     resource: &str,
     before: Option<usize>,
-    after: Option<usize>,
+    mut measure: impl FnMut() -> Option<usize>,
 ) -> Result<()> {
-    if let (Some(before), Some(after)) = (before, after)
-        && after > before + 2
-    {
-        bail!("{resource} did not converge: before {before}, after {after}");
+    let Some(before) = before else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + RESOURCE_CONVERGENCE_WAIT;
+    loop {
+        let Some(after) = measure() else {
+            return Ok(());
+        };
+        if after <= before + 2 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("{resource} did not converge: before {before}, after {after}");
+        }
+        std::thread::sleep(RESOURCE_POLL);
     }
-    Ok(())
 }
 
 fn open_fd_count() -> Option<usize> {

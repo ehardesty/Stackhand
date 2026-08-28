@@ -106,14 +106,13 @@ fn every_cleanup_failure_is_retained_with_remaining_pids() {
 }
 
 #[test]
-fn later_waves_receive_only_the_shared_deadlines_remaining_time() {
+fn later_waves_receive_the_same_shared_deadline() {
     let runtime = FakeRuntime::shared();
     runtime.set_hold_stops(true);
     let mut h = Harness::with(shutdown_project(), Arc::clone(&runtime));
     start_all(&mut h);
-    h.command(Command::Shutdown {
-        deadline: h.clock.now() + Duration::from_secs(10),
-    });
+    let deadline = h.clock.now() + Duration::from_secs(10);
+    h.command(Command::Shutdown { deadline });
     h.clock.advance(Duration::from_secs(3));
 
     for process in ["worker", "setup"] {
@@ -127,22 +126,15 @@ fn later_waves_receive_only_the_shared_deadlines_remaining_time() {
             remaining_pids: Vec::new(),
         }));
     }
-    let budgets: Vec<_> = runtime
+    let deadlines: Vec<_> = runtime
         .intents()
         .into_iter()
         .filter_map(|intent| match intent {
-            Intent::Stop { remaining, .. } => remaining,
+            Intent::Stop { deadline, .. } => deadline,
             Intent::Start { .. } | Intent::Cancel { .. } => None,
         })
         .collect();
-    assert_eq!(
-        budgets,
-        [
-            Duration::from_secs(10),
-            Duration::from_secs(10),
-            Duration::from_secs(7),
-        ]
-    );
+    assert_eq!(deadlines, [deadline, deadline, deadline]);
 }
 
 #[test]

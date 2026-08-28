@@ -24,7 +24,7 @@ pub(crate) enum Intent {
     Stop {
         process_id: ProcessId,
         run_id: RunId,
-        remaining: Option<Duration>,
+        deadline: Option<Instant>,
     },
     Cancel {
         process_id: ProcessId,
@@ -112,13 +112,13 @@ impl RunSeam for FakeRuntime {
         &self,
         process_id: ProcessId,
         run_id: RunId,
-        remaining: Option<Duration>,
+        deadline: Option<Instant>,
         events: &SeamSender,
     ) {
         self.record(Intent::Stop {
             process_id,
             run_id,
-            remaining,
+            deadline,
         });
         if self.hold_stops.load(Ordering::Acquire) {
             return;
@@ -186,10 +186,10 @@ impl RunSeam for Arc<FakeRuntime> {
         &self,
         process_id: ProcessId,
         run_id: RunId,
-        remaining: Option<Duration>,
+        deadline: Option<Instant>,
         events: &SeamSender,
     ) {
-        (**self).stop(process_id, run_id, remaining, events);
+        (**self).stop(process_id, run_id, deadline, events);
     }
 }
 

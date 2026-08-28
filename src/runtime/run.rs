@@ -320,10 +320,6 @@ impl OwnedRun {
         !self.stopping.load(Ordering::Acquire)
     }
 
-    fn ladder_trace(&self) -> ladder::LadderTrace {
-        self.ladder_trace_with(self.ladder)
-    }
-
     fn ladder_trace_with(&self, ladder: crate::runtime::ShutdownLadder) -> ladder::LadderTrace {
         if self.signals_stopped.load(Ordering::Acquire) {
             let detail = self
@@ -367,15 +363,26 @@ impl OwnedRun {
 
     /// Wait naturally, clean descendants, then reap the root.
     pub fn wait(&mut self) -> Result<RunOutcome> {
-        self.wait_with_ladder(self.ladder)
+        let final_deadline = Instant::now() + self.ladder.final_deadline;
+        self.wait_with_ladder_until(self.ladder, final_deadline)
     }
 
-    /// Wait naturally while clamping cleanup to the Project deadline.
+    /// Wait naturally while clamping cleanup to one absolute deadline.
+    pub(crate) fn wait_until(&mut self, final_deadline: Instant) -> Result<RunOutcome> {
+        let remaining = final_deadline.saturating_duration_since(Instant::now());
+        self.wait_with_ladder_until(self.ladder.clamped_to(remaining), final_deadline)
+    }
+
+    /// Wait naturally while clamping cleanup to a relative budget.
     pub(crate) fn wait_with_timeout(&mut self, remaining: Duration) -> Result<RunOutcome> {
-        self.wait_with_ladder(self.ladder.clamped_to(remaining))
+        self.wait_until(Instant::now() + remaining)
     }
 
-    fn wait_with_ladder(&mut self, ladder: ShutdownLadder) -> Result<RunOutcome> {
+    fn wait_with_ladder_until(
+        &mut self,
+        ladder: ShutdownLadder,
+        final_deadline: Instant,
+    ) -> Result<RunOutcome> {
         if let Some(outcome) = &self.outcome {
             return Ok(outcome.clone());
         }
@@ -404,7 +411,7 @@ impl OwnedRun {
 
         let trace = self.ladder_trace_with(ladder);
         let disposition = RunExitDisposition::UnexpectedExit;
-        self.finalize_after_ladder(trace, disposition, false)
+        self.finalize_after_ladder(trace, disposition, false, final_deadline)
     }
 
     fn finalize_after_ladder(
@@ -412,6 +419,7 @@ impl OwnedRun {
         mut trace: ladder::LadderTrace,
         mut disposition: RunExitDisposition,
         intentional_stop: bool,
+        final_deadline: Instant,
     ) -> Result<RunOutcome> {
         if trace.signals_stopped {
             self.signals_stopped.store(true, Ordering::Release);
@@ -427,7 +435,6 @@ impl OwnedRun {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(detail);
             }
         }
-        let final_deadline = Instant::now() + self.ladder.final_deadline;
         let settled_before_finalize = tree_is_settled(self.tree.as_ref());
         let mut io_failures = Vec::new();
         let mut terminal_failure = None;
@@ -639,21 +646,30 @@ impl OwnedRun {
     }
 
     /// Run the semantic signal ladder, confirm containment, reap the root,
-    /// drain final output, finalize the terminal, and join all Run workers.
-    /// Repeated calls observe the first structured outcome.
+    /// drain final output, finalize the terminal, and join all Run workers
+    /// using the ladder's configured deadline. Repeated calls observe the
+    /// first structured outcome.
     pub fn shutdown(&mut self) -> Result<RunOutcome> {
-        self.shutdown_with_ladder(self.ladder)
+        let final_deadline = Instant::now() + self.ladder.final_deadline;
+        self.shutdown_with_ladder_until(self.ladder, final_deadline)
     }
 
-    /// Shut down this Run with every ladder wait clamped to one remaining
-    /// Project deadline. Repeated calls still observe the first outcome.
+    /// Shut down this Run with every ladder wait clamped to one absolute
+    /// deadline. Repeated calls still observe the first outcome.
+    pub(crate) fn shutdown_until(&mut self, final_deadline: Instant) -> Result<RunOutcome> {
+        let remaining = final_deadline.saturating_duration_since(Instant::now());
+        self.shutdown_with_ladder_until(self.ladder.clamped_to(remaining), final_deadline)
+    }
+
+    /// Shut down this Run with a relative cleanup budget.
     pub fn shutdown_with_timeout(&mut self, remaining: Duration) -> Result<RunOutcome> {
-        self.shutdown_with_ladder(self.ladder.clamped_to(remaining))
+        self.shutdown_until(Instant::now() + remaining)
     }
 
-    fn shutdown_with_ladder(
+    fn shutdown_with_ladder_until(
         &mut self,
         ladder: crate::runtime::ShutdownLadder,
+        final_deadline: Instant,
     ) -> Result<RunOutcome> {
         if let Some(outcome) = &self.outcome {
             return Ok(outcome.clone());
@@ -662,7 +678,12 @@ impl OwnedRun {
         self.stopping.store(true, Ordering::Release);
 
         let trace = self.ladder_trace_with(ladder);
-        self.finalize_after_ladder(trace, RunExitDisposition::IntentionalStop, true)
+        self.finalize_after_ladder(
+            trace,
+            RunExitDisposition::IntentionalStop,
+            true,
+            final_deadline,
+        )
     }
 
     fn emit(&self, kind: RunEventKind) {

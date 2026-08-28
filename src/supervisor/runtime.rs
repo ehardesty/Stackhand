@@ -81,8 +81,7 @@ impl RunSeam for RealRunSeam {
         }
     }
 
-    fn begin_shutdown(&self, remaining: Duration) {
-        let deadline = Instant::now() + remaining;
+    fn begin_shutdown(&self, deadline: Instant) {
         let records: Vec<_> = self
             .runs
             .lock()
@@ -191,7 +190,7 @@ impl RunSeam for RealRunSeam {
         &self,
         process_id: ProcessId,
         run_id: RuntimeRunId,
-        remaining: Option<Duration>,
+        deadline: Option<Instant>,
         events: &SeamSender,
     ) {
         let key = (process_id.get(), run_id.get());
@@ -202,7 +201,7 @@ impl RunSeam for RealRunSeam {
             .get(&key)
             .cloned();
         match record {
-            Some(record) => record.request_stop(remaining),
+            Some(record) => record.request_stop(deadline),
             None => events.send(SeamEvent::Failed {
                 process_id,
                 run_id,
@@ -286,12 +285,12 @@ fn own_run(
         let natural_exit = root_pid.is_some_and(root_exit_pending);
         if let Some((mut run, cause)) = record.take_completion(natural_exit) {
             let result = match cause {
-                FinishCause::Natural => match record.project_remaining() {
-                    Some(remaining) => run.wait_with_timeout(remaining),
+                FinishCause::Natural => match record.project_deadline() {
+                    Some(deadline) => run.wait_until(deadline),
                     None => run.wait(),
                 },
-                FinishCause::Stop(request) => match request.remaining {
-                    Some(remaining) => run.shutdown_with_timeout(remaining),
+                FinishCause::Stop(request) => match request.deadline {
+                    Some(deadline) => run.shutdown_until(deadline),
                     None => run.shutdown(),
                 },
             };

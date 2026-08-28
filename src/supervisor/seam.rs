@@ -8,7 +8,7 @@
 
 use crossbeam_channel::Sender;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::geometry::TerminalGeometry;
 use crate::model::{ReadinessProbe, ShellConfig};
@@ -216,9 +216,9 @@ pub(crate) trait RunSeam: Send {
     /// is a no-op for adapters that do not observe output.
     fn arm_log_matcher(&self, _process_id: ProcessId, _run_id: RunId, _matcher: LogMatcherIntent) {}
 
-    /// Apply the Project's shared remaining deadline to cleanup work that a
+    /// Apply the Project's shared absolute deadline to cleanup work that a
     /// natural-exit owner can already be completing.
-    fn begin_shutdown(&self, _remaining: Duration) {}
+    fn begin_shutdown(&self, _deadline: Instant) {}
 
     /// Begin one Run. Report progress only as [`SeamEvent`]s on `events`;
     /// never block the caller on process work beyond cheap bookkeeping.
@@ -231,7 +231,7 @@ pub(crate) trait RunSeam: Send {
         &self,
         process_id: ProcessId,
         run_id: RunId,
-        remaining: Option<Duration>,
+        deadline: Option<Instant>,
         events: &SeamSender,
     );
 }

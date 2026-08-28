@@ -36,8 +36,7 @@ impl Core {
         if self.shutdown.is_some() {
             return;
         }
-        self.seam
-            .begin_shutdown(deadline.saturating_duration_since(self.clock.now()));
+        self.seam.begin_shutdown(deadline);
         let remaining: BTreeSet<usize> = self
             .entries
             .iter()
@@ -129,16 +128,17 @@ impl Core {
             .filter(|index| !state.dispatched.contains(index))
             .collect();
 
-        // Even at the deadline, every Run receives one zero-wait cleanup
-        // attempt. The shared bound must not cause deeper Dependencies to be
-        // skipped when an earlier dependent did not finish.
+        // Even at the deadline, every Run receives one cleanup attempt using
+        // the shared deadline. The bound must not cause deeper Dependencies
+        // to be skipped when an earlier dependent did not finish.
+        let deadline = state.deadline;
         for index in unattempted {
             let entry = &mut self.entries[index];
             entry.lifecycle = Lifecycle::Stopping;
             self.seam.stop(
                 entry.process_id,
                 entry.current_run.expect("shutdown tracks active Runs"),
-                Some(Duration::ZERO),
+                Some(deadline),
                 &self.events,
             );
         }
@@ -176,7 +176,7 @@ impl Core {
                 })
             })
             .collect();
-        let remaining = state.deadline.saturating_duration_since(self.clock.now());
+        let deadline = state.deadline;
 
         for index in candidates {
             let run_id: RunId = self.entries[index]
@@ -190,7 +190,7 @@ impl Core {
             let entry = &mut self.entries[index];
             entry.lifecycle = Lifecycle::Stopping;
             self.seam
-                .stop(entry.process_id, run_id, Some(remaining), &self.events);
+                .stop(entry.process_id, run_id, Some(deadline), &self.events);
         }
     }
 }

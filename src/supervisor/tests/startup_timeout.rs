@@ -54,7 +54,7 @@ fn startup_timeout_is_measured_from_spawn_and_stops_the_run() {
             Intent::Stop {
                 process_id: stop_process,
                 run_id: stop_run,
-                remaining: None,
+                deadline: None,
             },
         ] if *process_id == ProcessId::new(0)
             && *run_id == RunId::new(1)
