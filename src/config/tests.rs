@@ -58,6 +58,7 @@ fn one_direct_command_service_loads_with_defaults() {
     assert_eq!(web.success_exit_codes, vec![0]);
     assert_eq!(web.restart.policy, RestartPolicy::Never);
     assert_eq!(web.restart.backoff, Duration::from_secs(2));
+    assert_eq!(web.restart.max_restarts, 5);
     assert_eq!(web.terminal_mode, TerminalMode::Pipe);
     assert_eq!(web.input_policy, InputPolicy::Disabled);
 }
@@ -72,7 +73,7 @@ fn restart_policy_and_backoff_load_with_explicit_values() {
         let project = write_and_load(
                 policy,
                 &format!(
-                    "version: 1\nprocesses:\n  - name: web\n    restart: {{policy: {policy}, backoff: 1500ms}}\n    command: {{program: /bin/sleep, args: [\"1\"]}}\n"
+                    "version: 1\nprocesses:\n  - name: web\n    restart: {{policy: {policy}, backoff: 1500ms, max_restarts: 3}}\n    command: {{program: /bin/sleep, args: [\"1\"]}}\n"
                 ),
             )
             .expect("valid restart settings");
@@ -81,6 +82,28 @@ fn restart_policy_and_backoff_load_with_explicit_values() {
             project.processes()[0].restart.backoff,
             Duration::from_millis(1500)
         );
+        assert_eq!(project.processes()[0].restart.max_restarts, 3);
+    }
+}
+
+#[test]
+fn restart_budget_defaults_to_five_and_accepts_zero_or_more_retries() {
+    let omitted = write_and_load(
+        "restart-budget-default",
+        "version: 1\nprocesses:\n  - name: web\n    restart: {policy: on_failure}\n    command: {program: /bin/true}\n",
+    )
+    .expect("an automatic policy may omit its budget");
+    assert_eq!(omitted.processes()[0].restart.max_restarts, 5);
+
+    for max_restarts in [0, 1, 12] {
+        let project = write_and_load(
+            &format!("restart-budget-{max_restarts}"),
+            &format!(
+                "version: 1\nprocesses:\n  - name: web\n    restart: {{policy: on_failure, max_restarts: {max_restarts}}}\n    command: {{program: /bin/true}}\n"
+            ),
+        )
+        .expect("a nonnegative whole-number budget is valid");
+        assert_eq!(project.processes()[0].restart.max_restarts, max_restarts);
     }
 }
 
@@ -103,6 +126,20 @@ fn invalid_restart_settings_are_rejected() {
             .message
             .contains("backoff must be greater than zero")
     );
+
+    for (label, value) in [
+        ("restart-budget-negative", "-1"),
+        ("restart-budget-float", "1.5"),
+    ] {
+        let error = write_and_load(
+            label,
+            &format!(
+                "version: 1\nprocesses:\n  - name: web\n    restart: {{max_restarts: {value}}}\n    command: {{program: /bin/true}}\n"
+            ),
+        )
+        .expect_err("the restart budget must be a nonnegative whole number");
+        assert!(error.message.contains("max_restarts"), "{}", error.message);
+    }
 }
 
 #[test]

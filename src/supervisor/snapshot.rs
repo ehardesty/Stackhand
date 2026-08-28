@@ -94,6 +94,18 @@ pub struct RestartBackoffStatus {
     pub next_attempt_at_ms: u64,
 }
 
+/// The visible automatic-retry budget for one Process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartBudgetStatus {
+    /// Automatic retries started after the initial Run in this session.
+    pub automatic_retries_used: u32,
+    /// The configured maximum automatic retries after the initial Run.
+    pub max_restarts: u32,
+    /// Whether a requested automatic retry was refused because no budget
+    /// remained.
+    pub exhausted: bool,
+}
+
 /// The immutable lifecycle and diagnostic view of one Process.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessSnapshot {
@@ -130,6 +142,8 @@ pub struct ProcessSnapshot {
     pub readiness: Option<ReadinessStatus>,
     /// The pending automatic retry while the Process is in RestartBackoff.
     pub restart_backoff: Option<RestartBackoffStatus>,
+    /// Automatic retry use and exhaustion for this Project session.
+    pub automatic_restart_budget: RestartBudgetStatus,
     /// The bounded recent finished-Run summaries, newest first.
     pub recent_runs: Vec<RunSummary>,
 }

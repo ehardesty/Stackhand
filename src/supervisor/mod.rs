@@ -52,7 +52,7 @@ pub use runtime::{ConsoleView, Consoles};
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
 pub use snapshot::{
     ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus,
-    RestartBackoffStatus,
+    RestartBackoffStatus, RestartBudgetStatus,
 };
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.

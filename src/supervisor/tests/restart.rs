@@ -8,19 +8,36 @@ use crate::model::RestartPolicy;
 use crate::supervisor::RunTrigger;
 
 fn restart_project(kind: ProcessKind, policy: RestartPolicy) -> EffectiveProject {
+    restart_project_with_max(kind, policy, 5)
+}
+
+fn restart_project_with_max(
+    kind: ProcessKind,
+    policy: RestartPolicy,
+    max_restarts: u32,
+) -> EffectiveProject {
     let mut process = simple("api", kind, Enabled::Yes, Autostart::No);
     process.restart = RestartConfig {
         policy,
         backoff: Duration::from_secs(2),
+        max_restarts,
     };
     EffectiveProject::new(vec![process]).expect("unique names and valid restart policy")
 }
 
 fn startup_timeout_restart_project(policy: RestartPolicy) -> EffectiveProject {
+    startup_timeout_restart_project_with_max(policy, 5)
+}
+
+fn startup_timeout_restart_project_with_max(
+    policy: RestartPolicy,
+    max_restarts: u32,
+) -> EffectiveProject {
     let mut process = probed_service("api");
     process.restart = RestartConfig {
         policy,
         backoff: Duration::from_secs(2),
+        max_restarts,
     };
     process
         .readiness
@@ -304,7 +321,9 @@ fn clearing_backoff_before_a_new_run_invalidates_the_old_timer() {
     h.command(Command::Stop("api".into()));
     h.command(Command::Start("api".into()));
 
-    assert_eq!(h.process("api").current_run, Some(2));
+    let api = h.process("api");
+    assert_eq!(api.current_run, Some(2));
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 0);
     h.advance_and_poll(Duration::from_secs(3));
     assert_eq!(start_count(&h), 2);
 }
@@ -331,4 +350,319 @@ fn automatic_restart_waits_for_confirmed_cleanup() {
     h.event(finished("api", 1, Some(7)));
     assert_eq!(h.process("api").lifecycle, Lifecycle::RestartBackoff);
     assert_eq!(h.process("api").current_run, None);
+}
+
+#[test]
+fn zero_retries_fails_without_scheduling_a_backoff() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        0,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+
+    let api = h.process("api");
+    assert_eq!(api.restart_backoff, None);
+    assert_eq!(api.lifecycle, Lifecycle::Stopped);
+    assert_eq!(api.desired, DesiredState::Running);
+    assert_eq!(
+        api.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::RestartLimit)
+    );
+    assert_eq!(
+        api.failure.as_ref().map(|failure| failure.detail.as_str()),
+        Some("Restart limit reached after 0 automatic attempts")
+    );
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 0);
+    assert_eq!(api.automatic_restart_budget.max_restarts, 0);
+    assert!(api.automatic_restart_budget.exhausted);
+
+    h.advance_and_poll(Duration::from_secs(3));
+    assert_eq!(start_count(&h), 1);
+}
+
+#[test]
+fn one_retry_is_consumed_before_the_new_run_and_then_exhausts() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        1,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+
+    let waiting = h.process("api");
+    assert_eq!(waiting.automatic_restart_budget.automatic_retries_used, 0);
+    assert!(!waiting.automatic_restart_budget.exhausted);
+    h.advance_and_poll(Duration::from_secs(2));
+
+    let retrying = h.process("api");
+    assert_eq!(retrying.current_run, Some(2));
+    assert_eq!(retrying.automatic_restart_budget.automatic_retries_used, 1);
+    assert!(!retrying.automatic_restart_budget.exhausted);
+
+    h.advance_and_poll(Duration::from_secs(10));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        1
+    );
+    assert!(!h.process("api").automatic_restart_budget.exhausted);
+
+    h.event(spawned("api", 2));
+    h.event(finished("api", 2, Some(7)));
+    let failed = h.process("api");
+    assert_eq!(failed.restart_backoff, None);
+    assert_eq!(
+        failed.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::RestartLimit)
+    );
+    assert!(failed.automatic_restart_budget.exhausted);
+    assert_eq!(start_count(&h), 2);
+    assert_eq!(failed.recent_runs[0].trigger, RunTrigger::AutomaticRestart);
+    assert_eq!(failed.recent_runs[1].trigger, RunTrigger::Manual);
+}
+
+#[test]
+fn always_policy_shares_one_budget_across_success_and_failure() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::Always,
+        2,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(0)));
+    h.advance_and_poll(Duration::from_secs(2));
+    assert_eq!(h.process("api").current_run, Some(2));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        1
+    );
+
+    h.event(spawned("api", 2));
+    h.event(finished("api", 2, Some(7)));
+    h.advance_and_poll(Duration::from_secs(2));
+    assert_eq!(h.process("api").current_run, Some(3));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        2
+    );
+
+    h.event(spawned("api", 3));
+    h.event(finished("api", 3, Some(0)));
+    let failed = h.process("api");
+    assert_eq!(
+        failed.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::RestartLimit)
+    );
+    assert_eq!(failed.automatic_restart_budget.automatic_retries_used, 2);
+    assert!(failed.automatic_restart_budget.exhausted);
+    assert_eq!(start_count(&h), 3);
+}
+
+#[test]
+fn mixed_failure_causes_share_one_restart_budget() {
+    let mut h = Harness::new(startup_timeout_restart_project_with_max(
+        RestartPolicy::OnFailure,
+        1,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+    h.advance_and_poll(Duration::from_secs(2));
+    assert_eq!(h.process("api").current_run, Some(2));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        1
+    );
+
+    h.event(spawned("api", 2));
+    h.advance_and_poll(Duration::from_secs(1));
+
+    let api = h.process("api");
+    assert_eq!(api.restart_backoff, None);
+    assert_eq!(api.current_run, None);
+    assert_eq!(
+        api.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::RestartLimit)
+    );
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 1);
+    assert!(api.automatic_restart_budget.exhausted);
+}
+
+#[test]
+fn manual_start_resets_an_exhausted_budget_without_consuming_a_retry() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        0,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+    assert!(h.process("api").automatic_restart_budget.exhausted);
+
+    h.command(Command::Start("api".into()));
+    let api = h.process("api");
+    assert_eq!(api.current_run, Some(2));
+    assert_eq!(api.lifecycle, Lifecycle::Starting);
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 0);
+    assert!(!api.automatic_restart_budget.exhausted);
+}
+
+#[test]
+fn a_new_project_session_starts_with_a_fresh_restart_budget() {
+    let mut first = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        0,
+    ));
+    start_service(&mut first);
+    first.event(finished("api", 1, Some(7)));
+    assert!(first.process("api").automatic_restart_budget.exhausted);
+
+    let second = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        0,
+    ));
+    let budget = second.process("api").automatic_restart_budget;
+    assert_eq!(budget.automatic_retries_used, 0);
+    assert!(!budget.exhausted);
+}
+
+#[test]
+fn manual_start_after_an_automatic_retry_keeps_a_manual_trigger() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        1,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+    h.advance_and_poll(Duration::from_secs(2));
+    h.event(spawned("api", 2));
+    h.event(finished("api", 2, Some(7)));
+    assert!(h.process("api").automatic_restart_budget.exhausted);
+
+    h.command(Command::Start("api".into()));
+    let api = h.process("api");
+    assert_eq!(api.current_run, Some(3));
+    assert_eq!(api.lifecycle, Lifecycle::Starting);
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 0);
+    assert!(!api.automatic_restart_budget.exhausted);
+
+    h.event(spawned("api", 3));
+    h.event(finished("api", 3, Some(0)));
+    assert_eq!(h.process("api").recent_runs[0].trigger, RunTrigger::Manual);
+}
+
+#[test]
+fn manual_restart_resets_used_retries_and_does_not_consume_one() {
+    let mut h = Harness::new(restart_project_with_max(
+        ProcessKind::Service,
+        RestartPolicy::OnFailure,
+        1,
+    ));
+    start_service(&mut h);
+    h.event(finished("api", 1, Some(7)));
+    h.advance_and_poll(Duration::from_secs(2));
+    assert_eq!(h.process("api").current_run, Some(2));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        1
+    );
+
+    h.command(Command::Restart("api".into()));
+    let api = h.process("api");
+    assert_eq!(api.current_run, Some(3));
+    assert_eq!(api.lifecycle, Lifecycle::Starting);
+    assert_eq!(api.automatic_restart_budget.automatic_retries_used, 0);
+    assert!(!api.automatic_restart_budget.exhausted);
+    assert_eq!(start_count(&h), 3);
+}
+
+#[test]
+fn startup_timeout_uses_the_same_zero_retry_limit() {
+    let runtime = FakeRuntime::shared();
+    runtime.set_hold_stops(true);
+    let mut h = Harness::with(
+        startup_timeout_restart_project_with_max(RestartPolicy::OnFailure, 0),
+        Arc::clone(&runtime),
+    );
+    start_service(&mut h);
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(SeamEvent::Finished(FinishedRun {
+        process_id: ProcessId::new(0),
+        run_id: RunId::new(1),
+        exit_code: None,
+        intentional_stop: true,
+        cleanup_confirmed: true,
+        detail: None,
+        remaining_pids: Vec::new(),
+    }));
+
+    let api = h.process("api");
+    assert_eq!(api.restart_backoff, None);
+    assert_eq!(
+        api.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::RestartLimit)
+    );
+    assert!(api.automatic_restart_budget.exhausted);
+    assert_eq!(start_count(&h), 1);
+}
+
+#[test]
+fn manual_restart_overrides_a_startup_timeout_restart() {
+    let runtime = FakeRuntime::shared();
+    runtime.set_hold_stops(true);
+    let mut h = Harness::with(
+        startup_timeout_restart_project_with_max(RestartPolicy::OnFailure, 1),
+        Arc::clone(&runtime),
+    );
+    start_service(&mut h);
+    h.advance_and_poll(Duration::from_secs(1));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Stopping);
+
+    h.command(Command::Restart("api".into()));
+    assert_eq!(h.process("api").current_run, Some(1));
+    assert_eq!(
+        h.process("api")
+            .automatic_restart_budget
+            .automatic_retries_used,
+        0
+    );
+
+    runtime.set_hold_stops(false);
+    h.event(SeamEvent::Finished(FinishedRun {
+        process_id: ProcessId::new(0),
+        run_id: RunId::new(1),
+        exit_code: None,
+        intentional_stop: true,
+        cleanup_confirmed: true,
+        detail: None,
+        remaining_pids: Vec::new(),
+    }));
+
+    let replacement = h.process("api");
+    assert_eq!(replacement.current_run, Some(2));
+    assert_eq!(replacement.lifecycle, Lifecycle::Starting);
+    assert_eq!(replacement.restart_backoff, None);
+    assert_eq!(
+        replacement.automatic_restart_budget.automatic_retries_used,
+        0
+    );
+    assert_eq!(replacement.recent_runs[0].trigger, RunTrigger::Manual);
+
+    h.event(spawned("api", 2));
+    h.event(finished("api", 2, Some(0)));
+    assert_eq!(h.process("api").recent_runs[0].trigger, RunTrigger::Restart);
 }

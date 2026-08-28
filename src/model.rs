@@ -66,18 +66,24 @@ impl RestartPolicy {
     }
 }
 
-/// The fixed delay before one automatic restart.
+/// The fixed delay and retry limit for automatic restarts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestartConfig {
     pub policy: RestartPolicy,
     pub backoff: Duration,
+    /// The number of automatic retries allowed after the initial Run.
+    pub max_restarts: u32,
 }
+
+/// The default number of automatic retries after the initial Run.
+pub const DEFAULT_MAX_RESTARTS: u32 = 5;
 
 impl Default for RestartConfig {
     fn default() -> Self {
         Self {
             policy: RestartPolicy::Never,
             backoff: Duration::from_secs(2),
+            max_restarts: DEFAULT_MAX_RESTARTS,
         }
     }
 }

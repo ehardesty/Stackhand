@@ -13,7 +13,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::core::{Core, DesiredState, Lifecycle, RestartBackoff, RestartReason};
+use super::core::{
+    Core, DesiredState, FailureKind, FailureSummary, Lifecycle, RestartBackoff, RestartReason,
+};
 use super::readiness::ReadinessState;
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
@@ -28,7 +30,11 @@ impl Core {
         }
         if trigger == RunTrigger::Manual {
             let entry = &mut self.entries[index];
+            let timeout_cleanup = entry.startup_timeout_pending;
             entry.clear_restart_state();
+            entry.restart_budget.reset();
+            entry.pending_trigger = trigger;
+            entry.restart_suppressed = timeout_cleanup;
             entry.exited = false;
         }
         self.require_running(index, trigger);
@@ -46,8 +52,13 @@ impl Core {
         }
         {
             let entry = &mut self.entries[index];
+            let timeout_cleanup = entry.startup_timeout_pending;
             entry.pending_trigger = trigger;
             entry.clear_restart_state();
+            if matches!(trigger, RunTrigger::Restart | RunTrigger::Rerun) {
+                entry.restart_budget.reset();
+            }
+            entry.restart_suppressed = timeout_cleanup;
             entry.exited = false;
         }
         self.require_running(index, trigger);
@@ -112,6 +123,14 @@ impl Core {
         };
         if !can_start {
             return;
+        }
+        let automatic_retry = self.entries[index].pending_trigger == RunTrigger::AutomaticRestart;
+        if automatic_retry {
+            let max_restarts = self.project.processes()[index].restart.max_restarts;
+            if !self.entries[index].restart_budget.consume(max_restarts) {
+                self.mark_restart_limit(index);
+                return;
+            }
         }
         let has_log_readiness = self.project.processes()[index]
             .readiness
@@ -237,6 +256,14 @@ impl Core {
         failed_run_id: RunId,
         reason: RestartReason,
     ) {
+        let max_restarts = self.project.processes()[index].restart.max_restarts;
+        if !self.entries[index]
+            .restart_budget
+            .has_remaining(max_restarts)
+        {
+            self.mark_restart_limit(index);
+            return;
+        }
         let deadline = self.clock.now() + self.project.processes()[index].restart.backoff;
         let entry = &mut self.entries[index];
         entry.desired = DesiredState::Running;
@@ -247,6 +274,21 @@ impl Core {
             failed_run_id,
             deadline,
             reason,
+        });
+    }
+
+    fn mark_restart_limit(&mut self, index: usize) {
+        let max_restarts = self.project.processes()[index].restart.max_restarts;
+        let entry = &mut self.entries[index];
+        entry.restart_budget.exhaust();
+        entry.desired = DesiredState::Running;
+        entry.lifecycle = Lifecycle::Stopped;
+        entry.blocked = None;
+        entry.awaiting_manual_restart = true;
+        entry.restart_backoff = None;
+        entry.failure = Some(FailureSummary {
+            kind: FailureKind::RestartLimit,
+            detail: format!("Restart limit reached after {max_restarts} automatic attempts"),
         });
     }
 

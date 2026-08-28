@@ -15,7 +15,9 @@ use crate::supervisor::clock::Clock;
 use crate::supervisor::command::Command;
 use crate::supervisor::readiness::ReadinessTracking;
 use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId};
-use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, RestartBackoffStatus};
+use crate::supervisor::snapshot::{
+    ProcessSnapshot, ProjectSnapshot, RestartBackoffStatus, RestartBudgetStatus,
+};
 
 /// The user's current intent for a Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +127,8 @@ pub enum FailureKind {
     Output,
     /// The bounded cleanup did not fully confirm.
     Shutdown,
+    /// No automatic retries remain for the Process.
+    RestartLimit,
 }
 
 /// One bounded failure summary: a structured kind and a bounded detail.
@@ -162,6 +166,45 @@ pub(super) struct RestartBackoff {
     pub(super) failed_run_id: RunId,
     pub(super) deadline: Instant,
     pub(super) reason: RestartReason,
+}
+
+/// Mutable retry state for one Process. The configured maximum remains in
+/// the immutable Process specification; this value tracks only this session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RestartBudget {
+    automatic_retries_used: u32,
+    exhausted: bool,
+}
+
+impl RestartBudget {
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn has_remaining(&self, max_restarts: u32) -> bool {
+        !self.exhausted && self.automatic_retries_used < max_restarts
+    }
+
+    pub(super) fn consume(&mut self, max_restarts: u32) -> bool {
+        if !self.has_remaining(max_restarts) {
+            self.exhausted = true;
+            return false;
+        }
+        self.automatic_retries_used += 1;
+        true
+    }
+
+    pub(super) fn exhaust(&mut self) {
+        self.exhausted = true;
+    }
+
+    pub(super) fn snapshot(&self, max_restarts: u32) -> RestartBudgetStatus {
+        RestartBudgetStatus {
+            automatic_retries_used: self.automatic_retries_used,
+            max_restarts,
+            exhausted: self.exhausted,
+        }
+    }
 }
 
 pub(crate) struct Core {
@@ -217,7 +260,9 @@ pub(super) struct Entry {
     pub(super) awaiting_manual_restart: bool,
     /// The pending automatic retry, if one is waiting for its fixed delay.
     pub(super) restart_backoff: Option<RestartBackoff>,
-    /// A manual stop suppresses a restart that was already being cleaned up.
+    /// The per-Process automatic retry budget for this Project session.
+    pub(super) restart_budget: RestartBudget,
+    /// An explicit action can suppress automatic restart for its cleanup.
     pub(super) restart_suppressed: bool,
     /// Work identities allocated for this Process. They are monotonic across
     /// Runs so a late result cannot become current through reuse.
@@ -249,6 +294,7 @@ impl Entry {
             startup_timeout_pending: false,
             awaiting_manual_restart: false,
             restart_backoff: None,
+            restart_budget: RestartBudget::default(),
             restart_suppressed: false,
             next_work_id: 1,
             run_cancelled: false,
@@ -475,7 +521,11 @@ impl Core {
                 entry.pending_trigger,
                 crate::supervisor::RunTrigger::Restart | crate::supervisor::RunTrigger::Rerun
             );
-            entry.restart_suppressed = !replacement_pending;
+            entry.restart_suppressed = if replacement_pending {
+                entry.startup_timeout_pending
+            } else {
+                true
+            };
             if !replacement_pending {
                 entry.desired = DesiredState::Stopped;
             }
@@ -595,6 +645,7 @@ impl Core {
                         .saturating_duration_since(self.epoch)
                         .as_millis() as u64,
                 }),
+                automatic_restart_budget: entry.restart_budget.snapshot(spec.restart.max_restarts),
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })
             .collect();

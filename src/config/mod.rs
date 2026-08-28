@@ -174,7 +174,14 @@ fn build_restart(
         }
         None => defaults.backoff,
     };
-    Ok(RestartConfig { policy, backoff })
+    let max_restarts = file
+        .and_then(|file| file.max_restarts)
+        .unwrap_or(defaults.max_restarts);
+    Ok(RestartConfig {
+        policy,
+        backoff,
+        max_restarts,
+    })
 }
 
 fn build_success_exit_codes(configured: Option<Vec<i32>>) -> Result<Vec<i32>, String> {
@@ -416,6 +423,7 @@ struct ProcessFile {
 struct RestartFile {
     policy: Option<String>,
     backoff: Option<String>,
+    max_restarts: Option<u32>,
 }
 
 #[derive(Deserialize)]

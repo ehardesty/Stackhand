@@ -671,6 +671,13 @@ fn selected_header(process: &ProcessSnapshot, now_ms: u64) -> String {
         header.push_str(&format!(" · PID {pid}"));
     }
     header.push_str(&format!(" · {}", status_label(process)));
+    let budget = &process.automatic_restart_budget;
+    if budget.automatic_retries_used > 0 || budget.exhausted {
+        header.push_str(&format!(
+            " · automatic retries {}/{}",
+            budget.automatic_retries_used, budget.max_restarts
+        ));
+    }
     if let Some(started_at_ms) = process.run_started_at_ms {
         let age_ms = now_ms.saturating_sub(started_at_ms);
         header.push_str(&format!(" · {}", format_age(age_ms)));
