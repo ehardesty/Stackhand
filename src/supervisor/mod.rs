@@ -123,8 +123,8 @@ pub(crate) fn start_with(
 /// the task ends when every caller drops its handle.
 ///
 /// Between messages the loop waits at most until the next readiness attempt
-/// becomes due, then polls the core's timers. Readiness work itself always
-/// runs on probe-adapter threads, never here.
+/// or startup deadline becomes due, then polls the core's timers. Readiness
+/// work itself always runs on probe-adapter threads, never here.
 fn run_task(
     core: &mut Core,
     inbox: &Receiver<Inbox>,

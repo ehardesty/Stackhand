@@ -111,6 +111,7 @@ impl Core {
         entry.failure = None;
         entry.metrics = None;
         entry.exited = false;
+        entry.startup_timeout_pending = false;
         entry.awaiting_manual_restart = false;
         entry.run_cancelled = false;
         entry.blocked = None;

@@ -11,24 +11,6 @@ fn probed_project() -> EffectiveProject {
     EffectiveProject::new(vec![probed_service("api")]).expect("unique names")
 }
 
-fn configured_readiness_project(
-    initial_delay: Duration,
-    success_threshold: u32,
-    failure_threshold: u32,
-) -> EffectiveProject {
-    let mut process = probed_service("api");
-    let readiness = process.readiness.as_mut().expect("the probe exists");
-    readiness.initial_delay = initial_delay;
-    readiness.success_threshold = success_threshold;
-    readiness.failure_threshold = failure_threshold;
-    EffectiveProject::new(vec![process]).expect("unique names")
-}
-
-fn start_probed(h: &mut Harness) {
-    h.command(Command::Start("api".into()));
-    h.event(spawned("api", 1));
-}
-
 #[test]
 fn a_probed_service_stays_starting_until_its_probe_passes() {
     let mut h = Harness::new(probed_project());

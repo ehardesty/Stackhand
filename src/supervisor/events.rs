@@ -63,6 +63,11 @@ impl Core {
                 let work_id = probed.then(|| self.allocate_work_id(index));
                 let now = self.clock.now();
                 let now_ms = self.now_ms();
+                let startup_deadline = self.project.processes()[index]
+                    .readiness
+                    .as_ref()
+                    .and_then(|config| config.startup_timeout)
+                    .map(|timeout| now + timeout);
                 let entry = &mut self.entries[index];
                 entry.root_pid = root_pid.map(|pid| pid.get());
                 if entry.lifecycle == super::core::Lifecycle::Starting {
@@ -80,6 +85,7 @@ impl Core {
                             last_error: None,
                             in_flight: None,
                             next_attempt_at: now + initial_delay,
+                            startup_deadline,
                         });
                     } else {
                         // A Service without readiness becomes Running at
@@ -118,6 +124,7 @@ impl Core {
                     tracking.consecutive_failures = 0;
                     if tracking.consecutive_successes >= success_threshold {
                         tracking.state = ReadinessState::Passing;
+                        tracking.startup_deadline = None;
                         if entry.lifecycle == super::core::Lifecycle::Starting {
                             entry.lifecycle = super::core::Lifecycle::Running;
                         }
@@ -190,11 +197,12 @@ impl Core {
     /// held cleanup, recent history, and replacement scheduling change in
     /// one serialized Supervisor turn.
     fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
+        let timed_out = self.entries[index].startup_timeout_pending;
         // Natural exit also ends any probe that is still in flight. The
         // identity gate below makes a result released after this point
         // harmless.
         self.cancel_run_work(index);
-        if !finished.intentional_stop {
+        if !finished.intentional_stop && !timed_out {
             match self.project.processes()[index].kind {
                 ProcessKind::OneShot => self.complete_one_shot(index, finished.exit_code),
                 ProcessKind::Service => self.observe_service_exit(index, finished.exit_code),
@@ -207,14 +215,27 @@ impl Core {
             // Hold the Run identity. A later Stop retries the same adapter
             // owner; no replacement Run can start before confirmation.
             entry.cleanup_unconfirmed = true;
-            entry.failure = Some(FailureSummary {
-                kind: FailureKind::Shutdown,
-                detail: finished
-                    .detail
-                    .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string()),
-            });
+            let cleanup_detail = finished
+                .detail
+                .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string());
+            if timed_out {
+                let failure = entry
+                    .failure
+                    .as_mut()
+                    .expect("a pending startup timeout has a recorded failure");
+                failure.detail = format!("{}; cleanup failed: {cleanup_detail}", failure.detail);
+            } else {
+                entry.failure = Some(FailureSummary {
+                    kind: FailureKind::Shutdown,
+                    detail: cleanup_detail,
+                });
+            }
             if entry.lifecycle != super::core::Lifecycle::Done {
-                entry.lifecycle = super::core::Lifecycle::Stopped;
+                entry.lifecycle = if timed_out {
+                    super::core::Lifecycle::Stopping
+                } else {
+                    super::core::Lifecycle::Stopped
+                };
             }
             entry.metrics = None;
             entry.readiness = None;
@@ -225,12 +246,21 @@ impl Core {
         if self.project.processes()[index].kind == ProcessKind::OneShot {
             entry.exited = true;
         }
-        entry.record_finished_run(now_ms, finished.exit_code, finished.intentional_stop);
+        if timed_out {
+            let failure = entry
+                .failure
+                .as_mut()
+                .expect("a pending startup timeout has a recorded failure");
+            failure.detail.push_str("; cleanup confirmed");
+        }
+        let intentional_stop = finished.intentional_stop && !timed_out;
+        entry.record_finished_run(now_ms, finished.exit_code, intentional_stop);
         entry.current_run = None;
         entry.root_pid = None;
         entry.metrics = None;
         entry.readiness = None;
         entry.cleanup_unconfirmed = false;
+        entry.startup_timeout_pending = false;
         // A successful One-shot stays Done. Every other finished Run settles
         // at Stopped after its result has been recorded.
         if entry.lifecycle != super::core::Lifecycle::Done {

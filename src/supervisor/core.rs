@@ -180,6 +180,8 @@ pub(super) struct ReadinessTracking {
     pub(super) in_flight: Option<AttemptId>,
     /// Earliest time [`Core::poll_timers`] may dispatch the next attempt.
     pub(super) next_attempt_at: Instant,
+    /// Deadline for the first success threshold, when configured.
+    pub(super) startup_deadline: Option<Instant>,
 }
 
 pub(super) struct Entry {
@@ -213,6 +215,8 @@ pub(super) struct Entry {
     pub(super) root_pid: Option<u32>,
     /// True after a One-shot Run has ended and its cleanup is confirmed.
     pub(super) exited: bool,
+    /// True while cleanup for a readiness startup timeout is still pending.
+    pub(super) startup_timeout_pending: bool,
     /// A naturally ended Service stays desired-running but waits for an
     /// explicit start or restart until automatic restart policy exists.
     pub(super) awaiting_manual_restart: bool,
@@ -243,6 +247,7 @@ impl Entry {
             run_trigger: RunTrigger::Dependency,
             root_pid: None,
             exited: false,
+            startup_timeout_pending: false,
             awaiting_manual_restart: false,
             next_work_id: 1,
             run_cancelled: false,
@@ -491,26 +496,68 @@ impl Core {
     /// whose attempt is due. Tests drive this directly with a fake clock;
     /// the threaded wrapper drives it on tick timeouts.
     pub(crate) fn poll_timers(&mut self, now: Instant) {
+        self.expire_startup_timeouts(now);
         for index in self.due_probe_indices(now) {
             self.dispatch_probe(index);
         }
         self.expire_shutdown(now);
     }
 
-    fn due_probe_indices(&self, now: Instant) -> Vec<usize> {
+    fn expire_startup_timeouts(&mut self, now: Instant) {
+        let expired = self
+            .active_readiness()
+            .filter_map(|(index, run_id, tracking)| {
+                tracking
+                    .startup_deadline
+                    .filter(|deadline| *deadline <= now)
+                    .map(|_| (index, run_id))
+            })
+            .collect::<Vec<_>>();
+        for (index, run_id) in expired {
+            self.timeout_startup(index, run_id);
+        }
+    }
+
+    /// The active readiness checks whose Run still desires Running.
+    fn active_readiness(&self) -> impl Iterator<Item = (usize, RunId, &ReadinessTracking)> + '_ {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
-                let Some(tracking) = entry.readiness.as_ref() else {
-                    return false;
-                };
-                entry.desired == DesiredState::Running
-                    && entry.current_run.is_some()
-                    && tracking.in_flight.is_none()
-                    && tracking.next_attempt_at <= now
+            .filter_map(|(index, entry)| {
+                let run_id = entry.current_run?;
+                let tracking = entry.readiness.as_ref()?;
+                (entry.desired == DesiredState::Running).then_some((index, run_id, tracking))
             })
-            .map(|(index, _)| index)
+    }
+
+    /// Turn an expired first-readiness deadline into a normal Run cleanup.
+    /// Readiness cancellation happens before the Process Tree stop request.
+    fn timeout_startup(&mut self, index: usize, run_id: RunId) {
+        let timeout = self.project.processes()[index]
+            .readiness
+            .as_ref()
+            .and_then(|config| config.startup_timeout)
+            .expect("a startup deadline has a configured timeout");
+        let process_id = self.entries[index].process_id;
+        self.cancel_run_work(index);
+        let entry = &mut self.entries[index];
+        entry.startup_timeout_pending = true;
+        entry.failure = Some(FailureSummary {
+            kind: FailureKind::Readiness,
+            detail: format!("readiness startup timeout after {} ms", timeout.as_millis()),
+        });
+        entry.desired = DesiredState::Stopped;
+        entry.lifecycle = Lifecycle::Stopping;
+        entry.blocked = None;
+        self.seam.stop(process_id, run_id, None, &self.events);
+    }
+
+    fn due_probe_indices(&self, now: Instant) -> Vec<usize> {
+        self.active_readiness()
+            .filter(|(_, _, tracking)| {
+                tracking.in_flight.is_none() && tracking.next_attempt_at <= now
+            })
+            .map(|(index, _, _)| index)
             .collect()
     }
 
@@ -550,22 +597,22 @@ impl Core {
         self.probes.probe(intent, &self.events);
     }
 
-    /// How long the caller may wait before some readiness attempt becomes
-    /// due, or `None` when no probe work is pending.
+    /// How long the caller may wait before some readiness attempt or startup
+    /// deadline becomes due, or `None` when no timer work is pending.
     pub(crate) fn time_until_next_timer(&self) -> Option<Duration> {
         let now = self.clock.now();
         let probe_wait = self
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let tracking = entry.readiness.as_ref()?;
-                (entry.desired == DesiredState::Running
-                    && entry.current_run.is_some()
-                    && tracking.in_flight.is_none())
-                .then(|| tracking.next_attempt_at.saturating_duration_since(now))
-            })
+            .active_readiness()
+            .filter(|(_, _, tracking)| tracking.in_flight.is_none())
+            .map(|(_, _, tracking)| tracking.next_attempt_at.saturating_duration_since(now))
             .min();
-        match (probe_wait, self.time_until_shutdown_deadline()) {
+        let startup_wait = self
+            .active_readiness()
+            .filter_map(|(_, _, tracking)| tracking.startup_deadline)
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min();
+        let readiness_wait = probe_wait.into_iter().chain(startup_wait).min();
+        match (readiness_wait, self.time_until_shutdown_deadline()) {
             (Some(probe), Some(shutdown)) => Some(probe.min(shutdown)),
             (Some(probe), None) => Some(probe),
             (None, Some(shutdown)) => Some(shutdown),

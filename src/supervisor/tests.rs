@@ -63,6 +63,19 @@ fn probed_service(name: &str) -> ProcessSpec {
     spec
 }
 
+fn configured_readiness_project(
+    initial_delay: Duration,
+    success_threshold: u32,
+    failure_threshold: u32,
+) -> EffectiveProject {
+    let mut process = probed_service("api");
+    let readiness = process.readiness.as_mut().expect("the probe exists");
+    readiness.initial_delay = initial_delay;
+    readiness.success_threshold = success_threshold;
+    readiness.failure_threshold = failure_threshold;
+    EffectiveProject::new(vec![process]).expect("unique names")
+}
+
 /// A Process that starts only after each named Dependency satisfies its
 /// `started` condition.
 fn depending_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
@@ -185,6 +198,11 @@ impl Harness {
             .cloned()
             .unwrap_or_else(|| panic!("process {name} missing from snapshot"))
     }
+}
+
+fn start_probed(h: &mut Harness) {
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 1));
 }
 
 fn spawned(process: &str, run: u64) -> SeamEvent {
@@ -657,6 +675,8 @@ fn unknown_commands_are_ignored() {
 
 #[cfg(test)]
 mod readiness;
+#[cfg(test)]
+mod startup_timeout;
 
 mod diagnostics;
 mod one_shot_lifecycle;
