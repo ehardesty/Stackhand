@@ -22,10 +22,21 @@ fn write_valid_project(path: &Path) {
 }
 
 fn run_validate(directory: &Path, path: Option<&Path>) -> std::process::Output {
+    run_validate_with_profile(directory, path, None)
+}
+
+fn run_validate_with_profile(
+    directory: &Path,
+    path: Option<&Path>,
+    profile: Option<&str>,
+) -> std::process::Output {
     let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
     command.current_dir(directory).args(["config", "validate"]);
     if let Some(path) = path {
         command.arg(path);
+    }
+    if let Some(profile) = profile {
+        command.args(["--profile", profile]);
     }
     command.output().expect("config validate runs")
 }
@@ -150,6 +161,72 @@ fn config_validate_keeps_invalid_schema_errors_on_stderr() {
         String::from_utf8_lossy(&output.stderr).contains("unsupported schema version 2"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_validates_the_selected_profile() {
+    let root = unique_directory("profile");
+    let config = root.join("project.yaml");
+    fs::write(
+        &config,
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local:\n    overrides:\n      web:\n        command: [/bin/true, 1]\n",
+    )
+    .expect("profile config writes");
+
+    let output = run_validate_with_profile(&root, Some(&config), Some("local"));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Process 'web': command argument 0 must be a string"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_rejects_an_unknown_profile_name() {
+    let root = unique_directory("unknown-profile");
+    let config = root.join("project.yaml");
+    fs::write(
+        &config,
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local: {}\n",
+    )
+    .expect("profile config writes");
+
+    let output = run_validate_with_profile(&root, Some(&config), Some("missing"));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown profile 'missing'"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_does_not_select_a_profile_without_the_option() {
+    let root = unique_directory("profile-explicit");
+    let config = root.join("project.yaml");
+    fs::write(
+        &config,
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local:\n    overrides:\n      added: {}\n",
+    )
+    .expect("profile config writes");
+
+    let base = run_validate(&root, Some(&config));
+    assert!(base.status.success(), "{base:?}");
+    let selected = run_validate_with_profile(&root, Some(&config), Some("local"));
+    assert!(!selected.status.success(), "{selected:?}");
+    assert!(
+        String::from_utf8_lossy(&selected.stderr).contains("Process 'added'"),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
     );
 
     fs::remove_dir_all(root).ok();

@@ -3,7 +3,7 @@
 //! This module defines the single canonical version 1 YAML shape. The resolver
 //! lowers it into the validated Project model.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -16,6 +16,19 @@ pub(super) struct ConfigFile {
     pub(super) version: u64,
     #[serde(default)]
     pub(super) processes: ProcessCollection,
+    pub(super) profiles: Option<BTreeMap<String, ProfileFile>>,
+    pub(super) settings: Option<SettingsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProfileFile {
+    #[serde(default)]
+    pub(super) enable: Vec<String>,
+    #[serde(default)]
+    pub(super) disable: Vec<String>,
+    #[serde(default)]
+    pub(super) overrides: ProcessCollection,
     pub(super) settings: Option<SettingsFile>,
 }
 

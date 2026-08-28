@@ -65,15 +65,30 @@ impl Drop for OwnedListener {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_fixture(
     fixture_flag: &str,
     config_path: &Path,
+    on_checkpoint: impl FnMut(&str),
+) -> String {
+    run_fixture_with_profile(fixture_flag, config_path, None, on_checkpoint)
+}
+
+pub fn run_fixture_with_profile(
+    fixture_flag: &str,
+    config_path: &Path,
+    profile: Option<&str>,
     mut on_checkpoint: impl FnMut(&str),
 ) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stackhand"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stackhand"));
+    command
         .env("SHELL", "/path/that/does/not/exist")
         .arg(fixture_flag)
-        .arg(config_path)
+        .arg(config_path);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

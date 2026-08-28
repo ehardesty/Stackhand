@@ -1,14 +1,18 @@
 //! Configuration: one YAML version 1 file becomes one validated
 //! [`EffectiveProject`] or a structured error before any Process starts.
 //!
-//! Profiles, overlays, and environment files are added by later milestones;
-//! version 1 currently accepts one canonical base configuration.
+//! The resolver applies one selected profile to the canonical base file before
+//! lowering the result into the validated Project model.
 
 mod file;
 mod readiness;
 
 #[cfg(test)]
 mod exit_tests;
+#[cfg(test)]
+mod profile_tests;
+#[cfg(test)]
+mod schema_tests;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,8 +20,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use self::file::{
-    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
-    TerminalFile,
+    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, ProfileFile, RestartFile,
+    SettingsFile, TerminalFile,
 };
 
 use crate::model::{
@@ -32,25 +36,45 @@ pub const BASE_FILE_NAME: &str = "stackhand.yaml";
 #[derive(Clone, Debug)]
 pub enum ResolutionRequest {
     /// Use exactly this Project path. No base-file discovery is performed.
-    Explicit(PathBuf),
+    Explicit {
+        path: PathBuf,
+        profile: Option<String>,
+    },
     /// Search for the nearest base file. `None` starts at the current
     /// directory; `Some` is useful for deterministic callers and tests.
-    Discover { start_dir: Option<PathBuf> },
+    Discover {
+        start_dir: Option<PathBuf>,
+        profile: Option<String>,
+    },
 }
 
 impl ResolutionRequest {
     pub fn explicit(path: impl Into<PathBuf>) -> Self {
-        Self::Explicit(path.into())
+        Self::Explicit {
+            path: path.into(),
+            profile: None,
+        }
     }
 
-    pub fn discover() -> Self {
-        Self::Discover { start_dir: None }
+    pub fn explicit_with_optional_profile(path: impl Into<PathBuf>, profile: Option<&str>) -> Self {
+        Self::Explicit {
+            path: path.into(),
+            profile: profile.map(str::to_owned),
+        }
+    }
+
+    pub fn discover_with_optional_profile(profile: Option<&str>) -> Self {
+        Self::Discover {
+            start_dir: None,
+            profile: profile.map(str::to_owned),
+        }
     }
 
     #[cfg(test)]
     pub fn discover_from(path: impl Into<PathBuf>) -> Self {
         Self::Discover {
             start_dir: Some(path.into()),
+            profile: None,
         }
     }
 }
@@ -81,13 +105,18 @@ impl ProjectResolution {
 
 /// Resolve and validate one Project before any Process starts.
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
-    let base = match request {
-        ResolutionRequest::Explicit(path) => absolute_normalized_path(&path)
-            .with_context(|| format!("could not resolve Project path {}", path.display()))
-            .map_err(config_error)?,
-        ResolutionRequest::Discover { start_dir } => discover_base(start_dir.as_deref())?,
+    let (base, profile) = match request {
+        ResolutionRequest::Explicit { path, profile } => (
+            absolute_normalized_path(&path)
+                .with_context(|| format!("could not resolve Project path {}", path.display()))
+                .map_err(config_error)?,
+            profile,
+        ),
+        ResolutionRequest::Discover { start_dir, profile } => {
+            (discover_base(start_dir.as_deref())?, profile)
+        }
     };
-    let project = load_file(&base)?;
+    let project = load_file(&base, profile.as_deref())?;
     Ok(ProjectResolution {
         project,
         sources: ResolutionSources { base },
@@ -105,24 +134,36 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
 /// Resolve and validate a Project without starting the Supervisor. When no
 /// path is provided, use the nearest discovered base file.
 pub fn validate_project(explicit_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
-    let request = explicit_path.map_or_else(ResolutionRequest::discover, |path| {
-        ResolutionRequest::explicit(path)
-    });
+    validate_project_with_profile(explicit_path, None)
+}
+
+/// Resolve and validate a Project with one explicitly selected profile.
+pub fn validate_project_with_profile(
+    explicit_path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
+    let request = explicit_path.map_or_else(
+        || ResolutionRequest::discover_with_optional_profile(profile),
+        |path| ResolutionRequest::explicit_with_optional_profile(path, profile),
+    );
     resolve(request).map(|resolution| resolution.sources.base)
 }
 
-fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
+fn load_file(path: &Path, profile: Option<&str>) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))
         .map_err(config_error)?;
-    let file: ConfigFile = serde_yaml::from_str(&text)
+    let mut file: ConfigFile = serde_yaml::from_str(&text)
         .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
     if file.version != 1 {
         return Err(config_error(anyhow::anyhow!(
             "unsupported schema version {}: this Stackhand reads version 1",
             file.version
         )));
+    }
+    if let Some(profile) = profile {
+        apply_profile(&mut file, profile)?;
     }
     let shell = build_shell(file.settings.as_ref())?;
     let processes = file
@@ -170,6 +211,131 @@ fn load_file(path: &Path) -> Result<EffectiveProject, ConfigError> {
             config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
         }
     })
+}
+
+fn apply_profile(file: &mut ConfigFile, requested: &str) -> Result<(), ConfigError> {
+    let profile = file
+        .profiles
+        .take()
+        .and_then(|mut profiles| profiles.remove(requested))
+        .ok_or_else(|| ConfigError {
+            message: format!("unknown profile '{requested}'"),
+        })?;
+    let ProfileFile {
+        enable,
+        disable,
+        overrides,
+        settings,
+    } = profile;
+
+    let mut mentioned = HashSet::new();
+    for name in enable.iter().chain(&disable) {
+        if !mentioned.insert(name) {
+            return Err(ConfigError {
+                message: format!("profile '{requested}' mentions Process '{name}' more than once"),
+            });
+        }
+    }
+
+    if let Some(settings) = settings {
+        merge_settings(&mut file.settings, settings);
+    }
+
+    for ProcessEntry { key, process } in overrides.entries {
+        if let Some(entry) = file
+            .processes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            merge_process(&mut entry.process, process);
+        } else {
+            file.processes.entries.push(ProcessEntry { key, process });
+        }
+    }
+
+    set_process_enabled(&mut file.processes.entries, &enable, true, requested)?;
+    set_process_enabled(&mut file.processes.entries, &disable, false, requested)?;
+    Ok(())
+}
+
+fn merge_settings(base: &mut Option<SettingsFile>, overlay: SettingsFile) {
+    match base {
+        Some(base) => {
+            if overlay.shell.is_some() {
+                base.shell = overlay.shell;
+            }
+        }
+        None => *base = Some(overlay),
+    }
+}
+
+fn merge_process(base: &mut ProcessFile, overlay: ProcessFile) {
+    let ProcessFile {
+        kind,
+        enabled,
+        autostart,
+        cwd,
+        environment,
+        terminal,
+        success_exit_codes,
+        depends_on,
+        ready,
+        liveness,
+        restart,
+        command,
+        shell,
+    } = overlay;
+
+    replace_if_present(&mut base.kind, kind);
+    replace_if_present(&mut base.enabled, enabled);
+    replace_if_present(&mut base.autostart, autostart);
+    replace_if_present(&mut base.cwd, cwd);
+    replace_if_present(&mut base.environment, environment);
+    replace_if_present(&mut base.terminal, terminal);
+    replace_if_present(&mut base.success_exit_codes, success_exit_codes);
+    replace_if_present(&mut base.depends_on, depends_on);
+    replace_if_present(&mut base.ready, ready);
+    replace_if_present(&mut base.liveness, liveness);
+    replace_if_present(&mut base.restart, restart);
+    match (command, shell) {
+        (Some(command), Some(shell)) => {
+            base.command = Some(command);
+            base.shell = Some(shell);
+        }
+        (Some(command), None) => {
+            base.command = Some(command);
+            base.shell = None;
+        }
+        (None, Some(shell)) => {
+            base.command = None;
+            base.shell = Some(shell);
+        }
+        (None, None) => {}
+    }
+}
+
+fn replace_if_present<T>(base: &mut Option<T>, overlay: Option<T>) {
+    if overlay.is_some() {
+        *base = overlay;
+    }
+}
+
+fn set_process_enabled(
+    processes: &mut [ProcessEntry],
+    names: &[String],
+    enabled: bool,
+    profile: &str,
+) -> Result<(), ConfigError> {
+    for name in names {
+        let Some(process) = processes.iter_mut().find(|entry| entry.key == *name) else {
+            return Err(ConfigError {
+                message: format!("profile '{profile}' references unknown Process '{name}'"),
+            });
+        };
+        process.process.enabled = Some(enabled);
+    }
+    Ok(())
 }
 
 fn discover_base(start_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {

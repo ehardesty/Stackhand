@@ -48,14 +48,20 @@ const PIPE_PROOFS: &[(&str, &str, crate::runtime::OutputStream)] = &[
 
 /// Run the integrated fixture from one production YAML Project.
 pub fn run(config_path: &Path) -> Result<()> {
+    run_with_profile(config_path, None)
+}
+
+/// Run the integrated fixture with one selected configuration profile.
+pub fn run_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
+    let request =
+        crate::config::ResolutionRequest::explicit_with_optional_profile(config_path, profile);
     let resolution =
-        crate::config::resolve(crate::config::ResolutionRequest::explicit(config_path))
-            .map_err(|error| anyhow!("configuration error: {error}"))?;
+        crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     let output_lifetime = std::sync::Arc::downgrade(&outputs);
     supervisor.command(Command::StartAutostart);
 
-    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs)?;
+    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs, profile.is_some())?;
     shutdown(supervisor)?;
     wait_for_pid_exit(descendant_pid)?;
 
@@ -73,6 +79,7 @@ fn prove_slice(
     supervisor: &SupervisorHandle,
     consoles: &crate::supervisor::Consoles,
     outputs: &OutputViews,
+    profile_selected: bool,
 ) -> Result<u32> {
     // Configuration order puts this dependent before its One-shot. Its
     // snapshot proves a failed completion dependency is visible and remains
@@ -110,6 +117,7 @@ fn prove_slice(
             && running(snapshot, "exited-dependent")
             && failed_exit(snapshot, "rerun-setup", Some(7))
             && waiting(snapshot, "rerun-dependent")
+            && (!profile_selected || completed(snapshot, "profile-added", Some(0)))
             && startup_timed_out(snapshot, "startup-timeout")
             && snapshot.named("shutdown-restart").is_some_and(|process| {
                 process.lifecycle == Lifecycle::RestartBackoff

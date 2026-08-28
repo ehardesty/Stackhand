@@ -328,6 +328,15 @@ processes:
       timeout: 100ms
       startup_timeout: 500ms
     shell: {timeout}
+profiles:
+  profile-fixture:
+    overrides:
+      profile-added:
+        kind: one-shot
+        terminal:
+          mode: pipe
+          input: disabled
+        command: [/bin/sh, "-c", "printf fixture-profile-added; exit 0"]
 "#,
         started_dependent = yaml_quote(STARTED_DEPENDENT),
         started_source = yaml_quote(STARTED_SOURCE),
@@ -365,7 +374,7 @@ fn run_invalid_project(label: &str, config: &str) -> std::process::Output {
 }
 
 #[test]
-fn one_configured_project_runs_the_complete_milestone_two_path() {
+fn one_configured_project_and_profile_run_the_complete_project_path() {
     let dir = unique_dir("milestone-two");
     let nested = dir.join("web");
     fs::create_dir_all(&nested).expect("working directory creates");
@@ -395,9 +404,12 @@ fn one_configured_project_runs_the_complete_milestone_two_path() {
     )
     .expect("config writes");
 
-    let stdout = support::run_fixture("--fixture-project", &config_path, |line| {
-        states.apply_checkpoint(line)
-    });
+    let stdout = support::run_fixture_with_profile(
+        "--fixture-project",
+        &config_path,
+        Some("profile-fixture"),
+        |line| states.apply_checkpoint(line),
+    );
     for checkpoint in [
         "fixture-blocked-ok",
         "fixture-started-ok",

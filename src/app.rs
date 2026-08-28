@@ -21,8 +21,10 @@ use crate::tui::{
 };
 
 use self::input_batch::{coalesce_adjacent_events, collect_input_batch};
+use self::resize::PendingResize;
 
 mod input_batch;
+mod resize;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
@@ -33,12 +35,26 @@ const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 /// supervise them interactively until the user quits with a controlled
 /// Project shutdown.
 pub fn run_project(config_path: &Path) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::explicit(config_path))
+    run_project_with_profile(config_path, None)
+}
+
+/// Load the explicit Project with one selected profile, then run it
+/// interactively.
+pub fn run_project_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
+    run_resolved(
+        crate::config::ResolutionRequest::explicit_with_optional_profile(config_path, profile),
+    )
 }
 
 /// Discover the nearest base Project, then run it interactively.
 pub fn run_discovered_project() -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::discover())
+    run_discovered_project_with_profile(None)
+}
+
+/// Discover the nearest base Project with one selected profile, then run it
+/// interactively.
+pub fn run_discovered_project_with_profile(profile: Option<&str>) -> Result<()> {
+    run_resolved(crate::config::ResolutionRequest::discover_with_optional_profile(profile))
 }
 
 fn run_resolved(request: crate::config::ResolutionRequest) -> Result<()> {
@@ -767,33 +783,6 @@ fn render_frame(
         })
         .map_err(|error| anyhow!("render failed: {error}"))?;
     pane.ok_or_else(|| anyhow!("the frame did not render"))
-}
-
-#[derive(Default)]
-struct PendingResize {
-    latest: Option<(TerminalGeometry, Instant)>,
-}
-
-impl PendingResize {
-    fn update(&mut self, geometry: TerminalGeometry, now: Instant) {
-        self.latest = Some((geometry, now + RESIZE_SETTLE_INTERVAL));
-    }
-
-    fn take_ready(&mut self, now: Instant) -> Option<TerminalGeometry> {
-        let (geometry, ready_at) = self.latest?;
-        if now < ready_at {
-            return None;
-        }
-        self.latest = None;
-        Some(geometry)
-    }
-
-    fn poll_interval(&self, now: Instant) -> Duration {
-        self.latest
-            .map(|(_, ready_at)| ready_at.saturating_duration_since(now))
-            .unwrap_or(EVENT_POLL_INTERVAL)
-            .min(EVENT_POLL_INTERVAL)
-    }
 }
 
 fn is_quit(key: KeyEvent, view: crate::tui::ConsoleViewState) -> bool {
