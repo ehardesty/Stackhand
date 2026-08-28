@@ -1,8 +1,12 @@
 use std::fs;
+use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::Command as StdCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn unique_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -14,198 +18,592 @@ fn unique_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Host one real TCP listener for the fixture's readiness probe. The
-/// listener lives in this test process; Stackhand's production TCP probe
-/// adapter connects to it over a real loopback socket. Each connection is
-/// accepted and closed; nothing is served.
-fn host_tcp_listener() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
-    let port = listener.local_addr().expect("local address").port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            drop(stream);
-        }
-    });
-    port
+/// A real local TCP target for the production TCP adapter. The worker owns
+/// the listener and exits when the test drops this endpoint.
+struct TcpEndpoint {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
 
-/// Host one real HTTP health endpoint for the fixture's HTTP readiness
-/// probe. The hand-rolled response proves the production adapter speaks a
-/// plain HTTP/1.0 GET against a real loopback socket.
-fn host_http_health_endpoint() -> u16 {
-    use std::io::Write;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
-    let port = listener.local_addr().expect("local address").port();
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+impl TcpEndpoint {
+    fn new() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP endpoint binds");
+        listener
+            .set_nonblocking(true)
+            .expect("TCP endpoint accepts nonblocking mode");
+        let port = listener
+            .local_addr()
+            .expect("TCP address is available")
+            .port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            worker: Some(worker),
         }
-    });
-    port
+    }
 }
 
-/// Prints the direct-command marker, then proves inline environment reached
-/// the child through `$FIXTURE_TOKEN`, then stays alive as a Service.
-const MARKER_SCRIPT: &str = "printf 'fixture-marker-12345\\n'; printf 'fixture-token-%s\\n' \"$FIXTURE_TOKEN\"; exec sleep 60";
+impl Drop for TcpEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
-/// One pipeline whose output only exists because both stages ran; then the
-/// Run stays alive as a Service.
-const SHELL_SCRIPT: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep 60";
+/// Mutable endpoint states controlled by checkpoint lines from the executable
+/// fixture. The supervised Project sees only real HTTP responses.
+struct HttpStates {
+    recovering_ready: AtomicBool,
+    liveness_recover: AtomicBool,
+    liveness_restart: AtomicBool,
+}
 
-/// A pipe-mode Service that proves stdout and stderr keep their identity in
-/// the retained output module, then stays alive.
-const PIPED_SCRIPT: &str = "sleep 60 & child=$!; printf 'fixture-descendant-pid-%s\\n' \"$child\"; printf 'fixture-pipe-out\\n'; printf 'fixture-pipe-err\\n' 1>&2; wait \"$child\"";
+impl HttpStates {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            recovering_ready: AtomicBool::new(true),
+            liveness_recover: AtomicBool::new(true),
+            liveness_restart: AtomicBool::new(true),
+        })
+    }
 
-fn fixture_config(tcp_port: u16, http_port: u16) -> String {
-    let marker = MARKER_SCRIPT.replace('"', "\\\"");
-    let piped = PIPED_SCRIPT.replace('"', "\\\"");
+    fn healthy(&self, path: &str) -> bool {
+        match path {
+            "/recover-ready" => self.recovering_ready.load(Ordering::Acquire),
+            "/liveness-recover" => self.liveness_recover.load(Ordering::Acquire),
+            "/liveness-restart" => self.liveness_restart.load(Ordering::Acquire),
+            "/never-ready" => false,
+            _ => true,
+        }
+    }
+
+    fn apply_checkpoint(&self, checkpoint: &str) {
+        match checkpoint {
+            "fixture-readiness-ready" => self.recovering_ready.store(false, Ordering::Release),
+            "fixture-readiness-failing" => self.recovering_ready.store(true, Ordering::Release),
+            "fixture-liveness-ready" => self.liveness_recover.store(false, Ordering::Release),
+            "fixture-liveness-failing" => self.liveness_recover.store(true, Ordering::Release),
+            "fixture-unhealthy-restart-ready" => {
+                self.liveness_restart.store(false, Ordering::Release)
+            }
+            "fixture-unhealthy-restart-backoff" => {
+                self.liveness_restart.store(true, Ordering::Release)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A real HTTP target for all production HTTP checks. Each response is
+/// selected from the request path and the state controlled by the test.
+struct HttpEndpoint {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl HttpEndpoint {
+    fn new(states: Arc<HttpStates>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("HTTP endpoint binds");
+        listener
+            .set_nonblocking(true)
+            .expect("HTTP endpoint accepts nonblocking mode");
+        let port = listener
+            .local_addr()
+            .expect("HTTP address is available")
+            .port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                        let mut request = [0; 512];
+                        let bytes = stream.read(&mut request).unwrap_or(0);
+                        let request_text = String::from_utf8_lossy(&request[..bytes]);
+                        let path = request_text.split_whitespace().nth(1).unwrap_or("/");
+                        let response = if states.healthy(path) {
+                            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+                        } else {
+                            b"HTTP/1.0 503 Unavailable\r\nContent-Length: 3\r\n\r\nbad".as_slice()
+                        };
+                        let _ = stream.write_all(response);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for HttpEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+const STARTED_SOURCE: &str = "printf 'fixture-started-source\\n'; exec sleep 60";
+const STARTED_DEPENDENT: &str = "printf 'fixture-started-dependent\\n'; exec sleep 60";
+const HELLO: &str =
+    "printf 'fixture-marker\\n'; printf 'fixture-token-%s\\n' \"$FIXTURE_TOKEN\"; exec sleep 60";
+const SHELLED: &str = "echo fixture-pipeline-lower | tr a-z A-Z; exec sleep 60";
+const PIPED: &str = "sleep 60 & child=$!; printf 'fixture-descendant-pid-%s\\n' \"$child\"; printf 'fixture-pipe-out\\n'; printf 'fixture-pipe-err\\n' 1>&2; wait \"$child\"";
+const NOISY: &str = "i=0; while [ \"$i\" -lt 2000 ]; do printf 'fixture-noisy-%s\\n' \"$i\"; i=$((i+1)); done; exec sleep 60";
+const ACCEPTED: &str = "printf 'fixture-accepted\\n'; exit 42";
+const EXITED: &str = "printf 'fixture-exited\\n'; exit 7";
+const RERUN: &str = "if [ -e \"$RERUN_MARKER\" ]; then printf 'fixture-rerun-success\\n'; exit 0; else : > \"$RERUN_MARKER\"; printf 'fixture-rerun-failure\\n'; exit 7; fi";
+const BUDGET: &str = "printf 'fixture-budget-run\\n'; exit 7";
+const SHUTDOWN_RESTART: &str = "printf 'fixture-shutdown-restart-run\\n'; exit 7";
+const TIMEOUT: &str = "sleep 60 & child=$!; printf 'fixture-timeout-descendant-pid-%s\\n' \"$child\"; wait \"$child\"";
+const LOG_READY: &str = "printf 'fixture-log-ready\\n'; exec sleep 60";
+
+fn yaml_quote(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(character),
+        }
+    }
+    format!("\"{escaped}\"")
+}
+
+fn fixture_config(
+    tcp_port: u16,
+    http_port: u16,
+    exec_marker: &Path,
+    rerun_marker: &Path,
+) -> String {
+    let exec_marker = yaml_quote(&exec_marker.to_string_lossy());
+    let exec_check = yaml_quote(&format!("test -f {exec_marker}"));
+    let rerun_marker = yaml_quote(&rerun_marker.to_string_lossy());
     format!(
-        "version: 1\n\
-         processes:\n\
-         \x20 - name: gated-started\n\
-         \x20   depends_on: [{{name: hello, condition: started}}]\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n\
-         \x20 - name: hello\n\
-         \x20   kind: service\n\
-         \x20   depends_on: [{{name: http-ready, condition: ready}}]\n\
-         \x20   terminal: pty\n\
-         \x20   input: focused\n\
-         \x20   working_dir: ./web\n\
-         \x20   env:\n\
-         \x20     FIXTURE_TOKEN: stackhand-env-ok\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{marker}\"]\n\
-         \x20 - name: shelled\n\
-         \x20   kind: service\n\
-         \x20   terminal: pty\n\
-         \x20   input: focused\n\
-         \x20   command:\n\
-         \x20     shell: {SHELL_SCRIPT}\n\
-         \x20 - name: piped\n\
-         \x20   kind: service\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{piped}\"]\n\
-         \x20 - name: manual\n\
-         \x20   kind: service\n\
-         \x20   autostart: false\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n\
-         \x20 - name: off\n\
-         \x20   enabled: false\n\
-         \x20   command:\n\
-         \x20     program: /bin/true\n\
-         \x20 - name: setup\n\
-         \x20   kind: one-shot\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"sleep 0.5; printf 'fixture-setup-ok\\\\n'\"]\n\
-         \x20 - name: gated\n\
-         \x20   depends_on: [{{name: setup, condition: completed_successfully}}]\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n\
-         \x20 - name: tcp-ready\n\
-         \x20   kind: service\n\
-         \x20   ready:\n\
-         \x20     tcp:\n\
-         \x20       host: 127.0.0.1\n\
-         \x20       port: {tcp_port}\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n\
-         \x20 - name: gated-ready\n\
-         \x20   depends_on: [{{name: http-ready, condition: ready}}]\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n\
-         \x20 - name: http-ready\n\
-         \x20   kind: service\n\
-         \x20   ready:\n\
-         \x20     http:\n\
-         \x20       url: \"http://127.0.0.1:{http_port}/healthz\"\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sleep\n\
-         \x20     args: [\"60\"]\n",
+        r#"version: 1
+processes:
+  - name: started-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: started-source
+        condition: started
+    command:
+      shell: {started_dependent}
+  - name: started-source
+    kind: service
+    terminal: pipe
+    command:
+      program: /bin/sh
+      args:
+        - "-c"
+        - {started_source}
+  - name: hello
+    kind: service
+    terminal: pty
+    input: focused
+    working_dir: ./web
+    depends_on:
+      - name: all-ready
+        condition: ready
+    env:
+      FIXTURE_TOKEN: stackhand-env-ok
+    command:
+      program: /bin/sh
+      args:
+        - "-c"
+        - {hello}
+  - name: shelled
+    kind: service
+    terminal: pty
+    input: focused
+    command:
+      shell: {shelled}
+  - name: piped
+    kind: service
+    terminal: pipe
+    command:
+      program: /bin/sh
+      args:
+        - "-c"
+        - {piped}
+  - name: noisy
+    kind: service
+    terminal: pipe
+    command:
+      shell: {noisy}
+  - name: manual
+    kind: service
+    autostart: false
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: off
+    kind: service
+    enabled: false
+    command:
+      program: /bin/true
+  - name: accepted
+    kind: one-shot
+    terminal: pipe
+    success_exit_codes: [42]
+    command:
+      program: /bin/sh
+      args:
+        - "-c"
+        - {accepted}
+  - name: completed-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: accepted
+        condition: completed_successfully
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: exited-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: exited-source
+        condition: exited
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: exited-source
+    kind: one-shot
+    terminal: pipe
+    command:
+      shell: {exited}
+  - name: rerun-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: rerun-setup
+        condition: completed_successfully
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: rerun-setup
+    kind: one-shot
+    terminal: pipe
+    env:
+      RERUN_MARKER: {rerun_marker}
+    command:
+      shell: {rerun}
+  - name: tcp-ready
+    kind: service
+    terminal: pipe
+    ready:
+      tcp:
+        host: 127.0.0.1
+        port: {tcp_port}
+      interval: 20ms
+      timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: http-ready
+    kind: service
+    terminal: pipe
+    ready:
+      http:
+        url: "http://127.0.0.1:{http_port}/http-ready"
+      interval: 20ms
+      timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: exec-ready
+    kind: service
+    terminal: pipe
+    ready:
+      exec:
+        command:
+          program: /bin/sh
+          args:
+            - "-c"
+            - {exec_check}
+      interval: 20ms
+      timeout: 500ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: log-ready
+    kind: service
+    terminal: pipe
+    ready:
+      log:
+        contains: fixture-log-ready
+      interval: 20ms
+      timeout: 500ms
+    command:
+      shell: {log_ready}
+  - name: all-ready
+    kind: service
+    terminal: pipe
+    ready:
+      all:
+        - tcp:
+            host: 127.0.0.1
+            port: {tcp_port}
+          interval: 20ms
+          timeout: 250ms
+        - http:
+            url: "http://127.0.0.1:{http_port}/all-ready"
+          interval: 20ms
+          timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: ready-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: recovering
+        condition: ready
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: recovering
+    kind: service
+    terminal: pipe
+    ready:
+      http:
+        url: "http://127.0.0.1:{http_port}/recover-ready"
+      interval: 20ms
+      timeout: 250ms
+      startup_timeout: 5s
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: liveness-recover
+    kind: service
+    terminal: pipe
+    liveness:
+      http:
+        url: "http://127.0.0.1:{http_port}/liveness-recover"
+      interval: 20ms
+      timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: liveness-restart
+    kind: service
+    terminal: pipe
+    restart:
+      policy: on_failure
+      backoff: 50ms
+      max_restarts: 1
+      on_unhealthy: true
+    liveness:
+      http:
+        url: "http://127.0.0.1:{http_port}/liveness-restart"
+      interval: 20ms
+      timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: budget
+    kind: service
+    terminal: pipe
+    restart:
+      policy: on_failure
+      backoff: 25ms
+      max_restarts: 2
+    command:
+      shell: {budget}
+  - name: shutdown-restart
+    kind: service
+    terminal: pipe
+    restart:
+      policy: on_failure
+      backoff: 60s
+      max_restarts: 2
+    command:
+      shell: {shutdown_restart}
+  - name: startup-timeout
+    kind: service
+    terminal: pipe
+    ready:
+      http:
+        url: "http://127.0.0.1:{http_port}/never-ready"
+      interval: 20ms
+      timeout: 100ms
+      startup_timeout: 500ms
+    command:
+      shell: {timeout}
+"#,
+        started_dependent = yaml_quote(STARTED_DEPENDENT),
+        started_source = yaml_quote(STARTED_SOURCE),
+        hello = yaml_quote(HELLO),
+        shelled = yaml_quote(SHELLED),
+        piped = yaml_quote(PIPED),
+        noisy = yaml_quote(NOISY),
+        accepted = yaml_quote(ACCEPTED),
+        exited = yaml_quote(EXITED),
+        rerun = yaml_quote(RERUN),
+        log_ready = yaml_quote(LOG_READY),
+        budget = yaml_quote(BUDGET),
+        shutdown_restart = yaml_quote(SHUTDOWN_RESTART),
+        timeout = yaml_quote(TIMEOUT),
     )
 }
 
-#[test]
-fn one_configured_service_runs_end_to_end() {
-    let dir = unique_dir("project");
-    let nested = dir.join("web");
-    fs::create_dir_all(&nested).expect("working directory creates");
-    // The readiness target is a real socket in this process; the probed
-    // supervised Process itself only sleeps.
-    let tcp_port = host_tcp_listener();
-    let http_port = host_http_health_endpoint();
-    let config_path = dir.join("stackhand.yaml");
-    fs::write(&config_path, fixture_config(tcp_port, http_port)).expect("config writes");
-
-    // An invalid login-shell setting must not affect the Project's /bin/sh
-    // fallback for its shell expression.
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
+fn run_executable_fixture(config_path: &Path, states: &HttpStates) -> String {
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
         .env("SHELL", "/path/that/does/not/exist")
+        .arg("--fixture-project")
+        .arg(config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the fixture binary runs");
+    let stdout = child.stdout.take().expect("fixture stdout is piped");
+    let (line_tx, line_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut stdout = String::new();
+    let timed_out = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break true;
+        }
+        match line_rx.recv_timeout(remaining) {
+            Ok(line) => {
+                states.apply_checkpoint(&line);
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(mpsc::RecvTimeoutError::Timeout) => break true,
+        }
+    };
+    if timed_out {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("the fixture process exits");
+    let _ = reader.join();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !timed_out && output.status.success(),
+        "integrated fixture failed: timed_out={timed_out} status={}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    stdout
+}
+
+fn run_invalid_project(label: &str, config: &str) -> std::process::Output {
+    let dir = unique_dir(label);
+    let config_path = dir.join("stackhand.yaml");
+    fs::write(&config_path, config).expect("config writes");
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
         .arg("--fixture-project")
         .arg(&config_path)
         .output()
         .expect("the fixture binary runs");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "fixture failed: {stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "invalid Project unexpectedly succeeded"
     );
-    assert!(stdout.contains("fixture-blocked-ok"), "{stdout}");
-    assert!(stdout.contains("fixture-started-ok"), "{stdout}");
-    // The fixture prints this checkpoint only after the direct command's
-    // marker, the inline-environment token, and the shell pipeline's
-    // transformed output all reached their consoles.
-    assert!(stdout.contains("fixture-output-ok"), "{stdout}");
-    // Pipe output stayed out of the control plane and landed in the
-    // bounded per-Process module with stream identity and the Run marker.
-    assert!(stdout.contains("fixture-pipe-output-ok"), "{stdout}");
-    // The One-shot completed through natural exit observation and its
-    // dependent started only after `completed_successfully` held.
-    assert!(stdout.contains("fixture-one-shot-ok"), "{stdout}");
-    assert!(stdout.contains("fixture-shutdown-ok"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+    output
+}
+
+#[test]
+fn one_configured_project_runs_the_complete_milestone_two_path() {
+    let dir = unique_dir("milestone-two");
+    let nested = dir.join("web");
+    fs::create_dir_all(&nested).expect("working directory creates");
+    let exec_marker = dir.join("exec-ready.marker");
+    fs::write(&exec_marker, "ready").expect("exec marker writes");
+    let rerun_marker = dir.join("rerun.marker");
+    let tcp = TcpEndpoint::new();
+    let states = HttpStates::new();
+    let http = HttpEndpoint::new(Arc::clone(&states));
+    let config_path = dir.join("stackhand.yaml");
+    fs::write(
+        &config_path,
+        fixture_config(tcp.port, http.port, &exec_marker, &rerun_marker),
+    )
+    .expect("config writes");
+
+    let stdout = run_executable_fixture(&config_path, &states);
+    for checkpoint in [
+        "fixture-blocked-ok",
+        "fixture-started-ok",
+        "fixture-output-ok",
+        "fixture-pipe-output-ok",
+        "fixture-startup-timeout-ok",
+        "fixture-readiness-recovered",
+        "fixture-liveness-recovered",
+        "fixture-unhealthy-restart-recovered",
+        "fixture-restart-budget-ok",
+        "fixture-rerun-recovered",
+        "fixture-shutdown-ok",
+    ] {
+        assert!(
+            stdout.contains(checkpoint),
+            "{checkpoint} missing: {stdout}"
+        );
+    }
 
     fs::remove_dir_all(&dir).ok();
 }
 
-/// Broken YAML must fail before any Process starts: the fixture prints its
-/// startup checkpoint only after every Process reaches its active lifecycle,
-/// so an absent checkpoint plus a failed exit means zero Processes ran.
+/// Broken YAML must fail before any Process starts.
 #[test]
 fn an_unknown_field_starts_nothing_and_fails_clearly() {
-    let dir = unique_dir("unknown-field");
-    let config_path = dir.join("stackhand.yaml");
-    fs::write(
-        &config_path,
+    let output = run_invalid_project(
+        "unknown-field",
         "version: 1\nprocesses:\n  - name: hello\n    comand:\n      program: /bin/true\n",
-    )
-    .expect("config writes");
+    );
 
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
-        .arg("--fixture-project")
-        .arg(&config_path)
-        .output()
-        .expect("the fixture binary runs");
-
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("unknown field"),
@@ -213,27 +611,15 @@ fn an_unknown_field_starts_nothing_and_fails_clearly() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("fixture-started-ok"), "{stdout}");
-
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn duplicate_process_names_start_nothing_and_fail_clearly() {
-    let dir = unique_dir("duplicate-name");
-    let config_path = dir.join("stackhand.yaml");
-    fs::write(
-        &config_path,
+    let output = run_invalid_project(
+        "duplicate-name",
         "version: 1\nprocesses:\n  - name: hello\n    command: {program: /bin/true}\n  - name: hello\n    command: {program: /bin/true}\n",
-    )
-    .expect("config writes");
+    );
 
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
-        .arg("--fixture-project")
-        .arg(&config_path)
-        .output()
-        .expect("the fixture binary runs");
-
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("duplicate Process name 'hello'"),
@@ -241,32 +627,18 @@ fn duplicate_process_names_start_nothing_and_fail_clearly() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("fixture-started-ok"), "{stdout}");
-
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn an_invalid_project_starts_nothing_and_fails_clearly() {
-    let dir = unique_dir("invalid");
-    let config_path = dir.join("stackhand.yaml");
-    fs::write(
-        &config_path,
+    let output = run_invalid_project(
+        "invalid",
         "version: 2\nprocesses:\n  - name: hello\n    command:\n      program: /bin/true\n",
-    )
-    .expect("config writes");
+    );
 
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
-        .arg("--fixture-project")
-        .arg(&config_path)
-        .output()
-        .expect("the fixture binary runs");
-
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("unsupported schema version 2"),
         "diagnostic was not clear: {stderr}"
     );
-
-    fs::remove_dir_all(&dir).ok();
 }

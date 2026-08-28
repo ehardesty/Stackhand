@@ -30,6 +30,96 @@ fn metric_and_age_labels_use_compact_units() {
     assert_eq!(format_age(61_000), "1m1s");
 }
 
+fn projection_process() -> crate::supervisor::ProcessSnapshot {
+    crate::supervisor::ProcessSnapshot {
+        process_id: crate::supervisor::ProcessId::new(1),
+        name: "api".to_string(),
+        kind: crate::model::ProcessKind::Service,
+        enabled: true,
+        autostart: true,
+        input_focused: false,
+        desired: crate::supervisor::DesiredState::Running,
+        lifecycle: crate::supervisor::Lifecycle::Running,
+        terminal_mode: crate::model::TerminalMode::Pipe,
+        current_run: Some(7),
+        root_pid: Some(42),
+        run_started_at_ms: Some(1_000),
+        failure: None,
+        metrics: None,
+        blocked_reason: None,
+        readiness: None,
+        liveness: None,
+        restart_backoff: None,
+        automatic_restart_budget: crate::supervisor::RestartBudgetStatus {
+            automatic_retries_used: 0,
+            max_restarts: 2,
+            exhausted: false,
+        },
+        recent_runs: Vec::new(),
+    }
+}
+
+#[test]
+fn tui_projection_keeps_lifecycle_reasons_visible() {
+    let mut process = projection_process();
+
+    process.lifecycle = crate::supervisor::Lifecycle::Waiting;
+    process.current_run = None;
+    process.blocked_reason = Some("all-ready: ready".to_string());
+    assert_eq!(status_label(&process), "Waiting (all-ready: ready)");
+    assert!(selected_header(&process, 5_000).contains("all-ready: ready"));
+
+    process.lifecycle = crate::supervisor::Lifecycle::Running;
+    process.current_run = Some(7);
+    process.blocked_reason = None;
+    process.readiness = Some(crate::supervisor::ReadinessStatus {
+        kind: crate::supervisor::ReadinessCheckKind::Http,
+        state: crate::supervisor::ReadinessState::Failing,
+        attempts: 3,
+        consecutive_successes: 0,
+        consecutive_failures: 3,
+        last_error: Some("HTTP status 503".to_string()),
+        startup_elapsed_ms: 500,
+        children: Vec::new(),
+    });
+    assert!(selected_header(&process, 5_000).contains("readiness attempt 3: HTTP status 503"));
+
+    process.readiness = None;
+    process.liveness = Some(crate::supervisor::LivenessStatus {
+        kind: crate::supervisor::LivenessCheckKind::Http,
+        state: crate::supervisor::LivenessState::Failing,
+        attempts: 3,
+        consecutive_successes: 0,
+        consecutive_failures: 3,
+        last_error: Some("HTTP status 503".to_string()),
+        elapsed_ms: 500,
+        children: Vec::new(),
+    });
+    assert_eq!(status_label(&process), "Unhealthy");
+
+    process.lifecycle = crate::supervisor::Lifecycle::RestartBackoff;
+    process.current_run = None;
+    process.liveness = None;
+    process.restart_backoff = Some(crate::supervisor::RestartBackoffStatus {
+        reason: "unhealthy".to_string(),
+        next_attempt_at_ms: 7_500,
+    });
+    process.automatic_restart_budget.automatic_retries_used = 1;
+    assert_eq!(status_label(&process), "Restarting (unhealthy)");
+    let header = selected_header(&process, 5_000);
+    assert!(header.contains("automatic retries 1/2"));
+    assert!(header.contains("next restart at 7500ms"));
+
+    process.lifecycle = crate::supervisor::Lifecycle::Stopped;
+    process.restart_backoff = None;
+    process.failure = Some(crate::supervisor::FailureSummary {
+        kind: crate::supervisor::FailureKind::RestartLimit,
+        detail: "Restart limit exhausted".to_string(),
+    });
+    assert_eq!(status_label(&process), "Failed (Restart limit exhausted)");
+    assert!(selected_header(&process, 5_000).contains("Restart limit exhausted"));
+}
+
 #[test]
 fn plain_q_quits_only_from_process_list_focus() {
     let plain_q = KeyEvent::new(KeyCode::Char('q'), crossterm::event::KeyModifiers::NONE);
