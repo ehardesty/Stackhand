@@ -3,9 +3,8 @@
 use crate::model::{ProcessKind, ReadinessProbe};
 use crate::runtime::ProcessId;
 
-use super::core::{
-    DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ReadinessState, RunSummary,
-};
+use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunSummary};
+use super::readiness::ReadinessState;
 
 /// An immutable view of the whole Project at one moment. Rendering and
 /// callers can hold and inspect this freely; it cannot mutate lifecycle
@@ -26,11 +25,12 @@ impl ProjectSnapshot {
     }
 }
 
-/// The supported leaf check kinds in the readiness snapshot.
+/// The check kinds in the readiness snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessCheckKind {
     Tcp,
     Http,
+    All,
 }
 
 impl From<&ReadinessProbe> for ReadinessCheckKind {
@@ -42,23 +42,43 @@ impl From<&ReadinessProbe> for ReadinessCheckKind {
     }
 }
 
+/// One bounded readiness progress view for one child of an `all` check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessChildStatus {
+    /// The one-based position of this child in the configured `all` list.
+    pub index: usize,
+    pub kind: ReadinessCheckKind,
+    pub state: ReadinessState,
+    pub attempts: u32,
+    pub consecutive_successes: u32,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
 /// One bounded readiness progress view of the current Run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessStatus {
-    /// The kind of check configured for this Service.
+    /// The kind of check configured for this Service. `All` identifies a
+    /// composite whose child states are in `children`.
     pub kind: ReadinessCheckKind,
-    /// The current threshold state of the check.
+    /// The aggregate threshold state of the check.
     pub state: ReadinessState,
-    /// Attempts dispatched for the current Run so far.
+    /// Total attempts dispatched for the current Run. For `All`, this is the
+    /// sum of the child attempts.
     pub attempts: u32,
-    /// Consecutive passing attempts currently counted.
+    /// Consecutive passing attempts currently counted. For `All`, this is the
+    /// sum of the child counters.
     pub consecutive_successes: u32,
-    /// Consecutive failing attempts currently counted.
+    /// Consecutive failing attempts currently counted. For `All`, this is the
+    /// sum of the child counters.
     pub consecutive_failures: u32,
-    /// The most recent failing attempt's bounded diagnostic, when any.
+    /// A retained bounded diagnostic from a child that has reported a
+    /// failure, when any.
     pub last_error: Option<String>,
     /// Milliseconds elapsed since readiness evaluation began after spawn.
     pub startup_elapsed_ms: u64,
+    /// Per-child progress for an `all` check. Empty for a direct leaf check.
+    pub children: Vec<ReadinessChildStatus>,
 }
 
 /// The immutable lifecycle and diagnostic view of one Process.

@@ -29,6 +29,7 @@ mod command;
 mod core;
 mod events;
 mod probe;
+mod readiness;
 mod runtime;
 mod schedule;
 mod seam;
@@ -43,11 +44,14 @@ pub use crate::runtime::ProcessId;
 pub use command::Command;
 pub use core::{
     DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
-    ReadinessState, RunExitDisposition, RunSummary, RunTrigger,
+    RunExitDisposition, RunSummary, RunTrigger,
 };
+pub use readiness::ReadinessState;
 pub use runtime::{ConsoleView, Consoles};
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
-pub use snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessStatus};
+pub use snapshot::{
+    ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus,
+};
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.
 pub use crate::output::{
@@ -122,9 +126,9 @@ pub(crate) fn start_with(
 /// a `SeamSender`, so the event channel stays connected for the whole loop;
 /// the task ends when every caller drops its handle.
 ///
-/// Between messages the loop waits at most until the next readiness attempt
-/// or startup deadline becomes due, then polls the core's timers. Readiness
-/// work itself always runs on probe-adapter threads, never here.
+/// Between messages the loop waits at most until the next child readiness
+/// attempt or startup deadline becomes due, then polls the core's timers.
+/// Readiness work itself always runs on probe-adapter threads, never here.
 fn run_task(
     core: &mut Core,
     inbox: &Receiver<Inbox>,

@@ -11,7 +11,8 @@
 //! A Dependency is a startup relationship only: nothing here stops an
 //! already-running dependent when a dependency later stops.
 
-use super::core::{Core, DesiredState, Lifecycle, ReadinessState};
+use super::core::{Core, DesiredState, Lifecycle};
+use super::readiness::ReadinessState;
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
 use crate::supervisor::RunTrigger;
@@ -183,7 +184,7 @@ impl Core {
         entry
             .readiness
             .as_ref()
-            .is_none_or(|tracking| tracking.state == ReadinessState::Passing)
+            .is_none_or(|tracking| tracking.state() == ReadinessState::Passing)
     }
 
     /// `exited` holds after the latest scheduled One-shot Run completes its

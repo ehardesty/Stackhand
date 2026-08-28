@@ -1,12 +1,12 @@
 //! Readiness configuration: one YAML `ready` block becomes one validated
 //! [`ReadinessConfig`] or a clear per-Process failure. The block carries
-//! exactly one TCP or HTTP probe and the common scheduling fields.
+//! exactly one leaf check or an `all` list with child scheduling fields.
 
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::model::{ReadinessConfig, ReadinessProbe};
+use crate::model::{ReadinessCheck, ReadinessConfig, ReadinessProbe};
 
 use super::ConfigError;
 
@@ -16,13 +16,87 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUCCESS_THRESHOLD: u32 = 1;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 1;
 
-/// One `ready` block: exactly one probe form and optional common scheduling
-/// fields.
+/// One `ready` block: one leaf check or an `all` list with independent
+/// scheduling for every child.
 pub(super) fn build_readiness(
     process_name: &str,
     file: &ReadinessFile,
 ) -> Result<ReadinessConfig, ConfigError> {
-    let fail = |detail: String| Err(ready_error(process_name, detail));
+    if file.any.is_some() {
+        return Err(ready_error(
+            process_name,
+            "the 'any' readiness form is not supported; use 'all' or one leaf check",
+        ));
+    }
+
+    let startup_timeout = file
+        .startup_timeout
+        .as_deref()
+        .map(|value| {
+            positive_duration(process_name, "startup_timeout", Some(value), Duration::ZERO)
+        })
+        .transpose()?;
+
+    let checks = if let Some(children) = &file.all {
+        if file.tcp.is_some() || file.http.is_some() {
+            return Err(ready_error(
+                process_name,
+                "define exactly one of 'tcp', 'http', or 'all'",
+            ));
+        }
+        if file.initial_delay.is_some()
+            || file.interval.is_some()
+            || file.timeout.is_some()
+            || file.success_threshold.is_some()
+            || file.failure_threshold.is_some()
+        {
+            return Err(ready_error(
+                process_name,
+                "an 'all' readiness check sets scheduling fields on each child, not on the parent",
+            ));
+        }
+        if children.len() < 2 {
+            return Err(ready_error(
+                process_name,
+                "'all' must contain at least two child checks",
+            ));
+        }
+        children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| build_leaf(process_name, child, Some(index + 1)))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![build_leaf(process_name, file, None)?]
+    };
+
+    Ok(ReadinessConfig {
+        checks,
+        startup_timeout,
+    })
+}
+
+fn build_leaf(
+    process_name: &str,
+    file: &ReadinessFile,
+    child_index: Option<usize>,
+) -> Result<ReadinessCheck, ConfigError> {
+    let fail = |detail: String| {
+        let detail = match child_index {
+            Some(index) => format!("all child {index}: {detail}"),
+            None => detail,
+        };
+        Err(ready_error(process_name, detail))
+    };
+    if file.all.is_some() {
+        return fail("nested 'all' readiness checks are not supported".to_string());
+    }
+    if file.any.is_some() {
+        return fail("the 'any' readiness form is not supported".to_string());
+    }
+    if child_index.is_some() && file.startup_timeout.is_some() {
+        return fail("startup_timeout is valid only on the parent 'ready' block".to_string());
+    }
     let probe = match (&file.tcp, &file.http) {
         (Some(tcp), None) => {
             if tcp.host.is_empty() {
@@ -37,8 +111,15 @@ pub(super) fn build_readiness(
             }
         }
         (None, Some(http)) => {
-            let (host, port, path) =
-                parse_http_url(&http.url).map_err(|detail| ready_error(process_name, detail))?;
+            let (host, port, path) = parse_http_url(&http.url).map_err(|detail| {
+                ready_error(
+                    process_name,
+                    match child_index {
+                        Some(index) => format!("all child {index}: {detail}"),
+                        None => detail,
+                    },
+                )
+            })?;
             ReadinessProbe::Http { host, port, path }
         }
         (Some(_), Some(_)) | (None, None) => {
@@ -63,13 +144,6 @@ pub(super) fn build_readiness(
         file.timeout.as_deref(),
         DEFAULT_TIMEOUT,
     )?;
-    let startup_timeout = file
-        .startup_timeout
-        .as_deref()
-        .map(|value| {
-            positive_duration(process_name, "startup_timeout", Some(value), Duration::ZERO)
-        })
-        .transpose()?;
     let success_threshold = configured_threshold(
         process_name,
         "success_threshold",
@@ -82,14 +156,13 @@ pub(super) fn build_readiness(
         file.failure_threshold,
         DEFAULT_FAILURE_THRESHOLD,
     )?;
-    Ok(ReadinessConfig {
+    Ok(ReadinessCheck {
         probe,
         initial_delay,
         interval,
         timeout,
         success_threshold,
         failure_threshold,
-        startup_timeout,
     })
 }
 
@@ -226,6 +299,9 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 pub(super) struct ReadinessFile {
     tcp: Option<TcpProbeFile>,
     http: Option<HttpProbeFile>,
+    all: Option<Vec<ReadinessFile>>,
+    /// Parsed only to provide a clear unsupported-form diagnostic.
+    any: Option<serde_yaml::Value>,
     initial_delay: Option<String>,
     interval: Option<String>,
     timeout: Option<String>,
@@ -278,16 +354,17 @@ mod tests {
             .readiness
             .clone()
             .expect("readiness parses");
+        let check = &readiness.checks[0];
         assert_eq!(
-            readiness.probe,
+            check.probe,
             ReadinessProbe::Http {
                 host: "localhost".into(),
                 port: 8080,
                 path: "/healthz?probe=1".into(),
             }
         );
-        assert_eq!(readiness.interval, Duration::from_millis(1_000));
-        assert_eq!(readiness.timeout, Duration::from_millis(2_000));
+        assert_eq!(check.interval, Duration::from_millis(1_000));
+        assert_eq!(check.timeout, Duration::from_millis(2_000));
 
         // The default port and path come from the URL.
         let bare = write_and_load(
@@ -297,7 +374,7 @@ mod tests {
         .expect("a bare http URL is valid");
         let readiness = bare.processes()[0].readiness.clone().expect("parses");
         assert_eq!(
-            readiness.probe,
+            readiness.checks[0].probe,
             ReadinessProbe::Http {
                 host: "example.test".into(),
                 port: 80,
@@ -341,15 +418,16 @@ mod tests {
             .readiness
             .clone()
             .expect("readiness parses");
+        let check = &readiness.checks[0];
         assert_eq!(
-            readiness.probe,
+            check.probe,
             ReadinessProbe::Tcp {
                 host: "127.0.0.1".into(),
                 port: 5432
             }
         );
-        assert_eq!(readiness.interval, Duration::from_millis(1_000));
-        assert_eq!(readiness.timeout, Duration::from_millis(2_000));
+        assert_eq!(check.interval, Duration::from_millis(1_000));
+        assert_eq!(check.timeout, Duration::from_millis(2_000));
     }
 
     #[test]
@@ -363,11 +441,12 @@ mod tests {
             .readiness
             .clone()
             .expect("readiness parses");
-        assert_eq!(readiness.initial_delay, Duration::from_millis(250));
-        assert_eq!(readiness.interval, Duration::from_secs(2));
-        assert_eq!(readiness.timeout, Duration::from_secs(3 * 60));
-        assert_eq!(readiness.success_threshold, 2);
-        assert_eq!(readiness.failure_threshold, 3);
+        let check = &readiness.checks[0];
+        assert_eq!(check.initial_delay, Duration::from_millis(250));
+        assert_eq!(check.interval, Duration::from_secs(2));
+        assert_eq!(check.timeout, Duration::from_secs(3 * 60));
+        assert_eq!(check.success_threshold, 2);
+        assert_eq!(check.failure_threshold, 3);
         assert_eq!(
             readiness.startup_timeout,
             Some(Duration::from_secs(4 * 60 * 60))
@@ -386,6 +465,7 @@ mod tests {
                 .readiness
                 .as_ref()
                 .expect("readiness parses")
+                .checks[0]
                 .initial_delay,
             Duration::ZERO
         );
@@ -510,6 +590,83 @@ mod tests {
             old_timeout.message.contains("use `timeout` instead"),
             "{old_timeout}"
         );
+    }
+
+    #[test]
+    fn all_readiness_parses_independent_children_and_one_parent_deadline() {
+        let project = write_and_load(
+            "readiness-all-ok",
+            "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n          initial_delay: 250ms\n          interval: 2s\n          timeout: 3s\n          success_threshold: 2\n          failure_threshold: 3\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      startup_timeout: 1m\n",
+        )
+        .expect("valid all readiness");
+        let readiness = project.processes()[0]
+            .readiness
+            .as_ref()
+            .expect("readiness parses");
+        assert_eq!(readiness.checks.len(), 2);
+        assert_eq!(readiness.startup_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(
+            readiness.checks[0].initial_delay,
+            Duration::from_millis(250)
+        );
+        assert_eq!(readiness.checks[0].interval, Duration::from_secs(2));
+        assert_eq!(readiness.checks[0].timeout, Duration::from_secs(3));
+        assert_eq!(readiness.checks[0].success_threshold, 2);
+        assert_eq!(readiness.checks[0].failure_threshold, 3);
+        assert_eq!(
+            readiness.checks[1].probe,
+            ReadinessProbe::Http {
+                host: "example.test".into(),
+                port: 80,
+                path: "/health".into(),
+            }
+        );
+        assert_eq!(readiness.checks[1].initial_delay, Duration::from_millis(4));
+        assert_eq!(readiness.checks[1].interval, Duration::from_secs(5));
+        assert_eq!(readiness.checks[1].timeout, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn all_readiness_rejects_invalid_composite_forms_clearly() {
+        let base = "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n";
+        let cases = [
+            ("empty", "      all: []\n", "at least two child checks"),
+            (
+                "one child",
+                "      all:\n        - tcp: {host: h, port: 1}\n",
+                "at least two child checks",
+            ),
+            (
+                "nested",
+                "      all:\n        - all:\n            - tcp: {host: h, port: 1}\n            - tcp: {host: h, port: 2}\n        - tcp: {host: h, port: 3}\n",
+                "nested 'all'",
+            ),
+            (
+                "any",
+                "      any:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n",
+                "'any' readiness form is not supported",
+            ),
+            (
+                "parent scheduling",
+                "      all:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n      interval: 1s\n",
+                "on each child",
+            ),
+        ];
+        for (label, block, expected) in cases {
+            let error = write_and_load(label, &format!("{base}{block}"))
+                .expect_err("an invalid all readiness block must fail");
+            assert!(error.message.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn all_readiness_rejects_child_startup_deadlines() {
+        let error = write_and_load(
+            "readiness-all-child-timeout",
+            "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n      all:\n        - tcp: {host: h, port: 1}\n          startup_timeout: 1s\n        - tcp: {host: h, port: 2}\n",
+        )
+        .expect_err("a child cannot own the composite startup deadline");
+        assert!(error.message.contains("parent 'ready' block"), "{error}");
     }
 
     #[test]

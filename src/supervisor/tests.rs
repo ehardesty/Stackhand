@@ -14,7 +14,8 @@ use super::{
 };
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
-    ProcessKind, ProcessSpec, ReadinessConfig, ReadinessProbe, ShellConfig, TerminalMode,
+    ProcessKind, ProcessSpec, ReadinessCheck, ReadinessConfig, ReadinessProbe, ShellConfig,
+    TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
@@ -49,15 +50,17 @@ fn probed_service(name: &str) -> ProcessSpec {
     let mut spec = service(name);
     spec.autostart = Autostart::No;
     spec.readiness = Some(ReadinessConfig {
-        probe: ReadinessProbe::Tcp {
-            host: "127.0.0.1".into(),
-            port: 1,
-        },
-        initial_delay: Duration::ZERO,
-        interval: Duration::from_secs(1),
-        timeout: Duration::from_millis(100),
-        success_threshold: 1,
-        failure_threshold: 1,
+        checks: vec![ReadinessCheck {
+            probe: ReadinessProbe::Tcp {
+                host: "127.0.0.1".into(),
+                port: 1,
+            },
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_millis(100),
+            success_threshold: 1,
+            failure_threshold: 1,
+        }],
         startup_timeout: None,
     });
     spec
@@ -70,9 +73,10 @@ fn configured_readiness_project(
 ) -> EffectiveProject {
     let mut process = probed_service("api");
     let readiness = process.readiness.as_mut().expect("the probe exists");
-    readiness.initial_delay = initial_delay;
-    readiness.success_threshold = success_threshold;
-    readiness.failure_threshold = failure_threshold;
+    let check = &mut readiness.checks[0];
+    check.initial_delay = initial_delay;
+    check.success_threshold = success_threshold;
+    check.failure_threshold = failure_threshold;
     EffectiveProject::new(vec![process]).expect("unique names")
 }
 

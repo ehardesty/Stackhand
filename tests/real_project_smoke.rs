@@ -3,14 +3,219 @@ use std::fs;
 use std::net::TcpListener;
 use std::process::Command;
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use stackhand::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    ReadinessConfig, ReadinessProbe, TerminalMode,
+    ReadinessCheck, ReadinessConfig, ReadinessProbe, TerminalMode,
 };
+
+#[cfg(unix)]
+fn host_tcp_readiness_endpoint() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP endpoint binds");
+    let port = listener
+        .local_addr()
+        .expect("TCP address is available")
+        .port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            drop(stream);
+        }
+    });
+    port
+}
+
+#[cfg(unix)]
+fn host_switching_http_endpoint(healthy: Arc<AtomicBool>) -> u16 {
+    use std::io::Write;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("HTTP endpoint binds");
+    let port = listener
+        .local_addr()
+        .expect("HTTP address is available")
+        .port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let response = if healthy.load(Ordering::Acquire) {
+                b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+            } else {
+                b"HTTP/1.0 503 Unavailable\r\n\r\n".as_slice()
+            };
+            let mut stream = stream;
+            let _ = stream.write_all(response);
+        }
+    });
+    port
+}
+
+#[cfg(unix)]
+#[test]
+fn all_readiness_uses_real_tcp_and_http_children_for_failure_and_recovery() {
+    let healthy = Arc::new(AtomicBool::new(false));
+    let tcp_port = host_tcp_readiness_endpoint();
+    let http_port = host_switching_http_endpoint(Arc::clone(&healthy));
+    let process = readiness_test_process(tcp_port, http_port);
+    let project = EffectiveProject::new(vec![process]).expect("all readiness project is valid");
+    let (supervisor, _consoles, _outputs) =
+        stackhand::supervisor::start(project).expect("Supervisor starts");
+    supervisor.command(stackhand::supervisor::Command::Start("mixed".into()));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().expect("Supervisor serves snapshots");
+        let mixed = snapshot.named("mixed").expect("mixed Process exists");
+        if mixed.readiness.as_ref().is_some_and(|readiness| {
+            readiness.last_error.as_deref() == Some("all child 2: status 503")
+        }) {
+            assert_eq!(mixed.lifecycle, stackhand::supervisor::Lifecycle::Starting);
+            assert_eq!(
+                mixed.readiness.as_ref().unwrap().kind,
+                stackhand::supervisor::ReadinessCheckKind::All
+            );
+            assert_eq!(
+                mixed.readiness.as_ref().unwrap().children[0].state,
+                stackhand::supervisor::ReadinessState::Passing
+            );
+            assert_eq!(
+                mixed.readiness.as_ref().unwrap().children[1].state,
+                stackhand::supervisor::ReadinessState::Pending
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial partial failure was not observed: {mixed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    healthy.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().expect("Supervisor serves snapshots");
+        let mixed = snapshot.named("mixed").expect("mixed Process exists");
+        if mixed.lifecycle == stackhand::supervisor::Lifecycle::Running
+            && mixed.readiness.as_ref().is_some_and(|readiness| {
+                readiness.state == stackhand::supervisor::ReadinessState::Passing
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed readiness did not recover: {mixed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    healthy.store(false, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().expect("Supervisor serves snapshots");
+        let mixed = snapshot.named("mixed").expect("mixed Process exists");
+        if mixed.lifecycle == stackhand::supervisor::Lifecycle::Running
+            && mixed.readiness.as_ref().is_some_and(|readiness| {
+                readiness.state == stackhand::supervisor::ReadinessState::Failing
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed readiness did not report loss: {mixed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    healthy.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().expect("Supervisor serves snapshots");
+        let mixed = snapshot.named("mixed").expect("mixed Process exists");
+        if mixed.readiness.as_ref().is_some_and(|readiness| {
+            readiness.state == stackhand::supervisor::ReadinessState::Passing
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed readiness did not recover again: {mixed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    supervisor.command(stackhand::supervisor::Command::Stop("mixed".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().expect("Supervisor serves snapshots");
+        let mixed = snapshot.named("mixed").expect("mixed Process exists");
+        if mixed.lifecycle == stackhand::supervisor::Lifecycle::Stopped
+            && mixed.current_run.is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed Process did not stop: {mixed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    supervisor.stop_task();
+}
+
+#[cfg(unix)]
+fn readiness_test_process(tcp_port: u16, http_port: u16) -> ProcessSpec {
+    ProcessSpec {
+        name: "mixed".into(),
+        kind: ProcessKind::Service,
+        enabled: Enabled::Yes,
+        autostart: Autostart::No,
+        success_exit_codes: vec![0],
+        command: CommandForm::Direct {
+            program: "/bin/sleep".into(),
+            args: vec!["60".into()],
+        },
+        working_dir: std::env::temp_dir(),
+        env: Vec::new(),
+        terminal_mode: TerminalMode::Pipe,
+        input_policy: InputPolicy::Disabled,
+        dependencies: Vec::new(),
+        readiness: Some(ReadinessConfig {
+            checks: vec![
+                ReadinessCheck {
+                    probe: ReadinessProbe::Tcp {
+                        host: "127.0.0.1".into(),
+                        port: tcp_port,
+                    },
+                    initial_delay: Duration::ZERO,
+                    interval: Duration::from_millis(20),
+                    timeout: Duration::from_millis(100),
+                    success_threshold: 1,
+                    failure_threshold: 1,
+                },
+                ReadinessCheck {
+                    probe: ReadinessProbe::Http {
+                        host: "127.0.0.1".into(),
+                        port: http_port,
+                        path: "/healthz".into(),
+                    },
+                    initial_delay: Duration::ZERO,
+                    interval: Duration::from_millis(20),
+                    timeout: Duration::from_millis(100),
+                    success_threshold: 1,
+                    failure_threshold: 1,
+                },
+            ],
+            startup_timeout: Some(Duration::from_secs(2)),
+        }),
+    }
+}
 
 #[cfg(unix)]
 #[test]
@@ -45,15 +250,17 @@ fn startup_timeout_confirms_real_process_tree_cleanup() {
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
         readiness: Some(ReadinessConfig {
-            probe: ReadinessProbe::Tcp {
-                host: "127.0.0.1".into(),
-                port: failed_port,
-            },
-            initial_delay: Duration::ZERO,
-            interval: Duration::from_secs(1),
-            timeout: Duration::from_millis(50),
-            success_threshold: 1,
-            failure_threshold: 1,
+            checks: vec![ReadinessCheck {
+                probe: ReadinessProbe::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: failed_port,
+                },
+                initial_delay: Duration::ZERO,
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_millis(50),
+                success_threshold: 1,
+                failure_threshold: 1,
+            }],
             startup_timeout: Some(Duration::from_millis(200)),
         }),
     };

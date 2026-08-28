@@ -195,8 +195,8 @@ pub(crate) trait RunSeam: Send {
 }
 
 /// One request for exactly one bounded readiness attempt. The Supervisor
-/// dispatches attempts one at a time per Run; the adapter performs each one
-/// off the control task and reports exactly one
+/// dispatches at most one attempt at a time per child; the adapter performs
+/// each one off the control task and reports exactly one
 /// [`SeamEvent::Readiness`] for these identities.
 #[derive(Clone, Debug)]
 pub struct ProbeIntent {

@@ -14,12 +14,9 @@ use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
 use crate::supervisor::command::Command;
-use crate::supervisor::seam::{
-    AttemptId, ProbeIntent, ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId,
-};
-use crate::supervisor::snapshot::{
-    ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessStatus,
-};
+use crate::supervisor::readiness::ReadinessTracking;
+use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId};
+use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot};
 
 /// The user's current intent for a Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,41 +144,6 @@ pub(crate) struct Core {
     epoch: Instant,
     pub(super) events: SeamSender,
     pub(super) shutdown: Option<crate::supervisor::shutdown::ShutdownState>,
-}
-
-/// The current state of one Service readiness check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadinessState {
-    /// No success threshold has been reached for this Run.
-    Pending,
-    /// The success threshold currently holds.
-    Passing,
-    /// The failure threshold has been reached after readiness.
-    Failing,
-}
-
-/// Live readiness bookkeeping for one probed Service's current Run.
-#[derive(Debug)]
-pub(super) struct ReadinessTracking {
-    /// Stable identity of this check within its Run.
-    pub(super) work_id: WorkId,
-    /// Session time when readiness evaluation began after spawn.
-    pub(super) started_at_ms: u64,
-    /// Attempts dispatched for this Run so far.
-    pub(super) attempts: u32,
-    pub(super) state: ReadinessState,
-    pub(super) consecutive_successes: u32,
-    pub(super) consecutive_failures: u32,
-    /// The next attempt identity. Attempt identities are never reused.
-    pub(super) next_attempt_id: u64,
-    pub(super) last_error: Option<String>,
-    /// One bounded attempt is out with the probe adapter; attempts for one
-    /// Run never overlap.
-    pub(super) in_flight: Option<AttemptId>,
-    /// Earliest time [`Core::poll_timers`] may dispatch the next attempt.
-    pub(super) next_attempt_at: Instant,
-    /// Deadline for the first success threshold, when configured.
-    pub(super) startup_deadline: Option<Instant>,
 }
 
 pub(super) struct Entry {
@@ -415,7 +377,7 @@ impl Core {
         };
         let process_id = self.entries[index].process_id;
         if let Some(tracking) = self.entries[index].readiness.as_ref() {
-            self.probes.cancel(process_id, run_id, tracking.work_id);
+            tracking.cancel(self.probes.as_ref(), process_id, run_id);
         }
         self.seam.cancel(process_id, run_id);
         self.entries[index].run_cancelled = true;
@@ -496,128 +458,16 @@ impl Core {
     /// whose attempt is due. Tests drive this directly with a fake clock;
     /// the threaded wrapper drives it on tick timeouts.
     pub(crate) fn poll_timers(&mut self, now: Instant) {
-        self.expire_startup_timeouts(now);
-        for index in self.due_probe_indices(now) {
-            self.dispatch_probe(index);
-        }
+        self.poll_readiness_timers(now);
         self.expire_shutdown(now);
     }
 
-    fn expire_startup_timeouts(&mut self, now: Instant) {
-        let expired = self
-            .active_readiness()
-            .filter_map(|(index, run_id, tracking)| {
-                tracking
-                    .startup_deadline
-                    .filter(|deadline| *deadline <= now)
-                    .map(|_| (index, run_id))
-            })
-            .collect::<Vec<_>>();
-        for (index, run_id) in expired {
-            self.timeout_startup(index, run_id);
-        }
-    }
-
-    /// The active readiness checks whose Run still desires Running.
-    fn active_readiness(&self) -> impl Iterator<Item = (usize, RunId, &ReadinessTracking)> + '_ {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let run_id = entry.current_run?;
-                let tracking = entry.readiness.as_ref()?;
-                (entry.desired == DesiredState::Running).then_some((index, run_id, tracking))
-            })
-    }
-
-    /// Turn an expired first-readiness deadline into a normal Run cleanup.
-    /// Readiness cancellation happens before the Process Tree stop request.
-    fn timeout_startup(&mut self, index: usize, run_id: RunId) {
-        let timeout = self.project.processes()[index]
-            .readiness
-            .as_ref()
-            .and_then(|config| config.startup_timeout)
-            .expect("a startup deadline has a configured timeout");
-        let process_id = self.entries[index].process_id;
-        self.cancel_run_work(index);
-        let entry = &mut self.entries[index];
-        entry.startup_timeout_pending = true;
-        entry.failure = Some(FailureSummary {
-            kind: FailureKind::Readiness,
-            detail: format!("readiness startup timeout after {} ms", timeout.as_millis()),
-        });
-        entry.desired = DesiredState::Stopped;
-        entry.lifecycle = Lifecycle::Stopping;
-        entry.blocked = None;
-        self.seam.stop(process_id, run_id, None, &self.events);
-    }
-
-    fn due_probe_indices(&self, now: Instant) -> Vec<usize> {
-        self.active_readiness()
-            .filter(|(_, _, tracking)| {
-                tracking.in_flight.is_none() && tracking.next_attempt_at <= now
-            })
-            .map(|(index, _, _)| index)
-            .collect()
-    }
-
-    /// Hand exactly one bounded attempt to the probe adapter. The adapter
-    /// answers with one `Readiness` event; until it arrives the Run has no
-    /// second attempt out.
-    fn dispatch_probe(&mut self, index: usize) {
-        let Some(config) = &self.project.processes()[index].readiness else {
-            return;
-        };
-        let probe = config.probe.clone();
-        let timeout = config.timeout;
-        let intent = {
-            let entry = &mut self.entries[index];
-            let Some(run_id) = entry.current_run else {
-                return;
-            };
-            let Some(tracking) = entry.readiness.as_mut() else {
-                return;
-            };
-            if tracking.in_flight.is_some() {
-                return;
-            }
-            let attempt_id = AttemptId::new(tracking.next_attempt_id);
-            tracking.next_attempt_id += 1;
-            tracking.in_flight = Some(attempt_id);
-            tracking.attempts += 1;
-            ProbeIntent {
-                process_id: entry.process_id,
-                run_id,
-                work_id: tracking.work_id,
-                attempt_id,
-                probe,
-                timeout,
-            }
-        };
-        self.probes.probe(intent, &self.events);
-    }
-
-    /// How long the caller may wait before some readiness attempt or startup
-    /// deadline becomes due, or `None` when no timer work is pending.
+    /// How long the caller may wait before readiness or shutdown work is due.
     pub(crate) fn time_until_next_timer(&self) -> Option<Duration> {
-        let now = self.clock.now();
-        let probe_wait = self
-            .active_readiness()
-            .filter(|(_, _, tracking)| tracking.in_flight.is_none())
-            .map(|(_, _, tracking)| tracking.next_attempt_at.saturating_duration_since(now))
-            .min();
-        let startup_wait = self
-            .active_readiness()
-            .filter_map(|(_, _, tracking)| tracking.startup_deadline)
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .min();
-        let readiness_wait = probe_wait.into_iter().chain(startup_wait).min();
-        match (readiness_wait, self.time_until_shutdown_deadline()) {
-            (Some(probe), Some(shutdown)) => Some(probe.min(shutdown)),
-            (Some(probe), None) => Some(probe),
-            (None, Some(shutdown)) => Some(shutdown),
-            (None, None) => None,
-        }
+        self.readiness_time_until_next_timer()
+            .into_iter()
+            .chain(self.time_until_shutdown_deadline())
+            .min()
     }
 
     pub(crate) fn snapshot(&self) -> ProjectSnapshot {
@@ -644,19 +494,11 @@ impl Core {
                 metrics: entry.metrics,
                 blocked_reason: entry.blocked.clone(),
                 readiness: entry.readiness.as_ref().map(|tracking| {
-                    let probe = spec
+                    let config = spec
                         .readiness
                         .as_ref()
                         .expect("tracking exists only for a configured readiness check");
-                    ReadinessStatus {
-                        kind: ReadinessCheckKind::from(&probe.probe),
-                        state: tracking.state,
-                        attempts: tracking.attempts,
-                        consecutive_successes: tracking.consecutive_successes,
-                        consecutive_failures: tracking.consecutive_failures,
-                        last_error: tracking.last_error.clone(),
-                        startup_elapsed_ms: now_ms.saturating_sub(tracking.started_at_ms),
-                    }
+                    tracking.snapshot(config, now_ms)
                 }),
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })

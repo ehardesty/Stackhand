@@ -110,8 +110,7 @@ impl DependencyCondition {
     }
 }
 
-/// One bounded network check that decides when a Service's current Run
-/// becomes available. Exactly one form per Process.
+/// One bounded network target for a leaf readiness check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadinessProbe {
     /// A TCP connection must succeed against this endpoint.
@@ -127,10 +126,9 @@ pub enum ReadinessProbe {
     },
 }
 
-/// The readiness policy of one Service: which probe decides availability,
-/// when checks begin, how results are counted, and how long startup may wait.
+/// Scheduling and threshold policy for one leaf readiness check.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadinessConfig {
+pub struct ReadinessCheck {
     pub probe: ReadinessProbe,
     /// How long to wait after spawn before the first attempt.
     pub initial_delay: Duration,
@@ -143,7 +141,15 @@ pub struct ReadinessConfig {
     /// Consecutive failing attempts required after readiness to become
     /// failing.
     pub failure_threshold: u32,
-    /// Optional deadline for reaching readiness after spawn.
+}
+
+/// The readiness policy of one Service. A direct check has one leaf in
+/// `checks`; an `all` check has one independently scheduled leaf per child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessConfig {
+    pub checks: Vec<ReadinessCheck>,
+    /// Optional deadline for the complete readiness policy to pass after
+    /// spawn. This is one composite deadline, not one deadline per child.
     pub startup_timeout: Option<Duration>,
 }
 

@@ -4,14 +4,10 @@
 //! authoritative lifecycle owner and keeps the Process/Run identity gate in
 //! one place.
 
-use std::time::Duration;
-
 use crate::model::ProcessKind;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
-use super::core::{
-    Core, FailureKind, FailureSummary, MetricsMetadata, ReadinessState, ReadinessTracking,
-};
+use super::core::{Core, FailureKind, FailureSummary, MetricsMetadata};
 
 impl Core {
     pub(crate) fn event(&mut self, event: SeamEvent) {
@@ -55,41 +51,24 @@ impl Core {
         }
         match event {
             SeamEvent::Spawned { root_pid, .. } => {
-                let initial_delay = self.project.processes()[index]
-                    .readiness
-                    .as_ref()
-                    .map_or(Duration::ZERO, |config| config.initial_delay);
-                let probed = self.project.processes()[index].readiness.is_some();
-                let work_id = probed.then(|| self.allocate_work_id(index));
                 let now = self.clock.now();
-                let now_ms = self.now_ms();
-                let startup_deadline = self.project.processes()[index]
-                    .readiness
-                    .as_ref()
-                    .and_then(|config| config.startup_timeout)
-                    .map(|timeout| now + timeout);
+                let initialize_readiness = self.entries[index].lifecycle
+                    == super::core::Lifecycle::Starting
+                    && self.entries[index].readiness.is_none();
+                let readiness = initialize_readiness
+                    .then(|| self.new_readiness_tracking(index, now))
+                    .flatten();
                 let entry = &mut self.entries[index];
                 entry.root_pid = root_pid.map(|pid| pid.get());
                 if entry.lifecycle == super::core::Lifecycle::Starting {
-                    if let Some(work_id) = work_id {
-                        // The Run exists but is not available yet; its first
-                        // attempt is due after the configured initial delay.
-                        entry.readiness = Some(ReadinessTracking {
-                            work_id,
-                            started_at_ms: now_ms,
-                            state: ReadinessState::Pending,
-                            attempts: 0,
-                            consecutive_successes: 0,
-                            consecutive_failures: 0,
-                            next_attempt_id: 1,
-                            last_error: None,
-                            in_flight: None,
-                            next_attempt_at: now + initial_delay,
-                            startup_deadline,
-                        });
-                    } else {
+                    if let Some(readiness) = readiness {
+                        // The Run exists but is not available yet; each
+                        // child owns its own first-attempt delay.
+                        entry.readiness = Some(readiness);
+                    } else if entry.readiness.is_none() {
                         // A Service without readiness becomes Running at
-                        // spawn; its label projects as Ready.
+                        // spawn; its label projects as Ready. A duplicate
+                        // Spawned event keeps existing child tracking intact.
                         entry.lifecycle = super::core::Lifecycle::Running;
                     }
                 }
@@ -105,38 +84,25 @@ impl Core {
                 let Some(config) = self.project.processes()[index].readiness.as_ref() else {
                     return;
                 };
-                let interval = config.interval;
-                let success_threshold = config.success_threshold;
-                let failure_threshold = config.failure_threshold;
                 let now = self.clock.now();
-                let entry = &mut self.entries[index];
-                let Some(tracking) = entry.readiness.as_mut() else {
+                let became_ready = {
+                    let entry = &mut self.entries[index];
+                    let Some(tracking) = entry.readiness.as_mut() else {
+                        return;
+                    };
+                    tracking.apply_result(config, work_id, attempt_id, now, passing, diagnostic)
+                };
+                let Some(became_ready) = became_ready else {
                     return;
                 };
-                if tracking.work_id != work_id || tracking.in_flight != Some(attempt_id) {
-                    return;
-                }
-                tracking.in_flight = None;
-                tracking.next_attempt_at = now + interval;
-                if passing {
-                    tracking.consecutive_successes =
-                        tracking.consecutive_successes.saturating_add(1);
-                    tracking.consecutive_failures = 0;
-                    if tracking.consecutive_successes >= success_threshold {
-                        tracking.state = ReadinessState::Passing;
-                        tracking.startup_deadline = None;
-                        if entry.lifecycle == super::core::Lifecycle::Starting {
-                            entry.lifecycle = super::core::Lifecycle::Running;
-                        }
-                    }
-                } else {
-                    tracking.consecutive_failures = tracking.consecutive_failures.saturating_add(1);
-                    tracking.consecutive_successes = 0;
-                    tracking.last_error = diagnostic;
-                    if tracking.state == ReadinessState::Passing
-                        && tracking.consecutive_failures >= failure_threshold
-                    {
-                        tracking.state = ReadinessState::Failing;
+                if became_ready {
+                    let entry = &mut self.entries[index];
+                    let Some(tracking) = entry.readiness.as_mut() else {
+                        return;
+                    };
+                    tracking.startup_deadline = None;
+                    if entry.lifecycle == super::core::Lifecycle::Starting {
+                        entry.lifecycle = super::core::Lifecycle::Running;
                     }
                 }
                 self.evaluate();
