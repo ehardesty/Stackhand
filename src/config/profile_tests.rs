@@ -39,9 +39,9 @@ processes:
   web:
     enabled: false
     autostart: false
-    command: [/bin/true]
+    command: [/usr/bin/true]
   worker:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   local:
     enable: [web]
@@ -53,7 +53,7 @@ profiles:
       added:
         kind: one-shot
         autostart: false
-        command: [/bin/true]
+        command: [/usr/bin/true]
 ",
         Some("local"),
     )
@@ -113,7 +113,7 @@ fn profile_selection_is_explicit_and_unknown_names_fail() {
     let yaml = "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   local:
     overrides:
@@ -185,7 +185,7 @@ profiles:
           FIRST: first
         success_exit_codes: [2, 3]
       first-added:
-        command: [/bin/true]
+        command: [/usr/bin/true]
   second:
     enable: [web]
     settings:
@@ -198,7 +198,7 @@ profiles:
           SECOND: second
         success_exit_codes: [7]
       second-added:
-        command: [/bin/true]
+        command: [/usr/bin/true]
 ";
 
     let forward =
@@ -256,9 +256,9 @@ fn null_clears_optional_fields_and_named_map_entries() {
 processes:
   db:
     kind: one-shot
-    command: [/bin/true]
+    command: [/usr/bin/true]
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     environment:
       KEEP: keep
       REMOVE: remove
@@ -310,7 +310,7 @@ fn base_environment_nulls_remove_inherited_environment_values() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     environment:
       MISSING: null
 profiles:
@@ -334,7 +334,7 @@ fn null_cannot_define_a_profile_process_or_required_command() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   bad:
     overrides:
@@ -355,7 +355,7 @@ profiles:
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   bad:
     overrides:
@@ -380,13 +380,13 @@ fn dependencies_are_checked_after_profile_merge_and_enablement_does_not_remove_t
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     depends_on: {cache: started}
 profiles:
   repair:
     overrides:
       cache:
-        command: [/bin/true]
+        command: [/usr/bin/true]
 ",
         &["repair"],
     )
@@ -399,13 +399,13 @@ profiles:
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     depends_on: {cache: started}
 profiles:
   repair:
     overrides:
       cache:
-        command: [/bin/true]
+        command: [/usr/bin/true]
 ",
         &[],
     )
@@ -420,9 +420,9 @@ profiles:
         "version: 1
 processes:
   cache:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     depends_on: {cache: started}
 profiles:
   no-cache:
@@ -442,10 +442,10 @@ fn profile_changes_can_repair_kind_checks_and_create_cycles() {
         "version: 1
 processes:
   setup:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     depends_on: {db: completed_successfully}
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   repair:
     overrides:
@@ -462,9 +462,9 @@ profiles:
         "version: 1
 processes:
   first:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   second:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   loop:
     overrides:
@@ -483,9 +483,9 @@ profiles:
         "version: 1
 processes:
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     depends_on: {db: started}
 profiles:
   break:

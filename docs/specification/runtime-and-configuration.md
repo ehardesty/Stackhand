@@ -368,7 +368,7 @@ Use `command` for a program and explicit arguments:
 command: [dotnet, run, --launch-profile, Local]
 ```
 
-This invokes the executable directly. No shell parsing, expansion, pipelines, redirection, or platform-dependent word splitting occurs.
+This invokes the executable directly. No shell parsing, expansion, pipelines, redirection, or platform-dependent word splitting occurs. A program name with a path separator is resolved from the base Project directory and checked before startup. A bare program name is left for the process launcher to find through `PATH`.
 
 ### 15.2 Shell execution
 
@@ -414,6 +414,8 @@ Common fields include:
 - A relative `cwd` resolves from the base config directory.
 - A missing or non-directory cwd is a validation error where it can be checked before start.
 - Hooks and probes inherit the process cwd unless they override it.
+- An explicit relative probe `cwd` resolves from the base Project directory.
+- A relative direct program in a probe uses the same base Project directory and path check as a Process command.
 
 ### 15.5 Environment precedence
 

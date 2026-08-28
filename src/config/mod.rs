@@ -6,6 +6,7 @@
 
 mod env;
 mod file;
+mod paths;
 mod profile;
 mod readiness;
 
@@ -13,6 +14,8 @@ mod readiness;
 mod exit_tests;
 #[cfg(test)]
 mod local_tests;
+#[cfg(test)]
+mod path_tests;
 #[cfg(test)]
 mod profile_tests;
 #[cfg(test)]
@@ -120,7 +123,7 @@ impl ProjectResolution {
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
     let (base, profiles, local) = match request {
         ResolutionRequest::Explicit { path, profiles } => (
-            absolute_normalized_path(&path)
+            paths::absolute_normalized(&path)
                 .with_context(|| format!("could not resolve Project path {}", path.display()))
                 .map_err(config_error)?,
             profiles,
@@ -314,9 +317,9 @@ fn discover_local_override(base: &Path) -> Option<PathBuf> {
 
 fn discover_base(start_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
     let starting_path = match start_dir {
-        Some(path) => absolute_normalized_path(path),
+        Some(path) => paths::absolute_normalized(path),
         None => std::env::current_dir()
-            .map(normalize_path)
+            .map(paths::normalize)
             .map_err(Into::into),
     }
     .with_context(|| "could not determine the Project discovery directory")
@@ -335,29 +338,6 @@ fn discover_base(start_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
         "could not find {BASE_FILE_NAME} from starting directory '{}'; checked that directory and each parent",
         starting_path.display()
     )))
-}
-
-fn absolute_normalized_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let current_dir = std::env::current_dir()?;
-    Ok(normalize_path(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        current_dir.join(path)
-    }))
-}
-
-fn normalize_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 fn config_error(error: anyhow::Error) -> ConfigError {
@@ -545,6 +525,17 @@ fn build_success_exit_codes(configured: Option<Vec<i32>>) -> Result<Vec<i32>, St
     Ok(codes)
 }
 
+fn resolve_direct_program(
+    command: &mut CommandForm,
+    base_dir: &Path,
+    context: &str,
+) -> Result<(), String> {
+    if let CommandForm::Direct { program, .. } = command {
+        paths::resolve_program(program, base_dir, context)?;
+    }
+    Ok(())
+}
+
 fn build_command_form(
     command: Option<&CommandFile>,
     shell: Option<&str>,
@@ -632,28 +623,21 @@ fn build_spec(
             ));
         }
     };
-    let command_form = match build_command_form(process.command.as_ref(), process.shell.as_deref())
-    {
-        Ok(command) => command,
-        Err(detail) => return fail(format!("Process '{name}': {detail}")),
-    };
+    let mut command_form =
+        match build_command_form(process.command.as_ref(), process.shell.as_deref()) {
+            Ok(command) => command,
+            Err(detail) => return fail(format!("Process '{name}': {detail}")),
+        };
+    if let Err(detail) = resolve_direct_program(&mut command_form, base_dir, "command") {
+        return fail(format!("Process '{name}': {detail}"));
+    }
     let working_dir = match process.cwd.as_deref() {
-        Some(dir) => {
-            let candidate = PathBuf::from(dir);
-            if candidate.is_absolute() {
-                candidate
-            } else {
-                base_dir.join(candidate)
-            }
-        }
+        Some(directory) => paths::resolve_directory(base_dir, directory, "working directory")
+            .map_err(|detail| ConfigError {
+                message: format!("Process '{name}': {detail}"),
+            })?,
         None => base_dir.to_path_buf(),
     };
-    if !working_dir.is_dir() {
-        return fail(format!(
-            "Process '{name}': working directory '{}' does not exist",
-            working_dir.display()
-        ));
-    }
     let (terminal_mode, input_policy) = match build_terminal_settings(process.terminal.as_ref()) {
         Ok(settings) => settings,
         Err(detail) => return fail(format!("Process '{name}': {detail}")),

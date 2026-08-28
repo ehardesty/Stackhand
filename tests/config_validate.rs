@@ -16,7 +16,7 @@ fn unique_directory(label: &str) -> PathBuf {
 fn write_valid_project(path: &Path) {
     fs::write(
         path,
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n",
     )
     .expect("project config writes");
 }
@@ -89,7 +89,7 @@ fn config_validate_uses_an_explicit_path_without_discovery() {
         .join("stackhand.local.yaml");
     fs::write(
         &explicit_local,
-        "processes:\n  local-only:\n    command: [/bin/true]\n",
+        "processes:\n  local-only:\n    command: [/usr/bin/true]\n",
     )
     .expect("explicit local override writes");
 
@@ -111,7 +111,7 @@ fn config_validate_reports_discovered_sources_in_precedence_order() {
     let base = root.join("stackhand.yaml");
     let local = root.join("stackhand.local.yaml");
     write_valid_project(&base);
-    fs::write(&local, "processes:\n  web:\n    command: [/bin/true]\n")
+    fs::write(&local, "processes:\n  web:\n    command: [/usr/bin/true]\n")
         .expect("local override writes");
 
     let output = run_validate(&nested, None);
@@ -216,7 +216,7 @@ fn config_validate_validates_the_selected_profile() {
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local:\n    overrides:\n      web:\n        command: [/bin/true, 1]\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local:\n    overrides:\n      web:\n        command: [/usr/bin/true, 1]\n",
     )
     .expect("profile config writes");
 
@@ -238,7 +238,7 @@ fn config_validate_rejects_an_unknown_profile_name() {
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local: {}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local: {}\n",
     )
     .expect("profile config writes");
 
@@ -259,7 +259,7 @@ fn config_validate_does_not_select_a_profile_without_the_option() {
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\nprofiles:\n  local:\n    overrides:\n      added: {}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local:\n    overrides:\n      added: {}\n",
     )
     .expect("profile config writes");
 
@@ -286,7 +286,7 @@ fn config_validate_does_not_print_environment_values() {
         .expect("invalid environment file writes");
     fs::write(
         &config,
-        "version: 1\nenv_files: [project.env]\nprocesses:\n  web:\n    command: [/bin/true]\n",
+        "version: 1\nenv_files: [project.env]\nprocesses:\n  web:\n    command: [/usr/bin/true]\n",
     )
     .expect("configuration writes");
 
@@ -311,7 +311,7 @@ fn config_validate_applies_repeated_profiles_in_cli_order() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   first:
     overrides:
@@ -320,7 +320,7 @@ profiles:
   second:
     overrides:
       web:
-        command: [/bin/true]
+        command: [/usr/bin/true]
 ",
     )
     .expect("ordered profile config writes");

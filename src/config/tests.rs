@@ -21,7 +21,7 @@ fn explicit_resolution_returns_the_selected_base_source() {
     let path = dir.join("stackhand.yaml");
     fs::write(
         &path,
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n",
     )
     .expect("resolution config writes");
 
@@ -41,7 +41,7 @@ fn discovery_uses_the_nearest_base_file_without_git_state() {
     let root = std::env::temp_dir().join(format!("stackhand-config-discovery-{unique}"));
     let nested = root.join("nested").join("deep");
     fs::create_dir_all(&nested).expect("discovery directories create");
-    let config = "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n";
+    let config = "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n";
     fs::write(root.join(BASE_FILE_NAME), config).expect("root config writes");
     fs::write(nested.join(BASE_FILE_NAME), config).expect("nested config writes");
 
@@ -112,7 +112,7 @@ fn restart_policy_and_backoff_load_with_explicit_values() {
 fn restart_budget_defaults_to_five_and_accepts_zero_or_more_retries() {
     let omitted = write_and_load(
         "restart-budget-default",
-        "version: 1\nprocesses:\n  web:\n    restart: {policy: on_failure}\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    restart: {policy: on_failure}\n    command: [/usr/bin/true]\n",
     )
     .expect("an automatic policy may omit its budget");
     assert_eq!(omitted.processes()[0].restart.max_restarts, 5);
@@ -121,7 +121,7 @@ fn restart_budget_defaults_to_five_and_accepts_zero_or_more_retries() {
         let project = write_and_load(
             &format!("restart-budget-{max_restarts}"),
             &format!(
-                "version: 1\nprocesses:\n  web:\n    restart: {{policy: on_failure, max_restarts: {max_restarts}}}\n    command: [/bin/true]\n"
+                "version: 1\nprocesses:\n  web:\n    restart: {{policy: on_failure, max_restarts: {max_restarts}}}\n    command: [/usr/bin/true]\n"
             ),
         )
         .expect("a nonnegative whole-number budget is valid");
@@ -133,14 +133,14 @@ fn restart_budget_defaults_to_five_and_accepts_zero_or_more_retries() {
 fn invalid_restart_settings_are_rejected() {
     let policy = write_and_load(
             "restart-policy-invalid",
-            "version: 1\nprocesses:\n  web:\n    restart: {policy: sometimes}\n    command: [/bin/true]\n",
+            "version: 1\nprocesses:\n  web:\n    restart: {policy: sometimes}\n    command: [/usr/bin/true]\n",
         )
         .expect_err("an unknown restart policy must fail");
     assert!(policy.message.contains("restart.policy"));
 
     let backoff = write_and_load(
         "restart-backoff-zero",
-        "version: 1\nprocesses:\n  web:\n    restart: {backoff: 0s}\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    restart: {backoff: 0s}\n    command: [/usr/bin/true]\n",
     )
     .expect_err("a zero restart backoff must fail");
     assert!(
@@ -156,7 +156,7 @@ fn invalid_restart_settings_are_rejected() {
         let error = write_and_load(
             label,
             &format!(
-                "version: 1\nprocesses:\n  web:\n    restart: {{max_restarts: {value}}}\n    command: [/bin/true]\n"
+                "version: 1\nprocesses:\n  web:\n    restart: {{max_restarts: {value}}}\n    command: [/usr/bin/true]\n"
             ),
         )
         .expect_err("the restart budget must be a nonnegative whole number");
@@ -168,7 +168,7 @@ fn invalid_restart_settings_are_rejected() {
 fn always_restart_is_rejected_for_one_shots() {
     let error = write_and_load(
             "restart-one-shot-always",
-            "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    restart: {policy: always}\n    command: [/bin/true]\n",
+            "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    restart: {policy: always}\n    command: [/usr/bin/true]\n",
         )
         .expect_err("always is invalid for a One-shot");
     assert!(
@@ -229,7 +229,7 @@ fn relative_working_directories_resolve_from_the_config_directory() {
     let path = dir.join("stackhand.yaml");
     fs::write(
         &path,
-        "version: 1\nprocesses:\n  web:\n    cwd: ./web\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    cwd: ./web\n    command: [/usr/bin/true]\n",
     )
     .expect("config writes");
     let project = load(&path).expect("valid config");
@@ -242,7 +242,7 @@ fn relative_working_directories_resolve_from_the_config_directory() {
 fn missing_working_directories_are_rejected_with_the_process_name() {
     let error = write_and_load(
         "missing-cwd",
-        "version: 1\nprocesses:\n  web:\n    cwd: ./nope\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    cwd: ./nope\n    command: [/usr/bin/true]\n",
     )
     .expect_err("a missing working directory must fail");
     assert!(
@@ -263,7 +263,7 @@ fn unsupported_versions_are_rejected() {
 fn unknown_fields_are_rejected() {
     let error = write_and_load(
         "unknown",
-        "version: 1\nprocesses:\n  web:\n    comand:\n      program: /bin/true\n",
+        "version: 1\nprocesses:\n  web:\n    comand:\n      program: /usr/bin/true\n",
     )
     .expect_err("unknown field must fail");
     assert!(error.message.contains("unknown field"), "{}", error.message);
@@ -313,17 +313,17 @@ processes:
       ready-service: ready
       exited-source: exited
       completed-source: completed_successfully
-    command: [/bin/true]
+    command: [/usr/bin/true]
   started-service:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   ready-service:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   exited-source:
     kind: one-shot
-    command: [/bin/true]
+    command: [/usr/bin/true]
   completed-source:
     kind: one-shot
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect("keyed configuration is valid");
@@ -373,7 +373,7 @@ fn keyed_process_map_owns_the_process_name() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect("a keyed Process does not need a nested name");
@@ -388,7 +388,7 @@ fn temporary_nested_process_names_name_the_canonical_map_key() {
 processes:
   web:
     name: api
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a Process name must not be nested in a keyed Process");
@@ -413,9 +413,9 @@ processes:
       db:
         name: cache
         condition: started
-    command: [/bin/true]
+    command: [/usr/bin/true]
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a Dependency condition must be a string");
@@ -438,9 +438,9 @@ processes:
   web:
     depends_on:
       db: waiting
-    command: [/bin/true]
+    command: [/usr/bin/true]
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("an unsupported keyed Dependency condition must fail");
@@ -458,9 +458,9 @@ fn duplicate_keyed_process_names_are_rejected() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("duplicate keyed names must fail");
@@ -475,7 +475,7 @@ processes:
 fn duplicate_names_are_rejected() {
     let error = write_and_load(
             "dup",
-            "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n  web:\n    command: [/bin/true]\n",
+            "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n  web:\n    command: [/usr/bin/true]\n",
         )
         .expect_err("duplicates must fail");
     assert!(error.message.contains("duplicate Process name 'web'"));
@@ -485,7 +485,7 @@ fn duplicate_names_are_rejected() {
 fn command_forms_are_mutually_exclusive_and_required() {
     let both = write_and_load(
         "both",
-        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    shell: echo hi\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n    shell: echo hi\n",
     )
     .expect_err("both forms must fail");
     assert!(both.message.contains("exactly one"), "{}", both.message);
@@ -530,7 +530,7 @@ fn unknown_dependency_references_are_rejected() {
 processes:
   web:
     depends_on: {db: started}
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a missing reference must fail");
@@ -549,10 +549,10 @@ fn dependency_cycles_are_rejected_before_startup() {
 processes:
   web:
     depends_on: {worker: started}
-    command: [/bin/true]
+    command: [/usr/bin/true]
   worker:
     depends_on: {web: started}
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a cycle must fail");
@@ -573,10 +573,10 @@ processes:
   web:
     kind: one-shot
     depends_on: {setup: completed_successfully}
-    command: [/bin/true]
+    command: [/usr/bin/true]
   setup:
     kind: one-shot
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect("a One-shot dependency accepts completed_successfully");
@@ -591,9 +591,9 @@ processes:
 processes:
   web:
     depends_on: {db: completed_successfully}
-    command: [/bin/true]
+    command: [/usr/bin/true]
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a Service dependency must reject completed_successfully");
@@ -610,7 +610,7 @@ processes:
 fn ready_condition_is_valid_only_on_service_dependencies() {
     let accepted = write_and_load(
             "deps-ready-ok",
-            "version: 1\nprocesses:\n  web:\n    depends_on: {db: ready}\n    command: [/bin/true]\n  db:\n    command: [/bin/true]\n",
+            "version: 1\nprocesses:\n  web:\n    depends_on: {db: ready}\n    command: [/usr/bin/true]\n  db:\n    command: [/usr/bin/true]\n",
         )
         .expect("a Service dependency accepts ready");
     assert_eq!(
@@ -620,7 +620,7 @@ fn ready_condition_is_valid_only_on_service_dependencies() {
 
     let error = write_and_load(
             "deps-ready-one-shot",
-            "version: 1\nprocesses:\n  web:\n    depends_on: {setup: ready}\n    command: [/bin/true]\n  setup:\n    kind: one-shot\n    command: [/bin/true]\n",
+            "version: 1\nprocesses:\n  web:\n    depends_on: {setup: ready}\n    command: [/usr/bin/true]\n  setup:\n    kind: one-shot\n    command: [/usr/bin/true]\n",
         )
         .expect_err("a One-shot dependency must reject ready");
     assert!(error.message.contains("'ready'"), "{}", error.message);
@@ -635,9 +635,9 @@ processes:
   web:
     depends_on:
       - db
-    command: [/bin/true]
+    command: [/usr/bin/true]
   db:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 ",
     )
     .expect_err("a Dependency collection must be keyed");
@@ -667,7 +667,7 @@ processes:
     terminal:
       mode: pty
       input: focused
-    command: [/bin/printf, \"hello world\", \"%s\\n\"]
+    command: [/usr/bin/printf, \"hello world\", \"%s\\n\"]
 ",
     )
     .expect("canonical Process fields are valid");
@@ -682,7 +682,7 @@ processes:
     assert_eq!(
         web.command,
         CommandForm::Direct {
-            program: "/bin/printf".into(),
+            program: "/usr/bin/printf".into(),
             args: vec!["hello world".into(), "%s\n".into()],
         }
     );
@@ -723,7 +723,7 @@ fn canonical_command_and_shell_are_mutually_exclusive() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     shell: echo conflict
 ",
     )
@@ -765,7 +765,9 @@ fn invalid_kinds_terminal_modes_and_input_policies_are_rejected() {
     ] {
         let error = write_and_load(
             label,
-            &format!("version: 1\nprocesses:\n  web:\n    {fields}\n    command: [/bin/true]\n"),
+            &format!(
+                "version: 1\nprocesses:\n  web:\n    {fields}\n    command: [/usr/bin/true]\n"
+            ),
         )
         .expect_err("invalid value must fail");
         assert!(

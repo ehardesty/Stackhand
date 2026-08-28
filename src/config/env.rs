@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_yaml::Value;
 
 use super::ConfigError;
 use super::file::ProcessFile;
+use super::paths::resolve;
 
 /// Load ordered literal environment files for one configuration owner.
 /// Later entries replace earlier entries, including entries in the same file.
@@ -16,7 +17,7 @@ pub(super) fn load_files(
 ) -> Result<BTreeMap<String, String>, ConfigError> {
     let mut values = BTreeMap::new();
     for configured in files {
-        let path = resolve_path(base_dir, configured);
+        let path = resolve(base_dir, Path::new(configured));
         let bytes = fs::read(&path).map_err(|error| ConfigError {
             message: format!(
                 "could not read {owner} environment file '{}': {error}",
@@ -165,16 +166,6 @@ fn validate_values(value: &Value, process_name: &str, source: &str) -> Result<()
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Tagged(_) => {}
     }
     Ok(())
-}
-
-/// Resolve one environment-file path against the base Project directory.
-fn resolve_path(base_dir: &Path, configured: &str) -> PathBuf {
-    let path = Path::new(configured);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_dir.join(path)
-    }
 }
 
 fn parse_line(line: &str) -> Result<Option<(String, String)>, String> {

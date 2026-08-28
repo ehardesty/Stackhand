@@ -199,7 +199,7 @@ fn local_null_values_have_the_same_merge_semantics_as_profile_values() {
         "version: 1
 processes:
   web:
-    command: [/bin/true]
+    command: [/usr/bin/true]
     environment:
       KEEP: keep
       REMOVE: remove

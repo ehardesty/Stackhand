@@ -2,7 +2,7 @@
 //! [`ReadinessConfig`] or a clear per-Process failure. The block carries
 //! exactly one leaf check or an `all` list with child scheduling fields.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -10,6 +10,7 @@ use serde::Deserialize;
 use crate::model::{LivenessConfig, ReadinessCheck, ReadinessConfig, ReadinessProbe};
 
 use super::ConfigError;
+use super::paths::resolve_directory;
 
 const DURATION_FORMAT_ERROR: &str = "use a nonnegative whole number with an ms, s, m, or h suffix";
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
@@ -278,28 +279,16 @@ fn build_exec_probe(
     base_dir: &Path,
     labels: CheckLabels,
 ) -> Result<ReadinessProbe, ConfigError> {
-    let command = super::build_command_form(file.command.as_ref(), file.shell.as_deref())
+    let mut command = super::build_command_form(file.command.as_ref(), file.shell.as_deref())
+        .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
+    super::resolve_direct_program(&mut command, base_dir, "exec probe")
         .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
     let working_dir = file
         .cwd
         .as_deref()
         .map(|directory| {
-            let path = PathBuf::from(directory);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                base_dir.join(path)
-            };
-            if path.is_dir() {
-                Ok(path)
-            } else {
-                Err(check_error_for(
-                    process_name,
-                    child_index,
-                    labels,
-                    format!("exec working directory '{}' does not exist", path.display()),
-                ))
-            }
+            resolve_directory(base_dir, directory, "exec working directory")
+                .map_err(|detail| check_error_for(process_name, child_index, labels, detail))
         })
         .transpose()?;
     let env = file

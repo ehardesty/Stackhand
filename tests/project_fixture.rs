@@ -141,7 +141,7 @@ processes:
   off:
     kind: service
     enabled: false
-    command: [/bin/true]
+    command: [/usr/bin/true]
   accepted:
     kind: one-shot
     terminal:
@@ -453,7 +453,7 @@ fn an_unknown_field_starts_nothing_and_fails_clearly() {
 fn a_temporary_process_collection_starts_nothing_and_names_the_replacement() {
     let output = run_invalid_project(
         "temporary-process-list",
-        "version: 1\nprocesses:\n  - name: hello\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  - name: hello\n    command: [/usr/bin/true]\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -470,7 +470,7 @@ fn a_temporary_process_collection_starts_nothing_and_names_the_replacement() {
 fn duplicate_process_names_start_nothing_and_fail_clearly() {
     let output = run_invalid_project(
         "duplicate-name",
-        "version: 1\nprocesses:\n  hello:\n    command: [/bin/true]\n  hello:\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  hello:\n    command: [/usr/bin/true]\n  hello:\n    command: [/usr/bin/true]\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -486,7 +486,7 @@ fn duplicate_process_names_start_nothing_and_fail_clearly() {
 fn an_invalid_project_starts_nothing_and_fails_clearly() {
     let output = run_invalid_project(
         "invalid",
-        "version: 2\nprocesses:\n  hello:\n    command: [/bin/true]\n",
+        "version: 2\nprocesses:\n  hello:\n    command: [/usr/bin/true]\n",
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);

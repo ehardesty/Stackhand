@@ -16,7 +16,7 @@ fn write_and_load(label: &str, yaml: &str) -> Result<EffectiveProject, ConfigErr
 fn success_exit_codes_are_unique_and_in_the_operating_system_range() {
     let accepted = write_and_load(
         "success-codes-ok",
-        "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    success_exit_codes: [0, 2, 130]\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    success_exit_codes: [0, 2, 130]\n    command: [/usr/bin/true]\n",
     )
     .expect("valid success exit codes");
     assert_eq!(accepted.processes()[0].success_exit_codes, vec![0, 2, 130]);
@@ -30,7 +30,7 @@ fn success_exit_codes_are_unique_and_in_the_operating_system_range() {
         let error = write_and_load(
             label,
             &format!(
-                "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    success_exit_codes: {codes}\n    command: [/bin/true]\n"
+                "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    success_exit_codes: {codes}\n    command: [/usr/bin/true]\n"
             ),
         )
         .expect_err("invalid success exit codes must fail");
@@ -42,7 +42,7 @@ fn success_exit_codes_are_unique_and_in_the_operating_system_range() {
 fn exited_condition_is_valid_only_on_one_shot_dependencies() {
     let accepted = write_and_load(
         "deps-exited-ok",
-        "version: 1\nprocesses:\n  web:\n    depends_on:\n      setup: exited\n    command: [/bin/true]\n  setup:\n    kind: one-shot\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    depends_on:\n      setup: exited\n    command: [/usr/bin/true]\n  setup:\n    kind: one-shot\n    command: [/usr/bin/true]\n",
     )
     .expect("a One-shot dependency accepts exited");
     assert_eq!(
@@ -52,7 +52,7 @@ fn exited_condition_is_valid_only_on_one_shot_dependencies() {
 
     let error = write_and_load(
         "deps-exited-service",
-        "version: 1\nprocesses:\n  web:\n    depends_on:\n      db: exited\n    command: [/bin/true]\n  db:\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  web:\n    depends_on:\n      db: exited\n    command: [/usr/bin/true]\n  db:\n    command: [/usr/bin/true]\n",
     )
     .expect_err("a Service dependency must reject exited");
     assert!(error.message.contains("'exited'"), "{error}");

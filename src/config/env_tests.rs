@@ -81,7 +81,7 @@ fn invalid_inline_environment_diagnostics_exclude_the_value() {
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n  child:\n    environment:\n      SECRET_VALUE: [{secret}]\n    command: [/bin/true]\n"
+            "version: 1\nprocesses:\n  child:\n    environment:\n      SECRET_VALUE: [{secret}]\n    command: [/usr/bin/true]\n"
         ),
     )
     .expect("configuration writes");
@@ -103,7 +103,7 @@ fn profile_and_local_environment_errors_name_their_source_without_values() {
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n  child:\n    command: [/bin/true]\nprofiles:\n  profile:\n    overrides:\n      child:\n        environment:\n          SECRET_VALUE: [{profile_secret}]\n"
+            "version: 1\nprocesses:\n  child:\n    command: [/usr/bin/true]\nprofiles:\n  profile:\n    overrides:\n      child:\n        environment:\n          SECRET_VALUE: [{profile_secret}]\n"
         ),
     )
     .expect("profile configuration writes");
@@ -119,7 +119,7 @@ fn profile_and_local_environment_errors_name_their_source_without_values() {
 
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  child:\n    command: [/bin/true]\n",
+        "version: 1\nprocesses:\n  child:\n    command: [/usr/bin/true]\n",
     )
     .expect("base configuration writes");
     let local_secret = "local-secret-sentinel";
@@ -237,7 +237,7 @@ fn profile_and_local_nulls_remove_environment_file_values() {
 env_files: [project.env]
 processes:
   child:
-    command: [/bin/true]
+    command: [/usr/bin/true]
 profiles:
   profile:
     overrides:
