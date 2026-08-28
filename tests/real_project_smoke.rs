@@ -1,7 +1,8 @@
 use std::fs;
 #[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::net::TcpListener;
-use std::process::Command;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -11,55 +12,33 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+mod support;
+
+#[cfg(unix)]
+use support::{OwnedListener, yaml_quote};
+
+#[cfg(unix)]
 use stackhand::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
     ReadinessCheck, ReadinessConfig, ReadinessProbe, RestartConfig, ShellConfig, TerminalMode,
 };
 
 #[cfg(unix)]
-fn host_tcp_readiness_endpoint() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP endpoint binds");
-    let port = listener
-        .local_addr()
-        .expect("TCP address is available")
-        .port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            drop(stream);
-        }
-    });
-    port
-}
-
-#[cfg(unix)]
-fn host_switching_http_endpoint(healthy: Arc<AtomicBool>) -> u16 {
-    use std::io::Write;
-
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("HTTP endpoint binds");
-    let port = listener
-        .local_addr()
-        .expect("HTTP address is available")
-        .port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let response = if healthy.load(Ordering::Acquire) {
-                b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
-            } else {
-                b"HTTP/1.0 503 Unavailable\r\n\r\n".as_slice()
-            };
-            let mut stream = stream;
-            let _ = stream.write_all(response);
-        }
-    });
-    port
-}
-
-#[cfg(unix)]
 #[test]
 fn all_readiness_uses_real_tcp_and_http_children_for_failure_and_recovery() {
     let healthy = Arc::new(AtomicBool::new(false));
-    let tcp_port = host_tcp_readiness_endpoint();
-    let http_port = host_switching_http_endpoint(Arc::clone(&healthy));
+    let tcp = OwnedListener::new(drop);
+    let http_healthy = Arc::clone(&healthy);
+    let http = OwnedListener::new(move |mut stream| {
+        let response = if http_healthy.load(Ordering::Acquire) {
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+        } else {
+            b"HTTP/1.0 503 Unavailable\r\n\r\n".as_slice()
+        };
+        let _ = stream.write_all(response);
+    });
+    let tcp_port = tcp.port();
+    let http_port = http.port();
     let process = readiness_test_process(tcp_port, http_port);
     let project = EffectiveProject::new(vec![process]).expect("all readiness project is valid");
     let (supervisor, _consoles, _outputs) =
@@ -450,7 +429,13 @@ fn wait_until_pid_gone(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         // SAFETY: signal 0 only probes whether this test-owned PID remains.
-        if unsafe { libc::kill(pid as libc::pid_t, 0) } < 0 {
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "PID {pid} cleanup probe failed: {error}"
+            );
             return;
         }
         assert!(Instant::now() < deadline, "PID {pid} was not cleaned up");
@@ -654,11 +639,12 @@ fn startup_timeout_confirms_real_process_tree_cleanup() {
         .expect("the child PID reached retained output");
 
     supervisor.stop_task();
-    assert!(unsafe { libc::kill(root_pid as libc::pid_t, 0) } < 0);
-    assert!(unsafe { libc::kill(child_pid as libc::pid_t, 0) } < 0);
+    wait_until_pid_gone(root_pid);
+    wait_until_pid_gone(child_pid);
     fs::remove_dir_all(dir).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn stackhand_repository_runs_as_a_small_real_project() {
     let unique = SystemTime::now()
@@ -668,42 +654,78 @@ fn stackhand_repository_runs_as_a_small_real_project() {
     let dir = std::env::temp_dir().join(format!("stackhand-real-smoke-{unique}"));
     fs::create_dir_all(&dir).expect("smoke directory creates");
     let config = dir.join("stackhand.yaml");
-    let repository = env!("CARGO_MANIFEST_DIR");
-    let cargo = env!("CARGO");
+    let repository = yaml_quote(env!("CARGO_MANIFEST_DIR"));
+    let cargo = yaml_quote(env!("CARGO"));
+    let healthy = Arc::new(AtomicBool::new(true));
+    let http_healthy = Arc::clone(&healthy);
+    let endpoint = OwnedListener::new(move |mut stream| {
+        let response = if http_healthy.load(Ordering::Acquire) {
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+        } else {
+            b"HTTP/1.0 503 Unavailable\r\n\r\n".as_slice()
+        };
+        let _ = stream.write_all(response);
+    });
     fs::write(
         &config,
         format!(
-            "version: 1\n\
-             processes:\n\
-             \x20 - name: inspect\n\
-             \x20   kind: one-shot\n\
-             \x20   terminal: pipe\n\
-             \x20   working_dir: \"{repository}\"\n\
-             \x20   command:\n\
-             \x20     program: \"{cargo}\"\n\
-             \x20     args: [\"metadata\", \"--no-deps\", \"--format-version\", \"1\"]\n\
-             \x20 - name: hold\n\
-             \x20   depends_on: [{{name: inspect, condition: completed_successfully}}]\n\
-             \x20   terminal: pipe\n\
-             \x20   command:\n\
-             \x20     program: /bin/sleep\n\
-             \x20     args: [\"60\"]\n"
+            r#"version: 1
+processes:
+  - name: inspect
+    kind: one-shot
+    terminal: pipe
+    working_dir: {repository}
+    command:
+      program: {cargo}
+      args: ["metadata", "--no-deps", "--format-version", "1"]
+  - name: hold
+    kind: service
+    terminal: pipe
+    command:
+      shell: |
+        sleep 60 & child=$!
+        printf 'hold-child-%s\n' "$child"
+        wait "$child"
+  - name: ready-service
+    kind: service
+    terminal: pipe
+    ready:
+      http:
+        url: "http://127.0.0.1:{port}/health"
+      interval: 20ms
+      timeout: 250ms
+    command:
+      program: /bin/sleep
+      args: ["60"]
+  - name: ready-dependent
+    kind: service
+    terminal: pipe
+    depends_on:
+      - name: ready-service
+        condition: ready
+    command:
+      program: /bin/sleep
+      args: ["60"]
+"#,
+            repository = repository,
+            cargo = cargo,
+            port = endpoint.port(),
         ),
     )
     .expect("smoke configuration writes");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_stackhand"))
-        .arg("--fixture-smoke")
-        .arg(&config)
-        .output()
-        .expect("smoke fixture runs");
-    assert!(
-        output.status.success(),
-        "smoke failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("real-project-cycles-ok"), "{stdout}");
-    assert!(stdout.contains("real-project-smoke-ok"), "{stdout}");
+    let stdout = support::run_fixture("--fixture-smoke", &config, |line| match line {
+        "real-project-ready" => healthy.store(false, Ordering::Release),
+        "real-project-failing" => healthy.store(true, Ordering::Release),
+        _ => {}
+    });
+    for cycle in 1..=3 {
+        let checkpoint = format!("real-project-cycle-{cycle}-cleanup-ok");
+        assert_eq!(
+            stdout.lines().filter(|line| *line == checkpoint).count(),
+            1,
+            "{checkpoint} was not reported once: {stdout}"
+        );
+    }
     fs::remove_dir_all(dir).ok();
 }

@@ -1,12 +1,14 @@
 use std::fs;
-use std::io::{BufRead, Read, Write};
-use std::net::TcpListener;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod support;
+
+use support::{OwnedListener, yaml_quote};
 
 fn unique_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -16,57 +18,6 @@ fn unique_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("stackhand-fixture-{label}-{nanos}"));
     fs::create_dir_all(&dir).expect("fixture directory creates");
     dir
-}
-
-/// A real local TCP target for the production TCP adapter. The worker owns
-/// the listener and exits when the test drops this endpoint.
-struct TcpEndpoint {
-    port: u16,
-    stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl TcpEndpoint {
-    fn new() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP endpoint binds");
-        listener
-            .set_nonblocking(true)
-            .expect("TCP endpoint accepts nonblocking mode");
-        let port = listener
-            .local_addr()
-            .expect("TCP address is available")
-            .port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker = thread::spawn(move || {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => drop(stream),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if worker_stop.load(Ordering::Acquire) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-        Self {
-            port,
-            stop,
-            worker: Some(worker),
-        }
-    }
-}
-
-impl Drop for TcpEndpoint {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 /// Mutable endpoint states controlled by checkpoint lines from the executable
@@ -113,69 +64,6 @@ impl HttpStates {
     }
 }
 
-/// A real HTTP target for all production HTTP checks. Each response is
-/// selected from the request path and the state controlled by the test.
-struct HttpEndpoint {
-    port: u16,
-    stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl HttpEndpoint {
-    fn new(states: Arc<HttpStates>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("HTTP endpoint binds");
-        listener
-            .set_nonblocking(true)
-            .expect("HTTP endpoint accepts nonblocking mode");
-        let port = listener
-            .local_addr()
-            .expect("HTTP address is available")
-            .port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker = thread::spawn(move || {
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-                        let mut request = [0; 512];
-                        let bytes = stream.read(&mut request).unwrap_or(0);
-                        let request_text = String::from_utf8_lossy(&request[..bytes]);
-                        let path = request_text.split_whitespace().nth(1).unwrap_or("/");
-                        let response = if states.healthy(path) {
-                            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
-                        } else {
-                            b"HTTP/1.0 503 Unavailable\r\nContent-Length: 3\r\n\r\nbad".as_slice()
-                        };
-                        let _ = stream.write_all(response);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if worker_stop.load(Ordering::Acquire) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-        Self {
-            port,
-            stop,
-            worker: Some(worker),
-        }
-    }
-}
-
-impl Drop for HttpEndpoint {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
 const STARTED_SOURCE: &str = "printf 'fixture-started-source\\n'; exec sleep 60";
 const STARTED_DEPENDENT: &str = "printf 'fixture-started-dependent\\n'; exec sleep 60";
 const HELLO: &str =
@@ -190,20 +78,6 @@ const BUDGET: &str = "printf 'fixture-budget-run\\n'; exit 7";
 const SHUTDOWN_RESTART: &str = "printf 'fixture-shutdown-restart-run\\n'; exit 7";
 const TIMEOUT: &str = "sleep 60 & child=$!; printf 'fixture-timeout-descendant-pid-%s\\n' \"$child\"; wait \"$child\"";
 const LOG_READY: &str = "printf 'fixture-log-ready\\n'; exec sleep 60";
-
-fn yaml_quote(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            _ => escaped.push(character),
-        }
-    }
-    format!("\"{escaped}\"")
-}
 
 fn fixture_config(
     tcp_port: u16,
@@ -485,57 +359,6 @@ processes:
     )
 }
 
-fn run_executable_fixture(config_path: &Path, states: &HttpStates) -> String {
-    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_stackhand"))
-        .env("SHELL", "/path/that/does/not/exist")
-        .arg("--fixture-project")
-        .arg(config_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the fixture binary runs");
-    let stdout = child.stdout.take().expect("fixture stdout is piped");
-    let (line_tx, line_rx) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut stdout = String::new();
-    let timed_out = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break true;
-        }
-        match line_rx.recv_timeout(remaining) {
-            Ok(line) => {
-                states.apply_checkpoint(&line);
-                stdout.push_str(&line);
-                stdout.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break false,
-            Err(mpsc::RecvTimeoutError::Timeout) => break true,
-        }
-    };
-    if timed_out {
-        let _ = child.kill();
-    }
-    let output = child.wait_with_output().expect("the fixture process exits");
-    let _ = reader.join();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !timed_out && output.status.success(),
-        "integrated fixture failed: timed_out={timed_out} status={}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    stdout
-}
-
 fn run_invalid_project(label: &str, config: &str) -> std::process::Output {
     let dir = unique_dir(label);
     let config_path = dir.join("stackhand.yaml");
@@ -563,17 +386,32 @@ fn one_configured_project_runs_the_complete_milestone_two_path() {
     let exec_marker = dir.join("exec-ready.marker");
     fs::write(&exec_marker, "ready").expect("exec marker writes");
     let rerun_marker = dir.join("rerun.marker");
-    let tcp = TcpEndpoint::new();
+    let tcp = OwnedListener::new(drop);
     let states = HttpStates::new();
-    let http = HttpEndpoint::new(Arc::clone(&states));
+    let http_states = Arc::clone(&states);
+    let http = OwnedListener::new(move |mut stream| {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+        let mut request = [0; 512];
+        let bytes = stream.read(&mut request).unwrap_or(0);
+        let request_text = String::from_utf8_lossy(&request[..bytes]);
+        let path = request_text.split_whitespace().nth(1).unwrap_or("/");
+        let response = if http_states.healthy(path) {
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+        } else {
+            b"HTTP/1.0 503 Unavailable\r\nContent-Length: 3\r\n\r\nbad".as_slice()
+        };
+        let _ = stream.write_all(response);
+    });
     let config_path = dir.join("stackhand.yaml");
     fs::write(
         &config_path,
-        fixture_config(tcp.port, http.port, &exec_marker, &rerun_marker),
+        fixture_config(tcp.port(), http.port(), &exec_marker, &rerun_marker),
     )
     .expect("config writes");
 
-    let stdout = run_executable_fixture(&config_path, &states);
+    let stdout = support::run_fixture("--fixture-project", &config_path, |line| {
+        states.apply_checkpoint(line)
+    });
     for checkpoint in [
         "fixture-blocked-ok",
         "fixture-started-ok",

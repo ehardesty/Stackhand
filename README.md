@@ -15,12 +15,12 @@ The specification controls when it conflicts with the implementation plan. Proto
 
 ## Current prototype
 
-Milestone 1 provides an integrated macOS prototype. It loads one YAML Project,
-starts and supervises Services and One-shots, applies Dependency and readiness
-conditions, renders pipe or PTY output, accepts focused terminal input, reports
-basic metrics, and performs controlled Project shutdown. It is validation
-software, not a supported release. See the example Projects below for the
-current behavior.
+Milestone 2 provides an integrated macOS prototype. It loads one YAML Project,
+starts and supervises Services and One-shots, applies Dependency, readiness,
+liveness, and restart rules, renders pipe or PTY output, accepts focused
+terminal input, reports basic metrics, and performs controlled Project
+shutdown. It is validation software, not a supported release. See the example
+Projects below for the current behavior.
 
 ## Build and run the Project prototype
 
@@ -41,7 +41,8 @@ Process list, or `Ctrl-Q` from anywhere, to stop the Project and restore the
 outer terminal.
 
 For ready-to-run Projects and manual checks, see
-[Example Projects](./examples/README.md).
+[Example Projects](./examples/README.md). For the macOS lifecycle validation
+record, see [Milestone 2 validation](./docs/implementation/milestone-2-validation.md).
 
 Press `v` from the Process list to enter Copy mode for a PTY console. Use
 `h`/`j`/`k`/`l` or the arrow keys to move, and press `v` again to begin the
