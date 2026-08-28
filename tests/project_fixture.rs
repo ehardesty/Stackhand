@@ -93,159 +93,150 @@ fn fixture_config(
 processes:
   started-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
       started-source: started
-    command:
-      shell: {started_dependent}
+    shell: {started_dependent}
   started-source:
     kind: service
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args:
-        - "-c"
-        - {started_source}
+    terminal:
+      mode: pipe
+      input: disabled
+    command: [/bin/sh, "-c", {started_source}]
   hello:
     kind: service
-    terminal: pty
-    input: focused
-    working_dir: ./web
+    terminal:
+      mode: pty
+      input: focused
+    cwd: ./web
     depends_on:
       all-ready: ready
-    env:
+    environment:
       FIXTURE_TOKEN: stackhand-env-ok
-    command:
-      program: /bin/sh
-      args:
-        - "-c"
-        - {hello}
+    command: [/bin/sh, "-c", {hello}]
   shelled:
     kind: service
-    terminal: pty
-    input: focused
-    command:
-      shell: {shelled}
+    terminal:
+      mode: pty
+      input: focused
+    shell: {shelled}
   piped:
     kind: service
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args:
-        - "-c"
-        - {piped}
+    terminal:
+      mode: pipe
+      input: disabled
+    command: [/bin/sh, "-c", {piped}]
   noisy:
     kind: service
-    terminal: pipe
-    command:
-      shell: {noisy}
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: {noisy}
   manual:
     kind: service
     autostart: false
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   off:
     kind: service
     enabled: false
-    command:
-      program: /bin/true
+    command: [/bin/true]
   accepted:
     kind: one-shot
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     success_exit_codes: [42]
-    command:
-      program: /bin/sh
-      args:
-        - "-c"
-        - {accepted}
+    command: [/bin/sh, "-c", {accepted}]
   completed-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
       accepted: completed_successfully
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   exited-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
       exited-source: exited
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   exited-source:
     kind: one-shot
-    terminal: pipe
-    command:
-      shell: {exited}
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: {exited}
   rerun-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
       rerun-setup: completed_successfully
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   rerun-setup:
     kind: one-shot
-    terminal: pipe
-    env:
+    terminal:
+      mode: pipe
+      input: disabled
+    environment:
       RERUN_MARKER: {rerun_marker}
-    command:
-      shell: {rerun}
+    shell: {rerun}
   tcp-ready:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       tcp:
         host: 127.0.0.1
         port: {tcp_port}
       interval: 20ms
       timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   http-ready:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       http:
         url: "http://127.0.0.1:{http_port}/http-ready"
       interval: 20ms
       timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   exec-ready:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       exec:
-        command:
-          program: /bin/sh
-          args:
-            - "-c"
-            - {exec_check}
+        command: [/bin/sh, "-c", {exec_check}]
       interval: 20ms
       timeout: 500ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   log-ready:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       log:
         contains: fixture-log-ready
       interval: 20ms
       timeout: 500ms
-    command:
-      shell: {log_ready}
+    shell: {log_ready}
   all-ready:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       all:
         - tcp:
@@ -257,43 +248,43 @@ processes:
             url: "http://127.0.0.1:{http_port}/all-ready"
           interval: 20ms
           timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   ready-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
       recovering: ready
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   recovering:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       http:
         url: "http://127.0.0.1:{http_port}/recover-ready"
       interval: 20ms
       timeout: 250ms
       startup_timeout: 5s
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   liveness-recover:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     liveness:
       http:
         url: "http://127.0.0.1:{http_port}/liveness-recover"
       interval: 20ms
       timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   liveness-restart:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     restart:
       policy: on_failure
       backoff: 50ms
@@ -304,38 +295,39 @@ processes:
         url: "http://127.0.0.1:{http_port}/liveness-restart"
       interval: 20ms
       timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
+    command: [/bin/sleep, "60"]
   budget:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     restart:
       policy: on_failure
       backoff: 25ms
       max_restarts: 2
-    command:
-      shell: {budget}
+    shell: {budget}
   shutdown-restart:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     restart:
       policy: on_failure
       backoff: 60s
       max_restarts: 2
-    command:
-      shell: {shutdown_restart}
+    shell: {shutdown_restart}
   startup-timeout:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       http:
         url: "http://127.0.0.1:{http_port}/never-ready"
       interval: 20ms
       timeout: 100ms
       startup_timeout: 500ms
-    command:
-      shell: {timeout}
+    shell: {timeout}
 "#,
         started_dependent = yaml_quote(STARTED_DEPENDENT),
         started_source = yaml_quote(STARTED_SOURCE),

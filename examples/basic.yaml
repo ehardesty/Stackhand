@@ -2,51 +2,46 @@ version: 1
 
 processes:
   # A pipe Service starts automatically. Pipe output is read-only.
-  - name: clock
+  clock:
     kind: service
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          while :; do
-            printf "clock %s\n" "$(date +%H:%M:%S)"
-            sleep 1
-          done
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: |
+      while :; do
+        printf "clock %s\n" "$(date +%H:%M:%S)"
+        sleep 1
+      done
 
   # Start this Process with `s`. Press `Esc` to send input to the shell.
-  - name: shell
+  shell:
     kind: service
     autostart: false
-    terminal: pty
-    input: focused
-    command:
-      program: /bin/sh
-      args: ["-l"]
+    terminal:
+      mode: pty
+      input: focused
+    command: [/bin/sh, "-l"]
 
   # Start this Process with `s`. Use `r` after it is Done to run it again.
-  - name: manual-task
+  manual-task:
     kind: one-shot
     autostart: false
-    terminal: pipe
-    env:
+    terminal:
+      mode: pipe
+      input: disabled
+    environment:
       EXAMPLE_MESSAGE: hello from a One-shot
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          printf "%s\n" "$EXAMPLE_MESSAGE"
-          sleep 1
-          printf "task complete\n"
+    shell: |
+      printf "%s\n" "$EXAMPLE_MESSAGE"
+      sleep 1
+      printf "task complete\n"
 
   # A disabled Process stays visible but cannot start.
-  - name: disabled-example
+  disabled-example:
     kind: service
     enabled: false
     autostart: false
-    terminal: pipe
-    command:
-      program: /bin/sleep
-      args: ["300"]
+    terminal:
+      mode: pipe
+      input: disabled
+    command: [/bin/sleep, "300"]

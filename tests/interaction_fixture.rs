@@ -50,32 +50,23 @@ fn fixture_config() -> String {
     format!(
         "version: 1\n\
          processes:\n\
-         \x20 - name: focused\n\
+         \x20 focused:\n\
          \x20   kind: service\n\
-         \x20   terminal: pty\n\
-         \x20   input: focused\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{focused}\"]\n\
-         \x20 - name: mute\n\
+         \x20   terminal: {{mode: pty, input: focused}}\n\
+         \x20   command: [/bin/sh, \"-c\", \"{focused}\"]\n\
+         \x20 mute:\n\
          \x20   kind: service\n\
-         \x20   terminal: pty\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{mute}\"]\n\
-         \x20 - name: piped\n\
+         \x20   terminal: {{mode: pty, input: disabled}}\n\
+         \x20   command: [/bin/sh, \"-c\", \"{mute}\"]\n\
+         \x20 piped:\n\
          \x20   kind: service\n\
-         \x20   terminal: pipe\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{piped}\"]\n\
-         \x20 - name: oneoff\n\
+         \x20   terminal: {{mode: pipe, input: disabled}}\n\
+         \x20   command: [/bin/sh, \"-c\", \"{piped}\"]\n\
+         \x20 oneoff:\n\
          \x20   kind: one-shot\n\
-         \x20   terminal: pipe\n\
+         \x20   terminal: {{mode: pipe, input: disabled}}\n\
          \x20   autostart: false\n\
-         \x20   command:\n\
-         \x20     program: /bin/sh\n\
-         \x20     args: [\"-c\", \"{oneoff}\"]\n",
+         \x20   command: [/bin/sh, \"-c\", \"{oneoff}\"]\n",
     )
 }
 

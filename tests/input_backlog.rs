@@ -23,12 +23,12 @@ fn wheel_burst_does_not_hold_later_keyboard_input_behind_redraws() {
         &config,
         r#"version: 1
 processes:
-  - name: scrolling
+  scrolling:
     kind: service
-    terminal: pty
-    command:
-      program: /bin/sh
-      args: ["-c", "i=0; while :; do if [ $((i % 100)) -eq 0 ]; then echo scroll-ready; fi; echo line-$i; i=$((i+1)); sleep 0.005; done"]
+    terminal:
+      mode: pty
+      input: focused
+    command: [/bin/sh, "-c", "i=0; while :; do if [ $((i % 100)) -eq 0 ]; then echo scroll-ready; fi; echo line-$i; i=$((i+1)); sleep 0.005; done"]
 "#,
     )
     .unwrap();

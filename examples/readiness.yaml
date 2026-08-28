@@ -3,58 +3,50 @@ version: 1
 processes:
   # The TCP port opens after three seconds. Until then, the selected header
   # shows failed readiness attempts.
-  - name: tcp-listener
+  tcp-listener:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       tcp:
         host: 127.0.0.1
         port: 43123
       interval: 500ms
       timeout: 500ms
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          printf "TCP listener delayed for 3 seconds\n"
-          sleep 3
-          printf "TCP listener ready\n"
-          exec nc -lk 127.0.0.1 43123
+    shell: |
+      printf "TCP listener delayed for 3 seconds\n"
+      sleep 3
+      printf "TCP listener ready\n"
+      exec nc -lk 127.0.0.1 43123
 
   # The helper uses /bin/sh and the macOS nc command to return HTTP 200.
-  - name: http-listener
+  http-listener:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       http:
         url: http://127.0.0.1:43124/health
       interval: 500ms
       timeout: 500ms
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          printf "HTTP listener delayed for 5 seconds\n"
-          sleep 5
-          exec ./scripts/http-ok.sh 43124
+    shell: |
+      printf "HTTP listener delayed for 5 seconds\n"
+      sleep 5
+      exec ./scripts/http-ok.sh 43124
 
   # This Process remains Waiting until both probes pass.
-  - name: ready-dependent
+  ready-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - name: tcp-listener
-        condition: ready
-      - name: http-listener
-        condition: ready
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          while :; do
-            printf "both listeners are ready\n"
-            sleep 2
-          done
+      tcp-listener: ready
+      http-listener: ready
+    shell: |
+      while :; do
+        printf "both listeners are ready\n"
+        sleep 2
+      done

@@ -671,41 +671,41 @@ fn stackhand_repository_runs_as_a_small_real_project() {
         format!(
             r#"version: 1
 processes:
-  - name: inspect
+  inspect:
     kind: one-shot
-    terminal: pipe
-    working_dir: {repository}
-    command:
-      program: {cargo}
-      args: ["metadata", "--no-deps", "--format-version", "1"]
-  - name: hold
+    terminal:
+      mode: pipe
+      input: disabled
+    cwd: {repository}
+    command: [{cargo}, "metadata", "--no-deps", "--format-version", "1"]
+  hold:
     kind: service
-    terminal: pipe
-    command:
-      shell: |
-        sleep 60 & child=$!
-        printf 'hold-child-%s\n' "$child"
-        wait "$child"
-  - name: ready-service
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: |
+      sleep 60 & child=$!
+      printf 'hold-child-%s\n' "$child"
+      wait "$child"
+  ready-service:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       http:
         url: "http://127.0.0.1:{port}/health"
       interval: 20ms
       timeout: 250ms
-    command:
-      program: /bin/sleep
-      args: ["60"]
-  - name: ready-dependent
+    command: [/bin/sleep, "60"]
+  ready-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - name: ready-service
-        condition: ready
-    command:
-      program: /bin/sleep
-      args: ["60"]
+      ready-service: ready
+    command: [/bin/sleep, "60"]
 "#,
             repository = repository,
             cargo = cargo,

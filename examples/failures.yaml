@@ -2,42 +2,40 @@ version: 1
 
 processes:
   # A failed One-shot keeps completed_successfully Dependencies blocked.
-  - name: failing-check
+  failing-check:
     kind: one-shot
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args: ["-c", 'printf "check failed with exit status 7\n"; exit 7']
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: 'printf "check failed with exit status 7\n"; exit 7'
 
-  - name: blocked-dependent
+  blocked-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - name: failing-check
-        condition: completed_successfully
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          while :; do
-            printf "this line must not appear\n"
-            sleep 1
-          done
+      failing-check: completed_successfully
+    shell: |
+      while :; do
+        printf "this line must not appear\n"
+        sleep 1
+      done
 
   # A Service that exits without a Stop request is a failed Run, even with
   # exit status zero.
-  - name: unexpected-exit
+  unexpected-exit:
     kind: service
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args: ["-c", 'printf "service will exit unexpectedly\n"; sleep 2; exit 0']
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: 'printf "service will exit unexpectedly\n"; sleep 2; exit 0'
 
   # Start this Process manually to see a clear spawn failure.
-  - name: missing-program
+  missing-program:
     kind: service
     autostart: false
-    terminal: pipe
-    command:
-      program: stackhand-example-command-that-does-not-exist
+    terminal:
+      mode: pipe
+      input: disabled
+    command: [stackhand-example-command-that-does-not-exist]

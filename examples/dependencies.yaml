@@ -2,78 +2,68 @@ version: 1
 
 processes:
   # A successful One-shot can release completed_successfully Dependencies.
-  - name: prepare
+  prepare:
     kind: one-shot
-    terminal: pipe
-    command:
-      program: /bin/sh
-      args: ["-c", 'printf "prepare started\n"; sleep 2; printf "prepare complete\n"']
+    terminal:
+      mode: pipe
+      input: disabled
+    shell: 'printf "prepare started\n"; sleep 2; printf "prepare complete\n"'
 
   # The Service starts before it becomes ready. This creates a visible window
   # between the started and ready Dependency conditions.
-  - name: database
+  database:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     ready:
       tcp:
         host: 127.0.0.1
         port: 43122
       interval: 500ms
       timeout: 500ms
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          printf "database starting\n"
-          sleep 4
-          printf "database listening\n"
-          exec nc -lk 127.0.0.1 43122
+    shell: |
+      printf "database starting\n"
+      sleep 4
+      printf "database listening\n"
+      exec nc -lk 127.0.0.1 43122
 
-  # A plain Process name means the started condition.
-  - name: started-dependent
+  # A keyed Dependency names the Process and states its condition.
+  started-dependent:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - database
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          while :; do
-            printf "database has started\n"
-            sleep 2
-          done
+      database: started
+    shell: |
+      while :; do
+        printf "database has started\n"
+        sleep 2
+      done
 
   # This One-shot waits for setup completion and Service readiness.
-  - name: migrate
+  migrate:
     kind: one-shot
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - name: prepare
-        condition: completed_successfully
-      - name: database
-        condition: ready
-    command:
-      program: /bin/sh
-      args: ["-c", 'printf "migration started\n"; sleep 2; printf "migration complete\n"']
+      prepare: completed_successfully
+      database: ready
+    shell: 'printf "migration started\n"; sleep 2; printf "migration complete\n"'
 
   # The final Service starts only after the migration succeeds.
-  - name: application
+  application:
     kind: service
-    terminal: pipe
+    terminal:
+      mode: pipe
+      input: disabled
     depends_on:
-      - name: database
-        condition: ready
-      - name: migrate
-        condition: completed_successfully
-    command:
-      program: /bin/sh
-      args:
-        - -c
-        - |
-          while :; do
-            printf "application is running\n"
-            sleep 2
-          done
+      database: ready
+      migrate: completed_successfully
+    shell: |
+      while :; do
+        printf "application is running\n"
+        sleep 2
+      done

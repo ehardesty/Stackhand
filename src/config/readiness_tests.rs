@@ -17,7 +17,7 @@ fn write_and_load(label: &str, yaml: &str) -> Result<crate::model::EffectiveProj
 fn http_readiness_parses_the_url_into_its_connect_target() {
     let project = write_and_load(
         "readiness-http-ok",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      http:\n        url: \"http://localhost:8080/healthz?probe=1\"\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      http:\n        url: \"http://localhost:8080/healthz?probe=1\"\n",
     )
     .expect("valid http readiness");
     let readiness = project.processes()[0]
@@ -39,7 +39,7 @@ fn http_readiness_parses_the_url_into_its_connect_target() {
     // The default port and path come from the URL.
     let bare = write_and_load(
         "readiness-http-bare",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      http: {url: \"http://example.test\"}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      http: {url: \"http://example.test\"}\n",
     )
     .expect("a bare http URL is valid");
     let readiness = bare.processes()[0].readiness.clone().expect("parses");
@@ -55,7 +55,7 @@ fn http_readiness_parses_the_url_into_its_connect_target() {
 
 #[test]
 fn invalid_http_readiness_urls_are_rejected_clearly() {
-    let base = "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      http: {url: \"";
+    let base = "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      http: {url: \"";
     let cases = [
         ("https", "https://example.test/\"}"),
         ("no scheme", "example.test/healthz\"}"),
@@ -80,7 +80,7 @@ fn invalid_http_readiness_urls_are_rejected_clearly() {
 fn tcp_readiness_parses_with_bounded_defaults() {
     let project = write_and_load(
         "readiness-tcp-ok",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      tcp:\n        host: 127.0.0.1\n        port: 5432\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      tcp:\n        host: 127.0.0.1\n        port: 5432\n",
     )
     .expect("valid tcp readiness");
     let readiness = project.processes()[0]
@@ -103,7 +103,7 @@ fn tcp_readiness_parses_with_bounded_defaults() {
 fn tcp_readiness_accepts_common_fields_and_every_duration_unit() {
     let project = write_and_load(
         "readiness-tcp-fields",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      tcp: {host: localhost, port: 1}\n      initial_delay: 250ms\n      interval: 2s\n      timeout: 3m\n      success_threshold: 2\n      failure_threshold: 3\n      startup_timeout: 4h\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      tcp: {host: localhost, port: 1}\n      initial_delay: 250ms\n      interval: 2s\n      timeout: 3m\n      success_threshold: 2\n      failure_threshold: 3\n      startup_timeout: 4h\n",
     )
     .expect("valid common readiness fields");
     let readiness = project.processes()[0]
@@ -126,7 +126,7 @@ fn tcp_readiness_accepts_common_fields_and_every_duration_unit() {
 fn initial_delay_may_be_zero() {
     let project = write_and_load(
         "readiness-zero-delay",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      initial_delay: 0s\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n      tcp: {host: h, port: 1}\n      initial_delay: 0s\n",
     )
     .expect("zero initial delay is valid");
     assert_eq!(
@@ -142,7 +142,7 @@ fn initial_delay_may_be_zero() {
 
 #[test]
 fn invalid_readiness_values_are_rejected_clearly() {
-    let base = "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n";
+    let base = "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n      tcp: {host: h, port: 1}\n";
     let cases = [
         ("zero interval", "      interval: 0s\n", "interval"),
         ("zero timeout", "      timeout: 0s\n", "timeout"),
@@ -199,7 +199,7 @@ fn invalid_readiness_values_are_rejected_clearly() {
         ("no form", "      tcp: null\n", "exactly one"),
     ] {
         let yaml = format!(
-            "version: 1\nprocesses:\n  - name: db\n    command: {{program: /bin/true}}\n    ready:\n{block}"
+            "version: 1\nprocesses:\n  db:\n    command: {{program: /bin/true}}\n    ready:\n{block}"
         );
         let error = write_and_load(label, &yaml).expect_err("the block must fail");
         assert!(error.message.contains(expected), "{label}: {error}");
@@ -210,7 +210,7 @@ fn invalid_readiness_values_are_rejected_clearly() {
 fn duration_overflow_is_rejected() {
     let error = write_and_load(
         "readiness-duration-overflow",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      startup_timeout: 18446744073709551616h\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n      tcp: {host: h, port: 1}\n      startup_timeout: 18446744073709551616h\n",
     )
     .expect_err("an overflowing duration must fail");
     assert!(error.message.contains("overflows"), "{error}");
@@ -220,7 +220,7 @@ fn duration_overflow_is_rejected() {
 fn removed_readiness_spellings_name_the_replacements() {
     let old_block = write_and_load(
         "removed-readiness-block",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    readiness:\n      tcp: {host: h, port: 1}\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    readiness:\n      tcp: {host: h, port: 1}\n",
     )
     .expect_err("the temporary block name must be rejected");
     assert!(
@@ -234,7 +234,7 @@ fn removed_readiness_spellings_name_the_replacements() {
 
     let old_interval = write_and_load(
         "removed-interval-field",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      interval_ms: 1s\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n      tcp: {host: h, port: 1}\n      interval_ms: 1s\n",
     )
     .expect_err("interval_ms must be rejected");
     assert!(
@@ -248,7 +248,7 @@ fn removed_readiness_spellings_name_the_replacements() {
 
     let old_timeout = write_and_load(
         "removed-timeout-field",
-        "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      timeout_ms: 1s\n",
+        "version: 1\nprocesses:\n  db:\n    command: [/bin/true]\n    ready:\n      tcp: {host: h, port: 1}\n      timeout_ms: 1s\n",
     )
     .expect_err("timeout_ms must be rejected");
     assert!(
@@ -265,7 +265,7 @@ fn removed_readiness_spellings_name_the_replacements() {
 fn all_readiness_parses_independent_children_and_one_parent_deadline() {
     let project = write_and_load(
         "readiness-all-ok",
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n          initial_delay: 250ms\n          interval: 2s\n          timeout: 3s\n          success_threshold: 2\n          failure_threshold: 3\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      startup_timeout: 1m\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n          initial_delay: 250ms\n          interval: 2s\n          timeout: 3s\n          success_threshold: 2\n          failure_threshold: 3\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      startup_timeout: 1m\n",
     )
     .expect("valid all readiness");
     let readiness = project.processes()[0]
@@ -297,8 +297,7 @@ fn all_readiness_parses_independent_children_and_one_parent_deadline() {
 
 #[test]
 fn all_readiness_rejects_invalid_composite_forms_clearly() {
-    let base =
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n";
+    let base = "version: 1\nprocesses:\n  api:\n    command: [/bin/true]\n    ready:\n";
     let cases = [
         ("empty", "      all: []\n", "at least two child checks"),
         (
@@ -333,7 +332,7 @@ fn all_readiness_rejects_invalid_composite_forms_clearly() {
 fn all_readiness_rejects_child_startup_deadlines() {
     let error = write_and_load(
         "readiness-all-child-timeout",
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n      all:\n        - tcp: {host: h, port: 1}\n          startup_timeout: 1s\n        - tcp: {host: h, port: 2}\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/true]\n    ready:\n      all:\n        - tcp: {host: h, port: 1}\n          startup_timeout: 1s\n        - tcp: {host: h, port: 2}\n",
     )
     .expect_err("a child cannot own the composite startup deadline");
     assert!(error.message.contains("parent 'ready' block"), "{error}");
@@ -343,7 +342,7 @@ fn all_readiness_rejects_child_startup_deadlines() {
 fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
     let direct = write_and_load(
         "exec-direct",
-        "version: 1\nprocesses:\n  - name: web\n    working_dir: /tmp\n    env: {BASE: process}\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      exec:\n        command: {program: /usr/bin/test, args: [\"-f\", \"ready\"]}\n        working_dir: /tmp\n        env: {CHECK: probe}\n        success_exit_codes: [0, 2]\n",
+        "version: 1\nprocesses:\n  web:\n    cwd: /tmp\n    environment: {BASE: process}\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        command: [/usr/bin/test, \"-f\", \"ready\"]\n        working_dir: /tmp\n        env: {CHECK: probe}\n        success_exit_codes: [0, 2]\n",
     )
     .expect("valid direct exec readiness");
     let probe = &direct.processes()[0]
@@ -367,7 +366,7 @@ fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
 
     let shell = write_and_load(
         "exec-shell",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      exec:\n        command: {shell: \"test \\\"$CHECK\\\" = probe\"}\n        env: {CHECK: probe}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      exec:\n        command: {shell: \"test \\\"$CHECK\\\" = probe\"}\n        env: {CHECK: probe}\n",
     )
     .expect("valid shell exec readiness");
     let probe = &shell.processes()[0]
@@ -391,7 +390,8 @@ fn exec_readiness_parses_direct_and_shell_commands_with_overrides() {
 
 #[test]
 fn exec_readiness_rejects_missing_invalid_and_unusable_configuration() {
-    let base = "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      exec:\n";
+    let base =
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      exec:\n";
     let cases = [
         ("missing-command", "        working_dir: /tmp\n", "requires"),
         (
@@ -401,22 +401,22 @@ fn exec_readiness_rejects_missing_invalid_and_unusable_configuration() {
         ),
         (
             "zero-success-codes",
-            "        command: {program: /bin/true}\n        success_exit_codes: []\n",
+            "        command: [/bin/true]\n        success_exit_codes: []\n",
             "at least one",
         ),
         (
             "duplicate-success-codes",
-            "        command: {program: /bin/true}\n        success_exit_codes: [0, 0]\n",
+            "        command: [/bin/true]\n        success_exit_codes: [0, 0]\n",
             "repeated",
         ),
         (
             "out-of-range-success-code",
-            "        command: {program: /bin/true}\n        success_exit_codes: [256]\n",
+            "        command: [/bin/true]\n        success_exit_codes: [256]\n",
             "0 through 255",
         ),
         (
             "missing-working-directory",
-            "        command: {program: /bin/true}\n        working_dir: /path/that/does/not/exist\n",
+            "        command: [/bin/true]\n        working_dir: /path/that/does/not/exist\n",
             "working directory",
         ),
     ];
@@ -431,7 +431,7 @@ fn exec_readiness_rejects_missing_invalid_and_unusable_configuration() {
 fn all_readiness_accepts_exec_as_one_independent_child() {
     let project = write_and_load(
         "readiness-all-exec",
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - exec:\n            command: {program: /bin/true}\n        - tcp: {host: localhost, port: 1}\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      all:\n        - exec:\n            command: [/bin/true]\n        - tcp: {host: localhost, port: 1}\n",
     )
     .expect("exec can be an all child");
     let checks = &project.processes()[0]
@@ -447,7 +447,7 @@ fn all_readiness_accepts_exec_as_one_independent_child() {
 fn log_readiness_accepts_one_nonempty_literal() {
     let project = write_and_load(
         "readiness-log-ok",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      log:\n        contains: \"Listening on :8080\"\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      log:\n        contains: \"Listening on :8080\"\n",
     )
     .expect("valid log readiness");
     let check = &project.processes()[0]
@@ -469,7 +469,7 @@ fn log_readiness_accepts_one_nonempty_literal() {
 fn log_readiness_rejects_empty_literals_and_regex_options() {
     let empty = write_and_load(
         "readiness-log-empty",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      log: {contains: \"\"}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      log: {contains: \"\"}\n",
     )
     .expect_err("an empty log literal must fail");
     assert!(
@@ -479,7 +479,7 @@ fn log_readiness_rejects_empty_literals_and_regex_options() {
 
     let regex = write_and_load(
         "readiness-log-regex",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      log: {contains: ready, regex: true}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/true]\n    ready:\n      log: {contains: ready, regex: true}\n",
     )
     .expect_err("regex log configuration must fail");
     assert!(regex.message.contains("unknown field `regex`"), "{regex}");
@@ -489,7 +489,7 @@ fn log_readiness_rejects_empty_literals_and_regex_options() {
 fn all_readiness_accepts_log_as_one_independent_child() {
     let project = write_and_load(
         "readiness-all-log",
-        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - log: {contains: ready}\n        - tcp: {host: localhost, port: 1}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      all:\n        - log: {contains: ready}\n        - tcp: {host: localhost, port: 1}\n",
     )
     .expect("log can be an all child");
     let checks = &project.processes()[0]
@@ -517,7 +517,7 @@ fn all_readiness_accepts_log_as_one_independent_child() {
 fn readiness_on_a_one_shot_is_rejected() {
     let error = write_and_load(
         "readiness-one-shot",
-        "version: 1\nprocesses:\n  - name: setup\n    kind: one-shot\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: 127.0.0.1, port: 1}\n",
+        "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    command: [/bin/true]\n    ready:\n      tcp: {host: 127.0.0.1, port: 1}\n",
     )
     .expect_err("a One-shot must reject readiness");
     assert!(error.message.contains("Services"), "{}", error.message);
@@ -527,7 +527,7 @@ fn readiness_on_a_one_shot_is_rejected() {
 fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
     let project = write_and_load(
         "liveness-all",
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    restart: {on_unhealthy: true}\n    liveness:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n        - exec: {command: {program: /bin/true}}\n        - log: {contains: heartbeat}\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    restart: {on_unhealthy: true}\n    liveness:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n        - exec: {command: [/bin/true]}\n        - log: {contains: heartbeat}\n",
     )
     .expect("valid liveness checks");
     let process = &project.processes()[0];
@@ -559,7 +559,7 @@ fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
 fn liveness_rejects_startup_deadlines_and_one_shot_processes() {
     let deadline = write_and_load(
         "liveness-startup-timeout",
-        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    liveness:\n      tcp: {host: localhost, port: 1}\n      startup_timeout: 1s\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/true]\n    liveness:\n      tcp: {host: localhost, port: 1}\n      startup_timeout: 1s\n",
     )
     .expect_err("liveness has no startup deadline");
     assert!(deadline.message.contains("startup_timeout"), "{deadline}");
@@ -570,7 +570,7 @@ fn liveness_rejects_startup_deadlines_and_one_shot_processes() {
 
     let one_shot = write_and_load(
         "liveness-one-shot",
-        "version: 1\nprocesses:\n  - name: setup\n    kind: one-shot\n    command: {program: /bin/true}\n    liveness:\n      tcp: {host: localhost, port: 1}\n",
+        "version: 1\nprocesses:\n  setup:\n    kind: one-shot\n    command: [/bin/true]\n    liveness:\n      tcp: {host: localhost, port: 1}\n",
     )
     .expect_err("one-shot processes cannot use liveness");
     assert!(
