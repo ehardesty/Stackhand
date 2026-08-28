@@ -432,7 +432,13 @@ impl Core {
     }
 
     fn service_or_one_shot_exit_failed(&self, index: usize, code: Option<i32>) -> bool {
-        !code.is_some_and(|code| {
+        !self.exit_code_succeeds(index, code)
+    }
+
+    /// Apply the Process's configured exit-code policy consistently to every
+    /// terminal path. A missing exit code never counts as success.
+    fn exit_code_succeeds(&self, index: usize, code: Option<i32>) -> bool {
+        code.is_some_and(|code| {
             self.project.processes()[index]
                 .success_exit_codes
                 .contains(&code)
@@ -443,11 +449,7 @@ impl Core {
     /// Only a configured exit code completes the One-shot; a missing code or
     /// any other code fails it. Desired State reverts to Stopped either way.
     fn complete_one_shot(&mut self, index: usize, code: Option<i32>) {
-        let success = code.is_some_and(|code| {
-            self.project.processes()[index]
-                .success_exit_codes
-                .contains(&code)
-        });
+        let success = self.exit_code_succeeds(index, code);
         let entry = &mut self.entries[index];
         if success {
             entry.lifecycle = super::core::Lifecycle::Done;

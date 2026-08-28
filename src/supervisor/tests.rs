@@ -700,4 +700,7 @@ mod service_lifecycle;
 mod dependency_scheduling;
 
 #[cfg(test)]
+mod dependency_recovery;
+
+#[cfg(test)]
 mod threaded;
