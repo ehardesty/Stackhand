@@ -9,7 +9,9 @@ use std::time::Duration;
 use crate::model::ProcessKind;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
-use super::core::{Core, FailureKind, FailureSummary, MetricsMetadata, ReadinessTracking};
+use super::core::{
+    Core, FailureKind, FailureSummary, MetricsMetadata, ReadinessState, ReadinessTracking,
+};
 
 impl Core {
     pub(crate) fn event(&mut self, event: SeamEvent) {
@@ -60,6 +62,7 @@ impl Core {
                 let probed = self.project.processes()[index].readiness.is_some();
                 let work_id = probed.then(|| self.allocate_work_id(index));
                 let now = self.clock.now();
+                let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
                 entry.root_pid = root_pid.map(|pid| pid.get());
                 if entry.lifecycle == super::core::Lifecycle::Starting {
@@ -68,7 +71,11 @@ impl Core {
                         // attempt is due after the configured initial delay.
                         entry.readiness = Some(ReadinessTracking {
                             work_id,
+                            started_at_ms: now_ms,
+                            state: ReadinessState::Pending,
                             attempts: 0,
+                            consecutive_successes: 0,
+                            consecutive_failures: 0,
                             next_attempt_id: 1,
                             last_error: None,
                             in_flight: None,
@@ -89,10 +96,13 @@ impl Core {
                 diagnostic,
                 ..
             } => {
-                let interval = self.project.processes()[index]
-                    .readiness
-                    .as_ref()
-                    .map(|config| config.interval);
+                let Some(config) = self.project.processes()[index].readiness.as_ref() else {
+                    return;
+                };
+                let interval = config.interval;
+                let success_threshold = config.success_threshold;
+                let failure_threshold = config.failure_threshold;
+                let now = self.clock.now();
                 let entry = &mut self.entries[index];
                 let Some(tracking) = entry.readiness.as_mut() else {
                     return;
@@ -101,17 +111,25 @@ impl Core {
                     return;
                 }
                 tracking.in_flight = None;
+                tracking.next_attempt_at = now + interval;
                 if passing {
-                    // Passing releases dependents through the Running
-                    // transition exactly once per Run; per-Run readiness
-                    // bookkeeping ends here, which also makes any further
-                    // result for this Run land on no tracking at all.
-                    entry.lifecycle = super::core::Lifecycle::Running;
-                    entry.readiness = None;
+                    tracking.consecutive_successes =
+                        tracking.consecutive_successes.saturating_add(1);
+                    tracking.consecutive_failures = 0;
+                    if tracking.consecutive_successes >= success_threshold {
+                        tracking.state = ReadinessState::Passing;
+                        if entry.lifecycle == super::core::Lifecycle::Starting {
+                            entry.lifecycle = super::core::Lifecycle::Running;
+                        }
+                    }
                 } else {
+                    tracking.consecutive_failures = tracking.consecutive_failures.saturating_add(1);
+                    tracking.consecutive_successes = 0;
                     tracking.last_error = diagnostic;
-                    if let Some(interval) = interval {
-                        tracking.next_attempt_at = self.clock.now() + interval;
+                    if tracking.state == ReadinessState::Passing
+                        && tracking.consecutive_failures >= failure_threshold
+                    {
+                        tracking.state = ReadinessState::Failing;
                     }
                 }
                 self.evaluate();

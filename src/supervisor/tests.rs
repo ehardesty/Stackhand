@@ -9,8 +9,8 @@ use super::ProjectSnapshot;
 use super::seam::{AttemptId, FinishedRun, WorkId};
 use super::support::{FakeClock, FakeProbes, FakeRuntime, Intent};
 use super::{
-    Command, Core, DesiredState, FailureKind, Lifecycle, ProcessSnapshot, RunExitDisposition,
-    SeamEvent, SeamSender,
+    Command, Core, DesiredState, FailureKind, Lifecycle, ProcessSnapshot, ReadinessCheckKind,
+    ReadinessState, RunExitDisposition, SeamEvent, SeamSender,
 };
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
@@ -208,11 +208,21 @@ fn finished(process: &str, run: u64, code: Option<i32>) -> SeamEvent {
 }
 
 fn readiness(process: &str, run: u64, passing: bool, diagnostic: Option<String>) -> SeamEvent {
+    readiness_attempt(process, run, 1, passing, diagnostic)
+}
+
+fn readiness_attempt(
+    process: &str,
+    run: u64,
+    attempt: u64,
+    passing: bool,
+    diagnostic: Option<String>,
+) -> SeamEvent {
     SeamEvent::Readiness {
         process_id: ProcessId::new(process_index(process)),
         run_id: RunId::new(run),
         work_id: WorkId::new(run),
-        attempt_id: AttemptId::new(1),
+        attempt_id: AttemptId::new(attempt),
         passing,
         diagnostic,
     }

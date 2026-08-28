@@ -203,7 +203,7 @@ fn failure_kinds_cover_the_supported_failure_sources() {
     );
 }
 
-/// Readiness diagnostics stay bounded: attempt count and the last error.
+/// Readiness diagnostics stay bounded: state, attempt count, and the last error.
 #[test]
 fn readiness_diagnostics_carry_attempts_and_the_last_error() {
     let mut h =
@@ -241,7 +241,10 @@ fn readiness_diagnostics_carry_attempts_and_the_last_error() {
         diagnostic: None,
     });
     let api = h.process("api");
-    assert_eq!(api.readiness, None, "a passing probe ends the bookkeeping");
+    let readiness = api
+        .readiness
+        .expect("a passing probe keeps recovery bookkeeping");
+    assert_eq!(readiness.state, ReadinessState::Passing);
     assert_eq!(api.lifecycle, Lifecycle::Running);
 }
 

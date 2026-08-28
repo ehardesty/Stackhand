@@ -1,9 +1,11 @@
 //! Immutable Supervisor views for rendering and other callers.
 
-use crate::model::ProcessKind;
+use crate::model::{ProcessKind, ReadinessProbe};
 use crate::runtime::ProcessId;
 
-use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunSummary};
+use super::core::{
+    DesiredState, FailureSummary, Lifecycle, MetricsMetadata, ReadinessState, RunSummary,
+};
 
 /// An immutable view of the whole Project at one moment. Rendering and
 /// callers can hold and inspect this freely; it cannot mutate lifecycle
@@ -24,13 +26,39 @@ impl ProjectSnapshot {
     }
 }
 
+/// The supported leaf check kinds in the readiness snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessCheckKind {
+    Tcp,
+    Http,
+}
+
+impl From<&ReadinessProbe> for ReadinessCheckKind {
+    fn from(probe: &ReadinessProbe) -> Self {
+        match probe {
+            ReadinessProbe::Tcp { .. } => Self::Tcp,
+            ReadinessProbe::Http { .. } => Self::Http,
+        }
+    }
+}
+
 /// One bounded readiness progress view of the current Run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessStatus {
+    /// The kind of check configured for this Service.
+    pub kind: ReadinessCheckKind,
+    /// The current threshold state of the check.
+    pub state: ReadinessState,
     /// Attempts dispatched for the current Run so far.
     pub attempts: u32,
+    /// Consecutive passing attempts currently counted.
+    pub consecutive_successes: u32,
+    /// Consecutive failing attempts currently counted.
+    pub consecutive_failures: u32,
     /// The most recent failing attempt's bounded diagnostic, when any.
     pub last_error: Option<String>,
+    /// Milliseconds elapsed since readiness evaluation began after spawn.
+    pub startup_elapsed_ms: u64,
 }
 
 /// The immutable lifecycle and diagnostic view of one Process.
@@ -63,8 +91,9 @@ pub struct ProcessSnapshot {
     /// Why this Process has not started although Desired State is Running:
     /// a bounded "dependency: condition" (or "dependency: disabled") reason.
     pub blocked_reason: Option<String>,
-    /// Readiness progress while the current Run of a probed Service is still
-    /// becoming available; `None` without a probe or once it passed or ended.
+    /// Readiness progress for the current Run of a probed Service, including
+    /// Passing and Failing recovery states; `None` without a probe or after it
+    /// ended.
     pub readiness: Option<ReadinessStatus>,
     /// The bounded recent finished-Run summaries, newest first.
     pub recent_runs: Vec<RunSummary>,

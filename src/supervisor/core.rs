@@ -17,7 +17,9 @@ use crate::supervisor::command::Command;
 use crate::supervisor::seam::{
     AttemptId, ProbeIntent, ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId,
 };
-use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
+use crate::supervisor::snapshot::{
+    ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessStatus,
+};
 
 /// The user's current intent for a Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,13 +149,29 @@ pub(crate) struct Core {
     pub(super) shutdown: Option<crate::supervisor::shutdown::ShutdownState>,
 }
 
+/// The current state of one Service readiness check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessState {
+    /// No success threshold has been reached for this Run.
+    Pending,
+    /// The success threshold currently holds.
+    Passing,
+    /// The failure threshold has been reached after readiness.
+    Failing,
+}
+
 /// Live readiness bookkeeping for one probed Service's current Run.
 #[derive(Debug)]
 pub(super) struct ReadinessTracking {
     /// Stable identity of this check within its Run.
     pub(super) work_id: WorkId,
+    /// Session time when readiness evaluation began after spawn.
+    pub(super) started_at_ms: u64,
     /// Attempts dispatched for this Run so far.
     pub(super) attempts: u32,
+    pub(super) state: ReadinessState,
+    pub(super) consecutive_successes: u32,
+    pub(super) consecutive_failures: u32,
     /// The next attempt identity. Attempt identities are never reused.
     pub(super) next_attempt_id: u64,
     pub(super) last_error: Option<String>,
@@ -175,8 +193,8 @@ pub(super) struct Entry {
     /// Why Desired State Running has not produced a Run yet, as a bounded
     /// "dependency: condition" reason.
     pub(super) blocked: Option<String>,
-    /// Present only while the current Run of a probed Service is alive and
-    /// still awaiting its first passing attempt.
+    /// Present while the current Run of a probed Service has an active
+    /// readiness check, including after the first pass for recovery tracking.
     pub(super) readiness: Option<ReadinessTracking>,
     /// The previous Run's cleanup finished unconfirmed: its Run identity
     /// stays held so a manual Stop can retry the bounded cleanup, and no
@@ -578,9 +596,20 @@ impl Core {
                 failure: entry.failure.clone(),
                 metrics: entry.metrics,
                 blocked_reason: entry.blocked.clone(),
-                readiness: entry.readiness.as_ref().map(|tracking| ReadinessStatus {
-                    attempts: tracking.attempts,
-                    last_error: tracking.last_error.clone(),
+                readiness: entry.readiness.as_ref().map(|tracking| {
+                    let probe = spec
+                        .readiness
+                        .as_ref()
+                        .expect("tracking exists only for a configured readiness check");
+                    ReadinessStatus {
+                        kind: ReadinessCheckKind::from(&probe.probe),
+                        state: tracking.state,
+                        attempts: tracking.attempts,
+                        consecutive_successes: tracking.consecutive_successes,
+                        consecutive_failures: tracking.consecutive_failures,
+                        last_error: tracking.last_error.clone(),
+                        startup_elapsed_ms: now_ms.saturating_sub(tracking.started_at_ms),
+                    }
                 }),
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })

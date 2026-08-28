@@ -43,11 +43,11 @@ pub use crate::runtime::ProcessId;
 pub use command::Command;
 pub use core::{
     DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
-    RunExitDisposition, RunSummary, RunTrigger,
+    ReadinessState, RunExitDisposition, RunSummary, RunTrigger,
 };
 pub use runtime::{ConsoleView, Consoles};
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
-pub use snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessStatus};
+pub use snapshot::{ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessStatus};
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.
 pub use crate::output::{

@@ -11,6 +11,19 @@ fn probed_project() -> EffectiveProject {
     EffectiveProject::new(vec![probed_service("api")]).expect("unique names")
 }
 
+fn configured_readiness_project(
+    initial_delay: Duration,
+    success_threshold: u32,
+    failure_threshold: u32,
+) -> EffectiveProject {
+    let mut process = probed_service("api");
+    let readiness = process.readiness.as_mut().expect("the probe exists");
+    readiness.initial_delay = initial_delay;
+    readiness.success_threshold = success_threshold;
+    readiness.failure_threshold = failure_threshold;
+    EffectiveProject::new(vec![process]).expect("unique names")
+}
+
 fn start_probed(h: &mut Harness) {
     h.command(Command::Start("api".into()));
     h.event(spawned("api", 1));
@@ -28,8 +41,102 @@ fn a_probed_service_stays_starting_until_its_probe_passes() {
     h.event(readiness("api", 1, true, None));
     let api = h.process("api");
     assert_eq!(api.lifecycle, Lifecycle::Running);
-    assert_eq!(api.readiness, None);
+    let readiness = api
+        .readiness
+        .expect("readiness stays visible after passing");
+    assert_eq!(readiness.kind, ReadinessCheckKind::Tcp);
+    assert_eq!(readiness.state, ReadinessState::Passing);
+    assert_eq!(readiness.attempts, 1);
+    assert_eq!(readiness.consecutive_successes, 1);
+    assert_eq!(readiness.consecutive_failures, 0);
+    assert_eq!(readiness.startup_elapsed_ms, 0);
     assert_eq!(api.failure, None);
+}
+
+#[test]
+fn initial_delay_defers_the_first_readiness_attempt() {
+    let mut h = Harness::new(configured_readiness_project(Duration::from_secs(1), 1, 1));
+    start_probed(&mut h);
+
+    h.advance_and_poll(Duration::from_millis(999));
+    assert!(h.probes.attempts().is_empty());
+    assert_eq!(h.process("api").readiness.unwrap().startup_elapsed_ms, 999);
+
+    h.advance_and_poll(Duration::from_millis(1));
+    assert_eq!(h.probes.attempts().len(), 1);
+}
+
+#[test]
+fn readiness_thresholds_support_pending_failing_and_recovery_states() {
+    let mut h = Harness::new(configured_readiness_project(Duration::ZERO, 2, 2));
+    start_probed(&mut h);
+    h.advance_and_poll(Duration::ZERO);
+
+    h.event(readiness("api", 1, true, None));
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Starting);
+    let status = api.readiness.expect("pending readiness remains visible");
+    assert_eq!(status.state, ReadinessState::Pending);
+    assert_eq!(status.consecutive_successes, 1);
+    assert_eq!(status.consecutive_failures, 0);
+
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt("api", 1, 2, true, None));
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Running);
+    assert_eq!(
+        api.readiness.as_ref().unwrap().state,
+        ReadinessState::Passing
+    );
+
+    // A single failure does not cross the failure threshold.
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt(
+        "api",
+        1,
+        3,
+        false,
+        Some("connection refused".into()),
+    ));
+    let status = h
+        .process("api")
+        .readiness
+        .expect("readiness remains visible");
+    assert_eq!(status.state, ReadinessState::Passing);
+    assert_eq!(status.consecutive_failures, 1);
+
+    // The second consecutive failure marks readiness Failing without
+    // stopping the live Service.
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt(
+        "api",
+        1,
+        4,
+        false,
+        Some("connection refused".into()),
+    ));
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Running);
+    let status = api.readiness.expect("failing readiness remains visible");
+    assert_eq!(status.state, ReadinessState::Failing);
+    assert_eq!(status.consecutive_failures, 2);
+
+    // Recovery also needs two consecutive passes and does not rerun startup.
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt("api", 1, 5, true, None));
+    assert_eq!(
+        h.process("api").readiness.unwrap().state,
+        ReadinessState::Failing
+    );
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt("api", 1, 6, true, None));
+    let status = h
+        .process("api")
+        .readiness
+        .expect("recovered readiness remains visible");
+    assert_eq!(status.state, ReadinessState::Passing);
+    assert_eq!(status.consecutive_successes, 2);
+    assert_eq!(status.consecutive_failures, 0);
 }
 
 #[test]
@@ -103,6 +210,21 @@ fn passing_readiness_releases_ready_dependents_exactly_once_per_run() {
 
     h.event(readiness("db", 1, true, None));
     assert_eq!(h.process("db").lifecycle, Lifecycle::Running);
+    assert_eq!(h.process("api").current_run, Some(1));
+
+    // Readiness loss does not stop an already-running dependent.
+    h.advance_and_poll(Duration::from_secs(1));
+    h.event(readiness_attempt(
+        "db",
+        1,
+        2,
+        false,
+        Some("connection refused".into()),
+    ));
+    assert_eq!(
+        h.process("db").readiness.unwrap().state,
+        ReadinessState::Failing
+    );
     assert_eq!(h.process("api").current_run, Some(1));
 
     // A duplicate passing result cannot release anyone again.

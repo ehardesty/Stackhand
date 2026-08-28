@@ -11,7 +11,7 @@
 //! A Dependency is a startup relationship only: nothing here stops an
 //! already-running dependent when a dependency later stops.
 
-use super::core::{Core, DesiredState, Lifecycle};
+use super::core::{Core, DesiredState, Lifecycle, ReadinessState};
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
 use crate::supervisor::RunTrigger;
@@ -172,11 +172,17 @@ impl Core {
 
     /// `ready` holds only while the dependency has an active Running Run. A
     /// probed Service reaches Running only when its readiness probe passed,
-    /// so Running implies availability; readiness passes at most once per
-    /// Run, so each Run releases its dependents exactly once.
+    /// and later readiness loss removes `ready` for any new dependent without
+    /// stopping an already-running dependent.
     fn ready_condition_satisfied(&self, index: usize) -> bool {
         let entry = &self.entries[index];
-        entry.current_run.is_some() && entry.lifecycle == Lifecycle::Running
+        if entry.current_run.is_none() || entry.lifecycle != Lifecycle::Running {
+            return false;
+        }
+        entry
+            .readiness
+            .as_ref()
+            .is_none_or(|tracking| tracking.state == ReadinessState::Passing)
     }
 
     /// `exited` holds after the latest scheduled One-shot Run completes its

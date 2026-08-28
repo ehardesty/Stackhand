@@ -189,14 +189,17 @@ fn prove_slice(
     println!("fixture-one-shot-ok");
 
     // The TCP-probed Service reached Running only through a real probe pass
-    // against the listener this test process hosts; per-Run readiness
-    // bookkeeping ends once the Run passed.
+    // against the listener this process hosts; its Passing state stays
+    // visible while later checks can detect loss and recovery.
     let tcp_ready = snapshot
         .named("tcp-ready")
         .expect("the fixture defines 'tcp-ready'");
     assert_eq!(tcp_ready.lifecycle, Lifecycle::Running);
     assert!(tcp_ready.current_run.is_some());
-    assert_eq!(tcp_ready.readiness, None, "a passed Run keeps no tracking");
+    assert_eq!(
+        tcp_ready.readiness.as_ref().map(|status| status.state),
+        Some(crate::supervisor::ReadinessState::Passing)
+    );
     assert_eq!(tcp_ready.failure, None);
     // The same holds for the HTTP-probed Service against the real local
     // health endpoint this process hosts.
@@ -205,7 +208,10 @@ fn prove_slice(
         .expect("the fixture defines 'http-ready'");
     assert_eq!(http_ready.lifecycle, Lifecycle::Running);
     assert!(http_ready.current_run.is_some());
-    assert_eq!(http_ready.readiness, None);
+    assert_eq!(
+        http_ready.readiness.as_ref().map(|status| status.state),
+        Some(crate::supervisor::ReadinessState::Passing)
+    );
     assert_eq!(http_ready.failure, None);
     let gated_ready = snapshot
         .named("gated-ready")

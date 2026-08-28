@@ -251,6 +251,22 @@ mod tests {
         port
     }
 
+    /// Serve one response per connection so a single real endpoint can move
+    /// from failing to passing across successive readiness attempts.
+    fn serve_responses(responses: Vec<&'static [u8]>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+        let port = listener.local_addr().expect("local address").port();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.write_all(response);
+            }
+        });
+        port
+    }
+
     #[test]
     fn tcp_attempt_passes_against_a_real_listener() {
         let port = spawn_listener();
@@ -307,6 +323,40 @@ mod tests {
         let error = http_attempt("127.0.0.1", port, "/", TIMEOUT).expect_err("refusal fails");
         assert!(!error.is_empty());
         assert!(error.chars().count() <= MAX_DIAGNOSTIC_CHARS);
+    }
+
+    #[test]
+    fn http_attempt_covers_failure_timeout_and_recovery_on_real_endpoints() {
+        let failed_port = spawn_http_server(b"HTTP/1.0 503 Unavailable\r\n\r\n");
+        let failure = http_attempt("127.0.0.1", failed_port, "/healthz", TIMEOUT)
+            .expect_err("a failing endpoint reports failure");
+        assert_eq!(failure, "status 503");
+
+        let silent_listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+        let silent_port = silent_listener.local_addr().expect("local address").port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = silent_listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+        let timeout = http_attempt(
+            "127.0.0.1",
+            silent_port,
+            "/healthz",
+            Duration::from_millis(50),
+        )
+        .expect_err("a silent endpoint times out");
+        assert!(timeout.contains("timed out"), "{timeout}");
+
+        let recovering_port = serve_responses(vec![
+            b"HTTP/1.0 503 Unavailable\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\n\r\n",
+        ]);
+        http_attempt("127.0.0.1", recovering_port, "/healthz", TIMEOUT)
+            .expect_err("the first recovery attempt fails");
+        http_attempt("127.0.0.1", recovering_port, "/healthz", TIMEOUT)
+            .expect("the next attempt recovers");
     }
 
     #[test]
