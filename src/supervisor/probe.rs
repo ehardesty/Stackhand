@@ -64,6 +64,7 @@ impl ProbeSeam for RealProbes {
                         ReadinessProbe::Http { host, port, path } => {
                             http_attempt(host, *port, path, intent.timeout)
                         }
+                        ReadinessProbe::Exec { .. } => super::exec::attempt(&intent, &canceled),
                     };
                     if !canceled.load(Ordering::Acquire) {
                         let (passing, diagnostic) = match attempt {
@@ -403,6 +404,7 @@ mod tests {
                     path: "/healthz".into(),
                 },
                 timeout: TIMEOUT,
+                exec_context: None,
             },
             &SeamSender::new(tx),
         );

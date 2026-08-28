@@ -30,6 +30,7 @@ impl ProjectSnapshot {
 pub enum ReadinessCheckKind {
     Tcp,
     Http,
+    Exec,
     All,
 }
 
@@ -38,6 +39,7 @@ impl From<&ReadinessProbe> for ReadinessCheckKind {
         match probe {
             ReadinessProbe::Tcp { .. } => Self::Tcp,
             ReadinessProbe::Http { .. } => Self::Http,
+            ReadinessProbe::Exec { .. } => Self::Exec,
         }
     }
 }

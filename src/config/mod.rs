@@ -140,36 +140,45 @@ fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigErr
     })
 }
 
-fn build_success_exit_codes(
-    process_name: &str,
-    configured: Option<Vec<i32>>,
-) -> Result<Vec<i32>, ConfigError> {
+fn build_success_exit_codes(configured: Option<Vec<i32>>) -> Result<Vec<i32>, String> {
     let codes = configured.unwrap_or_else(|| vec![0]);
     if codes.is_empty() {
-        return Err(ConfigError {
-            message: format!(
-                "Process '{process_name}': success_exit_codes must contain at least one exit code"
-            ),
-        });
+        return Err("success_exit_codes must contain at least one exit code".to_string());
     }
     let mut seen = HashSet::with_capacity(codes.len());
     for code in &codes {
         if !(0..=MAX_EXIT_CODE).contains(code) {
-            return Err(ConfigError {
-                message: format!(
-                    "Process '{process_name}': success_exit_codes values must be unique exit codes from 0 through {MAX_EXIT_CODE}"
-                ),
-            });
+            return Err(format!(
+                "success_exit_codes values must be unique exit codes from 0 through {MAX_EXIT_CODE}"
+            ));
         }
         if !seen.insert(*code) {
-            return Err(ConfigError {
-                message: format!(
-                    "Process '{process_name}': success_exit_codes values must be unique; {code} is repeated"
-                ),
-            });
+            return Err(format!(
+                "success_exit_codes values must be unique; {code} is repeated"
+            ));
         }
     }
     Ok(codes)
+}
+
+fn build_command_form(command: &CommandFile) -> Result<CommandForm, String> {
+    match (&command.program, &command.shell) {
+        (Some(program), None) => Ok(CommandForm::Direct {
+            program: std::ffi::OsString::from(program),
+            args: command
+                .args
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+        }),
+        (None, Some(shell)) => Ok(CommandForm::Shell {
+            text: shell.clone(),
+        }),
+        (Some(_), Some(_)) => Err("define exactly one of 'program' or 'shell'".to_string()),
+        (None, None) => Err("define 'program' or 'shell' under 'command'".to_string()),
+    }
 }
 
 fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, ConfigError> {
@@ -184,31 +193,9 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
             ));
         }
     };
-    let command_form = match (&process.command.program, &process.command.shell) {
-        (Some(program), None) => CommandForm::Direct {
-            program: std::ffi::OsString::from(program),
-            args: process
-                .command
-                .args
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect(),
-        },
-        (None, Some(shell)) => CommandForm::Shell {
-            text: shell.clone(),
-        },
-        (Some(_), Some(_)) => {
-            return fail(format!(
-                "Process '{name}': define exactly one of 'program' or 'shell'"
-            ));
-        }
-        (None, None) => {
-            return fail(format!(
-                "Process '{name}': define 'program' or 'shell' under 'command'"
-            ));
-        }
+    let command_form = match build_command_form(&process.command) {
+        Ok(command) => command,
+        Err(detail) => return fail(format!("Process '{name}': {detail}")),
     };
     let working_dir = match &process.working_dir {
         Some(dir) => {
@@ -255,9 +242,12 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
     };
     let readiness = match &process.ready {
         None => None,
-        Some(file) => Some(readiness::build_readiness(&name, file)?),
+        Some(file) => Some(readiness::build_readiness(&name, file, base_dir)?),
     };
-    let success_exit_codes = build_success_exit_codes(&name, process.success_exit_codes.clone())?;
+    let success_exit_codes = match build_success_exit_codes(process.success_exit_codes.clone()) {
+        Ok(codes) => codes,
+        Err(detail) => return fail(format!("Process '{name}': {detail}")),
+    };
     Ok(ProcessSpec {
         name,
         kind,

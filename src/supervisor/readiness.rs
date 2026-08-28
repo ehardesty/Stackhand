@@ -4,9 +4,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::model::ReadinessConfig;
+use crate::model::{ReadinessConfig, ReadinessProbe};
 use crate::runtime::{ProcessId, RunId};
-use crate::supervisor::seam::{AttemptId, ProbeIntent, ProbeSeam, WorkId};
+use crate::supervisor::seam::{AttemptId, ExecContext, ProbeIntent, ProbeSeam, WorkId};
 
 use super::core::{Core, FailureKind, FailureSummary, Lifecycle};
 use super::snapshot::{ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus};
@@ -317,6 +317,11 @@ impl Core {
         };
         let probe = check_config.probe.clone();
         let timeout = check_config.timeout;
+        let exec_context = matches!(&probe, ReadinessProbe::Exec { .. }).then(|| ExecContext {
+            working_dir: self.project.processes()[index].working_dir.clone(),
+            env: self.project.processes()[index].env.clone(),
+            shell: self.project.shell().clone(),
+        });
         let intent = {
             let entry = &mut self.entries[index];
             let Some(run_id) = entry.current_run else {
@@ -342,6 +347,7 @@ impl Core {
                 attempt_id,
                 probe,
                 timeout,
+                exec_context,
             }
         };
         self.probes.probe(intent, &self.events);

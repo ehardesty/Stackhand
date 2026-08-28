@@ -49,7 +49,7 @@ impl Enabled {
 
 /// Exactly one command form for one Process. The two forms are mutually
 /// exclusive.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandForm {
     /// Run `program` with `args` directly, without shell parsing.
     Direct {
@@ -58,6 +58,20 @@ pub enum CommandForm {
     },
     /// Run `text` through the user's shell.
     Shell { text: String },
+}
+
+impl CommandForm {
+    /// Resolve this validated command with the Project's shell policy.
+    pub(crate) fn resolve(&self, shell: &ShellConfig) -> (OsString, Vec<OsString>) {
+        match self {
+            Self::Direct { program, args } => (program.clone(), args.clone()),
+            Self::Shell { text } => {
+                let mut args = shell.args.clone();
+                args.push(OsString::from(text));
+                (shell.program.clone(), args)
+            }
+        }
+    }
 }
 
 /// The terminal transport for one Process's Runs.
@@ -123,6 +137,14 @@ pub enum ReadinessProbe {
         port: u16,
         /// The request path and any query, always starting with `/`.
         path: String,
+    },
+    /// Run one validated direct or shell command without a PTY. The optional
+    /// working directory and environment entries override the Process values.
+    Exec {
+        command: CommandForm,
+        working_dir: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        success_exit_codes: Vec<i32>,
     },
 }
 

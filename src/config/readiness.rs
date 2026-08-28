@@ -2,6 +2,7 @@
 //! [`ReadinessConfig`] or a clear per-Process failure. The block carries
 //! exactly one leaf check or an `all` list with child scheduling fields.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -21,6 +22,7 @@ const DEFAULT_FAILURE_THRESHOLD: u32 = 1;
 pub(super) fn build_readiness(
     process_name: &str,
     file: &ReadinessFile,
+    base_dir: &Path,
 ) -> Result<ReadinessConfig, ConfigError> {
     if file.any.is_some() {
         return Err(ready_error(
@@ -38,10 +40,10 @@ pub(super) fn build_readiness(
         .transpose()?;
 
     let checks = if let Some(children) = &file.all {
-        if file.tcp.is_some() || file.http.is_some() {
+        if file.tcp.is_some() || file.http.is_some() || file.exec.is_some() {
             return Err(ready_error(
                 process_name,
-                "define exactly one of 'tcp', 'http', or 'all'",
+                "define exactly one of 'tcp', 'http', 'exec', or 'all'",
             ));
         }
         if file.initial_delay.is_some()
@@ -64,10 +66,10 @@ pub(super) fn build_readiness(
         children
             .iter()
             .enumerate()
-            .map(|(index, child)| build_leaf(process_name, child, Some(index + 1)))
+            .map(|(index, child)| build_leaf(process_name, child, Some(index + 1), base_dir))
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        vec![build_leaf(process_name, file, None)?]
+        vec![build_leaf(process_name, file, None, base_dir)?]
     };
 
     Ok(ReadinessConfig {
@@ -80,14 +82,9 @@ fn build_leaf(
     process_name: &str,
     file: &ReadinessFile,
     child_index: Option<usize>,
+    base_dir: &Path,
 ) -> Result<ReadinessCheck, ConfigError> {
-    let fail = |detail: String| {
-        let detail = match child_index {
-            Some(index) => format!("all child {index}: {detail}"),
-            None => detail,
-        };
-        Err(ready_error(process_name, detail))
-    };
+    let fail = |detail: String| Err(ready_error_for(process_name, child_index, detail));
     if file.all.is_some() {
         return fail("nested 'all' readiness checks are not supported".to_string());
     }
@@ -97,8 +94,8 @@ fn build_leaf(
     if child_index.is_some() && file.startup_timeout.is_some() {
         return fail("startup_timeout is valid only on the parent 'ready' block".to_string());
     }
-    let probe = match (&file.tcp, &file.http) {
-        (Some(tcp), None) => {
+    let probe = match (&file.tcp, &file.http, &file.exec) {
+        (Some(tcp), None, None) => {
             if tcp.host.is_empty() {
                 return fail("tcp host must not be empty".to_string());
             }
@@ -110,20 +107,14 @@ fn build_leaf(
                 port: tcp.port,
             }
         }
-        (None, Some(http)) => {
-            let (host, port, path) = parse_http_url(&http.url).map_err(|detail| {
-                ready_error(
-                    process_name,
-                    match child_index {
-                        Some(index) => format!("all child {index}: {detail}"),
-                        None => detail,
-                    },
-                )
-            })?;
+        (None, Some(http), None) => {
+            let (host, port, path) = parse_http_url(&http.url)
+                .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
             ReadinessProbe::Http { host, port, path }
         }
-        (Some(_), Some(_)) | (None, None) => {
-            return fail("define exactly one of 'tcp' or 'http'".to_string());
+        (None, None, Some(exec)) => build_exec_probe(process_name, exec, child_index, base_dir)?,
+        _ => {
+            return fail("define exactly one of 'tcp', 'http', or 'exec'".to_string());
         }
     };
     let initial_delay = duration_or_default(
@@ -170,6 +161,74 @@ fn ready_error(process_name: &str, detail: impl Into<String>) -> ConfigError {
     ConfigError {
         message: format!("Process '{process_name}': ready: {}", detail.into()),
     }
+}
+
+fn ready_error_for(
+    process_name: &str,
+    child_index: Option<usize>,
+    detail: impl Into<String>,
+) -> ConfigError {
+    let detail = detail.into();
+    let detail = child_index
+        .map(|index| format!("all child {index}: {detail}"))
+        .unwrap_or(detail);
+    ready_error(process_name, detail)
+}
+
+fn build_exec_probe(
+    process_name: &str,
+    file: &ExecFile,
+    child_index: Option<usize>,
+    base_dir: &Path,
+) -> Result<ReadinessProbe, ConfigError> {
+    let command = file.command.as_ref().ok_or_else(|| {
+        ready_error_for(
+            process_name,
+            child_index,
+            "exec requires a 'command' mapping",
+        )
+    })?;
+    let command = super::build_command_form(command)
+        .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
+    let working_dir = file
+        .working_dir
+        .as_deref()
+        .map(|directory| {
+            let path = PathBuf::from(directory);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            };
+            if path.is_dir() {
+                Ok(path)
+            } else {
+                Err(ready_error_for(
+                    process_name,
+                    child_index,
+                    format!("exec working directory '{}' does not exist", path.display()),
+                ))
+            }
+        })
+        .transpose()?;
+    let env = file
+        .env
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let success_exit_codes = super::build_success_exit_codes(file.success_exit_codes.clone())
+        .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
+    Ok(ReadinessProbe::Exec {
+        command,
+        working_dir,
+        env,
+        success_exit_codes,
+    })
 }
 
 fn duration_or_default(
@@ -299,6 +358,7 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 pub(super) struct ReadinessFile {
     tcp: Option<TcpProbeFile>,
     http: Option<HttpProbeFile>,
+    exec: Option<ExecFile>,
     all: Option<Vec<ReadinessFile>>,
     /// Parsed only to provide a clear unsupported-form diagnostic.
     any: Option<serde_yaml::Value>,
@@ -323,359 +383,15 @@ pub(super) struct HttpProbeFile {
     url: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::load;
-    use std::fs;
-
-    fn write_and_load(
-        label: &str,
-        yaml: &str,
-    ) -> Result<crate::model::EffectiveProject, ConfigError> {
-        let dir = std::env::temp_dir().join(format!("stackhand-config-readiness-{label}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("config directory creates");
-        let path = dir.join("stackhand.yaml");
-        fs::write(&path, yaml).expect("config writes");
-        let project = load(&path);
-        let _ = fs::remove_dir_all(&dir);
-        project
-    }
-
-    #[test]
-    fn http_readiness_parses_the_url_into_its_connect_target() {
-        let project = write_and_load(
-            "readiness-http-ok",
-            "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      http:\n        url: \"http://localhost:8080/healthz?probe=1\"\n",
-        )
-        .expect("valid http readiness");
-        let readiness = project.processes()[0]
-            .readiness
-            .clone()
-            .expect("readiness parses");
-        let check = &readiness.checks[0];
-        assert_eq!(
-            check.probe,
-            ReadinessProbe::Http {
-                host: "localhost".into(),
-                port: 8080,
-                path: "/healthz?probe=1".into(),
-            }
-        );
-        assert_eq!(check.interval, Duration::from_millis(1_000));
-        assert_eq!(check.timeout, Duration::from_millis(2_000));
-
-        // The default port and path come from the URL.
-        let bare = write_and_load(
-            "readiness-http-bare",
-            "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      http: {url: \"http://example.test\"}\n",
-        )
-        .expect("a bare http URL is valid");
-        let readiness = bare.processes()[0].readiness.clone().expect("parses");
-        assert_eq!(
-            readiness.checks[0].probe,
-            ReadinessProbe::Http {
-                host: "example.test".into(),
-                port: 80,
-                path: "/".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_http_readiness_urls_are_rejected_clearly() {
-        let base = "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      http: {url: \"";
-        let cases = [
-            ("https", "https://example.test/\"}"),
-            ("no scheme", "example.test/healthz\"}"),
-            ("no host", "http:///healthz\"}"),
-            ("bad port", "http://example.test:0/\"}"),
-            ("non-numeric port", "http://example.test:none/\"}"),
-            ("userinfo", "http://user@example.test/\"}"),
-            ("ipv6 literal", "http://[::1]:8080/\"}"),
-        ];
-        for (label, tail) in cases {
-            let error = write_and_load(label, &format!("{base}{tail}"))
-                .expect_err("an invalid URL must fail");
-            assert!(
-                error.message.contains("invalid http URL")
-                    || error.message.contains("not supported"),
-                "{label}: {}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn tcp_readiness_parses_with_bounded_defaults() {
-        let project = write_and_load(
-            "readiness-tcp-ok",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      tcp:\n        host: 127.0.0.1\n        port: 5432\n",
-        )
-        .expect("valid tcp readiness");
-        let readiness = project.processes()[0]
-            .readiness
-            .clone()
-            .expect("readiness parses");
-        let check = &readiness.checks[0];
-        assert_eq!(
-            check.probe,
-            ReadinessProbe::Tcp {
-                host: "127.0.0.1".into(),
-                port: 5432
-            }
-        );
-        assert_eq!(check.interval, Duration::from_millis(1_000));
-        assert_eq!(check.timeout, Duration::from_millis(2_000));
-    }
-
-    #[test]
-    fn tcp_readiness_accepts_common_fields_and_every_duration_unit() {
-        let project = write_and_load(
-            "readiness-tcp-fields",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      tcp: {host: localhost, port: 1}\n      initial_delay: 250ms\n      interval: 2s\n      timeout: 3m\n      success_threshold: 2\n      failure_threshold: 3\n      startup_timeout: 4h\n",
-        )
-        .expect("valid common readiness fields");
-        let readiness = project.processes()[0]
-            .readiness
-            .clone()
-            .expect("readiness parses");
-        let check = &readiness.checks[0];
-        assert_eq!(check.initial_delay, Duration::from_millis(250));
-        assert_eq!(check.interval, Duration::from_secs(2));
-        assert_eq!(check.timeout, Duration::from_secs(3 * 60));
-        assert_eq!(check.success_threshold, 2);
-        assert_eq!(check.failure_threshold, 3);
-        assert_eq!(
-            readiness.startup_timeout,
-            Some(Duration::from_secs(4 * 60 * 60))
-        );
-    }
-
-    #[test]
-    fn initial_delay_may_be_zero() {
-        let project = write_and_load(
-            "readiness-zero-delay",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      initial_delay: 0s\n",
-        )
-        .expect("zero initial delay is valid");
-        assert_eq!(
-            project.processes()[0]
-                .readiness
-                .as_ref()
-                .expect("readiness parses")
-                .checks[0]
-                .initial_delay,
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn invalid_readiness_values_are_rejected_clearly() {
-        let base = "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n";
-        let cases = [
-            ("zero interval", "      interval: 0s\n", "interval"),
-            ("zero timeout", "      timeout: 0s\n", "timeout"),
-            (
-                "zero startup timeout",
-                "      startup_timeout: 0s\n",
-                "startup_timeout",
-            ),
-            (
-                "zero success threshold",
-                "      success_threshold: 0\n",
-                "success_threshold",
-            ),
-            (
-                "zero failure threshold",
-                "      failure_threshold: 0\n",
-                "failure_threshold",
-            ),
-            ("duration without suffix", "      interval: 1\n", "suffix"),
-            ("negative duration", "      timeout: '-1s'\n", "nonnegative"),
-            (
-                "fractional duration",
-                "      timeout: 1.5s\n",
-                "whole number",
-            ),
-            (
-                "unknown scheduling field",
-                "      attempts: 1\n",
-                "unknown field",
-            ),
-            (
-                "unknown check field",
-                "      http: {url: 'http://h/', mode: fast}\n",
-                "unknown field",
-            ),
-            (
-                "both forms",
-                "      http: {url: 'http://h/'}\n",
-                "exactly one",
-            ),
-        ];
-        for (label, block, expected) in cases {
-            let error = write_and_load(label, &format!("{base}{block}"))
-                .expect_err("an invalid readiness block must fail");
-            assert!(
-                error.message.contains(expected),
-                "{label}: {}",
-                error.message
-            );
-        }
-        for (label, block, expected) in [
-            ("port zero", "      tcp: {host: h, port: 0}\n", "port"),
-            ("empty host", "      tcp: {host: '', port: 1}\n", "host"),
-            ("no form", "      tcp: null\n", "exactly one"),
-        ] {
-            let yaml = format!(
-                "version: 1\nprocesses:\n  - name: db\n    command: {{program: /bin/true}}\n    ready:\n{block}"
-            );
-            let error = write_and_load(label, &yaml).expect_err("the block must fail");
-            assert!(error.message.contains(expected), "{label}: {error}");
-        }
-    }
-
-    #[test]
-    fn duration_overflow_is_rejected() {
-        let error = write_and_load(
-            "readiness-duration-overflow",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      startup_timeout: 18446744073709551616h\n",
-        )
-        .expect_err("an overflowing duration must fail");
-        assert!(error.message.contains("overflows"), "{error}");
-    }
-
-    #[test]
-    fn removed_readiness_spellings_name_the_replacements() {
-        let old_block = write_and_load(
-            "removed-readiness-block",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    readiness:\n      tcp: {host: h, port: 1}\n",
-        )
-        .expect_err("the temporary block name must be rejected");
-        assert!(
-            old_block.message.contains("unknown field `readiness`"),
-            "{old_block}"
-        );
-        assert!(
-            old_block.message.contains("use `ready` instead"),
-            "{old_block}"
-        );
-
-        let old_interval = write_and_load(
-            "removed-interval-field",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      interval_ms: 1s\n",
-        )
-        .expect_err("interval_ms must be rejected");
-        assert!(
-            old_interval.message.contains("unknown field `interval_ms`"),
-            "{old_interval}"
-        );
-        assert!(
-            old_interval.message.contains("use `interval` instead"),
-            "{old_interval}"
-        );
-
-        let old_timeout = write_and_load(
-            "removed-timeout-field",
-            "version: 1\nprocesses:\n  - name: db\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: h, port: 1}\n      timeout_ms: 1s\n",
-        )
-        .expect_err("timeout_ms must be rejected");
-        assert!(
-            old_timeout.message.contains("unknown field `timeout_ms`"),
-            "{old_timeout}"
-        );
-        assert!(
-            old_timeout.message.contains("use `timeout` instead"),
-            "{old_timeout}"
-        );
-    }
-
-    #[test]
-    fn all_readiness_parses_independent_children_and_one_parent_deadline() {
-        let project = write_and_load(
-            "readiness-all-ok",
-            "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n          initial_delay: 250ms\n          interval: 2s\n          timeout: 3s\n          success_threshold: 2\n          failure_threshold: 3\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      startup_timeout: 1m\n",
-        )
-        .expect("valid all readiness");
-        let readiness = project.processes()[0]
-            .readiness
-            .as_ref()
-            .expect("readiness parses");
-        assert_eq!(readiness.checks.len(), 2);
-        assert_eq!(readiness.startup_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(
-            readiness.checks[0].initial_delay,
-            Duration::from_millis(250)
-        );
-        assert_eq!(readiness.checks[0].interval, Duration::from_secs(2));
-        assert_eq!(readiness.checks[0].timeout, Duration::from_secs(3));
-        assert_eq!(readiness.checks[0].success_threshold, 2);
-        assert_eq!(readiness.checks[0].failure_threshold, 3);
-        assert_eq!(
-            readiness.checks[1].probe,
-            ReadinessProbe::Http {
-                host: "example.test".into(),
-                port: 80,
-                path: "/health".into(),
-            }
-        );
-        assert_eq!(readiness.checks[1].initial_delay, Duration::from_millis(4));
-        assert_eq!(readiness.checks[1].interval, Duration::from_secs(5));
-        assert_eq!(readiness.checks[1].timeout, Duration::from_secs(6));
-    }
-
-    #[test]
-    fn all_readiness_rejects_invalid_composite_forms_clearly() {
-        let base = "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n";
-        let cases = [
-            ("empty", "      all: []\n", "at least two child checks"),
-            (
-                "one child",
-                "      all:\n        - tcp: {host: h, port: 1}\n",
-                "at least two child checks",
-            ),
-            (
-                "nested",
-                "      all:\n        - all:\n            - tcp: {host: h, port: 1}\n            - tcp: {host: h, port: 2}\n        - tcp: {host: h, port: 3}\n",
-                "nested 'all'",
-            ),
-            (
-                "any",
-                "      any:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n",
-                "'any' readiness form is not supported",
-            ),
-            (
-                "parent scheduling",
-                "      all:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n      interval: 1s\n",
-                "on each child",
-            ),
-        ];
-        for (label, block, expected) in cases {
-            let error = write_and_load(label, &format!("{base}{block}"))
-                .expect_err("an invalid all readiness block must fail");
-            assert!(error.message.contains(expected), "{label}: {error}");
-        }
-    }
-
-    #[test]
-    fn all_readiness_rejects_child_startup_deadlines() {
-        let error = write_and_load(
-            "readiness-all-child-timeout",
-            "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    ready:\n      all:\n        - tcp: {host: h, port: 1}\n          startup_timeout: 1s\n        - tcp: {host: h, port: 2}\n",
-        )
-        .expect_err("a child cannot own the composite startup deadline");
-        assert!(error.message.contains("parent 'ready' block"), "{error}");
-    }
-
-    #[test]
-    fn readiness_on_a_one_shot_is_rejected() {
-        let error = write_and_load(
-            "readiness-one-shot",
-            "version: 1\nprocesses:\n  - name: setup\n    kind: one-shot\n    command: {program: /bin/true}\n    ready:\n      tcp: {host: 127.0.0.1, port: 1}\n",
-        )
-        .expect_err("a One-shot must reject readiness");
-        assert!(error.message.contains("Services"), "{}", error.message);
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecFile {
+    command: Option<super::CommandFile>,
+    working_dir: Option<String>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+    success_exit_codes: Option<Vec<i32>>,
 }
+
+#[cfg(test)]
+#[path = "readiness_tests.rs"]
+mod tests;

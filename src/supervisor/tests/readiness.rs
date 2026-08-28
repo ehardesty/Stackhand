@@ -105,6 +105,52 @@ fn a_probed_service_stays_starting_until_its_probe_passes() {
 }
 
 #[test]
+fn exec_probe_intent_carries_process_context_and_has_its_own_snapshot_kind() {
+    let mut process = probed_service("api");
+    process.working_dir = std::path::PathBuf::from("/tmp");
+    process.env = vec![("BASE".into(), "process".into())];
+    process.readiness.as_mut().expect("readiness exists").checks[0].probe = ReadinessProbe::Exec {
+        command: CommandForm::Shell {
+            text: "test \"$CHECK\" = probe".to_string(),
+        },
+        working_dir: Some(std::path::PathBuf::from("/var/empty")),
+        env: vec![("CHECK".into(), "probe".into())],
+        success_exit_codes: vec![0, 2],
+    };
+    let project = EffectiveProject::with_shell(
+        vec![process],
+        ShellConfig {
+            program: "/bin/bash".into(),
+            args: vec!["-c".into()],
+        },
+    )
+    .expect("exec readiness project is valid");
+    let mut h = Harness::new(project);
+    start_probed(&mut h);
+    h.advance_and_poll(Duration::ZERO);
+
+    let request = h
+        .probes
+        .requests()
+        .into_iter()
+        .next()
+        .expect("exec attempt exists");
+    assert!(matches!(request.probe, ReadinessProbe::Exec { .. }));
+    let context = request.exec_context.expect("exec context is attached");
+    assert_eq!(context.working_dir, std::path::PathBuf::from("/tmp"));
+    assert_eq!(context.env, vec![("BASE".into(), "process".into())]);
+    assert_eq!(context.shell.program, std::ffi::OsString::from("/bin/bash"));
+    assert_eq!(context.shell.args, vec![std::ffi::OsString::from("-c")]);
+    assert_eq!(
+        h.process("api")
+            .readiness
+            .expect("readiness is visible")
+            .kind,
+        ReadinessCheckKind::Exec
+    );
+}
+
+#[test]
 fn initial_delay_defers_the_first_readiness_attempt() {
     let mut h = Harness::new(configured_readiness_project(Duration::from_secs(1), 1, 1));
     start_probed(&mut h);

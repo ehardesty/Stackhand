@@ -7,10 +7,11 @@
 //! widens the external Supervisor interface.
 
 use crossbeam_channel::Sender;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::geometry::TerminalGeometry;
-use crate::model::ReadinessProbe;
+use crate::model::{ReadinessProbe, ShellConfig};
 use crate::runtime::{OsPid, ProcessId, RunId};
 use crate::supervisor::FailureKind;
 
@@ -194,6 +195,16 @@ pub(crate) trait RunSeam: Send {
     );
 }
 
+/// Process context needed to resolve one exec readiness command. The
+/// readiness configuration stores only validated overrides; the Supervisor
+/// supplies the current Process context when it dispatches an attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecContext {
+    pub(crate) working_dir: PathBuf,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) shell: ShellConfig,
+}
+
 /// One request for exactly one bounded readiness attempt. The Supervisor
 /// dispatches at most one attempt at a time per child; the adapter performs
 /// each one off the control task and reports exactly one
@@ -206,6 +217,7 @@ pub struct ProbeIntent {
     pub attempt_id: AttemptId,
     pub probe: ReadinessProbe,
     pub timeout: Duration,
+    pub(crate) exec_context: Option<ExecContext>,
 }
 
 /// The readiness seam. Implementations own network waits so they never run

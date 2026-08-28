@@ -28,6 +28,7 @@ mod clock;
 mod command;
 mod core;
 mod events;
+mod exec;
 mod probe;
 mod readiness;
 mod runtime;

@@ -5,7 +5,6 @@
 //! snapshots — the same surface the serializing task wrapper drives.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -388,15 +387,7 @@ impl Core {
         let spec = &self.project.processes()[index];
         // Shell command text reaches the child through the Project's
         // configured launcher; direct commands never gain shell parsing.
-        let (program, args) = match &spec.command {
-            crate::model::CommandForm::Direct { program, args } => (program.clone(), args.clone()),
-            crate::model::CommandForm::Shell { text } => {
-                let shell = self.project.shell();
-                let mut args = shell.args.clone();
-                args.push(OsString::from(text));
-                (shell.program.clone(), args)
-            }
-        };
+        let (program, args) = spec.command.resolve(self.project.shell());
         StartIntent {
             process_id: self.entries[index].process_id,
             run_id,
