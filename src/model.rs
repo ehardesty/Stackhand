@@ -90,8 +90,11 @@ pub enum DependencyCondition {
     /// The dependency Service has an active Run whose readiness probe has
     /// passed. Valid only when the dependency Process is a Service.
     Ready,
-    /// The dependency One-shot's latest completed Run exited with code zero.
+    /// The dependency One-shot's latest scheduled Run has ended.
     /// Valid only when the dependency Process is a One-shot.
+    Exited,
+    /// The dependency One-shot's latest completed Run exited with an accepted
+    /// success code. Valid only when the dependency Process is a One-shot.
     CompletedSuccessfully,
 }
 
@@ -101,6 +104,7 @@ impl DependencyCondition {
         match self {
             Self::Started => "started",
             Self::Ready => "ready",
+            Self::Exited => "exited",
             Self::CompletedSuccessfully => "completed_successfully",
         }
     }
@@ -157,6 +161,8 @@ pub struct ProcessSpec {
     pub kind: ProcessKind,
     pub enabled: Enabled,
     pub autostart: Autostart,
+    /// Exit codes that count as success for a One-shot Run.
+    pub success_exit_codes: Vec<i32>,
     pub command: CommandForm,
     /// Absolute working directory. Relative paths are resolved by
     /// configuration before this model exists.
@@ -184,8 +190,9 @@ pub enum ProjectError {
         dependency: String,
     },
     /// A Dependency condition is not valid for the dependency Process's
-    /// kind; only One-shot dependencies support `completed_successfully`
-    /// and only Service dependencies support `ready`.
+    /// kind; only One-shot dependencies support `exited` and
+    /// `completed_successfully`, and only Service dependencies support
+    /// `ready`.
     InvalidCondition {
         process: String,
         dependency: String,
@@ -267,7 +274,7 @@ impl EffectiveProject {
                     });
                 };
                 let condition_kind_mismatch = match dependency.condition {
-                    DependencyCondition::CompletedSuccessfully => {
+                    DependencyCondition::Exited | DependencyCondition::CompletedSuccessfully => {
                         processes[dependency_index].kind == ProcessKind::Service
                     }
                     DependencyCondition::Ready => {
@@ -397,6 +404,7 @@ mod tests {
             kind: ProcessKind::Service,
             enabled: Enabled::Yes,
             autostart: Autostart::No,
+            success_exit_codes: vec![0],
             command: CommandForm::Direct {
                 program: "sleep".into(),
                 args: vec!["1".into()],

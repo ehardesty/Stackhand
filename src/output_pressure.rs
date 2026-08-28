@@ -42,6 +42,7 @@ fn noisy_process(name: &str) -> ProcessSpec {
         kind: ProcessKind::Service,
         enabled: Enabled::Yes,
         autostart: Autostart::Yes,
+        success_exit_codes: vec![0],
         command: CommandForm::Direct {
             program: "yes".into(),
             args: vec!["stackhand-noise".into()],
@@ -66,6 +67,7 @@ fn quiet_process(name: &str, autostart: bool) -> ProcessSpec {
         } else {
             Autostart::No
         },
+        success_exit_codes: vec![0],
         command: CommandForm::Direct {
             program: "/bin/sleep".into(),
             args: vec!["60".into()],

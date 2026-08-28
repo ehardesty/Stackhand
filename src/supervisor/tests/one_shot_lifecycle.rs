@@ -96,6 +96,134 @@ fn non_zero_exit_fails_and_keeps_the_dependent_blocked_with_a_reason() {
 }
 
 #[test]
+fn an_accepted_nonzero_exit_code_completes_and_is_retained() {
+    let mut setup = simple("api", ProcessKind::OneShot, Enabled::Yes, Autostart::No);
+    setup.success_exit_codes = vec![42];
+    let mut h = Harness::new(EffectiveProject::new(vec![setup]).expect("unique names"));
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 1));
+    h.event(finished("api", 1, Some(42)));
+
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Done);
+    assert_eq!(api.failure, None);
+    assert_eq!(api.recent_runs[0].exit, RunExitDisposition::Success);
+    assert_eq!(api.recent_runs[0].exit_code, Some(42));
+}
+
+#[test]
+fn a_terminating_one_shot_result_never_matches_success_exit_codes() {
+    let mut h = Harness::new(
+        EffectiveProject::new(vec![simple(
+            "api",
+            ProcessKind::OneShot,
+            Enabled::Yes,
+            Autostart::No,
+        )])
+        .expect("unique names"),
+    );
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 1));
+    h.event(finished("api", 1, None));
+
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Stopped);
+    assert!(api.failure.is_some());
+    assert_eq!(api.recent_runs[0].exit_code, None);
+}
+
+#[test]
+fn a_spawn_failed_one_shot_releases_an_exited_dependent() {
+    let project = EffectiveProject::new(vec![
+        depending_exited_on("api", &["setup"]),
+        simple("setup", ProcessKind::OneShot, Enabled::Yes, Autostart::No),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    h.event(SeamEvent::Failed {
+        process_id: ProcessId::new(pair_index("setup")),
+        run_id: RunId::new(1),
+        kind: FailureKind::Spawn,
+        detail: "spawn failed".to_string(),
+    });
+
+    assert_eq!(h.process("setup").lifecycle, Lifecycle::Stopped);
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Starting);
+}
+
+#[test]
+fn an_exited_one_shot_releases_a_dependent_after_failure() {
+    let project = EffectiveProject::new(vec![
+        depending_exited_on("api", &["setup"]),
+        simple("setup", ProcessKind::OneShot, Enabled::Yes, Autostart::No),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Waiting);
+    h.event(pair_spawned("setup", 1));
+    h.event(pair_finished("setup", 1, Some(7)));
+
+    let setup = h.process("setup");
+    assert_eq!(setup.lifecycle, Lifecycle::Stopped);
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Starting);
+    assert_eq!(api.current_run, Some(1));
+}
+
+#[test]
+fn rerunning_a_one_shot_invalidates_its_exited_condition() {
+    let project = EffectiveProject::new(vec![
+        depending_exited_on("api", &["setup"]),
+        simple("setup", ProcessKind::OneShot, Enabled::Yes, Autostart::No),
+        depending_exited_on("worker", &["setup"]),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    h.event(pair_spawned("setup", 1));
+    h.event(pair_finished("setup", 1, Some(7)));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Starting);
+
+    h.command(Command::Restart("setup".into()));
+    assert_eq!(h.process("setup").current_run, Some(2));
+    h.command(Command::Start("worker".into()));
+    let worker = h.process("worker");
+    assert_eq!(worker.lifecycle, Lifecycle::Waiting);
+    assert_eq!(worker.blocked_reason.as_deref(), Some("setup: exited"));
+
+    h.event(pair_spawned("setup", 2));
+    h.event(pair_finished("setup", 2, Some(7)));
+    assert_eq!(h.process("worker").lifecycle, Lifecycle::Starting);
+}
+
+#[test]
+fn an_unexpected_service_exit_keeps_desired_running_without_restarting() {
+    let mut h = Harness::new(four_process_project());
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 1));
+    h.event(finished("api", 1, Some(7)));
+
+    let api = h.process("api");
+    assert_eq!(api.lifecycle, Lifecycle::Stopped);
+    assert_eq!(api.desired, DesiredState::Running);
+    assert_eq!(
+        api.failure.as_ref().expect("failure is visible").detail,
+        "exited unexpectedly with code 7"
+    );
+    assert_eq!(api.current_run, None);
+    assert_eq!(
+        h.runtime
+            .intents()
+            .iter()
+            .filter(|intent| matches!(intent, Intent::Start { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn done_persists_across_evaluations_stops_and_a_manual_restart() {
     let mut h = Harness::new(one_shot_project());
     h.command(Command::Start("api".into()));
@@ -144,7 +272,9 @@ fn service_natural_exit_shows_stopped_with_failure_never_done() {
         api.failure.as_ref().expect("failure is visible").detail,
         "exited unexpectedly with code 0"
     );
-    assert_eq!(api.desired, DesiredState::Stopped);
+    // Desired State remains Running so a later restart policy can make an
+    // explicit decision; the baseline does not start a replacement Run.
+    assert_eq!(api.desired, DesiredState::Running);
 
     assert_eq!(api.current_run, None);
     assert!(api.failure.is_some());

@@ -24,6 +24,7 @@ fn one_shot_project(command: CommandForm) -> EffectiveProject {
         kind: ProcessKind::OneShot,
         enabled: Enabled::Yes,
         autostart: Autostart::No,
+        success_exit_codes: vec![0],
         command,
         working_dir: std::env::temp_dir(),
         env: Vec::new(),

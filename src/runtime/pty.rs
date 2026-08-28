@@ -75,20 +75,6 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
-    /// Whether the root process has exited, with its exit code when the
-    /// platform reports one. Does not consume the child handle. Used by the
-    /// Run owner's natural-exit wait.
-    #[allow(dead_code)]
-    pub(crate) fn try_wait(&mut self) -> Result<Option<i32>> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let status = child
-            .try_wait()
-            .context("could not poll the process exit state")?;
-        Ok(status.map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX)))
-    }
-
     /// Reap only after the caller has observed root exit without reaping and
     /// Process Tree work is complete. The poll is bounded and never calls the
     /// blocking child wait when the deadline has passed.
@@ -99,9 +85,9 @@ impl PtyProcess {
             };
             match child.try_wait()? {
                 Some(status) => {
-                    let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
+                    let code = reported_exit_code(&status);
                     let _ = self.child.take();
-                    return Ok(Some(code));
+                    return Ok(code);
                 }
                 None if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(2));
@@ -199,8 +185,15 @@ impl PtyProcess {
             child.kill().context("could not stop the shell")?;
         }
         let status = child.wait().context("could not wait for the shell")?;
-        Ok(Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)))
+        Ok(reported_exit_code(&status))
     }
+}
+
+fn reported_exit_code(status: &portable_pty::ExitStatus) -> Option<i32> {
+    status
+        .signal()
+        .is_none()
+        .then(|| i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
 }
 
 impl Drop for PtyProcess {
@@ -231,4 +224,21 @@ fn pty_size(geometry: TerminalGeometry) -> PtySize {
 
 fn display_program(program: &OsStr) -> String {
     program.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminating_signal_has_no_success_exit_code() {
+        assert_eq!(
+            reported_exit_code(&portable_pty::ExitStatus::with_signal("SIGINT")),
+            None
+        );
+        assert_eq!(
+            reported_exit_code(&portable_pty::ExitStatus::with_exit_code(42)),
+            Some(42)
+        );
+    }
 }

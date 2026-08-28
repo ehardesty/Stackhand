@@ -6,6 +6,10 @@
 
 mod readiness;
 
+#[cfg(test)]
+mod exit_tests;
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -15,6 +19,8 @@ use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
     InputPolicy, ProcessKind, ProcessSpec, ShellConfig, TerminalMode,
 };
+
+const MAX_EXIT_CODE: i32 = 255;
 
 /// Load and validate the Project at `path`. Relative working directories
 /// resolve from the configuration file's directory.
@@ -52,7 +58,7 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
             dependency,
             condition,
         } => config_error(anyhow::anyhow!(
-            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'completed_successfully' is valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
+            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'exited' and 'completed_successfully' are valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
         )),
         crate::model::ProjectError::ReadinessOnOneShot { process } => config_error(
             anyhow::anyhow!(
@@ -132,6 +138,38 @@ fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigErr
         program: std::ffi::OsString::from(&shell.program),
         args: args.into_iter().map(std::ffi::OsString::from).collect(),
     })
+}
+
+fn build_success_exit_codes(
+    process_name: &str,
+    configured: Option<Vec<i32>>,
+) -> Result<Vec<i32>, ConfigError> {
+    let codes = configured.unwrap_or_else(|| vec![0]);
+    if codes.is_empty() {
+        return Err(ConfigError {
+            message: format!(
+                "Process '{process_name}': success_exit_codes must contain at least one exit code"
+            ),
+        });
+    }
+    let mut seen = HashSet::with_capacity(codes.len());
+    for code in &codes {
+        if !(0..=MAX_EXIT_CODE).contains(code) {
+            return Err(ConfigError {
+                message: format!(
+                    "Process '{process_name}': success_exit_codes values must be unique exit codes from 0 through {MAX_EXIT_CODE}"
+                ),
+            });
+        }
+        if !seen.insert(*code) {
+            return Err(ConfigError {
+                message: format!(
+                    "Process '{process_name}': success_exit_codes values must be unique; {code} is repeated"
+                ),
+            });
+        }
+    }
+    Ok(codes)
 }
 
 fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, ConfigError> {
@@ -219,11 +257,13 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
         None => None,
         Some(file) => Some(readiness::build_readiness(&name, file)?),
     };
+    let success_exit_codes = build_success_exit_codes(&name, process.success_exit_codes.clone())?;
     Ok(ProcessSpec {
         name,
         kind,
         enabled: Enabled::flag(process.enabled.unwrap_or(true)),
         autostart: Autostart::flag(process.autostart.unwrap_or(true)),
+        success_exit_codes,
         command: command_form,
         working_dir,
         env: process
@@ -289,12 +329,13 @@ fn build_dependency(
         Some("started") => DependencyCondition::Started,
         Some("ready") => DependencyCondition::Ready,
         // Kind honesty is enforced later against the full Process list: a
-        // One-shot dependency supports `completed_successfully`, a Service
-        // dependency supports `ready`.
+        // One-shot dependency supports `exited` and
+        // `completed_successfully`, a Service dependency supports `ready`.
+        Some("exited") => DependencyCondition::Exited,
         Some("completed_successfully") => DependencyCondition::CompletedSuccessfully,
         Some(other) => {
             return fail(format!(
-                "unsupported condition '{other}' (this Stackhand supports 'started', 'ready', and 'completed_successfully')"
+                "unsupported condition '{other}' (this Stackhand supports 'started', 'ready', 'exited', and 'completed_successfully')"
             ));
         }
     };
@@ -334,6 +375,7 @@ struct ProcessFile {
     env: Option<std::collections::BTreeMap<String, String>>,
     terminal: Option<String>,
     input: Option<String>,
+    success_exit_codes: Option<Vec<i32>>,
     depends_on: Option<Vec<serde_yaml::Value>>,
     ready: Option<readiness::ReadinessFile>,
     command: CommandFile,
@@ -405,6 +447,7 @@ mod tests {
         assert_eq!(web.kind, ProcessKind::Service);
         assert_eq!(web.enabled, Enabled::Yes);
         assert_eq!(web.autostart, Autostart::Yes);
+        assert_eq!(web.success_exit_codes, vec![0]);
         assert_eq!(web.terminal_mode, TerminalMode::Pipe);
         assert_eq!(web.input_policy, InputPolicy::Disabled);
     }

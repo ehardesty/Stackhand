@@ -119,8 +119,14 @@ impl Core {
             SeamEvent::Finished(finished) => self.apply_finished_run(index, finished),
             SeamEvent::Failed { kind, detail, .. } => {
                 self.cancel_run_work(index);
+                let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
                 let now_ms = self.now_ms();
                 let entry = &mut self.entries[index];
+                if one_shot {
+                    // A spawn failure still ends the scheduled One-shot Run;
+                    // `exited` does not require successful process creation.
+                    entry.exited = true;
+                }
                 entry.failure = Some(FailureSummary { kind, detail });
                 // A failed adapter report ends the Run identity and reverts
                 // the Process to stopped so it can be started again.
@@ -198,6 +204,9 @@ impl Core {
             return;
         }
 
+        if self.project.processes()[index].kind == ProcessKind::OneShot {
+            entry.exited = true;
+        }
         entry.record_finished_run(now_ms, finished.exit_code, finished.intentional_stop);
         entry.current_run = None;
         entry.root_pid = None;
@@ -213,35 +222,36 @@ impl Core {
     }
 
     /// Project one One-shot Run result into its terminal lifecycle state.
-    /// Exit code zero completes the One-shot; every other exit fails it.
-    /// Either way Desired State reverts to Stopped: restarting is manual
-    /// until automatic restart policy work lands.
+    /// Only a configured exit code completes the One-shot; a missing code or
+    /// any other code fails it. Desired State reverts to Stopped either way.
     fn complete_one_shot(&mut self, index: usize, code: Option<i32>) {
+        let success = code.is_some_and(|code| {
+            self.project.processes()[index]
+                .success_exit_codes
+                .contains(&code)
+        });
         let entry = &mut self.entries[index];
-        match code {
-            Some(0) => {
-                entry.lifecycle = super::core::Lifecycle::Done;
-                entry.failure = None;
-            }
-            other => {
-                entry.lifecycle = super::core::Lifecycle::Running;
-                entry.failure = Some(FailureSummary {
-                    kind: FailureKind::ProcessExit,
-                    detail: match other {
-                        Some(exit_code) => format!("exited with code {exit_code}"),
-                        None => "exited without an exit code".to_string(),
-                    },
-                });
-            }
+        if success {
+            entry.lifecycle = super::core::Lifecycle::Done;
+            entry.failure = None;
+        } else {
+            entry.lifecycle = super::core::Lifecycle::Stopped;
+            entry.failure = Some(FailureSummary {
+                kind: FailureKind::ProcessExit,
+                detail: match code {
+                    Some(exit_code) => format!("exited with code {exit_code}"),
+                    None => "exited without an exit code".to_string(),
+                },
+            });
         }
         entry.desired = super::core::DesiredState::Stopped;
         entry.blocked = None;
     }
 
     /// Record a Service's unexpected natural result. The Run identity stays
-    /// occupied until the finished fact confirms cleanup. Desired State reverts
-    /// to Stopped so the Supervisor never silently crash-loops; automatic
-    /// restart policy is later milestone work.
+    /// occupied until the finished fact confirms cleanup. Desired State stays
+    /// Running so later restart policy can make an explicit decision; until
+    /// then the scheduler waits for a manual start or restart.
     fn observe_service_exit(&mut self, index: usize, code: Option<i32>) {
         let entry = &mut self.entries[index];
         if entry.desired == super::core::DesiredState::Running {
@@ -252,7 +262,7 @@ impl Core {
                     None => "exited unexpectedly".to_string(),
                 },
             });
-            entry.desired = super::core::DesiredState::Stopped;
+            entry.awaiting_manual_restart = true;
             entry.blocked = None;
         }
     }

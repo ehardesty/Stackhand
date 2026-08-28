@@ -23,6 +23,10 @@ impl Core {
         if !self.is_enabled(index) {
             return;
         }
+        if trigger == RunTrigger::Manual {
+            self.entries[index].awaiting_manual_restart = false;
+            self.entries[index].exited = false;
+        }
         self.require_running(index, trigger);
         self.evaluate();
     }
@@ -37,6 +41,8 @@ impl Core {
             return;
         }
         self.entries[index].pending_trigger = trigger;
+        self.entries[index].awaiting_manual_restart = false;
+        self.entries[index].exited = false;
         self.require_running(index, trigger);
         let entry = &mut self.entries[index];
         if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
@@ -92,7 +98,10 @@ impl Core {
     fn begin_desired_run(&mut self, index: usize) {
         let now_ms = self.now_ms();
         let entry = &mut self.entries[index];
-        if entry.current_run.is_some() || entry.desired != DesiredState::Running {
+        if entry.current_run.is_some()
+            || entry.desired != DesiredState::Running
+            || entry.awaiting_manual_restart
+        {
             return;
         }
         let run_id = RunId::new(entry.next_run);
@@ -101,6 +110,8 @@ impl Core {
         entry.lifecycle = Lifecycle::Starting;
         entry.failure = None;
         entry.metrics = None;
+        entry.exited = false;
+        entry.awaiting_manual_restart = false;
         entry.run_cancelled = false;
         entry.blocked = None;
         // Starting is the immediate invalidation of an earlier successful
@@ -146,6 +157,7 @@ impl Core {
         match condition {
             DependencyCondition::Started => self.started_condition_satisfied(index),
             DependencyCondition::Ready => self.ready_condition_satisfied(index),
+            DependencyCondition::Exited => self.exited_condition_satisfied(index),
             DependencyCondition::CompletedSuccessfully => self.completed_condition_satisfied(index),
         }
     }
@@ -165,6 +177,13 @@ impl Core {
     fn ready_condition_satisfied(&self, index: usize) -> bool {
         let entry = &self.entries[index];
         entry.current_run.is_some() && entry.lifecycle == Lifecycle::Running
+    }
+
+    /// `exited` holds after the latest scheduled One-shot Run completes its
+    /// cleanup, whether its exit succeeded or failed. Starting a later Run
+    /// immediately clears the condition.
+    fn exited_condition_satisfied(&self, index: usize) -> bool {
+        self.entries[index].exited
     }
 
     /// `completed_successfully` holds while the dependency's authoritative

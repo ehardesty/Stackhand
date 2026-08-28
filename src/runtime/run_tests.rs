@@ -608,7 +608,9 @@ wait";
 
         run.interrupt().expect("tree interrupt through PTY seam");
         let exit = run.wait().expect("PTY root exited after interrupt");
-        assert_ne!(exit.exit_code, None);
+        // A PTY signal is not an operating-system exit code and must never
+        // match a configured One-shot success code.
+        assert_eq!(exit.exit_code, None);
         run.shutdown().expect("cleanup joins terminal tasks");
         assert!(pids_alive(&[root.get()]).is_empty());
     }

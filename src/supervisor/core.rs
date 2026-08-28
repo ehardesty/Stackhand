@@ -44,8 +44,8 @@ pub enum Lifecycle {
     Stopping,
     /// No current Run remains after a stop or exit.
     Stopped,
-    /// A One-shot Run completed with exit code zero. Done survives like a
-    /// satisfied Dependency condition until a new Run starts.
+    /// A One-shot Run completed with an accepted success exit code. Done
+    /// survives like a satisfied Dependency condition until a new Run starts.
     Done,
 }
 
@@ -79,6 +79,8 @@ pub struct RunSummary {
     /// Milliseconds after session start when the Run ended.
     pub ended_at_ms: u64,
     pub exit: RunExitDisposition,
+    /// The raw operating-system exit code, when one was reported.
+    pub exit_code: Option<i32>,
     /// Whether a user stop intentionally ended the Run.
     pub intentional_stop: bool,
     /// The bounded failure reason, present when the Run did not complete.
@@ -191,6 +193,11 @@ pub(super) struct Entry {
     pub(super) run_trigger: RunTrigger,
     /// The spawned root PID of the current Run, when observed.
     pub(super) root_pid: Option<u32>,
+    /// True after a One-shot Run has ended and its cleanup is confirmed.
+    pub(super) exited: bool,
+    /// A naturally ended Service stays desired-running but waits for an
+    /// explicit start or restart until automatic restart policy exists.
+    pub(super) awaiting_manual_restart: bool,
     /// Work identities allocated for this Process. They are monotonic across
     /// Runs so a late result cannot become current through reuse.
     pub(super) next_work_id: u64,
@@ -217,6 +224,8 @@ impl Entry {
             pending_trigger: RunTrigger::Dependency,
             run_trigger: RunTrigger::Dependency,
             root_pid: None,
+            exited: false,
+            awaiting_manual_restart: false,
             next_work_id: 1,
             run_cancelled: false,
         }
@@ -258,6 +267,7 @@ impl Entry {
             started_at_ms,
             ended_at_ms: now_ms,
             exit,
+            exit_code,
             intentional_stop,
             failure,
             trigger: self.run_trigger,

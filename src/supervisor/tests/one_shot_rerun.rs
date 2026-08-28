@@ -180,6 +180,7 @@ fn a_bounded_recent_run_summary_records_attempts() {
             started_at_ms: recent[0].started_at_ms,
             ended_at_ms: recent[0].ended_at_ms,
             exit: RunExitDisposition::Failed { code: Some(5) },
+            exit_code: Some(5),
             intentional_stop: false,
             failure: Some("exited with code 5".to_string()),
             trigger: RunTrigger::Rerun,

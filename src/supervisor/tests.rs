@@ -8,7 +8,10 @@ use std::time::Duration;
 use super::ProjectSnapshot;
 use super::seam::{AttemptId, FinishedRun, WorkId};
 use super::support::{FakeClock, FakeProbes, FakeRuntime, Intent};
-use super::{Command, Core, DesiredState, Lifecycle, ProcessSnapshot, SeamEvent, SeamSender};
+use super::{
+    Command, Core, DesiredState, FailureKind, Lifecycle, ProcessSnapshot, RunExitDisposition,
+    SeamEvent, SeamSender,
+};
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
     ProcessKind, ProcessSpec, ReadinessConfig, ReadinessProbe, ShellConfig, TerminalMode,
@@ -26,6 +29,7 @@ fn simple(name: &str, kind: ProcessKind, enabled: Enabled, autostart: Autostart)
         kind,
         enabled,
         autostart,
+        success_exit_codes: vec![0],
         command: CommandForm::Direct {
             program: "sleep".into(),
             args: vec!["1".into()],
@@ -89,6 +93,15 @@ fn depending_completed_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
     let mut spec = depending_on(name, dependencies);
     for dependency in &mut spec.dependencies {
         dependency.condition = DependencyCondition::CompletedSuccessfully;
+    }
+    spec
+}
+
+/// A Process that starts after a One-shot ends, regardless of its exit result.
+fn depending_exited_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
+    let mut spec = depending_on(name, dependencies);
+    for dependency in &mut spec.dependencies {
+        dependency.condition = DependencyCondition::Exited;
     }
     spec
 }
