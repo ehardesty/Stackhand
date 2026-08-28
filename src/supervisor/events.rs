@@ -64,6 +64,12 @@ impl Core {
         }
         match event {
             SeamEvent::Spawned { root_pid, .. } => {
+                if self.entries[index].spawned {
+                    // A Run has one authoritative spawn fact. Repeated
+                    // callbacks must not overwrite its PID or reinitialize
+                    // Run-scoped work.
+                    return;
+                }
                 let now = self.clock.now();
                 let initialize_readiness = self.entries[index].lifecycle
                     == super::core::Lifecycle::Starting
@@ -382,7 +388,7 @@ impl Core {
                 if intentional_stop {
                     return None;
                 }
-                let failed = self.service_or_one_shot_exit_failed(index, exit_code);
+                let failed = !self.exit_code_succeeds(index, exit_code);
                 match policy {
                     RestartPolicy::Never => None,
                     RestartPolicy::OnFailure => failed.then_some(RestartReason::FailedRun),
@@ -429,10 +435,6 @@ impl Core {
             self.entries[index].restart_suppressed = false;
         }
         self.evaluate();
-    }
-
-    fn service_or_one_shot_exit_failed(&self, index: usize, code: Option<i32>) -> bool {
-        !self.exit_code_succeeds(index, code)
     }
 
     /// Apply the Process's configured exit-code policy consistently to every

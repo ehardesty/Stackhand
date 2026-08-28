@@ -4,307 +4,33 @@
 //! Supervisor.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
 use crate::runtime::{
-    LiveLogMatcher, LogPattern, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind,
-    RunId as RuntimeRunId, RunMode, RunOutputObserver, RunOutputReceiver, RunRuntime,
-    RunStartRequest, SpawnCommand, TerminalHandle, root_exit_pending,
+    LiveLogMatcher, LogPattern, OsPid, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId,
+    RunMode, RunOutputObserver, RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand,
+    root_exit_pending,
 };
 use crate::supervisor::FailureKind;
 use crate::supervisor::seam::{
     AttemptId, FinishedRun, LogMatcherIntent, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId,
 };
-use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 
-/// Identifies one active Run inside the adapter.
-type RunKey = (u32, u64);
-type RunRegistry = Arc<Mutex<HashMap<RunKey, Arc<RunRecord>>>>;
+use super::consoles::Consoles;
+#[cfg(test)]
+use super::run_record::{AdapterTestHooks, TestPause};
+use super::run_record::{FinishCause, RunKey, RunRecord, RunRegistry};
 
-/// How often a Run owner polls for natural exit and low-volume events.
-const OWNER_POLL: Duration = Duration::from_millis(50);
 /// How often a retained-output drain polls for the Run's output channel
 /// closing; output chunks themselves arrive without waiting for this.
 const OUTPUT_DRAIN_POLL: Duration = Duration::from_millis(50);
 const METRICS_INTERVAL: Duration = Duration::from_secs(2);
-
-#[cfg(test)]
-#[derive(Clone, Default)]
-struct AdapterTestHooks {
-    after_spawn: Option<TestPause>,
-    after_finished: Option<TestPause>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct TestPause {
-    reached: Arc<std::sync::Barrier>,
-    resume: Arc<std::sync::Barrier>,
-}
-
-#[cfg(test)]
-impl TestPause {
-    fn new() -> Self {
-        Self {
-            reached: Arc::new(std::sync::Barrier::new(2)),
-            resume: Arc::new(std::sync::Barrier::new(2)),
-        }
-    }
-
-    fn pause_worker(&self) {
-        self.reached.wait();
-        self.resume.wait();
-    }
-
-    fn wait_until_reached(&self) {
-        self.reached.wait();
-    }
-
-    fn resume(&self) {
-        self.resume.wait();
-    }
-}
-
-#[derive(Clone, Copy)]
-struct StopRequest {
-    remaining: Option<Duration>,
-}
-
-#[derive(Clone, Copy)]
-enum FinishCause {
-    Natural,
-    Stop(StopRequest),
-}
-
-impl FinishCause {
-    fn intentional_stop(self) -> bool {
-        matches!(self, Self::Stop(_))
-    }
-}
-
-/// One serialized ownership protocol for a Run from synchronous reservation
-/// through confirmed cleanup. The Run stays in exactly one phase. Stop,
-/// natural exit, terminal access, and Project deadline updates all use this
-/// record instead of competing map removals or a second completion registry.
-enum RunState {
-    Spawning,
-    StopBeforeSpawn(StopRequest),
-    Active(OwnedRun),
-    Pending { run: OwnedRun, cause: FinishCause },
-    Finishing,
-    Unconfirmed(OwnedRun),
-    Finished,
-}
-
-struct RunCoordination {
-    state: RunState,
-    project_deadline: Option<Instant>,
-}
-
-struct RunRecord {
-    coordination: Mutex<RunCoordination>,
-    wake: Condvar,
-    /// Closes terminal access and auxiliary observations as soon as the
-    /// Supervisor replaces or stops this Run. Process cleanup and the
-    /// bounded output drain remain owned by `OwnedRun`.
-    cancelled: Arc<AtomicBool>,
-    /// The output observer is retained so the Supervisor can arm fresh
-    /// liveness log windows after the Run has spawned.
-    log_matcher: Mutex<Option<Arc<LiveLogMatcher>>>,
-    #[cfg(test)]
-    test_hooks: AdapterTestHooks,
-}
-
-impl RunRecord {
-    fn spawning() -> Self {
-        Self {
-            coordination: Mutex::new(RunCoordination {
-                state: RunState::Spawning,
-                project_deadline: None,
-            }),
-            wake: Condvar::new(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            log_matcher: Mutex::new(None),
-            #[cfg(test)]
-            test_hooks: AdapterTestHooks::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn spawning_with_test_hooks(test_hooks: AdapterTestHooks) -> Self {
-        Self {
-            test_hooks,
-            ..Self::spawning()
-        }
-    }
-
-    fn set_log_matcher(&self, matcher: Option<Arc<LiveLogMatcher>>) {
-        *self
-            .log_matcher
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = matcher;
-    }
-
-    fn arm_log_matcher(&self, matcher: LogMatcherIntent) {
-        let live_matcher = self
-            .log_matcher
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let Some(live_matcher) = live_matcher else {
-            return;
-        };
-        live_matcher
-            .replace(LogPattern {
-                key: matcher.work_id.get(),
-                contains: matcher.contains,
-                attempt_id: matcher.attempt_id.map(AttemptId::get),
-            })
-            .expect("validated log liveness patterns remain valid");
-    }
-
-    /// Install a spawned Run. Its output marker and drain are ready before
-    /// either active use or a stop queued during spawn can finish the Run.
-    fn install(&self, run: OwnedRun, on_spawned: impl FnOnce()) {
-        let mut coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        on_spawned();
-        coordination.state = match coordination.state {
-            RunState::Spawning => RunState::Active(run),
-            RunState::StopBeforeSpawn(request) => RunState::Pending {
-                run,
-                cause: FinishCause::Stop(request),
-            },
-            _ => panic!("a Run can be installed only into its spawn reservation"),
-        };
-        self.wake.notify_one();
-    }
-
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.wake.notify_all();
-    }
-
-    fn request_stop(&self, remaining: Option<Duration>) {
-        let request = StopRequest { remaining };
-        let mut coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = std::mem::replace(&mut coordination.state, RunState::Finishing);
-        coordination.state = match state {
-            RunState::Spawning => RunState::StopBeforeSpawn(request),
-            RunState::StopBeforeSpawn(_) => RunState::StopBeforeSpawn(request),
-            RunState::Active(run) | RunState::Unconfirmed(run) => RunState::Pending {
-                run,
-                cause: FinishCause::Stop(request),
-            },
-            state @ (RunState::Pending { .. } | RunState::Finishing | RunState::Finished) => state,
-        };
-        self.wake.notify_one();
-    }
-
-    fn set_project_deadline(&self, deadline: Instant) {
-        let mut coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        coordination.project_deadline = Some(deadline);
-        self.wake.notify_one();
-    }
-
-    /// Claim the only completion action. A queued stop wins over natural
-    /// exit because it was recorded first under the same lock.
-    fn take_completion(&self, natural_exit: bool) -> Option<(OwnedRun, FinishCause)> {
-        let mut coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = std::mem::replace(&mut coordination.state, RunState::Finishing);
-        match state {
-            RunState::Pending { run, cause } => Some((run, cause)),
-            RunState::Active(run) if natural_exit => Some((run, FinishCause::Natural)),
-            state => {
-                coordination.state = state;
-                None
-            }
-        }
-    }
-
-    fn project_remaining(&self) -> Option<Duration> {
-        self.coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .project_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-    }
-
-    fn finish(&self, run: OwnedRun, cleanup_confirmed: bool) {
-        let mut coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        coordination.state = if cleanup_confirmed {
-            RunState::Finished
-        } else {
-            RunState::Unconfirmed(run)
-        };
-        self.wake.notify_all();
-    }
-
-    fn wait_for_work(&self) {
-        let coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = self
-            .wake
-            .wait_timeout(coordination, OWNER_POLL)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-
-    fn is_active(&self) -> bool {
-        !self.cancelled.load(Ordering::Acquire)
-            && matches!(
-                self.coordination
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .state,
-                RunState::Active(_)
-            )
-    }
-
-    fn is_finished(&self) -> bool {
-        matches!(
-            self.coordination
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .state,
-            RunState::Finished
-        )
-    }
-
-    fn with_terminal<R>(&self, f: impl FnOnce(&TerminalHandle<'_>) -> R) -> Option<R> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return None;
-        }
-        let coordination = self
-            .coordination
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &coordination.state {
-            RunState::Active(run) => run.terminal().map(|handle| f(&handle)),
-            _ => None,
-        }
-    }
-}
 
 /// Starts Runs through the real Run interface. Synchronous reservations and
 /// cheap coordinator updates stay on the caller. Spawn, completion, output
@@ -375,7 +101,7 @@ impl RunSeam for RealRunSeam {
         let record = Arc::new(RunRecord::spawning());
         #[cfg(test)]
         let record = Arc::new(RunRecord::spawning_with_test_hooks(self.test_hooks.clone()));
-        let output_observer = build_output_observer(&intent, Arc::clone(&record.cancelled), events);
+        let output_observer = build_output_observer(&intent, record.cancellation_flag(), events);
         record.set_log_matcher(output_observer.clone());
         let mut runs = self
             .runs
@@ -686,67 +412,6 @@ fn build_command(intent: &StartIntent) -> SpawnCommand {
         command = command.with_env(key.clone(), value.clone());
     }
     command
-}
-
-/// Data-plane access to the terminal session each PTY Run owns. Output bytes
-/// and terminal interaction stay outside the Supervisor control queue.
-pub struct Consoles {
-    runs: RunRegistry,
-}
-
-impl Consoles {
-    /// The live console view for one Process's current Run, when one is
-    /// active.
-    pub fn view_process(&self, process_id: ProcessId, run_id: u64) -> Option<ConsoleView> {
-        let record = self
-            .runs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(process_id.get(), run_id))
-            .cloned()?;
-        record.is_active().then_some(ConsoleView { record })
-    }
-
-    /// The live console view by scalar Process identity.
-    /// Kept for caller compatibility; internal callers use [`Self::view_process`].
-    pub fn view(&self, process_id: u32, run_id: u64) -> Option<ConsoleView> {
-        self.view_process(ProcessId::new(process_id), run_id)
-    }
-}
-
-/// A shared handle to one active PTY Run's terminal. Every operation locks
-/// one Run coordinator briefly and never performs process work.
-pub struct ConsoleView {
-    record: Arc<RunRecord>,
-}
-
-impl ConsoleView {
-    pub(crate) fn with<R>(&self, f: impl FnOnce(&TerminalHandle<'_>) -> R) -> Option<R> {
-        self.record.with_terminal(f)
-    }
-
-    pub fn snapshot(&self) -> Option<OwnedTerminalSnapshot> {
-        self.with(|handle| handle.snapshot())
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.with(|handle| handle.is_dirty()).unwrap_or(false)
-    }
-
-    pub fn mouse_tracking(&self) -> bool {
-        self.with(|handle| handle.mouse_tracking()).unwrap_or(false)
-    }
-
-    pub fn poll_event(&self) -> Option<TerminalEvent> {
-        self.with(|handle| handle.poll_event())?
-    }
-
-    /// Resize to the selected console geometry. Returns false when the Run
-    /// rejected the request (stopping or backpressure); non-fatal either way.
-    pub fn resize(&self, geometry: TerminalGeometry) -> bool {
-        let result = self.with(|handle| handle.resize(geometry));
-        !matches!(result, Some(Err(_)))
-    }
 }
 
 #[cfg(test)]

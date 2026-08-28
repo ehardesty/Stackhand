@@ -233,12 +233,14 @@ fn manual_stop_cancels_a_pending_automatic_restart() {
     ));
     start_service(&mut h);
     h.event(finished("api", 1, Some(7)));
+    let budget_before = h.process("api").automatic_restart_budget.clone();
     h.command(Command::Stop("api".into()));
 
     let api = h.process("api");
     assert_eq!(api.lifecycle, Lifecycle::Stopped);
     assert_eq!(api.desired, DesiredState::Stopped);
     assert_eq!(api.restart_backoff, None);
+    assert_eq!(api.automatic_restart_budget, budget_before);
     h.advance_and_poll(Duration::from_secs(3));
     assert_eq!(start_count(&h), 1);
 }
@@ -299,6 +301,7 @@ fn project_shutdown_cancels_backoff_and_suppresses_restart() {
     ));
     start_service(&mut h);
     h.event(finished("api", 1, Some(7)));
+    let budget_before = h.process("api").automatic_restart_budget.clone();
     h.command(Command::Shutdown {
         deadline: h.clock.now() + Duration::from_secs(20),
     });
@@ -307,6 +310,7 @@ fn project_shutdown_cancels_backoff_and_suppresses_restart() {
     assert_eq!(api.lifecycle, Lifecycle::Stopped);
     assert_eq!(api.desired, DesiredState::Stopped);
     assert_eq!(api.restart_backoff, None);
+    assert_eq!(api.automatic_restart_budget, budget_before);
     assert!(h.snapshot().shutdown.expect("shutdown exists").complete);
     h.advance_and_poll(Duration::from_secs(3));
     assert_eq!(start_count(&h), 1);

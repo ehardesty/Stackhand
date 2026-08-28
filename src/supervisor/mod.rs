@@ -27,12 +27,14 @@ use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamEvent, SeamSender};
 mod checks;
 mod clock;
 mod command;
+mod consoles;
 mod core;
 mod events;
 mod exec;
 mod liveness;
 mod probe;
 mod readiness;
+mod run_record;
 mod runtime;
 mod schedule;
 mod seam;
@@ -46,11 +48,11 @@ mod tests;
 pub use crate::runtime::ProcessId;
 pub use checks::{CheckState, LivenessState, ReadinessState};
 pub use command::Command;
+pub use consoles::{ConsoleView, Consoles};
 pub use core::{
     DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
     RunExitDisposition, RunSummary, RunTrigger,
 };
-pub use runtime::{ConsoleView, Consoles};
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
 pub use snapshot::{
     LivenessCheckKind, LivenessChildStatus, LivenessStatus, ProcessSnapshot, ProjectSnapshot,

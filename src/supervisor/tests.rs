@@ -497,8 +497,16 @@ fn unexpected_exit_stays_visible_as_a_failure() {
     h.event(spawned("api", 1));
     h.event(finished("api", 1, Some(3)));
 
+    let api = h.process("api");
+    assert_eq!(api.desired, DesiredState::Running);
+    assert_eq!(api.lifecycle, Lifecycle::Stopped);
+    assert_eq!(api.current_run, None);
     assert_eq!(
-        h.process("api").failure.expect("failure is visible").detail,
+        api.failure.as_ref().map(|failure| failure.kind),
+        Some(FailureKind::ProcessExit)
+    );
+    assert_eq!(
+        api.failure.expect("failure is visible").detail,
         "exited unexpectedly with code 3"
     );
 }
@@ -701,6 +709,9 @@ mod dependency_scheduling;
 
 #[cfg(test)]
 mod dependency_recovery;
+
+#[cfg(test)]
+mod transition_matrix;
 
 #[cfg(test)]
 mod threaded;
