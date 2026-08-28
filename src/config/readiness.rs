@@ -40,10 +40,10 @@ pub(super) fn build_readiness(
         .transpose()?;
 
     let checks = if let Some(children) = &file.all {
-        if file.tcp.is_some() || file.http.is_some() || file.exec.is_some() {
+        if file.tcp.is_some() || file.http.is_some() || file.exec.is_some() || file.log.is_some() {
             return Err(ready_error(
                 process_name,
-                "define exactly one of 'tcp', 'http', 'exec', or 'all'",
+                "define exactly one of 'tcp', 'http', 'exec', 'log', or 'all'",
             ));
         }
         if file.initial_delay.is_some()
@@ -94,8 +94,8 @@ fn build_leaf(
     if child_index.is_some() && file.startup_timeout.is_some() {
         return fail("startup_timeout is valid only on the parent 'ready' block".to_string());
     }
-    let probe = match (&file.tcp, &file.http, &file.exec) {
-        (Some(tcp), None, None) => {
+    let probe = match (&file.tcp, &file.http, &file.exec, &file.log) {
+        (Some(tcp), None, None, None) => {
             if tcp.host.is_empty() {
                 return fail("tcp host must not be empty".to_string());
             }
@@ -107,14 +107,24 @@ fn build_leaf(
                 port: tcp.port,
             }
         }
-        (None, Some(http), None) => {
+        (None, Some(http), None, None) => {
             let (host, port, path) = parse_http_url(&http.url)
                 .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
             ReadinessProbe::Http { host, port, path }
         }
-        (None, None, Some(exec)) => build_exec_probe(process_name, exec, child_index, base_dir)?,
+        (None, None, Some(exec), None) => {
+            build_exec_probe(process_name, exec, child_index, base_dir)?
+        }
+        (None, None, None, Some(log)) => {
+            if log.contains.is_empty() {
+                return fail("log contains must not be empty".to_string());
+            }
+            ReadinessProbe::Log {
+                contains: log.contains.clone(),
+            }
+        }
         _ => {
-            return fail("define exactly one of 'tcp', 'http', or 'exec'".to_string());
+            return fail("define exactly one of 'tcp', 'http', 'exec', or 'log'".to_string());
         }
     };
     let initial_delay = duration_or_default(
@@ -359,6 +369,7 @@ pub(super) struct ReadinessFile {
     tcp: Option<TcpProbeFile>,
     http: Option<HttpProbeFile>,
     exec: Option<ExecFile>,
+    log: Option<LogProbeFile>,
     all: Option<Vec<ReadinessFile>>,
     /// Parsed only to provide a clear unsupported-form diagnostic.
     any: Option<serde_yaml::Value>,
@@ -381,6 +392,12 @@ pub(super) struct TcpProbeFile {
 #[serde(deny_unknown_fields)]
 pub(super) struct HttpProbeFile {
     url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogProbeFile {
+    contains: String,
 }
 
 #[derive(Deserialize)]

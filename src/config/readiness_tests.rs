@@ -444,6 +444,76 @@ fn all_readiness_accepts_exec_as_one_independent_child() {
 }
 
 #[test]
+fn log_readiness_accepts_one_nonempty_literal() {
+    let project = write_and_load(
+        "readiness-log-ok",
+        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      log:\n        contains: \"Listening on :8080\"\n",
+    )
+    .expect("valid log readiness");
+    let check = &project.processes()[0]
+        .readiness
+        .as_ref()
+        .expect("readiness parses")
+        .checks[0];
+    assert_eq!(
+        check.probe,
+        ReadinessProbe::Log {
+            contains: "Listening on :8080".into(),
+        }
+    );
+    assert_eq!(check.initial_delay, Duration::ZERO);
+    assert_eq!(check.interval, Duration::from_secs(1));
+}
+
+#[test]
+fn log_readiness_rejects_empty_literals_and_regex_options() {
+    let empty = write_and_load(
+        "readiness-log-empty",
+        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      log: {contains: \"\"}\n",
+    )
+    .expect_err("an empty log literal must fail");
+    assert!(
+        empty.message.contains("log contains must not be empty"),
+        "{empty}"
+    );
+
+    let regex = write_and_load(
+        "readiness-log-regex",
+        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/true}\n    ready:\n      log: {contains: ready, regex: true}\n",
+    )
+    .expect_err("regex log configuration must fail");
+    assert!(regex.message.contains("unknown field `regex`"), "{regex}");
+}
+
+#[test]
+fn all_readiness_accepts_log_as_one_independent_child() {
+    let project = write_and_load(
+        "readiness-all-log",
+        "version: 1\nprocesses:\n  - name: web\n    command: {program: /bin/sleep, args: [\"1\"]}\n    ready:\n      all:\n        - log: {contains: ready}\n        - tcp: {host: localhost, port: 1}\n",
+    )
+    .expect("log can be an all child");
+    let checks = &project.processes()[0]
+        .readiness
+        .as_ref()
+        .expect("readiness parses")
+        .checks;
+    assert_eq!(checks.len(), 2);
+    assert_eq!(
+        checks[0].probe,
+        ReadinessProbe::Log {
+            contains: "ready".into()
+        }
+    );
+    assert_eq!(
+        checks[1].probe,
+        ReadinessProbe::Tcp {
+            host: "localhost".into(),
+            port: 1
+        }
+    );
+}
+
+#[test]
 fn readiness_on_a_one_shot_is_rejected() {
     let error = write_and_load(
         "readiness-one-shot",

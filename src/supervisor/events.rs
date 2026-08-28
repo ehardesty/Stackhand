@@ -56,21 +56,27 @@ impl Core {
                     == super::core::Lifecycle::Starting
                     && self.entries[index].readiness.is_none();
                 let readiness = initialize_readiness
-                    .then(|| self.new_readiness_tracking(index, now))
+                    .then(|| self.new_readiness_tracking(index, now, true))
                     .flatten();
+                let spawn_now_ms = self.now_ms();
+                let readiness_config = self.project.processes()[index].readiness.clone();
                 let entry = &mut self.entries[index];
                 entry.root_pid = root_pid.map(|pid| pid.get());
-                if entry.lifecycle == super::core::Lifecycle::Starting {
-                    if let Some(readiness) = readiness {
-                        // The Run exists but is not available yet; each
-                        // child owns its own first-attempt delay.
-                        entry.readiness = Some(readiness);
-                    } else if entry.readiness.is_none() {
-                        // A Service without readiness becomes Running at
-                        // spawn; its label projects as Ready. A duplicate
-                        // Spawned event keeps existing child tracking intact.
-                        entry.lifecycle = super::core::Lifecycle::Running;
-                    }
+                if let Some(readiness) = readiness {
+                    // The Run exists but is not available yet; each child
+                    // owns its own first-attempt delay.
+                    entry.readiness = Some(readiness);
+                }
+                if let Some(config) = readiness_config.as_ref()
+                    && let Some(tracking) = entry.readiness.as_mut()
+                {
+                    tracking.activate(config, now, spawn_now_ms);
+                } else if entry.lifecycle == super::core::Lifecycle::Starting
+                    && entry.readiness.is_none()
+                {
+                    // A Service without readiness becomes Running at spawn;
+                    // its label projects as Ready.
+                    entry.lifecycle = super::core::Lifecycle::Running;
                 }
                 self.evaluate();
             }
@@ -96,14 +102,23 @@ impl Core {
                     return;
                 };
                 if became_ready {
+                    self.promote_ready(index);
+                }
+                self.evaluate();
+            }
+            SeamEvent::LogMatched { work_id, .. } => {
+                let became_ready = {
                     let entry = &mut self.entries[index];
                     let Some(tracking) = entry.readiness.as_mut() else {
                         return;
                     };
-                    tracking.startup_deadline = None;
-                    if entry.lifecycle == super::core::Lifecycle::Starting {
-                        entry.lifecycle = super::core::Lifecycle::Running;
-                    }
+                    tracking.apply_log_match(work_id)
+                };
+                let Some(became_ready) = became_ready else {
+                    return;
+                };
+                if became_ready {
+                    self.promote_ready(index);
                 }
                 self.evaluate();
             }
@@ -155,6 +170,18 @@ impl Core {
                     });
                 }
             }
+        }
+    }
+
+    /// Project an aggregate readiness pass into lifecycle state. Event
+    /// identity and child state are handled by each event arm before this
+    /// shared effect runs.
+    fn promote_ready(&mut self, index: usize) {
+        if let Some(tracking) = self.entries[index].readiness.as_mut() {
+            tracking.clear_startup_deadline();
+        }
+        if self.entries[index].lifecycle == super::core::Lifecycle::Starting {
+            self.entries[index].lifecycle = super::core::Lifecycle::Running;
         }
     }
 

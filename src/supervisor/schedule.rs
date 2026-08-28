@@ -97,14 +97,31 @@ impl Core {
     }
 
     fn begin_desired_run(&mut self, index: usize) {
-        let now_ms = self.now_ms();
-        let entry = &mut self.entries[index];
-        if entry.current_run.is_some()
-            || entry.desired != DesiredState::Running
-            || entry.awaiting_manual_restart
-        {
+        let can_start = {
+            let entry = &self.entries[index];
+            entry.current_run.is_none()
+                && entry.desired == DesiredState::Running
+                && !entry.awaiting_manual_restart
+        };
+        if !can_start {
             return;
         }
+        let has_log_readiness = self.project.processes()[index]
+            .readiness
+            .as_ref()
+            .is_some_and(|config| {
+                config
+                    .checks
+                    .iter()
+                    .any(|check| matches!(check.probe, crate::model::ReadinessProbe::Log { .. }))
+            });
+        // Allocate readiness identities before the adapter can spawn only
+        // when a live log match needs them. Other checks start at Spawned.
+        let readiness = has_log_readiness
+            .then(|| self.new_readiness_tracking(index, self.clock.now(), false))
+            .flatten();
+        let now_ms = self.now_ms();
+        let entry = &mut self.entries[index];
         let run_id = RunId::new(entry.next_run);
         entry.next_run += 1;
         entry.current_run = Some(run_id);
@@ -120,6 +137,7 @@ impl Core {
         // One-shot completion represented by Done.
         entry.run_started_at_ms = Some(now_ms);
         entry.run_trigger = entry.pending_trigger;
+        entry.readiness = readiness;
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }

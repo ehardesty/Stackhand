@@ -54,6 +54,7 @@ pub(crate) fn attempt(intent: &ProbeIntent, canceled: &AtomicBool) -> Result<(),
         ladder: EXEC_CLEANUP_LADDER,
         metrics_interval: None,
         on_output_wake: None,
+        output_observer: None,
     };
     let mut run = RunRuntime
         .start(request)

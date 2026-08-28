@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use crate::model::{ReadinessConfig, ReadinessProbe};
 use crate::runtime::{ProcessId, RunId};
-use crate::supervisor::seam::{AttemptId, ExecContext, ProbeIntent, ProbeSeam, WorkId};
+use crate::supervisor::seam::{
+    AttemptId, ExecContext, LogMatcherIntent, ProbeIntent, ProbeSeam, WorkId,
+};
 
 use super::core::{Core, FailureKind, FailureSummary, Lifecycle};
 use super::snapshot::{ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus};
@@ -26,31 +28,61 @@ pub enum ReadinessState {
 #[derive(Debug)]
 pub(super) struct ReadinessTracking {
     /// Session time when readiness evaluation began after spawn.
-    pub(super) started_at_ms: u64,
-    /// One independently scheduled state record for every leaf check.
-    pub(super) checks: Vec<ReadinessCheckTracking>,
+    started_at_ms: u64,
+    /// One state record for every leaf check. The enum keeps scheduled probe
+    /// state out of live log children.
+    checks: Vec<ReadinessCheckTracking>,
     /// Deadline for the complete readiness policy to pass, when configured.
-    pub(super) startup_deadline: Option<Instant>,
+    startup_deadline: Option<Instant>,
+    /// False while a log matcher is waiting for the Run's Spawned fact. Work
+    /// identities exist before spawn, but timers must start at spawn.
+    started: bool,
 }
 
-/// Mutable scheduling and threshold state for one leaf readiness check.
+/// One readiness child. Live log children only carry the state needed for a
+/// latched observation; scheduled probes carry the additional attempt state.
 #[derive(Debug)]
-pub(super) struct ReadinessCheckTracking {
+enum ReadinessCheckTracking {
+    Probe(ProbeCheckTracking),
+    Log(LogCheckTracking),
+}
+
+#[derive(Debug)]
+struct CheckProgress {
     /// Stable identity of this check within its Run.
-    pub(super) work_id: WorkId,
-    /// Attempts dispatched for this check.
-    pub(super) attempts: u32,
-    pub(super) state: ReadinessState,
-    pub(super) consecutive_successes: u32,
-    pub(super) consecutive_failures: u32,
+    work_id: WorkId,
+    /// Observations or attempts recorded for this check.
+    attempts: u32,
+    state: ReadinessState,
+    consecutive_successes: u32,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProbeCheckTracking {
+    progress: CheckProgress,
     /// The next attempt identity. Attempt identities are never reused.
-    pub(super) next_attempt_id: u64,
-    pub(super) last_error: Option<String>,
+    next_attempt_id: u64,
     /// One bounded attempt is out with the probe adapter; attempts for one
     /// check never overlap.
-    pub(super) in_flight: Option<AttemptId>,
+    in_flight: Option<AttemptId>,
     /// Earliest time the next attempt may be dispatched.
-    pub(super) next_attempt_at: Instant,
+    next_attempt_at: Instant,
+}
+
+#[derive(Debug)]
+struct LogCheckTracking {
+    progress: CheckProgress,
+}
+
+impl ReadinessCheckTracking {
+    fn progress(&self) -> &CheckProgress {
+        match self {
+            Self::Probe(check) => &check.progress,
+            Self::Log(check) => &check.progress,
+        }
+    }
 }
 
 impl ReadinessTracking {
@@ -62,13 +94,13 @@ impl ReadinessTracking {
             && self
                 .checks
                 .iter()
-                .all(|check| check.state == ReadinessState::Passing)
+                .all(|check| check.progress().state == ReadinessState::Passing)
         {
             ReadinessState::Passing
         } else if self
             .checks
             .iter()
-            .any(|check| check.state == ReadinessState::Failing)
+            .any(|check| check.progress().state == ReadinessState::Failing)
         {
             ReadinessState::Failing
         } else {
@@ -76,10 +108,14 @@ impl ReadinessTracking {
         }
     }
 
-    /// Cancel every child operation for this Run.
+    /// Cancel every scheduled probe operation for this Run. Log observation
+    /// has no adapter operation to cancel; its Run observer is canceled by the
+    /// runtime seam.
     pub(super) fn cancel(&self, probes: &dyn ProbeSeam, process_id: ProcessId, run_id: RunId) {
         for check in &self.checks {
-            probes.cancel(process_id, run_id, check.work_id);
+            if let ReadinessCheckTracking::Probe(check) = check {
+                probes.cancel(process_id, run_id, check.progress.work_id);
+            }
         }
     }
 
@@ -97,32 +133,162 @@ impl ReadinessTracking {
         let check_index = self
             .checks
             .iter()
-            .position(|check| check.work_id == work_id)?;
+            .position(|check| check.progress().work_id == work_id)?;
         let check_config = config.checks.get(check_index)?;
-        let check = self.checks.get_mut(check_index)?;
+        let ReadinessCheckTracking::Probe(check) = self.checks.get_mut(check_index)? else {
+            return None;
+        };
         if check.in_flight != Some(attempt_id) {
             return None;
         }
 
         check.in_flight = None;
         check.next_attempt_at = now + check_config.interval;
+        let progress = &mut check.progress;
         if passing {
-            check.consecutive_successes = check.consecutive_successes.saturating_add(1);
-            check.consecutive_failures = 0;
-            if check.consecutive_successes >= check_config.success_threshold {
-                check.state = ReadinessState::Passing;
+            progress.consecutive_successes = progress.consecutive_successes.saturating_add(1);
+            progress.consecutive_failures = 0;
+            if progress.consecutive_successes >= check_config.success_threshold {
+                progress.state = ReadinessState::Passing;
             }
         } else {
-            check.consecutive_failures = check.consecutive_failures.saturating_add(1);
-            check.consecutive_successes = 0;
-            check.last_error = diagnostic;
-            if check.state == ReadinessState::Passing
-                && check.consecutive_failures >= check_config.failure_threshold
+            progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
+            progress.consecutive_successes = 0;
+            progress.last_error = diagnostic;
+            if progress.state == ReadinessState::Passing
+                && progress.consecutive_failures >= check_config.failure_threshold
             {
-                check.state = ReadinessState::Failing;
+                progress.state = ReadinessState::Failing;
             }
         }
         Some(self.state() == ReadinessState::Passing)
+    }
+
+    /// Apply the first live match for one log child. A log match is one
+    /// observation, not a scheduled attempt, but it passes immediately and
+    /// stays latched until this Run ends.
+    pub(super) fn apply_log_match(&mut self, work_id: WorkId) -> Option<bool> {
+        let check_index = self
+            .checks
+            .iter()
+            .position(|check| check.progress().work_id == work_id)?;
+        let ReadinessCheckTracking::Log(check) = self.checks.get_mut(check_index)? else {
+            return None;
+        };
+        let progress = &mut check.progress;
+        if progress.state == ReadinessState::Passing {
+            return None;
+        }
+        progress.attempts = progress.attempts.saturating_add(1);
+        progress.consecutive_successes = progress.consecutive_successes.saturating_add(1);
+        progress.consecutive_failures = 0;
+        progress.state = ReadinessState::Passing;
+        Some(self.state() == ReadinessState::Passing)
+    }
+
+    pub(super) fn clear_startup_deadline(&mut self) {
+        self.startup_deadline = None;
+    }
+
+    /// Return the live log checks that must be attached to the Run's output
+    /// observer. The configured literal remains the source of truth.
+    pub(super) fn log_matchers(&self, config: &ReadinessConfig) -> Vec<LogMatcherIntent> {
+        self.checks
+            .iter()
+            .zip(&config.checks)
+            .filter_map(|(tracking, check_config)| {
+                let ReadinessCheckTracking::Log(_) = tracking else {
+                    return None;
+                };
+                let ReadinessProbe::Log { contains } = &check_config.probe else {
+                    return None;
+                };
+                Some(LogMatcherIntent {
+                    work_id: tracking.progress().work_id,
+                    contains: contains.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Return the scheduled probe children that are due now. Live log
+    /// children have no timer and therefore never enter this iterator.
+    pub(super) fn due_probe_indices(&self, now: Instant) -> impl Iterator<Item = usize> + '_ {
+        self.checks
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, check)| {
+                let ReadinessCheckTracking::Probe(check) = check else {
+                    return None;
+                };
+                (check.in_flight.is_none() && check.next_attempt_at <= now).then_some(index)
+            })
+    }
+
+    /// Start one scheduled probe and reserve its attempt identity.
+    pub(super) fn begin_probe(
+        &mut self,
+        check_index: usize,
+        process_id: ProcessId,
+        run_id: RunId,
+        probe: ReadinessProbe,
+        timeout: Duration,
+        exec_context: Option<ExecContext>,
+    ) -> Option<ProbeIntent> {
+        let ReadinessCheckTracking::Probe(check) = self.checks.get_mut(check_index)? else {
+            return None;
+        };
+        if check.in_flight.is_some() {
+            return None;
+        }
+        let attempt_id = AttemptId::new(check.next_attempt_id);
+        check.next_attempt_id += 1;
+        check.in_flight = Some(attempt_id);
+        check.progress.attempts += 1;
+        Some(ProbeIntent {
+            process_id,
+            run_id,
+            work_id: check.progress.work_id,
+            attempt_id,
+            probe,
+            timeout,
+            exec_context,
+        })
+    }
+
+    /// How long until the next scheduled probe becomes due.
+    pub(super) fn next_probe_wait(&self, now: Instant) -> Option<Duration> {
+        self.checks
+            .iter()
+            .filter_map(|check| {
+                let ReadinessCheckTracking::Probe(check) = check else {
+                    return None;
+                };
+                check
+                    .in_flight
+                    .is_none()
+                    .then(|| check.next_attempt_at.saturating_duration_since(now))
+            })
+            .min()
+    }
+
+    /// Start timing and scheduled checks when the Run reports Spawned. A
+    /// duplicate Spawned fact does not reset the current Run's progress.
+    pub(super) fn activate(&mut self, config: &ReadinessConfig, now: Instant, now_ms: u64) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.started_at_ms = now_ms;
+        self.startup_deadline = (self.state() != ReadinessState::Passing)
+            .then_some(config.startup_timeout)
+            .flatten()
+            .map(|timeout| now + timeout);
+        for (check, check_config) in self.checks.iter_mut().zip(&config.checks) {
+            if let ReadinessCheckTracking::Probe(check) = check {
+                check.next_attempt_at = now + check_config.initial_delay;
+            }
+        }
     }
 
     /// Project the authoritative child state into the public snapshot.
@@ -139,15 +305,14 @@ impl ReadinessTracking {
                     .probe,
             )
         };
-        let attempts = self
-            .checks
-            .iter()
-            .fold(0_u32, |total, check| total.saturating_add(check.attempts));
+        let attempts = self.checks.iter().fold(0_u32, |total, check| {
+            total.saturating_add(check.progress().attempts)
+        });
         let consecutive_successes = self.checks.iter().fold(0_u32, |total, check| {
-            total.saturating_add(check.consecutive_successes)
+            total.saturating_add(check.progress().consecutive_successes)
         });
         let consecutive_failures = self.checks.iter().fold(0_u32, |total, check| {
-            total.saturating_add(check.consecutive_failures)
+            total.saturating_add(check.progress().consecutive_failures)
         });
         let children = if is_composite {
             self.checks
@@ -157,11 +322,11 @@ impl ReadinessTracking {
                 .map(|(index, (tracking, config))| ReadinessChildStatus {
                     index: index + 1,
                     kind: ReadinessCheckKind::from(&config.probe),
-                    state: tracking.state,
-                    attempts: tracking.attempts,
-                    consecutive_successes: tracking.consecutive_successes,
-                    consecutive_failures: tracking.consecutive_failures,
-                    last_error: tracking.last_error.clone(),
+                    state: tracking.progress().state,
+                    attempts: tracking.progress().attempts,
+                    consecutive_successes: tracking.progress().consecutive_successes,
+                    consecutive_failures: tracking.progress().consecutive_failures,
+                    last_error: tracking.progress().last_error.clone(),
                 })
                 .collect()
         } else {
@@ -171,11 +336,21 @@ impl ReadinessTracking {
             .checks
             .iter()
             .enumerate()
-            .filter(|(_, check)| !is_composite || check.state != ReadinessState::Passing)
-            .find_map(|(index, check)| check.last_error.as_ref().map(|error| (index, error)))
+            .filter(|(_, check)| !is_composite || check.progress().state != ReadinessState::Passing)
+            .find_map(|(index, check)| {
+                check
+                    .progress()
+                    .last_error
+                    .as_ref()
+                    .map(|error| (index, error))
+            })
             .or_else(|| {
                 self.checks.iter().enumerate().find_map(|(index, check)| {
-                    check.last_error.as_ref().map(|error| (index, error))
+                    check
+                        .progress()
+                        .last_error
+                        .as_ref()
+                        .map(|error| (index, error))
                 })
             });
         let last_error = error.map(|(index, error)| {
@@ -203,35 +378,50 @@ impl Core {
         &mut self,
         index: usize,
         now: Instant,
+        started: bool,
     ) -> Option<ReadinessTracking> {
         let config = self.project.processes()[index].readiness.as_ref()?;
         if config.checks.is_empty() {
             return None;
         }
-        let initial_delays = config
+        let check_specs = config
             .checks
             .iter()
-            .map(|check| check.initial_delay)
+            .map(|check| (check.probe.clone(), check.initial_delay))
             .collect::<Vec<_>>();
-        let startup_deadline = config.startup_timeout.map(|timeout| now + timeout);
-        let checks = initial_delays
+        let startup_deadline = started
+            .then_some(config.startup_timeout)
+            .flatten()
+            .map(|timeout| now + timeout);
+        let checks = check_specs
             .into_iter()
-            .map(|initial_delay| ReadinessCheckTracking {
-                work_id: self.allocate_work_id(index),
-                attempts: 0,
-                state: ReadinessState::Pending,
-                consecutive_successes: 0,
-                consecutive_failures: 0,
-                next_attempt_id: 1,
-                last_error: None,
-                in_flight: None,
-                next_attempt_at: now + initial_delay,
+            .map(|(probe, initial_delay)| {
+                let progress = CheckProgress {
+                    work_id: self.allocate_work_id(index),
+                    attempts: 0,
+                    state: ReadinessState::Pending,
+                    consecutive_successes: 0,
+                    consecutive_failures: 0,
+                    last_error: None,
+                };
+                match probe {
+                    ReadinessProbe::Log { .. } => {
+                        ReadinessCheckTracking::Log(LogCheckTracking { progress })
+                    }
+                    _ => ReadinessCheckTracking::Probe(ProbeCheckTracking {
+                        progress,
+                        next_attempt_id: 1,
+                        in_flight: None,
+                        next_attempt_at: now + initial_delay,
+                    }),
+                }
             })
             .collect();
         Some(ReadinessTracking {
             started_at_ms: self.now_ms(),
             checks,
             startup_deadline,
+            started,
         })
     }
 
@@ -257,7 +447,9 @@ impl Core {
         }
     }
 
-    /// The active readiness checks whose Run still desires Running.
+    /// The active readiness checks whose Run still desires Running and has
+    /// reported Spawned. Log work may exist before that fact so early output
+    /// has stable identities, but its timer must still start at Spawned.
     fn active_readiness(&self) -> impl Iterator<Item = (usize, RunId, &ReadinessTracking)> + '_ {
         self.entries
             .iter()
@@ -265,7 +457,7 @@ impl Core {
             .filter_map(|(index, entry)| {
                 let run_id = entry.current_run?;
                 let tracking = entry.readiness.as_ref()?;
-                (entry.desired == super::core::DesiredState::Running)
+                (entry.desired == super::core::DesiredState::Running && tracking.started)
                     .then_some((index, run_id, tracking))
             })
     }
@@ -296,11 +488,8 @@ impl Core {
         self.active_readiness()
             .flat_map(|(index, _, tracking)| {
                 tracking
-                    .checks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, check)| check.in_flight.is_none() && check.next_attempt_at <= now)
-                    .map(move |(check_index, _)| (index, check_index))
+                    .due_probe_indices(now)
+                    .map(move |check_index| (index, check_index))
             })
             .collect()
     }
@@ -322,33 +511,22 @@ impl Core {
             env: self.project.processes()[index].env.clone(),
             shell: self.project.shell().clone(),
         });
-        let intent = {
-            let entry = &mut self.entries[index];
-            let Some(run_id) = entry.current_run else {
-                return;
-            };
-            let Some(tracking) = entry.readiness.as_mut() else {
-                return;
-            };
-            let Some(check) = tracking.checks.get_mut(check_index) else {
-                return;
-            };
-            if check.in_flight.is_some() {
-                return;
-            }
-            let attempt_id = AttemptId::new(check.next_attempt_id);
-            check.next_attempt_id += 1;
-            check.in_flight = Some(attempt_id);
-            check.attempts += 1;
-            ProbeIntent {
-                process_id: entry.process_id,
-                run_id,
-                work_id: check.work_id,
-                attempt_id,
-                probe,
-                timeout,
-                exec_context,
-            }
+        let process_id = self.entries[index].process_id;
+        let Some(run_id) = self.entries[index].current_run else {
+            return;
+        };
+        let Some(tracking) = self.entries[index].readiness.as_mut() else {
+            return;
+        };
+        let Some(intent) = tracking.begin_probe(
+            check_index,
+            process_id,
+            run_id,
+            probe,
+            timeout,
+            exec_context,
+        ) else {
+            return;
         };
         self.probes.probe(intent, &self.events);
     }
@@ -358,13 +536,7 @@ impl Core {
         let now = self.clock.now();
         let probe_wait = self
             .active_readiness()
-            .flat_map(|(_, _, tracking)| {
-                tracking
-                    .checks
-                    .iter()
-                    .filter(|check| check.in_flight.is_none())
-                    .map(|check| check.next_attempt_at.saturating_duration_since(now))
-            })
+            .filter_map(|(_, _, tracking)| tracking.next_probe_wait(now))
             .min();
         let startup_wait = self
             .active_readiness()

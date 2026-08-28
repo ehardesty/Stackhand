@@ -31,6 +31,7 @@ pub enum ReadinessCheckKind {
     Tcp,
     Http,
     Exec,
+    Log,
     All,
 }
 
@@ -40,6 +41,7 @@ impl From<&ReadinessProbe> for ReadinessCheckKind {
             ReadinessProbe::Tcp { .. } => Self::Tcp,
             ReadinessProbe::Http { .. } => Self::Http,
             ReadinessProbe::Exec { .. } => Self::Exec,
+            ReadinessProbe::Log { .. } => Self::Log,
         }
     }
 }

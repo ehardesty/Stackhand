@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::byte_budget::ByteBudget;
-use crate::runtime::{RunEvent, RunEventKind, RunId};
+use crate::runtime::{RunEvent, RunEventKind, RunId, RunOutputObserver};
 
 /// Identifies which stream produced an output chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +174,7 @@ impl PipeRun {
         run_id: RunId,
         events: EventSink,
         output: OutputSink,
+        observer: Option<Arc<dyn RunOutputObserver>>,
     ) -> Result<Self> {
         let mut cmd = Command::new(command.program());
         cmd.args(command.args())
@@ -211,6 +212,7 @@ impl PipeRun {
                 &events,
                 Arc::clone(&io_failures),
                 Arc::clone(&dropped_bytes),
+                observer.clone(),
             ));
         }
         if let Some(stderr) = stderr {
@@ -222,6 +224,7 @@ impl PipeRun {
                 &events,
                 Arc::clone(&io_failures),
                 Arc::clone(&dropped_bytes),
+                observer,
             ));
         }
 
@@ -366,6 +369,7 @@ impl PipeRun {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_stream_reader(
     mut stream: impl Read + Send + 'static,
     run_id: RunId,
@@ -374,6 +378,7 @@ fn spawn_stream_reader(
     events: &EventSink,
     io_failures: Arc<Mutex<Vec<String>>>,
     dropped_bytes: Arc<AtomicUsize>,
+    observer: Option<Arc<dyn RunOutputObserver>>,
 ) -> JoinHandle<()> {
     let output = output.clone();
     let events = events.clone();
@@ -431,7 +436,11 @@ fn spawn_stream_reader(
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        if !emit(buffer[..count].to_vec()) {
+                        let data = buffer[..count].to_vec();
+                        if let Some(observer) = &observer {
+                            observer.observe(&data);
+                        }
+                        if !emit(data) {
                             return;
                         }
                     }

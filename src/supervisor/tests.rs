@@ -678,6 +678,8 @@ fn unknown_commands_are_ignored() {
 }
 
 #[cfg(test)]
+mod log_readiness;
+#[cfg(test)]
 mod readiness;
 #[cfg(test)]
 mod startup_timeout;

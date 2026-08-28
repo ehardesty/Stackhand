@@ -40,6 +40,7 @@ pub(crate) fn start_fixture_run(
         ladder: Default::default(),
         metrics_interval: None,
         on_output_wake,
+        output_observer: None,
     })
 }
 

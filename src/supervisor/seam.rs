@@ -125,6 +125,13 @@ pub enum SeamEvent {
         passing: bool,
         diagnostic: Option<String>,
     },
+    /// A configured literal appeared in the current Run's live output.
+    /// Output bytes never travel through this event.
+    LogMatched {
+        process_id: ProcessId,
+        run_id: RunId,
+        work_id: WorkId,
+    },
 }
 
 impl SeamEvent {
@@ -134,7 +141,8 @@ impl SeamEvent {
             | Self::Failed { process_id, .. }
             | Self::OutputFailure { process_id, .. }
             | Self::Metrics { process_id, .. }
-            | Self::Readiness { process_id, .. } => *process_id,
+            | Self::Readiness { process_id, .. }
+            | Self::LogMatched { process_id, .. } => *process_id,
             Self::Finished(finished) => finished.process_id,
         }
     }
@@ -145,10 +153,18 @@ impl SeamEvent {
             | Self::Failed { run_id, .. }
             | Self::OutputFailure { run_id, .. }
             | Self::Metrics { run_id, .. }
-            | Self::Readiness { run_id, .. } => *run_id,
+            | Self::Readiness { run_id, .. }
+            | Self::LogMatched { run_id, .. } => *run_id,
             Self::Finished(finished) => finished.run_id,
         }
     }
+}
+
+/// One live log matcher attached to a Run before it can emit output.
+#[derive(Clone, Debug)]
+pub(crate) struct LogMatcherIntent {
+    pub(crate) work_id: WorkId,
+    pub(crate) contains: String,
 }
 
 /// One request to begin a Run. The Supervisor allocates the Run identity;
@@ -166,6 +182,8 @@ pub struct StartIntent {
     /// The PTY geometry of the rendered console pane at request time.
     pub initial_geometry: TerminalGeometry,
     pub pty: bool,
+    /// Literal log checks to attach before this Run is spawned.
+    pub(crate) log_matchers: Vec<LogMatcherIntent>,
 }
 
 /// The runtime seam. Implementations own every Run they start until stop.

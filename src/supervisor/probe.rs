@@ -65,6 +65,9 @@ impl ProbeSeam for RealProbes {
                             http_attempt(host, *port, path, intent.timeout)
                         }
                         ReadinessProbe::Exec { .. } => super::exec::attempt(&intent, &canceled),
+                        ReadinessProbe::Log { .. } => {
+                            unreachable!("log readiness uses the live output observer")
+                        }
                     };
                     if !canceled.load(Ordering::Acquire) {
                         let (passing, diagnostic) = match attempt {

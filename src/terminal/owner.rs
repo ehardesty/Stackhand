@@ -20,7 +20,7 @@ use super::history::{BoundedOutputHistory, OutputHistoryMetrics};
 use super::session::OwnedCursorState;
 use super::state::{PendingInput, TerminalState};
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{BoundedPtyWriter, PtyResizer};
+use crate::runtime::{BoundedPtyWriter, PtyResizer, RunOutputObserver};
 
 pub const OUTPUT_QUEUE_SLOTS: usize = 64;
 pub const OUTPUT_READ_BUFFER_BYTES: usize = 4_096;
@@ -121,6 +121,7 @@ impl OwnerHandle {
         commands: CommandReceiver,
         geometry: TerminalGeometry,
         wake: impl Fn() + Send + 'static,
+        observer: Option<Arc<dyn RunOutputObserver>>,
     ) -> Result<Self> {
         let shared = Arc::new(SharedOwner {
             render: Mutex::new(OwnedRender {
@@ -147,6 +148,7 @@ impl OwnerHandle {
                     geometry,
                     &worker_shared,
                     &wake,
+                    observer,
                 );
                 if let Err(error) = result {
                     worker_shared.record(OwnerEvent::Failed(error.to_string()));
@@ -290,6 +292,7 @@ impl Effects {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_owner(
     reader: Box<dyn Read + Send>,
     resizer: PtyResizer,
@@ -298,6 +301,7 @@ fn run_owner(
     geometry: TerminalGeometry,
     shared: &SharedOwner,
     wake: &dyn Fn(),
+    observer: Option<Arc<dyn RunOutputObserver>>,
 ) -> Result<()> {
     let (output_tx, output_rx) = crossbeam_channel::bounded(OUTPUT_QUEUE_SLOTS);
     let reader = spawn_reader(reader, output_tx)?;
@@ -337,6 +341,9 @@ fn run_owner(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             };
+            if let Some(observer) = &observer {
+                observer.observe(&data);
+            }
             let evicted = history.push(&data);
             *shared
                 .history

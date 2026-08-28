@@ -26,6 +26,7 @@ fn start_sampled(command: SpawnCommand) -> StartedRun {
             ladder: quick_ladder(100, 100),
             metrics_interval: Some(Duration::from_millis(20)),
             on_output_wake: None,
+            output_observer: None,
         })
         .expect("sampled run started");
     StartedRun {

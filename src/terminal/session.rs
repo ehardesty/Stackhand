@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,9 @@ use super::owner::{OwnerEvent, OwnerHandle};
 use super::paste::{self, PasteRejection, PasteRequest};
 pub use super::selection::{SelectionDirection, SelectionPoint};
 use crate::geometry::TerminalGeometry;
-use crate::runtime::{PtyIo, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer};
+use crate::runtime::{
+    PtyIo, PtyWriterEvent, PtyWriterOwner, RunOutputObserver, spawn_bounded_pty_writer,
+};
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const INPUT_QUEUE_LIMIT_BYTES: usize = 256 * 1_024;
@@ -123,10 +125,20 @@ impl CopyRequest {
 }
 
 impl TerminalSession {
+    #[allow(dead_code)]
     pub fn spawn(
         io: PtyIo,
         geometry: TerminalGeometry,
         wake: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
+        Self::spawn_with_observer(io, geometry, wake, None)
+    }
+
+    pub(crate) fn spawn_with_observer(
+        io: PtyIo,
+        geometry: TerminalGeometry,
+        wake: impl Fn() + Send + 'static,
+        observer: Option<Arc<dyn RunOutputObserver>>,
     ) -> Result<Self> {
         let (writer, writer_owner) = spawn_bounded_pty_writer(io.writer, INPUT_QUEUE_LIMIT_BYTES)
             .context("could not start the bounded PTY writer")?;
@@ -138,6 +150,7 @@ impl TerminalSession {
             command_receiver,
             geometry,
             wake,
+            observer,
         )?;
         Ok(Self {
             owner,

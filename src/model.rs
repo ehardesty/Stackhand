@@ -146,6 +146,8 @@ pub enum ReadinessProbe {
         env: Vec<(String, String)>,
         success_exit_codes: Vec<i32>,
     },
+    /// Observe the current Run's live output for one literal substring.
+    Log { contains: String },
 }
 
 /// Scheduling and threshold policy for one leaf readiness check.

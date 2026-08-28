@@ -15,16 +15,17 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::geometry::TerminalGeometry;
+use crate::runtime::PtyProcess;
 use crate::runtime::ladder::{self, RUN_EXIT_POLL_INTERVAL};
 use crate::runtime::metrics::{MetricsSampler, RunMetrics};
 use crate::runtime::outcome::{
     ResizeRejected, RunExitDisposition, RunOutcome, ShutdownLadder, StageResult,
 };
-use crate::runtime::pipe::{PipeRun, RunOutputSender};
+use crate::runtime::pipe::PipeRun;
 use crate::runtime::process_tree::{SemanticSignal, SignalError, UnixProcessTree};
-use crate::runtime::{PtyProcess, SpawnCommand};
 use crate::terminal::{InputRejection as SessionInputRejection, TerminalSession};
 
+use super::start::RunStartRequest;
 use super::terminal_handle::TerminalHandle;
 
 /// Identifies one supervised Process across Runs.
@@ -78,28 +79,6 @@ pub enum RunMode {
     Pty { initial_geometry: TerminalGeometry },
     /// Non-interactive transport with separate stdout and stderr drains.
     Pipe,
-}
-
-/// Everything needed to start one Run.
-pub struct RunStartRequest {
-    pub process_id: ProcessId,
-    pub run_id: RunId,
-    pub command: SpawnCommand,
-    pub mode: RunMode,
-    /// Low-volume sink for Run state events. High-volume output never enters
-    /// this path.
-    pub events: mpsc::Sender<RunEvent>,
-    /// High-volume sink for pipe-mode process output. PTY-mode Runs deliver
-    /// output into their TerminalSession instead.
-    pub output: RunOutputSender,
-    /// The configured semantic shutdown ladder timeouts for this Run.
-    pub ladder: ShutdownLadder,
-    /// Aggregate Process Tree sampling interval. `None` disables sampling.
-    pub metrics_interval: Option<Duration>,
-    /// Optional wake called when terminal output arrives. This is the
-    /// redraw-notification path for interactive hosts; it never carries
-    /// output bytes.
-    pub on_output_wake: Option<Box<dyn Fn() + Send + 'static>>,
 }
 
 /// A low-volume Run lifecycle event. Every event carries the `RunId`.
@@ -179,11 +158,17 @@ pub struct RunRuntime;
 
 impl RunRuntime {
     pub fn start(&self, request: RunStartRequest) -> Result<OwnedRun> {
+        let output_observer = request.output_observer.clone();
         let inner = match request.mode {
             RunMode::Pty { initial_geometry } => {
                 let spawned = PtyProcess::spawn(request.command, initial_geometry)?;
                 let wake = request.on_output_wake.unwrap_or_else(|| Box::new(|| {}));
-                let session = TerminalSession::spawn(spawned.io, initial_geometry, wake)?;
+                let session = TerminalSession::spawn_with_observer(
+                    spawned.io,
+                    initial_geometry,
+                    wake,
+                    output_observer,
+                )?;
                 let tree = spawned.process.process_id().map(UnixProcessTree::from_root);
                 (
                     tree,
@@ -199,6 +184,7 @@ impl RunRuntime {
                     request.run_id,
                     request.events.clone(),
                     request.output.clone(),
+                    output_observer,
                 )?;
                 let tree = pipe.root_pid().map(UnixProcessTree::from_root);
                 (tree, RunInner::Pipe(pipe))

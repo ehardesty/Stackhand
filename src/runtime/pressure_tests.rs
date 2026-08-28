@@ -42,6 +42,7 @@ fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> PipeRunFixture {
             ladder,
             metrics_interval: None,
             on_output_wake: None,
+            output_observer: None,
         })
         .expect("pipe run started");
     let root_pid = run.root_pid().expect("root pid").get();
@@ -190,6 +191,7 @@ fn run_pty_pressure_case() {
             on_output_wake: Some(Box::new(move || {
                 wake_counter.fetch_add(1, Ordering::Relaxed);
             })),
+            output_observer: None,
         })
         .expect("PTY pressure Run started");
 
@@ -331,6 +333,7 @@ fn noisy_run_does_not_delay_another_runs_interrupt_and_shutdown() {
             ladder: quick_ladder(100, 100),
             metrics_interval: None,
             on_output_wake: None,
+            output_observer: None,
         })
         .expect("quiet run started");
 
@@ -419,6 +422,7 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
                 ladder: quick_ladder(50, 50),
                 metrics_interval: Some(Duration::from_millis(40)),
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("cycle run started");
         let outcome = run.wait().expect("natural completion");
@@ -446,6 +450,7 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
                 ladder: quick_ladder(50, 50),
                 metrics_interval: Some(Duration::from_millis(40)),
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("pty cycle run started");
         let outcome = run.wait().expect("pty natural completion");

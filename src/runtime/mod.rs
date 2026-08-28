@@ -1,5 +1,6 @@
 mod input_writer;
 mod ladder;
+mod log_matcher;
 mod metrics;
 mod outcome;
 mod pipe;
@@ -9,6 +10,8 @@ mod terminal_handle;
 // The Run ownership seam is the product interface for Milestone 0B. Some of
 // its public surface (resize, natural-exit waiting) is exercised through
 // callers and tests rather than this crate's non-test code yet.
+#[cfg(test)]
+mod log_observer_tests;
 #[cfg(test)]
 mod metrics_tests;
 #[cfg(test)]
@@ -21,12 +24,14 @@ mod run_tests;
 mod sampler_fixture;
 #[cfg(test)]
 mod shutdown_tests;
+mod start;
 #[cfg(test)]
 pub(crate) use terminal_handle::handle_for_test;
 
 pub(crate) use input_writer::{
     BoundedPtyWriter, PtyWriterEvent, PtyWriterOwner, spawn_bounded_pty_writer,
 };
+pub(crate) use log_matcher::{LiveLogMatcher, LogPattern};
 pub(crate) use pty::{PtyIo, PtyProcess, PtyResizer, SpawnCommand};
 // These re-exports form the public Run ownership seam; some are used only by
 // callers outside this module tree today.
@@ -42,8 +47,8 @@ pub use pipe::{
 #[allow(unused_imports)]
 pub use run::{
     InputRejected, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunMode, RunRuntime,
-    RunStartRequest,
 };
+pub use start::{RunOutputObserver, RunStartRequest};
 pub use terminal_handle::TerminalHandle;
 
 /// Whether one Run's root child has exited but is not yet reaped. The

@@ -32,6 +32,7 @@ mod pty_seam_tests {
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("fixture run started");
         (run, receiver)
@@ -63,6 +64,7 @@ mod pty_seam_tests {
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
+                output_observer: None,
             })
             .unwrap();
 
@@ -143,6 +145,7 @@ mod pipe_tests {
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("pipe run started");
         (run, event_receiver, output_receiver)
@@ -297,6 +300,7 @@ mod process_tree_tests {
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("pipe run started");
         let root_pid = run.root_pid().expect("pipe mode reports a root pid").get();
@@ -602,6 +606,7 @@ wait";
                 ladder: Default::default(),
                 metrics_interval: None,
                 on_output_wake: None,
+                output_observer: None,
             })
             .expect("pty run started");
         let root = run.root_pid().expect("pty root pid");

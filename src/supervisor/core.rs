@@ -388,6 +388,12 @@ impl Core {
         // Shell command text reaches the child through the Project's
         // configured launcher; direct commands never gain shell parsing.
         let (program, args) = spec.command.resolve(self.project.shell());
+        let log_matchers = self.entries[index]
+            .readiness
+            .as_ref()
+            .zip(spec.readiness.as_ref())
+            .map(|(tracking, config)| tracking.log_matchers(config))
+            .unwrap_or_default();
         StartIntent {
             process_id: self.entries[index].process_id,
             run_id,
@@ -397,6 +403,7 @@ impl Core {
             env: spec.env.clone(),
             initial_geometry: self.initial_geometry,
             pty: matches!(spec.terminal_mode, crate::model::TerminalMode::Pty),
+            log_matchers,
         }
     }
 

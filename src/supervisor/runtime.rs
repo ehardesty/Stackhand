@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
 use crate::runtime::{
-    OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId, RunMode,
-    RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
-    root_exit_pending,
+    LiveLogMatcher, LogPattern, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind,
+    RunId as RuntimeRunId, RunMode, RunOutputObserver, RunOutputReceiver, RunRuntime,
+    RunStartRequest, SpawnCommand, TerminalHandle, root_exit_pending,
 };
 use crate::supervisor::FailureKind;
-use crate::supervisor::seam::{FinishedRun, RunSeam, SeamEvent, SeamSender, StartIntent};
+use crate::supervisor::seam::{FinishedRun, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 
 /// Identifies one active Run inside the adapter.
@@ -110,7 +110,7 @@ struct RunRecord {
     /// Closes terminal access and auxiliary observations as soon as the
     /// Supervisor replaces or stops this Run. Process cleanup and the
     /// bounded output drain remain owned by `OwnedRun`.
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -123,7 +123,7 @@ impl RunRecord {
                 project_deadline: None,
             }),
             wake: Condvar::new(),
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
@@ -361,6 +361,8 @@ impl RunSeam for RealRunSeam {
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             let (output_tx, output_rx) = crate::runtime::output_channel();
+            let output_observer =
+                build_output_observer(&intent, Arc::clone(&record.cancelled), &events);
             let request = RunStartRequest {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
@@ -377,6 +379,7 @@ impl RunSeam for RealRunSeam {
                 ladder: Default::default(),
                 metrics_interval: Some(METRICS_INTERVAL),
                 on_output_wake: None,
+                output_observer,
             };
             match RunRuntime.start(request) {
                 Ok(run) => {
@@ -431,6 +434,36 @@ impl RunSeam for RealRunSeam {
             }),
         }
     }
+}
+
+fn build_output_observer(
+    intent: &StartIntent,
+    cancelled: Arc<AtomicBool>,
+    events: &SeamSender,
+) -> Option<Arc<dyn RunOutputObserver>> {
+    if intent.log_matchers.is_empty() {
+        return None;
+    }
+    let patterns = intent
+        .log_matchers
+        .iter()
+        .map(|matcher| LogPattern {
+            key: matcher.work_id.get(),
+            contains: matcher.contains.clone(),
+        })
+        .collect();
+    let process_id = intent.process_id;
+    let run_id = intent.run_id;
+    let events = events.clone();
+    let matcher = LiveLogMatcher::new(patterns, cancelled, move |key| {
+        events.send(SeamEvent::LogMatched {
+            process_id,
+            run_id,
+            work_id: WorkId::new(key),
+        });
+    })
+    .expect("validated log readiness patterns create a matcher");
+    Some(matcher)
 }
 
 /// Drain output independently of the cancellation latch. Output is a

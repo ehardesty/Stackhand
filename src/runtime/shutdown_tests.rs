@@ -43,6 +43,7 @@ fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> StartedRun {
             ladder,
             metrics_interval: None,
             on_output_wake: None,
+            output_observer: None,
         })
         .expect("pipe run started");
     let root_pid = run.root_pid().expect("pipe mode reports a root pid").get();
@@ -224,6 +225,7 @@ fn input_and_resize_are_rejected_after_shutdown_starts() {
             ladder: quick_ladder(100, 100),
             metrics_interval: None,
             on_output_wake: None,
+            output_observer: None,
         })
         .expect("pty run started");
     assert!(run.accepts_input());
