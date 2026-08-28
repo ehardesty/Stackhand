@@ -615,10 +615,13 @@ fn status_label(process: &ProcessSnapshot) -> String {
     if process.lifecycle == Lifecycle::Done {
         return "Done".to_string();
     }
-    // A failure stays visible while the Process is not mid-shutdown; the
-    // Stopping branch folds its own failure reason into the label.
-    if process.lifecycle != Lifecycle::Stopping
-        && let Some(failure) = &process.failure
+    // A failure stays visible while the Process is not mid-shutdown or
+    // waiting through an automatic restart delay. Those states project their
+    // own reason into the label.
+    if !matches!(
+        process.lifecycle,
+        Lifecycle::Stopping | Lifecycle::RestartBackoff
+    ) && let Some(failure) = &process.failure
     {
         return format!("Failed ({})", short_reason(&failure.detail));
     }
@@ -638,6 +641,10 @@ fn status_label(process: &ProcessSnapshot) -> String {
                 "Stopping".to_string()
             }
         }
+        Lifecycle::RestartBackoff => match &process.restart_backoff {
+            Some(backoff) => format!("Restarting ({})", short_reason(&backoff.reason)),
+            None => "Restarting".to_string(),
+        },
     }
 }
 
@@ -675,6 +682,13 @@ fn selected_header(process: &ProcessSnapshot, now_ms: u64) -> String {
     if process.lifecycle == Lifecycle::Waiting {
         if let Some(reason) = &process.blocked_reason {
             header.push_str(&format!(" · {reason}"));
+        }
+    } else if process.lifecycle == Lifecycle::RestartBackoff {
+        if let Some(backoff) = &process.restart_backoff {
+            header.push_str(&format!(
+                " · {} · next restart at {}ms",
+                backoff.reason, backoff.next_attempt_at_ms
+            ));
         }
     } else if let Some(readiness) = &process.readiness {
         if let Some(last_error) = &readiness.last_error {

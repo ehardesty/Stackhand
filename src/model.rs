@@ -33,6 +33,55 @@ impl Autostart {
     }
 }
 
+/// When a failed or unexpected Run should be started again automatically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RestartPolicy {
+    /// Never start another Run without a user command.
+    #[default]
+    Never,
+    /// Start another Run only after a failed Run.
+    OnFailure,
+    /// Start another Run after every unintentional Service exit.
+    Always,
+}
+
+impl RestartPolicy {
+    /// Parse the configuration spelling of this policy.
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "never" => Some(Self::Never),
+            "on_failure" => Some(Self::OnFailure),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    /// Return the configuration spelling of this policy.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnFailure => "on_failure",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// The fixed delay before one automatic restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartConfig {
+    pub policy: RestartPolicy,
+    pub backoff: Duration,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            policy: RestartPolicy::Never,
+            backoff: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Whether configuration enables a Process at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enabled {
@@ -208,6 +257,8 @@ pub struct ProcessSpec {
     /// When set, the Service stays Starting until this probe passes. Valid
     /// on Services only; configuration validation rejects it on One-shots.
     pub readiness: Option<ReadinessConfig>,
+    /// Policy for restarting a failed or unexpectedly ended Run.
+    pub restart: RestartConfig,
 }
 
 /// Why one effective Project could not be built.
@@ -232,6 +283,11 @@ pub enum ProjectError {
     /// for readiness.
     ReadinessOnOneShot {
         process: String,
+    },
+    /// An automatic restart policy is not valid for this Process kind.
+    InvalidRestartPolicy {
+        process: String,
+        policy: String,
     },
     /// The Dependency graph has a cycle; the path repeats its first name.
     DependencyCycle(Vec<String>),
@@ -324,6 +380,12 @@ impl EffectiveProject {
             if spec.readiness.is_some() && spec.kind == ProcessKind::OneShot {
                 return Err(ProjectError::ReadinessOnOneShot {
                     process: spec.name.clone(),
+                });
+            }
+            if spec.kind == ProcessKind::OneShot && spec.restart.policy == RestartPolicy::Always {
+                return Err(ProjectError::InvalidRestartPolicy {
+                    process: spec.name.clone(),
+                    policy: spec.restart.policy.label().to_string(),
                 });
             }
             dependency_indices.push(resolved);
@@ -435,6 +497,7 @@ mod tests {
             enabled: Enabled::Yes,
             autostart: Autostart::No,
             success_exit_codes: vec![0],
+            restart: RestartConfig::default(),
             command: CommandForm::Direct {
                 program: "sleep".into(),
                 args: vec!["1".into()],

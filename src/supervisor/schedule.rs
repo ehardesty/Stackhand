@@ -11,7 +11,9 @@
 //! A Dependency is a startup relationship only: nothing here stops an
 //! already-running dependent when a dependency later stops.
 
-use super::core::{Core, DesiredState, Lifecycle};
+use std::time::{Duration, Instant};
+
+use super::core::{Core, DesiredState, Lifecycle, RestartBackoff, RestartReason};
 use super::readiness::ReadinessState;
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
@@ -25,8 +27,9 @@ impl Core {
             return;
         }
         if trigger == RunTrigger::Manual {
-            self.entries[index].awaiting_manual_restart = false;
-            self.entries[index].exited = false;
+            let entry = &mut self.entries[index];
+            entry.clear_restart_state();
+            entry.exited = false;
         }
         self.require_running(index, trigger);
         self.evaluate();
@@ -41,9 +44,12 @@ impl Core {
         if !self.is_enabled(index) {
             return;
         }
-        self.entries[index].pending_trigger = trigger;
-        self.entries[index].awaiting_manual_restart = false;
-        self.entries[index].exited = false;
+        {
+            let entry = &mut self.entries[index];
+            entry.pending_trigger = trigger;
+            entry.clear_restart_state();
+            entry.exited = false;
+        }
         self.require_running(index, trigger);
         let entry = &mut self.entries[index];
         if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
@@ -102,6 +108,7 @@ impl Core {
             entry.current_run.is_none()
                 && entry.desired == DesiredState::Running
                 && !entry.awaiting_manual_restart
+                && entry.restart_backoff.is_none()
         };
         if !can_start {
             return;
@@ -130,7 +137,7 @@ impl Core {
         entry.metrics = None;
         entry.exited = false;
         entry.startup_timeout_pending = false;
-        entry.awaiting_manual_restart = false;
+        entry.clear_restart_state();
         entry.run_cancelled = false;
         entry.blocked = None;
         // Starting is the immediate invalidation of an earlier successful
@@ -144,7 +151,10 @@ impl Core {
 
     fn mark_blocked(&mut self, index: usize, reason: String) {
         let entry = &mut self.entries[index];
-        if entry.current_run.is_some() || entry.desired != DesiredState::Running {
+        if entry.current_run.is_some()
+            || entry.desired != DesiredState::Running
+            || entry.restart_backoff.is_some()
+        {
             return;
         }
         entry.lifecycle = Lifecycle::Waiting;
@@ -218,7 +228,71 @@ impl Core {
         self.entries[index].lifecycle == Lifecycle::Done
     }
 
+    /// Hold one automatic retry behind the configured fixed delay. The
+    /// failed Run identity is retained so a stale expiry cannot authorize a
+    /// later Run.
+    pub(super) fn schedule_automatic_restart(
+        &mut self,
+        index: usize,
+        failed_run_id: RunId,
+        reason: RestartReason,
+    ) {
+        let deadline = self.clock.now() + self.project.processes()[index].restart.backoff;
+        let entry = &mut self.entries[index];
+        entry.desired = DesiredState::Running;
+        entry.lifecycle = Lifecycle::RestartBackoff;
+        entry.blocked = None;
+        entry.clear_restart_state();
+        entry.restart_backoff = Some(RestartBackoff {
+            failed_run_id,
+            deadline,
+            reason,
+        });
+    }
+
+    /// Release automatic retries whose fixed delay has expired. Only the
+    /// still-current backoff can produce the next Run; an old state is left
+    /// inert rather than being allowed to start a newer or stopped Run.
+    pub(super) fn poll_restart_timers(&mut self, now: Instant) {
+        let expired = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let deadline = valid_restart_deadline(entry)?;
+                (deadline <= now).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in expired.iter().copied() {
+            let entry = &mut self.entries[index];
+            entry.restart_backoff = None;
+            entry.pending_trigger = RunTrigger::AutomaticRestart;
+        }
+        if !expired.is_empty() {
+            self.evaluate();
+        }
+    }
+
+    /// How long until a still-authoritative automatic retry is due.
+    pub(super) fn restart_time_until_next_timer(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        self.entries
+            .iter()
+            .filter_map(valid_restart_deadline)
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+    }
+
     pub(super) fn is_enabled(&self, index: usize) -> bool {
         matches!(self.project.processes()[index].enabled, Enabled::Yes)
     }
+}
+
+fn valid_restart_deadline(entry: &super::core::Entry) -> Option<Instant> {
+    let backoff = entry.restart_backoff?;
+    (entry.current_run.is_none()
+        && entry.desired == DesiredState::Running
+        && entry.lifecycle == Lifecycle::RestartBackoff
+        && entry.next_run == backoff.failed_run_id.get().saturating_add(1))
+    .then_some(backoff.deadline)
 }

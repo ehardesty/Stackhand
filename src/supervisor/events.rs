@@ -4,10 +4,23 @@
 //! authoritative lifecycle owner and keeps the Process/Run identity gate in
 //! one place.
 
-use crate::model::ProcessKind;
+use crate::model::{ProcessKind, RestartPolicy};
+use crate::runtime::RunId;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
-use super::core::{Core, FailureKind, FailureSummary, MetricsMetadata};
+use super::core::{Core, FailureKind, FailureSummary, MetricsMetadata, RestartReason};
+
+#[derive(Clone, Copy)]
+enum TerminalOutcome {
+    Failed {
+        kind: FailureKind,
+    },
+    Finished {
+        exit_code: Option<i32>,
+        intentional_stop: bool,
+        timed_out: bool,
+    },
+}
 
 impl Core {
     pub(crate) fn event(&mut self, event: SeamEvent) {
@@ -124,26 +137,7 @@ impl Core {
             }
             SeamEvent::Finished(finished) => self.apply_finished_run(index, finished),
             SeamEvent::Failed { kind, detail, .. } => {
-                self.cancel_run_work(index);
-                let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
-                let now_ms = self.now_ms();
-                let entry = &mut self.entries[index];
-                if one_shot {
-                    // A spawn failure still ends the scheduled One-shot Run;
-                    // `exited` does not require successful process creation.
-                    entry.exited = true;
-                }
-                entry.failure = Some(FailureSummary { kind, detail });
-                // A failed adapter report ends the Run identity and reverts
-                // the Process to stopped so it can be started again.
-                entry.record_finished_run(now_ms, None, false);
-                entry.current_run = None;
-                entry.root_pid = None;
-                entry.desired = super::core::DesiredState::Stopped;
-                entry.lifecycle = super::core::Lifecycle::Stopped;
-                entry.metrics = None;
-                entry.readiness = None;
-                self.evaluate();
+                self.apply_failed_run(index, kind, detail);
             }
             SeamEvent::Metrics {
                 run_id,
@@ -191,6 +185,14 @@ impl Core {
     /// one serialized Supervisor turn.
     fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
         let timed_out = self.entries[index].startup_timeout_pending;
+        let restart_reason = self.restart_reason_for_terminal(
+            index,
+            TerminalOutcome::Finished {
+                exit_code: finished.exit_code,
+                intentional_stop: finished.intentional_stop,
+                timed_out,
+            },
+        );
         // Natural exit also ends any probe that is still in flight. The
         // identity gate below makes a result released after this point
         // harmless.
@@ -202,9 +204,8 @@ impl Core {
             }
         }
 
-        let now_ms = self.now_ms();
-        let entry = &mut self.entries[index];
         if !finished.cleanup_confirmed {
+            let entry = &mut self.entries[index];
             // Hold the Run identity. A later Stop retries the same adapter
             // owner; no replacement Run can start before confirmation.
             entry.cleanup_unconfirmed = true;
@@ -236,30 +237,139 @@ impl Core {
             return;
         }
 
-        if self.project.processes()[index].kind == ProcessKind::OneShot {
-            entry.exited = true;
+        {
+            let entry = &mut self.entries[index];
+            if self.project.processes()[index].kind == ProcessKind::OneShot {
+                entry.exited = true;
+            }
+            if timed_out {
+                let failure = entry
+                    .failure
+                    .as_mut()
+                    .expect("a pending startup timeout has a recorded failure");
+                failure.detail.push_str("; cleanup confirmed");
+            }
         }
-        if timed_out {
-            let failure = entry
-                .failure
-                .as_mut()
-                .expect("a pending startup timeout has a recorded failure");
-            failure.detail.push_str("; cleanup confirmed");
-        }
-        let intentional_stop = finished.intentional_stop && !timed_out;
-        entry.record_finished_run(now_ms, finished.exit_code, intentional_stop);
-        entry.current_run = None;
-        entry.root_pid = None;
-        entry.metrics = None;
-        entry.readiness = None;
-        entry.cleanup_unconfirmed = false;
-        entry.startup_timeout_pending = false;
-        // A successful One-shot stays Done. Every other finished Run settles
-        // at Stopped after its result has been recorded.
-        if entry.lifecycle != super::core::Lifecycle::Done {
+        self.finalize_confirmed_run(
+            index,
+            finished.run_id,
+            finished.exit_code,
+            finished.intentional_stop && !timed_out,
+            restart_reason,
+        );
+    }
+
+    /// Apply a failed adapter fact as a confirmed failed Run. Spawn failures
+    /// have no separate Process Tree cleanup fact, so this event itself
+    /// releases the Run identity and enters the same restart policy path.
+    fn apply_failed_run(&mut self, index: usize, kind: FailureKind, detail: String) {
+        let restart_reason =
+            self.restart_reason_for_terminal(index, TerminalOutcome::Failed { kind });
+        let failed_run_id = self.entries[index]
+            .current_run
+            .expect("a failed event belongs to the current Run");
+        self.cancel_run_work(index);
+        let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
+        {
+            let entry = &mut self.entries[index];
+            if one_shot {
+                // A spawn failure still ends the scheduled One-shot Run;
+                // `exited` does not require successful process creation.
+                entry.exited = true;
+            }
+            entry.failure = Some(FailureSummary { kind, detail });
+            entry.desired = super::core::DesiredState::Stopped;
             entry.lifecycle = super::core::Lifecycle::Stopped;
         }
+        self.finalize_confirmed_run(index, failed_run_id, None, false, restart_reason);
+    }
+
+    fn restart_reason_for_terminal(
+        &self,
+        index: usize,
+        outcome: TerminalOutcome,
+    ) -> Option<RestartReason> {
+        if self.shutdown_in_progress() || self.entries[index].restart_suppressed {
+            return None;
+        }
+        let policy = self.project.processes()[index].restart.policy;
+        match outcome {
+            TerminalOutcome::Failed { kind } => match policy {
+                RestartPolicy::Never => None,
+                RestartPolicy::OnFailure | RestartPolicy::Always => match kind {
+                    FailureKind::Configuration | FailureKind::Spawn => {
+                        Some(RestartReason::SpawnFailure)
+                    }
+                    _ => Some(RestartReason::FailedRun),
+                },
+            },
+            TerminalOutcome::Finished {
+                exit_code,
+                intentional_stop,
+                timed_out,
+            } => {
+                if timed_out {
+                    // The timeout initiates the cleanup, so the runtime may
+                    // report that cleanup as intentional. The timeout
+                    // failure still owns the automatic restart decision.
+                    return (policy != RestartPolicy::Never)
+                        .then_some(RestartReason::StartupTimeout);
+                }
+                if intentional_stop {
+                    return None;
+                }
+                let failed = self.service_or_one_shot_exit_failed(index, exit_code);
+                match policy {
+                    RestartPolicy::Never => None,
+                    RestartPolicy::OnFailure => failed.then_some(RestartReason::FailedRun),
+                    RestartPolicy::Always if failed => Some(RestartReason::FailedRun),
+                    RestartPolicy::Always => Some(RestartReason::UnexpectedSuccessfulExit),
+                }
+            }
+        }
+    }
+
+    fn finalize_confirmed_run(
+        &mut self,
+        index: usize,
+        run_id: RunId,
+        exit_code: Option<i32>,
+        intentional_stop: bool,
+        restart_reason: Option<RestartReason>,
+    ) {
+        let now_ms = self.now_ms();
+        {
+            let entry = &mut self.entries[index];
+            debug_assert_eq!(entry.current_run, Some(run_id));
+            entry.record_finished_run(now_ms, exit_code, intentional_stop);
+            entry.current_run = None;
+            entry.root_pid = None;
+            entry.metrics = None;
+            entry.readiness = None;
+            entry.cleanup_unconfirmed = false;
+            entry.startup_timeout_pending = false;
+            // A successful One-shot stays Done. Every other finished Run
+            // settles at Stopped after its result has been recorded.
+            if entry.lifecycle != super::core::Lifecycle::Done {
+                entry.lifecycle = super::core::Lifecycle::Stopped;
+            }
+        }
+        if let Some(reason) = restart_reason {
+            // The terminal Run identity is the timer's guard. The Run has
+            // been released before the replacement timer is installed.
+            self.schedule_automatic_restart(index, run_id, reason);
+        } else {
+            self.entries[index].restart_suppressed = false;
+        }
         self.evaluate();
+    }
+
+    fn service_or_one_shot_exit_failed(&self, index: usize, code: Option<i32>) -> bool {
+        !code.is_some_and(|code| {
+            self.project.processes()[index]
+                .success_exit_codes
+                .contains(&code)
+        })
     }
 
     /// Project one One-shot Run result into its terminal lifecycle state.

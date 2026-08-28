@@ -87,5 +87,5 @@ The example is intentionally noisy. Press `Ctrl-Q` when the check is complete.
 
 These examples are for the current macOS prototype. Windows is not supported.
 Linux interactive PTY behavior is not yet current validation evidence.
-Stackhand does not yet support automatic restart policies, hooks, liveness,
-startup timeouts, profiles, overlays, or configuration discovery.
+Stackhand does not yet support hooks, liveness, profiles, overlays, or
+configuration discovery.

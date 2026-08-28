@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use stackhand::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    ReadinessCheck, ReadinessConfig, ReadinessProbe, ShellConfig, TerminalMode,
+    ReadinessCheck, ReadinessConfig, ReadinessProbe, RestartConfig, ShellConfig, TerminalMode,
 };
 
 #[cfg(unix)]
@@ -120,6 +120,7 @@ fn readiness_test_process(tcp_port: u16, http_port: u16) -> ProcessSpec {
         enabled: Enabled::Yes,
         autostart: Autostart::No,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "/bin/sleep".into(),
             args: vec!["60".into()],
@@ -174,6 +175,7 @@ fn exec_service(
         enabled: Enabled::Yes,
         autostart: Autostart::No,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "/bin/sleep".into(),
             args: vec!["60".into()],
@@ -574,6 +576,7 @@ fn startup_timeout_confirms_real_process_tree_cleanup() {
         enabled: Enabled::Yes,
         autostart: Autostart::No,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "/bin/sh".into(),
             args: vec![

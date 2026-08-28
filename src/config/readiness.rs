@@ -289,7 +289,7 @@ fn configured_threshold(
 }
 
 /// Parse a nonnegative whole-number duration with one supported suffix.
-fn parse_duration(value: &str) -> Result<Duration, String> {
+pub(super) fn parse_duration(value: &str) -> Result<Duration, String> {
     let (digits, nanos_per_unit) = if let Some(digits) = value.strip_suffix("ms") {
         (digits, 1_000_000_u128)
     } else if let Some(digits) = value.strip_suffix('s') {

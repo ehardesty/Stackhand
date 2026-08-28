@@ -85,6 +85,15 @@ pub struct ReadinessStatus {
     pub children: Vec<ReadinessChildStatus>,
 }
 
+/// The visible state of one pending automatic restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartBackoffStatus {
+    /// Why the current Run will be started again.
+    pub reason: String,
+    /// Session milliseconds when the next automatic Run may start.
+    pub next_attempt_at_ms: u64,
+}
+
 /// The immutable lifecycle and diagnostic view of one Process.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessSnapshot {
@@ -119,6 +128,8 @@ pub struct ProcessSnapshot {
     /// Passing and Failing recovery states; `None` without a probe or after it
     /// ended.
     pub readiness: Option<ReadinessStatus>,
+    /// The pending automatic retry while the Process is in RestartBackoff.
+    pub restart_backoff: Option<RestartBackoffStatus>,
     /// The bounded recent finished-Run summaries, newest first.
     pub recent_runs: Vec<RunSummary>,
 }

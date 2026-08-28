@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    ReadinessCheck, ReadinessConfig, ReadinessProbe, TerminalMode,
+    ReadinessCheck, ReadinessConfig, ReadinessProbe, RestartConfig, TerminalMode,
 };
 use crate::supervisor::clock::SystemClock;
 use crate::supervisor::core::Core;
@@ -27,6 +27,7 @@ fn one_shot_project(command: CommandForm) -> EffectiveProject {
         enabled: Enabled::Yes,
         autostart: Autostart::No,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command,
         working_dir: std::env::temp_dir(),
         env: Vec::new(),
@@ -69,6 +70,7 @@ fn real_log_project(marker_file: &std::path::Path) -> EffectiveProject {
         enabled: Enabled::Yes,
         autostart: Autostart::No,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Shell {
             text: "if [ ! -e \"$STACKHAND_LOG_RUN\" ]; then : > \"$STACKHAND_LOG_RUN\"; printf 'ready'; fi; sleep 30"
                 .to_string(),

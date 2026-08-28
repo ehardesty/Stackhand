@@ -14,8 +14,8 @@ use super::{
 };
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
-    ProcessKind, ProcessSpec, ReadinessCheck, ReadinessConfig, ReadinessProbe, ShellConfig,
-    TerminalMode,
+    ProcessKind, ProcessSpec, ReadinessCheck, ReadinessConfig, ReadinessProbe, RestartConfig,
+    ShellConfig, TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
@@ -31,6 +31,7 @@ fn simple(name: &str, kind: ProcessKind, enabled: Enabled, autostart: Autostart)
         enabled,
         autostart,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "sleep".into(),
             args: vec!["1".into()],
@@ -689,6 +690,7 @@ mod one_shot_lifecycle;
 mod one_shot_rerun;
 mod project_shutdown;
 
+mod restart;
 mod service_lifecycle;
 
 #[cfg(test)]

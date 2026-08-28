@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::model::{
     Autostart, CommandForm, EffectiveProject, Enabled, InputPolicy, ProcessKind, ProcessSpec,
-    TerminalMode,
+    RestartConfig, TerminalMode,
 };
 use crate::supervisor::{Command, Lifecycle};
 
@@ -43,6 +43,7 @@ fn noisy_process(name: &str) -> ProcessSpec {
         enabled: Enabled::Yes,
         autostart: Autostart::Yes,
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "yes".into(),
             args: vec!["stackhand-noise".into()],
@@ -68,6 +69,7 @@ fn quiet_process(name: &str, autostart: bool) -> ProcessSpec {
             Autostart::No
         },
         success_exit_codes: vec![0],
+        restart: RestartConfig::default(),
         command: CommandForm::Direct {
             program: "/bin/sleep".into(),
             args: vec!["60".into()],

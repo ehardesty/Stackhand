@@ -59,7 +59,14 @@ impl Core {
             entry.desired = DesiredState::Stopped;
             entry.blocked = None;
             entry.readiness = None;
-            if entry.current_run.is_none() && entry.lifecycle == Lifecycle::Waiting {
+            entry.restart_backoff = None;
+            entry.restart_suppressed = true;
+            if entry.current_run.is_none()
+                && matches!(
+                    entry.lifecycle,
+                    Lifecycle::Waiting | Lifecycle::RestartBackoff
+                )
+            {
                 entry.lifecycle = Lifecycle::Stopped;
             }
         }

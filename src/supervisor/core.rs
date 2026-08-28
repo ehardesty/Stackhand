@@ -15,7 +15,7 @@ use crate::supervisor::clock::Clock;
 use crate::supervisor::command::Command;
 use crate::supervisor::readiness::ReadinessTracking;
 use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId};
-use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot};
+use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, RestartBackoffStatus};
 
 /// The user's current intent for a Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub enum Lifecycle {
     Waiting,
     /// Bounded shutdown is in progress for the current Run.
     Stopping,
+    /// Desired State is Running while a failed Run waits before retrying.
+    RestartBackoff,
     /// No current Run remains after a stop or exit.
     Stopped,
     /// A One-shot Run completed with an accepted success exit code. Done
@@ -98,6 +100,8 @@ pub enum RunTrigger {
     Restart,
     /// The user reran the selected One-shot.
     Rerun,
+    /// The scheduler restarted a failed Run automatically.
+    AutomaticRestart,
     /// The scheduler started a Process because the user marked a
     /// dependent Process Running.
     Dependency,
@@ -128,6 +132,36 @@ pub enum FailureKind {
 pub struct FailureSummary {
     pub kind: FailureKind,
     pub detail: String,
+}
+
+/// Why the Supervisor is waiting before an automatic restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestartReason {
+    SpawnFailure,
+    FailedRun,
+    StartupTimeout,
+    UnexpectedSuccessfulExit,
+}
+
+impl RestartReason {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::SpawnFailure => "spawn failure",
+            Self::FailedRun => "failed Run",
+            Self::StartupTimeout => "startup timeout",
+            Self::UnexpectedSuccessfulExit => "unexpected successful exit",
+        }
+    }
+}
+
+/// One pending automatic restart. The failed Run identity makes the timer
+/// specific to the Run that created it even though no Run is current during
+/// the backoff.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RestartBackoff {
+    pub(super) failed_run_id: RunId,
+    pub(super) deadline: Instant,
+    pub(super) reason: RestartReason,
 }
 
 pub(crate) struct Core {
@@ -179,8 +213,12 @@ pub(super) struct Entry {
     /// True while cleanup for a readiness startup timeout is still pending.
     pub(super) startup_timeout_pending: bool,
     /// A naturally ended Service stays desired-running but waits for an
-    /// explicit start or restart until automatic restart policy exists.
+    /// explicit start or restart when automatic restart is disabled.
     pub(super) awaiting_manual_restart: bool,
+    /// The pending automatic retry, if one is waiting for its fixed delay.
+    pub(super) restart_backoff: Option<RestartBackoff>,
+    /// A manual stop suppresses a restart that was already being cleaned up.
+    pub(super) restart_suppressed: bool,
     /// Work identities allocated for this Process. They are monotonic across
     /// Runs so a late result cannot become current through reuse.
     pub(super) next_work_id: u64,
@@ -210,9 +248,19 @@ impl Entry {
             exited: false,
             startup_timeout_pending: false,
             awaiting_manual_restart: false,
+            restart_backoff: None,
+            restart_suppressed: false,
             next_work_id: 1,
             run_cancelled: false,
         }
+    }
+
+    /// Remove transient automatic-restart gates before a new explicit or
+    /// admitted Run takes ownership. The pending trigger remains unchanged.
+    pub(super) fn clear_restart_state(&mut self) {
+        self.awaiting_manual_restart = false;
+        self.restart_backoff = None;
+        self.restart_suppressed = false;
     }
 
     /// Record the bounded finished-Run summary for the Run that just ended
@@ -410,15 +458,53 @@ impl Core {
     fn stop_at(&mut self, index: usize) {
         // An unconfirmed cleanup holds its Run identity: Stop retries the
         // bounded cleanup for that same Run, and only a confirmed completion
-        // releases it.
+        // releases it. The manual stop also suppresses any automatic retry
+        // that the held Run would otherwise have scheduled.
         if self.entries[index].cleanup_unconfirmed {
             let run_id = self.entries[index]
                 .current_run
                 .expect("an unconfirmed cleanup holds its Run identity");
             let process_id = self.entries[index].process_id;
-            self.entries[index].lifecycle = Lifecycle::Stopping;
+            let entry = &mut self.entries[index];
+            // A Restart/Rerun already requested this cleanup as the first
+            // half of a replacement. Stop is the retry operation for that
+            // unconfirmed cleanup; preserve the pending desire so the
+            // replacement can start after confirmation. A plain Stop keeps
+            // its normal suppressing meaning.
+            let replacement_pending = matches!(
+                entry.pending_trigger,
+                crate::supervisor::RunTrigger::Restart | crate::supervisor::RunTrigger::Rerun
+            );
+            entry.restart_suppressed = !replacement_pending;
+            if !replacement_pending {
+                entry.desired = DesiredState::Stopped;
+            }
+            entry.lifecycle = Lifecycle::Stopping;
             self.cancel_run_work(index);
             self.seam.stop(process_id, run_id, None, &self.events);
+            return;
+        }
+        // A pending automatic retry has no Run to stop. Removing the state
+        // invalidates the timer, so an expiry already queued elsewhere can
+        // never authorize a new Run.
+        if self.entries[index].restart_backoff.is_some() {
+            let entry = &mut self.entries[index];
+            entry.clear_restart_state();
+            entry.desired = DesiredState::Stopped;
+            entry.lifecycle = Lifecycle::Stopped;
+            entry.blocked = None;
+            return;
+        }
+        // A cleanup already dispatched by a timeout or restart remains the
+        // same Run. Change the desired state and suppress its replacement,
+        // but do not issue a second stop request.
+        if self.entries[index].current_run.is_some()
+            && self.entries[index].lifecycle == Lifecycle::Stopping
+        {
+            let entry = &mut self.entries[index];
+            entry.desired = DesiredState::Stopped;
+            entry.restart_suppressed = true;
+            entry.blocked = None;
             return;
         }
         if self.entries[index].desired != DesiredState::Running {
@@ -439,6 +525,7 @@ impl Core {
         let entry = &mut self.entries[index];
         entry.desired = DesiredState::Stopped;
         entry.lifecycle = Lifecycle::Stopping;
+        entry.restart_suppressed = true;
         entry.blocked = None;
         // Pending readiness belongs to the ending Run. The work cancellation
         // also rejects any result released after this command.
@@ -457,13 +544,16 @@ impl Core {
     /// the threaded wrapper drives it on tick timeouts.
     pub(crate) fn poll_timers(&mut self, now: Instant) {
         self.poll_readiness_timers(now);
+        self.poll_restart_timers(now);
         self.expire_shutdown(now);
     }
 
-    /// How long the caller may wait before readiness or shutdown work is due.
+    /// How long the caller may wait before readiness, restart, or shutdown
+    /// work is due.
     pub(crate) fn time_until_next_timer(&self) -> Option<Duration> {
         self.readiness_time_until_next_timer()
             .into_iter()
+            .chain(self.restart_time_until_next_timer())
             .chain(self.time_until_shutdown_deadline())
             .min()
     }
@@ -497,6 +587,13 @@ impl Core {
                         .as_ref()
                         .expect("tracking exists only for a configured readiness check");
                     tracking.snapshot(config, now_ms)
+                }),
+                restart_backoff: entry.restart_backoff.map(|backoff| RestartBackoffStatus {
+                    reason: backoff.reason.label().to_string(),
+                    next_attempt_at_ms: backoff
+                        .deadline
+                        .saturating_duration_since(self.epoch)
+                        .as_millis() as u64,
                 }),
                 recent_runs: entry.runs.iter().rev().cloned().collect(),
             })

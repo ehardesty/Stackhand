@@ -42,6 +42,7 @@ Accepted success codes affect oneshot completion and failure classification. The
 - `always`: restart after any unintentional service exit while desired state remains `Running`.
 - A oneshot may use `never` or `on_failure`; `always` is invalid for a oneshot.
 - The default policy is `never`.
+- The default fixed restart backoff is `2s`.
 - `on_unhealthy`: when enabled, liveness failure initiates shutdown and counts as a failed run.
 - Manual stop never triggers automatic restart.
 - Project shutdown suppresses all automatic restarts.
