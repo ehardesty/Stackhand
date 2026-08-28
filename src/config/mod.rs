@@ -1,10 +1,11 @@
 //! Configuration: one YAML version 1 file becomes one validated
 //! [`EffectiveProject`] or a structured error before any Process starts.
 //!
-//! The resolver applies one selected profile to the canonical base file before
+//! The resolver applies selected profiles to the canonical base file before
 //! lowering the result into the validated Project model.
 
 mod file;
+mod profile;
 mod readiness;
 
 #[cfg(test)]
@@ -17,12 +18,15 @@ mod schema_tests;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use serde_yaml::Value;
+
 use anyhow::Context;
 
 use self::file::{
-    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, ProfileFile, RestartFile,
-    SettingsFile, TerminalFile,
+    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
+    TerminalFile,
 };
+use self::profile::apply_profiles;
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
@@ -38,13 +42,13 @@ pub enum ResolutionRequest {
     /// Use exactly this Project path. No base-file discovery is performed.
     Explicit {
         path: PathBuf,
-        profile: Option<String>,
+        profiles: Vec<String>,
     },
     /// Search for the nearest base file. `None` starts at the current
     /// directory; `Some` is useful for deterministic callers and tests.
     Discover {
         start_dir: Option<PathBuf>,
-        profile: Option<String>,
+        profiles: Vec<String>,
     },
 }
 
@@ -52,21 +56,24 @@ impl ResolutionRequest {
     pub fn explicit(path: impl Into<PathBuf>) -> Self {
         Self::Explicit {
             path: path.into(),
-            profile: None,
+            profiles: Vec::new(),
         }
     }
 
-    pub fn explicit_with_optional_profile(path: impl Into<PathBuf>, profile: Option<&str>) -> Self {
+    pub fn explicit_with_profiles(
+        path: impl Into<PathBuf>,
+        profiles: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self::Explicit {
             path: path.into(),
-            profile: profile.map(str::to_owned),
+            profiles: profiles.into_iter().collect(),
         }
     }
 
-    pub fn discover_with_optional_profile(profile: Option<&str>) -> Self {
+    pub fn discover_with_profiles(profiles: impl IntoIterator<Item = String>) -> Self {
         Self::Discover {
             start_dir: None,
-            profile: profile.map(str::to_owned),
+            profiles: profiles.into_iter().collect(),
         }
     }
 
@@ -74,7 +81,7 @@ impl ResolutionRequest {
     pub fn discover_from(path: impl Into<PathBuf>) -> Self {
         Self::Discover {
             start_dir: Some(path.into()),
-            profile: None,
+            profiles: Vec::new(),
         }
     }
 }
@@ -105,18 +112,19 @@ impl ProjectResolution {
 
 /// Resolve and validate one Project before any Process starts.
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
-    let (base, profile) = match request {
-        ResolutionRequest::Explicit { path, profile } => (
+    let (base, profiles) = match request {
+        ResolutionRequest::Explicit { path, profiles } => (
             absolute_normalized_path(&path)
                 .with_context(|| format!("could not resolve Project path {}", path.display()))
                 .map_err(config_error)?,
-            profile,
+            profiles,
         ),
-        ResolutionRequest::Discover { start_dir, profile } => {
-            (discover_base(start_dir.as_deref())?, profile)
-        }
+        ResolutionRequest::Discover {
+            start_dir,
+            profiles,
+        } => (discover_base(start_dir.as_deref())?, profiles),
     };
-    let project = load_file(&base, profile.as_deref())?;
+    let project = load_file(&base, &profiles)?;
     Ok(ProjectResolution {
         project,
         sources: ResolutionSources { base },
@@ -142,29 +150,46 @@ pub fn validate_project_with_profile(
     explicit_path: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<PathBuf, ConfigError> {
+    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    validate_project_with_profiles(explicit_path, &profiles)
+}
+
+/// Resolve and validate a Project with profiles selected in CLI order.
+pub fn validate_project_with_profiles(
+    explicit_path: Option<&Path>,
+    profiles: &[String],
+) -> Result<PathBuf, ConfigError> {
     let request = explicit_path.map_or_else(
-        || ResolutionRequest::discover_with_optional_profile(profile),
-        |path| ResolutionRequest::explicit_with_optional_profile(path, profile),
+        || ResolutionRequest::discover_with_profiles(profiles.iter().cloned()),
+        |path| ResolutionRequest::explicit_with_profiles(path, profiles.iter().cloned()),
     );
     resolve(request).map(|resolution| resolution.sources.base)
 }
 
-fn load_file(path: &Path, profile: Option<&str>) -> Result<EffectiveProject, ConfigError> {
+fn load_file(path: &Path, profiles: &[String]) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))
         .map_err(config_error)?;
-    let mut file: ConfigFile = serde_yaml::from_str(&text)
+    let mut document: Value = serde_yaml::from_str(&text)
         .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
-    if file.version != 1 {
+    let version = read_version(&document)?;
+    if version != 1 {
         return Err(config_error(anyhow::anyhow!(
-            "unsupported schema version {}: this Stackhand reads version 1",
-            file.version
+            "unsupported schema version {version}: this Stackhand reads version 1"
         )));
     }
-    if let Some(profile) = profile {
-        apply_profile(&mut file, profile)?;
-    }
+    reject_base_environment_nulls(&document)?;
+    let file: ConfigFile = if profiles.is_empty() {
+        serde_yaml::from_str(&text)
+            .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?
+    } else {
+        apply_profiles(&mut document, profiles)?;
+        let merged = serde_yaml::to_string(&document)
+            .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
+        serde_yaml::from_str(&merged)
+            .map_err(|error| config_error(anyhow::anyhow!(format_merged_yaml_error(&error))))?
+    };
     let shell = build_shell(file.settings.as_ref())?;
     let processes = file
         .processes
@@ -213,127 +238,66 @@ fn load_file(path: &Path, profile: Option<&str>) -> Result<EffectiveProject, Con
     })
 }
 
-fn apply_profile(file: &mut ConfigFile, requested: &str) -> Result<(), ConfigError> {
-    let profile = file
-        .profiles
-        .take()
-        .and_then(|mut profiles| profiles.remove(requested))
-        .ok_or_else(|| ConfigError {
-            message: format!("unknown profile '{requested}'"),
-        })?;
-    let ProfileFile {
-        enable,
-        disable,
-        overrides,
-        settings,
-    } = profile;
+fn read_version(document: &Value) -> Result<u64, ConfigError> {
+    let Some(root) = document.as_mapping() else {
+        return Err(ConfigError {
+            message: "configuration must be a mapping".to_string(),
+        });
+    };
+    let Some(version) = root.get(Value::String("version".to_string())) else {
+        return Err(ConfigError {
+            message: "configuration must define a numeric version".to_string(),
+        });
+    };
+    serde_yaml::from_value(version.clone()).map_err(|error| ConfigError {
+        message: format!("configuration version must be an unsigned integer: {error}"),
+    })
+}
 
-    let mut mentioned = HashSet::new();
-    for name in enable.iter().chain(&disable) {
-        if !mentioned.insert(name) {
-            return Err(ConfigError {
-                message: format!("profile '{requested}' mentions Process '{name}' more than once"),
-            });
-        }
+fn reject_base_environment_nulls(document: &Value) -> Result<(), ConfigError> {
+    let Some(processes) = document
+        .as_mapping()
+        .and_then(|root| root.get(Value::String("processes".to_string())))
+        .and_then(Value::as_mapping)
+    else {
+        return Ok(());
+    };
+    for (name, process) in processes {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        reject_environment_nulls(process, name)?;
     }
-
-    if let Some(settings) = settings {
-        merge_settings(&mut file.settings, settings);
-    }
-
-    for ProcessEntry { key, process } in overrides.entries {
-        if let Some(entry) = file
-            .processes
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == key)
-        {
-            merge_process(&mut entry.process, process);
-        } else {
-            file.processes.entries.push(ProcessEntry { key, process });
-        }
-    }
-
-    set_process_enabled(&mut file.processes.entries, &enable, true, requested)?;
-    set_process_enabled(&mut file.processes.entries, &disable, false, requested)?;
     Ok(())
 }
 
-fn merge_settings(base: &mut Option<SettingsFile>, overlay: SettingsFile) {
-    match base {
-        Some(base) => {
-            if overlay.shell.is_some() {
-                base.shell = overlay.shell;
+fn reject_environment_nulls(value: &Value, process_name: &str) -> Result<(), ConfigError> {
+    match value {
+        Value::Mapping(mapping) => {
+            if let Some(environment) = mapping.get(Value::String("environment".to_string()))
+                && let Some(entries) = environment.as_mapping()
+            {
+                for (name, value) in entries {
+                    if value.is_null() {
+                        let name = name.as_str().unwrap_or("<non-string>");
+                        return Err(ConfigError {
+                            message: format!(
+                                "Process '{process_name}': environment variable '{name}' must be a string"
+                            ),
+                        });
+                    }
+                }
+            }
+            for child in mapping.values() {
+                reject_environment_nulls(child, process_name)?;
             }
         }
-        None => *base = Some(overlay),
-    }
-}
-
-fn merge_process(base: &mut ProcessFile, overlay: ProcessFile) {
-    let ProcessFile {
-        kind,
-        enabled,
-        autostart,
-        cwd,
-        environment,
-        terminal,
-        success_exit_codes,
-        depends_on,
-        ready,
-        liveness,
-        restart,
-        command,
-        shell,
-    } = overlay;
-
-    replace_if_present(&mut base.kind, kind);
-    replace_if_present(&mut base.enabled, enabled);
-    replace_if_present(&mut base.autostart, autostart);
-    replace_if_present(&mut base.cwd, cwd);
-    replace_if_present(&mut base.environment, environment);
-    replace_if_present(&mut base.terminal, terminal);
-    replace_if_present(&mut base.success_exit_codes, success_exit_codes);
-    replace_if_present(&mut base.depends_on, depends_on);
-    replace_if_present(&mut base.ready, ready);
-    replace_if_present(&mut base.liveness, liveness);
-    replace_if_present(&mut base.restart, restart);
-    match (command, shell) {
-        (Some(command), Some(shell)) => {
-            base.command = Some(command);
-            base.shell = Some(shell);
+        Value::Sequence(values) => {
+            for child in values {
+                reject_environment_nulls(child, process_name)?;
+            }
         }
-        (Some(command), None) => {
-            base.command = Some(command);
-            base.shell = None;
-        }
-        (None, Some(shell)) => {
-            base.command = None;
-            base.shell = Some(shell);
-        }
-        (None, None) => {}
-    }
-}
-
-fn replace_if_present<T>(base: &mut Option<T>, overlay: Option<T>) {
-    if overlay.is_some() {
-        *base = overlay;
-    }
-}
-
-fn set_process_enabled(
-    processes: &mut [ProcessEntry],
-    names: &[String],
-    enabled: bool,
-    profile: &str,
-) -> Result<(), ConfigError> {
-    for name in names {
-        let Some(process) = processes.iter_mut().find(|entry| entry.key == *name) else {
-            return Err(ConfigError {
-                message: format!("profile '{profile}' references unknown Process '{name}'"),
-            });
-        };
-        process.process.enabled = Some(enabled);
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Tagged(_) => {}
     }
     Ok(())
 }
@@ -407,19 +371,41 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn format_yaml_error(error: &serde_yaml::Error) -> String {
+    format_yaml_error_with_location(error, true)
+}
+
+fn format_merged_yaml_error(error: &serde_yaml::Error) -> String {
+    format_yaml_error_with_location(error, false)
+}
+
+fn format_yaml_error_with_location(error: &serde_yaml::Error, include_location: bool) -> String {
     let detail = error.to_string();
+    let detail = match yaml_duplicate_hint(&detail) {
+        Some(hint) => hint,
+        None => detail,
+    };
     let detail = match yaml_replacement_hint(&detail) {
         Some(hint) => format!("{detail}; {hint}"),
         None => detail,
     };
-    match error.location() {
-        Some(location) => format!(
+    if include_location && let Some(location) = error.location() {
+        return format!(
             "invalid configuration at line {}, column {}: {detail}",
             location.line(),
             location.column(),
-        ),
-        None => format!("invalid configuration: {detail}"),
+        );
     }
+    format!("invalid configuration: {detail}")
+}
+
+fn yaml_duplicate_hint(detail: &str) -> Option<String> {
+    if !detail.contains("duplicate entry with key")
+        || !(detail.starts_with("processes:") || detail.contains(".overrides:"))
+    {
+        return None;
+    }
+    let name = detail.split_once("key \"")?.1.split_once('"')?.0;
+    Some(format!("duplicate Process name '{name}'"))
 }
 
 fn yaml_replacement_hint(detail: &str) -> Option<&'static str> {
@@ -455,7 +441,12 @@ fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigErr
     let Some(shell) = settings.and_then(|settings| settings.shell.as_ref()) else {
         return Ok(ShellConfig::default());
     };
-    if shell.program.trim().is_empty() {
+    let Some(program) = shell.program.as_deref() else {
+        return Err(ConfigError {
+            message: "settings.shell.program is required".to_string(),
+        });
+    };
+    if program.trim().is_empty() {
         return Err(ConfigError {
             message: "settings.shell.program must not be empty".to_string(),
         });
@@ -467,7 +458,7 @@ fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigErr
         });
     }
     Ok(ShellConfig {
-        program: std::ffi::OsString::from(&shell.program),
+        program: std::ffi::OsString::from(program),
         args: args.into_iter().map(std::ffi::OsString::from).collect(),
     })
 }
@@ -614,7 +605,7 @@ fn build_environment(process: &ProcessFile) -> Vec<(String, String)> {
         .map(|entries| {
             entries
                 .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
+                .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
                 .collect()
         })
         .unwrap_or_default()
@@ -709,7 +700,11 @@ fn build_dependency(
     index: usize,
     entry: &DependencyEntry,
 ) -> Result<DependencySpec, ConfigError> {
-    let condition = entry.value.as_str().ok_or_else(|| {
+    let condition = entry
+        .value
+        .as_ref()
+        .and_then(serde_yaml::Value::as_str)
+        .ok_or_else(|| {
         dependency_error(
             process_name,
             index,

@@ -292,11 +292,12 @@ The temporary list collections, nested command objects, `working_dir`, `env`,
 top-level `input`, and scalar terminal values are rejected. The validation
 message names the canonical replacement to use.
 
-A Project may define named profiles. Select one profile explicitly with
-`--profile NAME` on the normal run command or on `config validate`. No profile
-is selected by default. A profile may use `enable`, `disable`, `settings`, and
-name-keyed `overrides`; an override can replace Process fields or add a complete
-Process. The selected result is validated before any Process starts.
+A Project may define named profiles. Select profiles explicitly with one or
+more `--profile NAME` options on the normal run command or on `config validate`.
+Profiles apply in the order of the options. No profile is selected by default. A
+profile may use `enable`, `disable`, `settings`, and name-keyed `overrides`; an
+override can replace Process fields or add a complete Process. The selected
+result is validated before any Process starts.
 
 The final filename remains open. Examples in this document use:
 

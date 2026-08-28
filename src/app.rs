@@ -41,9 +41,17 @@ pub fn run_project(config_path: &Path) -> Result<()> {
 /// Load the explicit Project with one selected profile, then run it
 /// interactively.
 pub fn run_project_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
-    run_resolved(
-        crate::config::ResolutionRequest::explicit_with_optional_profile(config_path, profile),
-    )
+    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    run_project_with_profiles(config_path, &profiles)
+}
+
+/// Load the explicit Project with profiles selected in CLI order, then run it
+/// interactively.
+pub fn run_project_with_profiles(config_path: &Path, profiles: &[String]) -> Result<()> {
+    run_resolved(crate::config::ResolutionRequest::explicit_with_profiles(
+        config_path,
+        profiles.iter().cloned(),
+    ))
 }
 
 /// Discover the nearest base Project, then run it interactively.
@@ -54,7 +62,16 @@ pub fn run_discovered_project() -> Result<()> {
 /// Discover the nearest base Project with one selected profile, then run it
 /// interactively.
 pub fn run_discovered_project_with_profile(profile: Option<&str>) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::discover_with_optional_profile(profile))
+    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    run_discovered_project_with_profiles(&profiles)
+}
+
+/// Discover the nearest base Project with profiles selected in CLI order,
+/// then run it interactively.
+pub fn run_discovered_project_with_profiles(profiles: &[String]) -> Result<()> {
+    run_resolved(crate::config::ResolutionRequest::discover_with_profiles(
+        profiles.iter().cloned(),
+    ))
 }
 
 fn run_resolved(request: crate::config::ResolutionRequest) -> Result<()> {

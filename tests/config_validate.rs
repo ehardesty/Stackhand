@@ -30,12 +30,21 @@ fn run_validate_with_profile(
     path: Option<&Path>,
     profile: Option<&str>,
 ) -> std::process::Output {
+    let profiles = profile.into_iter().collect::<Vec<_>>();
+    run_validate_with_profiles(directory, path, &profiles)
+}
+
+fn run_validate_with_profiles(
+    directory: &Path,
+    path: Option<&Path>,
+    profiles: &[&str],
+) -> std::process::Output {
     let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
     command.current_dir(directory).args(["config", "validate"]);
     if let Some(path) = path {
         command.arg(path);
     }
-    if let Some(profile) = profile {
+    for profile in profiles {
         command.args(["--profile", profile]);
     }
     command.output().expect("config validate runs")
@@ -227,6 +236,43 @@ fn config_validate_does_not_select_a_profile_without_the_option() {
         String::from_utf8_lossy(&selected.stderr).contains("Process 'added'"),
         "{}",
         String::from_utf8_lossy(&selected.stderr)
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_applies_repeated_profiles_in_cli_order() {
+    let root = unique_directory("profile-order");
+    let config = root.join("project.yaml");
+    fs::write(
+        &config,
+        "version: 1
+processes:
+  web:
+    command: [/bin/true]
+profiles:
+  first:
+    overrides:
+      web:
+        command: [/bin/echo, 1]
+  second:
+    overrides:
+      web:
+        command: [/bin/true]
+",
+    )
+    .expect("ordered profile config writes");
+
+    let forward = run_validate_with_profiles(&root, Some(&config), &["first", "second"]);
+    assert!(forward.status.success(), "{forward:?}");
+    let reverse = run_validate_with_profiles(&root, Some(&config), &["second", "first"]);
+    assert!(!reverse.status.success(), "{reverse:?}");
+    assert!(
+        String::from_utf8_lossy(&reverse.stderr)
+            .contains("Process 'web': command argument 0 must be a string"),
+        "{}",
+        String::from_utf8_lossy(&reverse.stderr)
     );
 
     fs::remove_dir_all(root).ok();

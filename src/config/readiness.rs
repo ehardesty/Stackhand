@@ -308,7 +308,7 @@ fn build_exec_probe(
         .map(|entries| {
             entries
                 .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
+                .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
                 .collect()
         })
         .unwrap_or_default();
@@ -492,7 +492,7 @@ struct ExecFile {
     command: Option<super::CommandFile>,
     shell: Option<String>,
     cwd: Option<String>,
-    environment: Option<std::collections::BTreeMap<String, String>>,
+    environment: Option<std::collections::BTreeMap<String, Option<String>>>,
     success_exit_codes: Option<Vec<i32>>,
 }
 

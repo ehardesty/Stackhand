@@ -71,13 +71,24 @@ pub fn run_fixture(
     config_path: &Path,
     on_checkpoint: impl FnMut(&str),
 ) -> String {
-    run_fixture_with_profile(fixture_flag, config_path, None, on_checkpoint)
+    run_fixture_with_profiles(fixture_flag, config_path, &[], on_checkpoint)
 }
 
+#[allow(dead_code)]
 pub fn run_fixture_with_profile(
     fixture_flag: &str,
     config_path: &Path,
     profile: Option<&str>,
+    on_checkpoint: impl FnMut(&str),
+) -> String {
+    let profiles = profile.into_iter().collect::<Vec<_>>();
+    run_fixture_with_profiles(fixture_flag, config_path, &profiles, on_checkpoint)
+}
+
+pub fn run_fixture_with_profiles(
+    fixture_flag: &str,
+    config_path: &Path,
+    profiles: &[&str],
     mut on_checkpoint: impl FnMut(&str),
 ) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stackhand"));
@@ -85,7 +96,7 @@ pub fn run_fixture_with_profile(
         .env("SHELL", "/path/that/does/not/exist")
         .arg(fixture_flag)
         .arg(config_path);
-    if let Some(profile) = profile {
+    for profile in profiles {
         command.arg("--profile").arg(profile);
     }
     let mut child = command

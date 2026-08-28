@@ -10,16 +10,20 @@ use serde::{Deserialize, Deserializer};
 
 use super::readiness::ReadinessFile;
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigFile {
     pub(super) version: u64,
     #[serde(default)]
     pub(super) processes: ProcessCollection,
+    // The typed parse keeps every profile subject to the top-level schema,
+    // including profiles that were not selected.
     pub(super) profiles: Option<BTreeMap<String, ProfileFile>>,
     pub(super) settings: Option<SettingsFile>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ProfileFile {
@@ -28,8 +32,8 @@ pub(super) struct ProfileFile {
     #[serde(default)]
     pub(super) disable: Vec<String>,
     #[serde(default)]
-    pub(super) overrides: ProcessCollection,
-    pub(super) settings: Option<SettingsFile>,
+    pub(super) overrides: serde_yaml::Value,
+    pub(super) settings: Option<serde_yaml::Value>,
 }
 
 #[derive(Default)]
@@ -96,7 +100,7 @@ pub(super) struct DependencyCollection {
 
 pub(super) struct DependencyEntry {
     pub(super) key: String,
-    pub(super) value: serde_yaml::Value,
+    pub(super) value: Option<serde_yaml::Value>,
 }
 
 impl<'de> Deserialize<'de> for DependencyCollection {
@@ -136,7 +140,7 @@ impl<'de> Deserialize<'de> for DependencyCollection {
                     }
                     entries.push(DependencyEntry {
                         key: name,
-                        value: map.next_value::<serde_yaml::Value>()?,
+                        value: map.next_value::<Option<serde_yaml::Value>>()?,
                     });
                 }
                 Ok(DependencyCollection { entries })
@@ -156,7 +160,7 @@ pub(super) struct SettingsFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ShellFile {
-    pub(super) program: String,
+    pub(super) program: Option<String>,
     pub(super) args: Option<Vec<String>>,
 }
 
@@ -167,7 +171,7 @@ pub(super) struct ProcessFile {
     pub(super) enabled: Option<bool>,
     pub(super) autostart: Option<bool>,
     pub(super) cwd: Option<String>,
-    pub(super) environment: Option<std::collections::BTreeMap<String, String>>,
+    pub(super) environment: Option<std::collections::BTreeMap<String, Option<String>>>,
     pub(super) terminal: Option<TerminalFile>,
     pub(super) success_exit_codes: Option<Vec<i32>>,
     pub(super) depends_on: Option<DependencyCollection>,

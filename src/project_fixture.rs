@@ -53,15 +53,23 @@ pub fn run(config_path: &Path) -> Result<()> {
 
 /// Run the integrated fixture with one selected configuration profile.
 pub fn run_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
-    let request =
-        crate::config::ResolutionRequest::explicit_with_optional_profile(config_path, profile);
+    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    run_with_profiles(config_path, &profiles)
+}
+
+/// Run the integrated fixture with profiles selected in CLI order.
+pub fn run_with_profiles(config_path: &Path, profiles: &[String]) -> Result<()> {
+    let request = crate::config::ResolutionRequest::explicit_with_profiles(
+        config_path,
+        profiles.iter().cloned(),
+    );
     let resolution =
         crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     let output_lifetime = std::sync::Arc::downgrade(&outputs);
     supervisor.command(Command::StartAutostart);
 
-    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs, profile.is_some())?;
+    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs, !profiles.is_empty())?;
     shutdown(supervisor)?;
     wait_for_pid_exit(descendant_pid)?;
 
