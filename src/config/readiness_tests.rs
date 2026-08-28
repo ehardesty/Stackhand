@@ -522,3 +522,59 @@ fn readiness_on_a_one_shot_is_rejected() {
     .expect_err("a One-shot must reject readiness");
     assert!(error.message.contains("Services"), "{}", error.message);
 }
+
+#[test]
+fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
+    let project = write_and_load(
+        "liveness-all",
+        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/sleep, args: [\"1\"]}\n    restart: {on_unhealthy: true}\n    liveness:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n        - exec: {command: {program: /bin/true}}\n        - log: {contains: heartbeat}\n",
+    )
+    .expect("valid liveness checks");
+    let process = &project.processes()[0];
+    assert!(process.restart.on_unhealthy);
+    let liveness = process.liveness.as_ref().expect("liveness parses");
+    assert_eq!(liveness.checks.len(), 4);
+    assert!(matches!(
+        liveness.checks[0].probe,
+        ReadinessProbe::Tcp { .. }
+    ));
+    assert!(matches!(
+        liveness.checks[1].probe,
+        ReadinessProbe::Http { .. }
+    ));
+    assert!(matches!(
+        liveness.checks[2].probe,
+        ReadinessProbe::Exec { .. }
+    ));
+    assert!(matches!(
+        liveness.checks[3].probe,
+        ReadinessProbe::Log { .. }
+    ));
+    assert_eq!(liveness.checks[0].initial_delay, Duration::ZERO);
+    assert_eq!(liveness.checks[0].interval, Duration::from_secs(1));
+    assert_eq!(liveness.checks[0].timeout, Duration::from_secs(2));
+}
+
+#[test]
+fn liveness_rejects_startup_deadlines_and_one_shot_processes() {
+    let deadline = write_and_load(
+        "liveness-startup-timeout",
+        "version: 1\nprocesses:\n  - name: api\n    command: {program: /bin/true}\n    liveness:\n      tcp: {host: localhost, port: 1}\n      startup_timeout: 1s\n",
+    )
+    .expect_err("liveness has no startup deadline");
+    assert!(deadline.message.contains("startup_timeout"), "{deadline}");
+    assert!(
+        deadline.message.contains("not supported for liveness"),
+        "{deadline}"
+    );
+
+    let one_shot = write_and_load(
+        "liveness-one-shot",
+        "version: 1\nprocesses:\n  - name: setup\n    kind: one-shot\n    command: {program: /bin/true}\n    liveness:\n      tcp: {host: localhost, port: 1}\n",
+    )
+    .expect_err("one-shot processes cannot use liveness");
+    assert!(
+        one_shot.message.contains("liveness") && one_shot.message.contains("Services"),
+        "{one_shot}"
+    );
+}

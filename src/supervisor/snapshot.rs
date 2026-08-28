@@ -1,10 +1,11 @@
 //! Immutable Supervisor views for rendering and other callers.
 
 use crate::model::{ProcessKind, ReadinessProbe};
+
+use super::checks::{LivenessState, ReadinessState};
 use crate::runtime::ProcessId;
 
 use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunSummary};
-use super::readiness::ReadinessState;
 
 /// An immutable view of the whole Project at one moment. Rendering and
 /// callers can hold and inspect this freely; it cannot mutate lifecycle
@@ -25,7 +26,7 @@ impl ProjectSnapshot {
     }
 }
 
-/// The check kinds in the readiness snapshot.
+/// The check kinds in the readiness and liveness snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessCheckKind {
     Tcp,
@@ -34,6 +35,9 @@ pub enum ReadinessCheckKind {
     Log,
     All,
 }
+
+/// The liveness name for the shared check-kind vocabulary.
+pub use ReadinessCheckKind as LivenessCheckKind;
 
 impl From<&ReadinessProbe> for ReadinessCheckKind {
     fn from(probe: &ReadinessProbe) -> Self {
@@ -59,6 +63,9 @@ pub struct ReadinessChildStatus {
     pub last_error: Option<String>,
 }
 
+/// The liveness name for the shared child progress view.
+pub use ReadinessChildStatus as LivenessChildStatus;
+
 /// One bounded readiness progress view of the current Run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessStatus {
@@ -83,6 +90,21 @@ pub struct ReadinessStatus {
     pub startup_elapsed_ms: u64,
     /// Per-child progress for an `all` check. Empty for a direct leaf check.
     pub children: Vec<ReadinessChildStatus>,
+}
+
+/// One bounded liveness progress view of the current Run. Liveness is
+/// inactive until the Run first becomes effectively ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LivenessStatus {
+    pub kind: LivenessCheckKind,
+    pub state: LivenessState,
+    pub attempts: u32,
+    pub consecutive_successes: u32,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+    /// Milliseconds since liveness evaluation began for this Run.
+    pub elapsed_ms: u64,
+    pub children: Vec<LivenessChildStatus>,
 }
 
 /// The visible state of one pending automatic restart.
@@ -140,6 +162,9 @@ pub struct ProcessSnapshot {
     /// Passing and Failing recovery states; `None` without a probe or after it
     /// ended.
     pub readiness: Option<ReadinessStatus>,
+    /// Liveness progress for the current Run. It is `Inactive` until the
+    /// Process first becomes effectively ready.
+    pub liveness: Option<LivenessStatus>,
     /// The pending automatic retry while the Process is in RestartBackoff.
     pub restart_backoff: Option<RestartBackoffStatus>,
     /// Automatic retry use and exhaustion for this Project session.

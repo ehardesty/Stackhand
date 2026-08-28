@@ -65,6 +65,11 @@ pub fn load(path: &Path) -> Result<EffectiveProject, ConfigError> {
                 "Process '{process}': readiness is valid only on Services; a One-shot completes instead of becoming ready"
             ),
         ),
+        crate::model::ProjectError::LivenessOnOneShot { process } => config_error(
+            anyhow::anyhow!(
+                "Process '{process}': liveness is valid only on Services; a One-shot cannot have ongoing health checks"
+            ),
+        ),
         crate::model::ProjectError::InvalidRestartPolicy { process, policy } => config_error(
             anyhow::anyhow!(
                 "Process '{process}': restart.policy '{policy}' is valid only for Services"
@@ -177,10 +182,14 @@ fn build_restart(
     let max_restarts = file
         .and_then(|file| file.max_restarts)
         .unwrap_or(defaults.max_restarts);
+    let on_unhealthy = file
+        .and_then(|file| file.on_unhealthy)
+        .unwrap_or(defaults.on_unhealthy);
     Ok(RestartConfig {
         policy,
         backoff,
         max_restarts,
+        on_unhealthy,
     })
 }
 
@@ -288,6 +297,10 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
         None => None,
         Some(file) => Some(readiness::build_readiness(&name, file, base_dir)?),
     };
+    let liveness = match &process.liveness {
+        None => None,
+        Some(file) => Some(readiness::build_liveness(&name, file, base_dir)?),
+    };
     let success_exit_codes = match build_success_exit_codes(process.success_exit_codes.clone()) {
         Ok(codes) => codes,
         Err(detail) => return fail(format!("Process '{name}': {detail}")),
@@ -311,6 +324,7 @@ fn build_spec(process: &ProcessFile, base_dir: &Path) -> Result<ProcessSpec, Con
         input_policy,
         dependencies,
         readiness,
+        liveness,
     })
 }
 
@@ -414,6 +428,7 @@ struct ProcessFile {
     success_exit_codes: Option<Vec<i32>>,
     depends_on: Option<Vec<serde_yaml::Value>>,
     ready: Option<readiness::ReadinessFile>,
+    liveness: Option<readiness::ReadinessFile>,
     restart: Option<RestartFile>,
     command: CommandFile,
 }
@@ -424,6 +439,7 @@ struct RestartFile {
     policy: Option<String>,
     backoff: Option<String>,
     max_restarts: Option<u32>,
+    on_unhealthy: Option<bool>,
 }
 
 #[derive(Deserialize)]

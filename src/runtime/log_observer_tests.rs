@@ -19,6 +19,7 @@ fn start_observed_run(
         vec![LogPattern {
             key: MATCH_KEY,
             contains: MATCH_TEXT.to_string(),
+            attempt_id: None,
         }],
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         move |key| {
@@ -85,6 +86,7 @@ fn observer_can_match_after_output_that_exceeds_retained_history() {
         vec![LogPattern {
             key: MATCH_KEY,
             contains: MATCH_TEXT.to_string(),
+            attempt_id: None,
         }],
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         move |key| received.lock().unwrap().push(key),

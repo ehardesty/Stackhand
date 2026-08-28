@@ -158,6 +158,7 @@ fn readiness_test_process(tcp_port: u16, http_port: u16) -> ProcessSpec {
             ],
             startup_timeout: Some(Duration::from_secs(2)),
         }),
+        liveness: None,
     }
 }
 
@@ -196,6 +197,7 @@ fn exec_service(
             }],
             startup_timeout: None,
         }),
+        liveness: None,
     }
 }
 
@@ -603,6 +605,7 @@ fn startup_timeout_confirms_real_process_tree_cleanup() {
             }],
             startup_timeout: Some(Duration::from_millis(200)),
         }),
+        liveness: None,
     };
     let project = EffectiveProject::new(vec![process]).expect("timeout project is valid");
     let (supervisor, _consoles, outputs) =

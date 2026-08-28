@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::model::{ReadinessCheck, ReadinessConfig, ReadinessProbe};
+use crate::model::{LivenessConfig, ReadinessCheck, ReadinessConfig, ReadinessProbe};
 
 use super::ConfigError;
 
@@ -17,6 +17,24 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUCCESS_THRESHOLD: u32 = 1;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 1;
 
+#[derive(Clone, Copy)]
+struct CheckLabels {
+    prefix: &'static str,
+    noun: &'static str,
+    child_startup_timeout_detail: &'static str,
+}
+
+const READINESS_LABELS: CheckLabels = CheckLabels {
+    prefix: "ready",
+    noun: "readiness",
+    child_startup_timeout_detail: "startup_timeout is valid only on the parent 'ready' block",
+};
+const LIVENESS_LABELS: CheckLabels = CheckLabels {
+    prefix: "liveness",
+    noun: "liveness",
+    child_startup_timeout_detail: "startup_timeout is not supported for liveness",
+};
+
 /// One `ready` block: one leaf check or an `all` list with independent
 /// scheduling for every child.
 pub(super) fn build_readiness(
@@ -24,25 +42,57 @@ pub(super) fn build_readiness(
     file: &ReadinessFile,
     base_dir: &Path,
 ) -> Result<ReadinessConfig, ConfigError> {
-    if file.any.is_some() {
-        return Err(ready_error(
-            process_name,
-            "the 'any' readiness form is not supported; use 'all' or one leaf check",
-        ));
-    }
-
+    reject_any_form(process_name, file, READINESS_LABELS)?;
     let startup_timeout = file
         .startup_timeout
         .as_deref()
         .map(|value| {
-            positive_duration(process_name, "startup_timeout", Some(value), Duration::ZERO)
+            positive_duration(
+                process_name,
+                "startup_timeout",
+                Some(value),
+                Duration::ZERO,
+                READINESS_LABELS,
+            )
         })
         .transpose()?;
+    let checks = build_checks(process_name, file, base_dir, READINESS_LABELS)?;
+    Ok(ReadinessConfig {
+        checks,
+        startup_timeout,
+    })
+}
 
+/// One `liveness` block. It shares leaf validation with readiness, but a
+/// liveness policy cannot own a startup deadline.
+pub(super) fn build_liveness(
+    process_name: &str,
+    file: &ReadinessFile,
+    base_dir: &Path,
+) -> Result<LivenessConfig, ConfigError> {
+    reject_any_form(process_name, file, LIVENESS_LABELS)?;
+    if file.startup_timeout.is_some() {
+        return Err(check_error(
+            process_name,
+            LIVENESS_LABELS,
+            "startup_timeout is not supported for liveness",
+        ));
+    }
+    let checks = build_checks(process_name, file, base_dir, LIVENESS_LABELS)?;
+    Ok(LivenessConfig { checks })
+}
+
+fn build_checks(
+    process_name: &str,
+    file: &ReadinessFile,
+    base_dir: &Path,
+    labels: CheckLabels,
+) -> Result<Vec<ReadinessCheck>, ConfigError> {
     let checks = if let Some(children) = &file.all {
         if file.tcp.is_some() || file.http.is_some() || file.exec.is_some() || file.log.is_some() {
-            return Err(ready_error(
+            return Err(check_error(
                 process_name,
+                labels,
                 "define exactly one of 'tcp', 'http', 'exec', 'log', or 'all'",
             ));
         }
@@ -52,30 +102,34 @@ pub(super) fn build_readiness(
             || file.success_threshold.is_some()
             || file.failure_threshold.is_some()
         {
-            return Err(ready_error(
+            return Err(check_error(
                 process_name,
-                "an 'all' readiness check sets scheduling fields on each child, not on the parent",
+                labels,
+                format!(
+                    "an 'all' {} check sets scheduling fields on each child, not on the parent",
+                    labels.noun
+                ),
             ));
         }
         if children.len() < 2 {
-            return Err(ready_error(
+            return Err(check_error(
                 process_name,
+                labels,
                 "'all' must contain at least two child checks",
             ));
         }
         children
             .iter()
             .enumerate()
-            .map(|(index, child)| build_leaf(process_name, child, Some(index + 1), base_dir))
+            .map(|(index, child)| {
+                build_leaf(process_name, child, Some(index + 1), base_dir, labels)
+            })
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        vec![build_leaf(process_name, file, None, base_dir)?]
+        vec![build_leaf(process_name, file, None, base_dir, labels)?]
     };
 
-    Ok(ReadinessConfig {
-        checks,
-        startup_timeout,
-    })
+    Ok(checks)
 }
 
 fn build_leaf(
@@ -83,16 +137,20 @@ fn build_leaf(
     file: &ReadinessFile,
     child_index: Option<usize>,
     base_dir: &Path,
+    labels: CheckLabels,
 ) -> Result<ReadinessCheck, ConfigError> {
-    let fail = |detail: String| Err(ready_error_for(process_name, child_index, detail));
+    let fail = |detail: String| Err(check_error_for(process_name, child_index, labels, detail));
     if file.all.is_some() {
-        return fail("nested 'all' readiness checks are not supported".to_string());
+        return fail(format!(
+            "nested 'all' {} checks are not supported",
+            labels.noun
+        ));
     }
     if file.any.is_some() {
-        return fail("the 'any' readiness form is not supported".to_string());
+        return fail(format!("the 'any' {} form is not supported", labels.noun));
     }
     if child_index.is_some() && file.startup_timeout.is_some() {
-        return fail("startup_timeout is valid only on the parent 'ready' block".to_string());
+        return fail(labels.child_startup_timeout_detail.to_string());
     }
     let probe = match (&file.tcp, &file.http, &file.exec, &file.log) {
         (Some(tcp), None, None, None) => {
@@ -108,12 +166,12 @@ fn build_leaf(
             }
         }
         (None, Some(http), None, None) => {
-            let (host, port, path) = parse_http_url(&http.url)
-                .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
+            let (host, port, path) = parse_http_url(&http.url, labels.noun)
+                .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
             ReadinessProbe::Http { host, port, path }
         }
         (None, None, Some(exec), None) => {
-            build_exec_probe(process_name, exec, child_index, base_dir)?
+            build_exec_probe(process_name, exec, child_index, base_dir, labels)?
         }
         (None, None, None, Some(log)) => {
             if log.contains.is_empty() {
@@ -132,30 +190,35 @@ fn build_leaf(
         "initial_delay",
         file.initial_delay.as_deref(),
         Duration::ZERO,
+        labels,
     )?;
     let interval = positive_duration(
         process_name,
         "interval",
         file.interval.as_deref(),
         DEFAULT_INTERVAL,
+        labels,
     )?;
     let timeout = positive_duration(
         process_name,
         "timeout",
         file.timeout.as_deref(),
         DEFAULT_TIMEOUT,
+        labels,
     )?;
     let success_threshold = configured_threshold(
         process_name,
         "success_threshold",
         file.success_threshold,
         DEFAULT_SUCCESS_THRESHOLD,
+        labels,
     )?;
     let failure_threshold = configured_threshold(
         process_name,
         "failure_threshold",
         file.failure_threshold,
         DEFAULT_FAILURE_THRESHOLD,
+        labels,
     )?;
     Ok(ReadinessCheck {
         probe,
@@ -167,22 +230,45 @@ fn build_leaf(
     })
 }
 
-fn ready_error(process_name: &str, detail: impl Into<String>) -> ConfigError {
+fn reject_any_form(
+    process_name: &str,
+    file: &ReadinessFile,
+    labels: CheckLabels,
+) -> Result<(), ConfigError> {
+    if file.any.is_some() {
+        return Err(check_error(
+            process_name,
+            labels,
+            format!(
+                "the 'any' {} form is not supported; use 'all' or one leaf check",
+                labels.noun
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn check_error(process_name: &str, labels: CheckLabels, detail: impl Into<String>) -> ConfigError {
     ConfigError {
-        message: format!("Process '{process_name}': ready: {}", detail.into()),
+        message: format!(
+            "Process '{process_name}': {}: {}",
+            labels.prefix,
+            detail.into()
+        ),
     }
 }
 
-fn ready_error_for(
+fn check_error_for(
     process_name: &str,
     child_index: Option<usize>,
+    labels: CheckLabels,
     detail: impl Into<String>,
 ) -> ConfigError {
     let detail = detail.into();
     let detail = child_index
         .map(|index| format!("all child {index}: {detail}"))
         .unwrap_or(detail);
-    ready_error(process_name, detail)
+    check_error(process_name, labels, detail)
 }
 
 fn build_exec_probe(
@@ -190,16 +276,18 @@ fn build_exec_probe(
     file: &ExecFile,
     child_index: Option<usize>,
     base_dir: &Path,
+    labels: CheckLabels,
 ) -> Result<ReadinessProbe, ConfigError> {
     let command = file.command.as_ref().ok_or_else(|| {
-        ready_error_for(
+        check_error_for(
             process_name,
             child_index,
+            labels,
             "exec requires a 'command' mapping",
         )
     })?;
     let command = super::build_command_form(command)
-        .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
+        .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
     let working_dir = file
         .working_dir
         .as_deref()
@@ -213,9 +301,10 @@ fn build_exec_probe(
             if path.is_dir() {
                 Ok(path)
             } else {
-                Err(ready_error_for(
+                Err(check_error_for(
                     process_name,
                     child_index,
+                    labels,
                     format!("exec working directory '{}' does not exist", path.display()),
                 ))
             }
@@ -232,7 +321,7 @@ fn build_exec_probe(
         })
         .unwrap_or_default();
     let success_exit_codes = super::build_success_exit_codes(file.success_exit_codes.clone())
-        .map_err(|detail| ready_error_for(process_name, child_index, detail))?;
+        .map_err(|detail| check_error_for(process_name, child_index, labels, detail))?;
     Ok(ReadinessProbe::Exec {
         command,
         working_dir,
@@ -246,11 +335,12 @@ fn duration_or_default(
     field: &str,
     value: Option<&str>,
     default: Duration,
+    labels: CheckLabels,
 ) -> Result<Duration, ConfigError> {
     value
         .map(|value| {
             parse_duration(value)
-                .map_err(|detail| ready_error(process_name, format!("{field}: {detail}")))
+                .map_err(|detail| check_error(process_name, labels, format!("{field}: {detail}")))
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
@@ -261,11 +351,13 @@ fn positive_duration(
     field: &str,
     value: Option<&str>,
     default: Duration,
+    labels: CheckLabels,
 ) -> Result<Duration, ConfigError> {
-    let duration = duration_or_default(process_name, field, value, default)?;
+    let duration = duration_or_default(process_name, field, value, default, labels)?;
     if duration.is_zero() {
-        return Err(ready_error(
+        return Err(check_error(
             process_name,
+            labels,
             format!("{field} must be greater than zero"),
         ));
     }
@@ -277,11 +369,13 @@ fn configured_threshold(
     field: &str,
     value: Option<u32>,
     default: u32,
+    labels: CheckLabels,
 ) -> Result<u32, ConfigError> {
     let threshold = value.unwrap_or(default);
     if threshold == 0 {
-        return Err(ready_error(
+        return Err(check_error(
             process_name,
+            labels,
             format!("{field} must be a positive whole number"),
         ));
     }
@@ -324,10 +418,10 @@ pub(super) fn parse_duration(value: &str) -> Result<Duration, String> {
 /// port (defaulting to 80), and request path (defaulting to `/`). Only
 /// what a raw HTTP/1.0 GET can reach is accepted; anything else fails with
 /// one clear reason.
-fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
+fn parse_http_url(url: &str, check_name: &str) -> Result<(String, u16, String), String> {
     let Some(rest) = url.strip_prefix("http://") else {
         return Err(if url.starts_with("https://") {
-            "https URLs are not supported for readiness probes; use a plain http URL".to_string()
+            format!("https URLs are not supported for {check_name} probes; use a plain http URL")
         } else {
             format!("invalid http URL '{url}': it must start with 'http://'")
         });

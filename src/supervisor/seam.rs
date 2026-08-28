@@ -16,7 +16,8 @@ use crate::runtime::{OsPid, ProcessId, RunId};
 use crate::supervisor::FailureKind;
 
 /// Identity of one long-lived piece of work within a Run, such as a
-/// readiness check. Work identities are never reused for a later Run.
+/// readiness or liveness check. Work identities are never reused for a later
+/// Run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WorkId(u64);
 
@@ -125,12 +126,24 @@ pub enum SeamEvent {
         passing: bool,
         diagnostic: Option<String>,
     },
+    /// One bounded liveness attempt finished for the current Run.
+    Liveness {
+        process_id: ProcessId,
+        run_id: RunId,
+        work_id: WorkId,
+        attempt_id: AttemptId,
+        passing: bool,
+        diagnostic: Option<String>,
+    },
     /// A configured literal appeared in the current Run's live output.
     /// Output bytes never travel through this event.
     LogMatched {
         process_id: ProcessId,
         run_id: RunId,
         work_id: WorkId,
+        /// Readiness matches have no scheduled attempt. Liveness matches
+        /// carry the attempt that armed the fresh output window.
+        attempt_id: Option<AttemptId>,
     },
 }
 
@@ -142,6 +155,7 @@ impl SeamEvent {
             | Self::OutputFailure { process_id, .. }
             | Self::Metrics { process_id, .. }
             | Self::Readiness { process_id, .. }
+            | Self::Liveness { process_id, .. }
             | Self::LogMatched { process_id, .. } => *process_id,
             Self::Finished(finished) => finished.process_id,
         }
@@ -154,6 +168,7 @@ impl SeamEvent {
             | Self::OutputFailure { run_id, .. }
             | Self::Metrics { run_id, .. }
             | Self::Readiness { run_id, .. }
+            | Self::Liveness { run_id, .. }
             | Self::LogMatched { run_id, .. } => *run_id,
             Self::Finished(finished) => finished.run_id,
         }
@@ -164,6 +179,9 @@ impl SeamEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct LogMatcherIntent {
     pub(crate) work_id: WorkId,
+    /// `None` is a latched readiness match. `Some` identifies one fresh
+    /// liveness attempt window.
+    pub(crate) attempt_id: Option<AttemptId>,
     pub(crate) contains: String,
 }
 
@@ -182,7 +200,8 @@ pub struct StartIntent {
     /// The PTY geometry of the rendered console pane at request time.
     pub initial_geometry: TerminalGeometry,
     pub pty: bool,
-    /// Literal log checks to attach before this Run is spawned.
+    /// Literal log checks to attach before this Run is spawned. Liveness
+    /// entries are placeholders until the first attempt is armed.
     pub(crate) log_matchers: Vec<LogMatcherIntent>,
 }
 
@@ -192,6 +211,10 @@ pub(crate) trait RunSeam: Send {
     /// such as output observations or future hooks. Cancellation is
     /// idempotent and never changes Supervisor state by itself.
     fn cancel(&self, _process_id: ProcessId, _run_id: RunId) {}
+
+    /// Replace one live log matcher with a fresh attempt window. The default
+    /// is a no-op for adapters that do not observe output.
+    fn arm_log_matcher(&self, _process_id: ProcessId, _run_id: RunId, _matcher: LogMatcherIntent) {}
 
     /// Apply the Project's shared remaining deadline to cleanup work that a
     /// natural-exit owner can already be completing.
@@ -223,10 +246,16 @@ pub(crate) struct ExecContext {
     pub(crate) shell: ShellConfig,
 }
 
-/// One request for exactly one bounded readiness attempt. The Supervisor
+/// Which health policy owns one probe request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeScope {
+    Readiness,
+    Liveness,
+}
+
+/// One request for exactly one bounded health-check attempt. The Supervisor
 /// dispatches at most one attempt at a time per child; the adapter performs
-/// each one off the control task and reports exactly one
-/// [`SeamEvent::Readiness`] for these identities.
+/// each one off the control task and reports exactly one matching seam event.
 #[derive(Clone, Debug)]
 pub struct ProbeIntent {
     pub process_id: ProcessId,
@@ -236,6 +265,7 @@ pub struct ProbeIntent {
     pub probe: ReadinessProbe,
     pub timeout: Duration,
     pub(crate) exec_context: Option<ExecContext>,
+    pub(crate) scope: ProbeScope,
 }
 
 /// The readiness seam. Implementations own network waits so they never run

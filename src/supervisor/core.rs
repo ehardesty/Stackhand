@@ -13,6 +13,7 @@ use crate::model::{Autostart, EffectiveProject, Enabled, ProcessKind};
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
 use crate::supervisor::command::Command;
+use crate::supervisor::liveness::LivenessTracking;
 use crate::supervisor::readiness::ReadinessTracking;
 use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId};
 use crate::supervisor::snapshot::{
@@ -123,6 +124,8 @@ pub enum FailureKind {
     ProcessExit,
     /// A readiness probe failure ended the Run.
     Readiness,
+    /// A liveness failure marked the Run unhealthy.
+    Liveness,
     /// The Run's output path failed.
     Output,
     /// The bounded cleanup did not fully confirm.
@@ -144,6 +147,7 @@ pub(super) enum RestartReason {
     SpawnFailure,
     FailedRun,
     StartupTimeout,
+    Unhealthy,
     UnexpectedSuccessfulExit,
 }
 
@@ -153,6 +157,7 @@ impl RestartReason {
             Self::SpawnFailure => "spawn failure",
             Self::FailedRun => "failed Run",
             Self::StartupTimeout => "startup timeout",
+            Self::Unhealthy => "unhealthy",
             Self::UnexpectedSuccessfulExit => "unexpected successful exit",
         }
     }
@@ -236,6 +241,14 @@ pub(super) struct Entry {
     /// Present while the current Run of a probed Service has an active
     /// readiness check, including after the first pass for recovery tracking.
     pub(super) readiness: Option<ReadinessTracking>,
+    /// Present while the current Run has an ongoing liveness policy. It is
+    /// inactive until this Run first becomes effectively ready.
+    pub(super) liveness: Option<LivenessTracking>,
+    /// True after the adapter reports that the current Run has spawned.
+    pub(super) spawned: bool,
+    /// True while an unhealthy Run is being shut down for an automatic
+    /// replacement, including while cleanup confirmation is pending.
+    pub(super) unhealthy_restart_pending: bool,
     /// The previous Run's cleanup finished unconfirmed: its Run identity
     /// stays held so a manual Stop can retry the bounded cleanup, and no
     /// new Run may replace it until that retry confirms.
@@ -284,6 +297,9 @@ impl Entry {
             metrics: None,
             blocked: None,
             readiness: None,
+            liveness: None,
+            spawned: false,
+            unhealthy_restart_pending: false,
             cleanup_unconfirmed: false,
             runs: VecDeque::new(),
             run_started_at_ms: None,
@@ -307,6 +323,7 @@ impl Entry {
         self.awaiting_manual_restart = false;
         self.restart_backoff = None;
         self.restart_suppressed = false;
+        self.unhealthy_restart_pending = false;
     }
 
     /// Record the bounded finished-Run summary for the Run that just ended
@@ -472,9 +489,14 @@ impl Core {
         if let Some(tracking) = self.entries[index].readiness.as_ref() {
             tracking.cancel(self.probes.as_ref(), process_id, run_id);
         }
+        if let Some(tracking) = self.entries[index].liveness.as_ref() {
+            tracking.cancel(self.probes.as_ref(), process_id, run_id);
+        }
         self.seam.cancel(process_id, run_id);
         self.entries[index].run_cancelled = true;
         self.entries[index].readiness = None;
+        self.entries[index].liveness = None;
+        self.entries[index].spawned = false;
     }
 
     pub(super) fn build_intent(&self, index: usize, run_id: RunId) -> StartIntent {
@@ -482,12 +504,19 @@ impl Core {
         // Shell command text reaches the child through the Project's
         // configured launcher; direct commands never gain shell parsing.
         let (program, args) = spec.command.resolve(self.project.shell());
-        let log_matchers = self.entries[index]
+        let mut log_matchers = self.entries[index]
             .readiness
             .as_ref()
             .zip(spec.readiness.as_ref())
             .map(|(tracking, config)| tracking.log_matchers(config))
             .unwrap_or_default();
+        if let Some((tracking, config)) = self.entries[index]
+            .liveness
+            .as_ref()
+            .zip(spec.liveness.as_ref())
+        {
+            log_matchers.extend(tracking.log_matchers(config));
+        }
         StartIntent {
             process_id: self.entries[index].process_id,
             run_id,
@@ -517,10 +546,11 @@ impl Core {
             // unconfirmed cleanup; preserve the pending desire so the
             // replacement can start after confirmation. A plain Stop keeps
             // its normal suppressing meaning.
-            let replacement_pending = matches!(
-                entry.pending_trigger,
-                crate::supervisor::RunTrigger::Restart | crate::supervisor::RunTrigger::Rerun
-            );
+            let replacement_pending = entry.unhealthy_restart_pending
+                || matches!(
+                    entry.pending_trigger,
+                    crate::supervisor::RunTrigger::Restart | crate::supervisor::RunTrigger::Rerun
+                );
             entry.restart_suppressed = if replacement_pending {
                 entry.startup_timeout_pending
             } else {
@@ -594,6 +624,7 @@ impl Core {
     /// the threaded wrapper drives it on tick timeouts.
     pub(crate) fn poll_timers(&mut self, now: Instant) {
         self.poll_readiness_timers(now);
+        self.poll_liveness_timers(now);
         self.poll_restart_timers(now);
         self.expire_shutdown(now);
     }
@@ -603,6 +634,7 @@ impl Core {
     pub(crate) fn time_until_next_timer(&self) -> Option<Duration> {
         self.readiness_time_until_next_timer()
             .into_iter()
+            .chain(self.liveness_time_until_next_timer())
             .chain(self.restart_time_until_next_timer())
             .chain(self.time_until_shutdown_deadline())
             .min()
@@ -636,6 +668,13 @@ impl Core {
                         .readiness
                         .as_ref()
                         .expect("tracking exists only for a configured readiness check");
+                    tracking.snapshot(config, now_ms)
+                }),
+                liveness: entry.liveness.as_ref().map(|tracking| {
+                    let config = spec
+                        .liveness
+                        .as_ref()
+                        .expect("tracking exists only for a configured liveness check");
                     tracking.snapshot(config, now_ms)
                 }),
                 restart_backoff: entry.restart_backoff.map(|backoff| RestartBackoffStatus {

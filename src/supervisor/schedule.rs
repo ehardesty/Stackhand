@@ -146,6 +146,7 @@ impl Core {
         let readiness = has_log_readiness
             .then(|| self.new_readiness_tracking(index, self.clock.now(), false))
             .flatten();
+        let liveness = self.new_liveness_tracking(index, self.clock.now());
         let now_ms = self.now_ms();
         let entry = &mut self.entries[index];
         let run_id = RunId::new(entry.next_run);
@@ -164,6 +165,9 @@ impl Core {
         entry.run_started_at_ms = Some(now_ms);
         entry.run_trigger = entry.pending_trigger;
         entry.readiness = readiness;
+        entry.liveness = liveness;
+        entry.spawned = false;
+        entry.unhealthy_restart_pending = false;
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }
@@ -286,6 +290,7 @@ impl Core {
         entry.blocked = None;
         entry.awaiting_manual_restart = true;
         entry.restart_backoff = None;
+        entry.unhealthy_restart_pending = false;
         entry.failure = Some(FailureSummary {
             kind: FailureKind::RestartLimit,
             detail: format!("Restart limit reached after {max_restarts} automatic attempts"),

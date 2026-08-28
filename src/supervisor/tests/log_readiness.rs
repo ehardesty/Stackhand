@@ -31,6 +31,7 @@ fn log_match(process: &str, run: u64, work: u64) -> SeamEvent {
         process_id: ProcessId::new(process_index(process)),
         run_id: RunId::new(run),
         work_id: WorkId::new(work),
+        attempt_id: None,
     }
 }
 

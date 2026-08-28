@@ -24,11 +24,13 @@ use crate::supervisor::probe::RealProbes;
 use crate::supervisor::runtime::RealRunSeam;
 use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamEvent, SeamSender};
 
+mod checks;
 mod clock;
 mod command;
 mod core;
 mod events;
 mod exec;
+mod liveness;
 mod probe;
 mod readiness;
 mod runtime;
@@ -42,17 +44,18 @@ mod support;
 mod tests;
 
 pub use crate::runtime::ProcessId;
+pub use checks::{CheckState, LivenessState, ReadinessState};
 pub use command::Command;
 pub use core::{
     DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
     RunExitDisposition, RunSummary, RunTrigger,
 };
-pub use readiness::ReadinessState;
 pub use runtime::{ConsoleView, Consoles};
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
 pub use snapshot::{
-    ProcessSnapshot, ProjectSnapshot, ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus,
-    RestartBackoffStatus, RestartBudgetStatus,
+    LivenessCheckKind, LivenessChildStatus, LivenessStatus, ProcessSnapshot, ProjectSnapshot,
+    ReadinessCheckKind, ReadinessChildStatus, ReadinessStatus, RestartBackoffStatus,
+    RestartBudgetStatus,
 };
 // The data-plane retained-output view is built alongside the Supervisor, so
 // its public types are reachable through this entry point.

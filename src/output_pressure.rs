@@ -54,6 +54,7 @@ fn noisy_process(name: &str) -> ProcessSpec {
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
         readiness: None,
+        liveness: None,
     }
 }
 
@@ -80,6 +81,7 @@ fn quiet_process(name: &str, autostart: bool) -> ProcessSpec {
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
         readiness: None,
+        liveness: None,
     }
 }
 

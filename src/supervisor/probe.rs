@@ -1,8 +1,7 @@
-//! The production readiness probe adapter. It performs one bounded TCP
+//! The production health probe adapter. It performs one bounded TCP
 //! connection or one bounded HTTP GET per request on its own worker thread
-//! and reports exactly one [`SeamEvent::Readiness`] for the requested
-//! identities. Network waits and socket errors never touch the Supervisor
-//! control task.
+//! and reports exactly one scoped health event for the requested identities.
+//! Network waits and socket errors never touch the Supervisor control task.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -13,7 +12,9 @@ use std::time::Duration;
 
 use crate::model::ReadinessProbe;
 use crate::runtime::{ProcessId, RunId};
-use crate::supervisor::seam::{AttemptId, ProbeIntent, ProbeSeam, SeamEvent, SeamSender, WorkId};
+use crate::supervisor::seam::{
+    AttemptId, ProbeIntent, ProbeScope, ProbeSeam, SeamEvent, SeamSender, WorkId,
+};
 
 /// Longest allowed diagnostic string; adapter error text stays bounded.
 const MAX_DIAGNOSTIC_CHARS: usize = 200;
@@ -54,7 +55,7 @@ impl ProbeSeam for RealProbes {
         let active = Arc::clone(&self.active);
         let events = events.clone();
         std::thread::Builder::new()
-            .name("readiness-probe".to_string())
+            .name("health-probe".to_string())
             .spawn(move || {
                 if !canceled.load(Ordering::Acquire) {
                     let attempt = match &intent.probe {
@@ -74,14 +75,25 @@ impl ProbeSeam for RealProbes {
                             Ok(()) => (true, None),
                             Err(diagnostic) => (false, Some(diagnostic)),
                         };
-                        events.send(SeamEvent::Readiness {
-                            process_id: intent.process_id,
-                            run_id: intent.run_id,
-                            work_id: intent.work_id,
-                            attempt_id: intent.attempt_id,
-                            passing,
-                            diagnostic,
-                        });
+                        let event = match intent.scope {
+                            ProbeScope::Readiness => SeamEvent::Readiness {
+                                process_id: intent.process_id,
+                                run_id: intent.run_id,
+                                work_id: intent.work_id,
+                                attempt_id: intent.attempt_id,
+                                passing,
+                                diagnostic,
+                            },
+                            ProbeScope::Liveness => SeamEvent::Liveness {
+                                process_id: intent.process_id,
+                                run_id: intent.run_id,
+                                work_id: intent.work_id,
+                                attempt_id: intent.attempt_id,
+                                passing,
+                                diagnostic,
+                            },
+                        };
+                        events.send(event);
                     }
                 }
                 active
@@ -408,6 +420,7 @@ mod tests {
                 },
                 timeout: TIMEOUT,
                 exec_context: None,
+                scope: ProbeScope::Readiness,
             },
             &SeamSender::new(tx),
         );
@@ -425,6 +438,44 @@ mod tests {
                 assert_eq!(diagnostic, None);
             }
             other => panic!("expected one passing Readiness event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_probe_seam_reports_one_scoped_liveness_event_for_an_http_request() {
+        let port = spawn_http_server(b"HTTP/1.0 200 OK\r\n\r\n");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        RealProbes::default().probe(
+            ProbeIntent {
+                process_id: ProcessId::new(7),
+                run_id: RunId::new(3),
+                work_id: WorkId::new(1),
+                attempt_id: crate::supervisor::seam::AttemptId::new(1),
+                probe: ReadinessProbe::Http {
+                    host: "127.0.0.1".into(),
+                    port,
+                    path: "/healthz".into(),
+                },
+                timeout: TIMEOUT,
+                exec_context: None,
+                scope: ProbeScope::Liveness,
+            },
+            &SeamSender::new(tx),
+        );
+        match rx.recv_timeout(TIMEOUT) {
+            Ok(SeamEvent::Liveness {
+                process_id,
+                run_id,
+                passing,
+                diagnostic,
+                ..
+            }) => {
+                assert_eq!(process_id, ProcessId::new(7));
+                assert_eq!(run_id, RunId::new(3));
+                assert!(passing);
+                assert_eq!(diagnostic, None);
+            }
+            other => panic!("expected one passing Liveness event, got {other:?}"),
         }
     }
 }

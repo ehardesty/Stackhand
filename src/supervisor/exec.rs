@@ -250,7 +250,7 @@ mod tests {
     use super::*;
     use crate::model::CommandForm;
     use crate::runtime::{ProcessId, RunId};
-    use crate::supervisor::seam::{AttemptId, ExecContext, WorkId};
+    use crate::supervisor::seam::{AttemptId, ExecContext, ProbeScope, WorkId};
 
     fn intent(command: CommandForm, timeout: Duration) -> ProbeIntent {
         ProbeIntent {
@@ -270,6 +270,7 @@ mod tests {
                 env: Vec::new(),
                 shell: crate::model::ShellConfig::default(),
             }),
+            scope: ProbeScope::Readiness,
         }
     }
 

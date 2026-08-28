@@ -17,7 +17,9 @@ use crate::runtime::{
     RunStartRequest, SpawnCommand, TerminalHandle, root_exit_pending,
 };
 use crate::supervisor::FailureKind;
-use crate::supervisor::seam::{FinishedRun, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId};
+use crate::supervisor::seam::{
+    AttemptId, FinishedRun, LogMatcherIntent, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId,
+};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 
 /// Identifies one active Run inside the adapter.
@@ -111,6 +113,9 @@ struct RunRecord {
     /// Supervisor replaces or stops this Run. Process cleanup and the
     /// bounded output drain remain owned by `OwnedRun`.
     cancelled: Arc<AtomicBool>,
+    /// The output observer is retained so the Supervisor can arm fresh
+    /// liveness log windows after the Run has spawned.
+    log_matcher: Mutex<Option<Arc<LiveLogMatcher>>>,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -124,6 +129,7 @@ impl RunRecord {
             }),
             wake: Condvar::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            log_matcher: Mutex::new(None),
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
@@ -135,6 +141,31 @@ impl RunRecord {
             test_hooks,
             ..Self::spawning()
         }
+    }
+
+    fn set_log_matcher(&self, matcher: Option<Arc<LiveLogMatcher>>) {
+        *self
+            .log_matcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = matcher;
+    }
+
+    fn arm_log_matcher(&self, matcher: LogMatcherIntent) {
+        let live_matcher = self
+            .log_matcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(live_matcher) = live_matcher else {
+            return;
+        };
+        live_matcher
+            .replace(LogPattern {
+                key: matcher.work_id.get(),
+                contains: matcher.contains,
+                attempt_id: matcher.attempt_id.map(AttemptId::get),
+            })
+            .expect("validated log liveness patterns remain valid");
     }
 
     /// Install a spawned Run. Its output marker and drain are ready before
@@ -344,6 +375,8 @@ impl RunSeam for RealRunSeam {
         let record = Arc::new(RunRecord::spawning());
         #[cfg(test)]
         let record = Arc::new(RunRecord::spawning_with_test_hooks(self.test_hooks.clone()));
+        let output_observer = build_output_observer(&intent, Arc::clone(&record.cancelled), events);
+        record.set_log_matcher(output_observer.clone());
         let mut runs = self
             .runs
             .lock()
@@ -362,7 +395,7 @@ impl RunSeam for RealRunSeam {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             let (output_tx, output_rx) = crate::runtime::output_channel();
             let output_observer =
-                build_output_observer(&intent, Arc::clone(&record.cancelled), &events);
+                output_observer.map(|observer| observer as Arc<dyn RunOutputObserver>);
             let request = RunStartRequest {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
@@ -410,6 +443,24 @@ impl RunSeam for RealRunSeam {
         });
     }
 
+    fn arm_log_matcher(
+        &self,
+        process_id: ProcessId,
+        run_id: RuntimeRunId,
+        matcher: LogMatcherIntent,
+    ) {
+        let key = (process_id.get(), run_id.get());
+        if let Some(record) = self
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            record.arm_log_matcher(matcher);
+        }
+    }
+
     fn stop(
         &self,
         process_id: ProcessId,
@@ -440,7 +491,7 @@ fn build_output_observer(
     intent: &StartIntent,
     cancelled: Arc<AtomicBool>,
     events: &SeamSender,
-) -> Option<Arc<dyn RunOutputObserver>> {
+) -> Option<Arc<LiveLogMatcher>> {
     if intent.log_matchers.is_empty() {
         return None;
     }
@@ -450,19 +501,21 @@ fn build_output_observer(
         .map(|matcher| LogPattern {
             key: matcher.work_id.get(),
             contains: matcher.contains.clone(),
+            attempt_id: matcher.attempt_id.map(AttemptId::get),
         })
         .collect();
     let process_id = intent.process_id;
     let run_id = intent.run_id;
     let events = events.clone();
-    let matcher = LiveLogMatcher::new(patterns, cancelled, move |key| {
+    let matcher = LiveLogMatcher::new_with_attempts(patterns, cancelled, move |key, attempt_id| {
         events.send(SeamEvent::LogMatched {
             process_id,
             run_id,
             work_id: WorkId::new(key),
+            attempt_id: attempt_id.map(AttemptId::new),
         });
     })
-    .expect("validated log readiness patterns create a matcher");
+    .expect("validated log health patterns create a matcher");
     Some(matcher)
 }
 

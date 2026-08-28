@@ -42,6 +42,7 @@ fn simple(name: &str, kind: ProcessKind, enabled: Enabled, autostart: Autostart)
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
         readiness: None,
+        liveness: None,
     }
 }
 
@@ -678,6 +679,8 @@ fn unknown_commands_are_ignored() {
     assert!(h.runtime.intents().is_empty());
 }
 
+#[cfg(test)]
+mod liveness;
 #[cfg(test)]
 mod log_readiness;
 #[cfg(test)]

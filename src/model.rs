@@ -66,13 +66,17 @@ impl RestartPolicy {
     }
 }
 
-/// The fixed delay and retry limit for automatic restarts.
+/// The fixed delay, retry limit, and unhealthy-recovery policy for automatic
+/// restarts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestartConfig {
     pub policy: RestartPolicy,
     pub backoff: Duration,
     /// The number of automatic retries allowed after the initial Run.
     pub max_restarts: u32,
+    /// Whether a liveness failure should stop the current Run and schedule a
+    /// controlled automatic restart.
+    pub on_unhealthy: bool,
 }
 
 /// The default number of automatic retries after the initial Run.
@@ -84,6 +88,7 @@ impl Default for RestartConfig {
             policy: RestartPolicy::Never,
             backoff: Duration::from_secs(2),
             max_restarts: DEFAULT_MAX_RESTARTS,
+            on_unhealthy: false,
         }
     }
 }
@@ -232,6 +237,13 @@ pub struct ReadinessConfig {
     pub startup_timeout: Option<Duration>,
 }
 
+/// The ongoing health policy of one Service. It uses the same leaf probe
+/// forms as readiness but has no startup deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LivenessConfig {
+    pub checks: Vec<ReadinessCheck>,
+}
+
 /// One startup Dependency of one Process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DependencySpec {
@@ -263,6 +275,10 @@ pub struct ProcessSpec {
     /// When set, the Service stays Starting until this probe passes. Valid
     /// on Services only; configuration validation rejects it on One-shots.
     pub readiness: Option<ReadinessConfig>,
+    /// When set, the Service is checked after it first becomes effectively
+    /// ready. Valid on Services only; configuration validation rejects it on
+    /// One-shots.
+    pub liveness: Option<LivenessConfig>,
     /// Policy for restarting a failed or unexpectedly ended Run.
     pub restart: RestartConfig,
 }
@@ -288,6 +304,11 @@ pub enum ProjectError {
     /// A readiness probe was configured on a One-shot; only Services wait
     /// for readiness.
     ReadinessOnOneShot {
+        process: String,
+    },
+    /// A liveness probe was configured on a One-shot; only Services have
+    /// ongoing health checks.
+    LivenessOnOneShot {
         process: String,
     },
     /// An automatic restart policy is not valid for this Process kind.
@@ -385,6 +406,11 @@ impl EffectiveProject {
             }
             if spec.readiness.is_some() && spec.kind == ProcessKind::OneShot {
                 return Err(ProjectError::ReadinessOnOneShot {
+                    process: spec.name.clone(),
+                });
+            }
+            if spec.liveness.is_some() && spec.kind == ProcessKind::OneShot {
+                return Err(ProjectError::LivenessOnOneShot {
                     process: spec.name.clone(),
                 });
             }
@@ -514,6 +540,7 @@ mod tests {
             input_policy: InputPolicy::Disabled,
             dependencies: Vec::new(),
             readiness: None,
+            liveness: None,
         }
     }
 

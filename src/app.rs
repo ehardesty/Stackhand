@@ -9,11 +9,11 @@ use crossterm::event::{
 use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll};
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
-use crate::supervisor::Lifecycle;
 use crate::supervisor::{
     Command, ConsoleView, Consoles, ProcessSnapshot, ProjectShutdownSnapshot, ProjectSnapshot,
     SupervisorHandle,
 };
+use crate::supervisor::{Lifecycle, LivenessState};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
     ConsolePaneKind, ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout,
@@ -614,6 +614,16 @@ fn status_label(process: &ProcessSnapshot) -> String {
     }
     if process.lifecycle == Lifecycle::Done {
         return "Done".to_string();
+    }
+    // A liveness failure is a health result while the Run remains active.
+    // Controlled recovery uses Stopping or RestartBackoff instead.
+    if process.lifecycle == Lifecycle::Running
+        && process
+            .liveness
+            .as_ref()
+            .is_some_and(|liveness| liveness.state == LivenessState::Failing)
+    {
+        return "Unhealthy".to_string();
     }
     // A failure stays visible while the Process is not mid-shutdown or
     // waiting through an automatic restart delay. Those states project their

@@ -10,7 +10,8 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::FailureKind;
 use crate::supervisor::clock::Clock;
 use crate::supervisor::seam::{
-    FinishedRun, ProbeIntent, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId,
+    FinishedRun, ProbeIntent, ProbeScope, ProbeSeam, RunSeam, SeamEvent, SeamSender, StartIntent,
+    WorkId,
 };
 
 /// One observable runtime action the Supervisor requested.
@@ -263,14 +264,25 @@ impl FakeProbes {
             .as_ref()
             .cloned()
         {
-            sender.send(SeamEvent::Readiness {
-                process_id: request.process_id,
-                run_id: request.run_id,
-                work_id,
-                attempt_id,
-                passing,
-                diagnostic,
-            });
+            let event = match request.scope {
+                ProbeScope::Readiness => SeamEvent::Readiness {
+                    process_id: request.process_id,
+                    run_id: request.run_id,
+                    work_id,
+                    attempt_id,
+                    passing,
+                    diagnostic,
+                },
+                ProbeScope::Liveness => SeamEvent::Liveness {
+                    process_id: request.process_id,
+                    run_id: request.run_id,
+                    work_id,
+                    attempt_id,
+                    passing,
+                    diagnostic,
+                },
+            };
+            sender.send(event);
         }
     }
 }

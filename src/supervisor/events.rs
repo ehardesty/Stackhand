@@ -73,23 +73,36 @@ impl Core {
                     .flatten();
                 let spawn_now_ms = self.now_ms();
                 let readiness_config = self.project.processes()[index].readiness.clone();
-                let entry = &mut self.entries[index];
-                entry.root_pid = root_pid.map(|pid| pid.get());
-                if let Some(readiness) = readiness {
-                    // The Run exists but is not available yet; each child
-                    // owns its own first-attempt delay.
-                    entry.readiness = Some(readiness);
+                {
+                    let entry = &mut self.entries[index];
+                    entry.root_pid = root_pid.map(|pid| pid.get());
+                    entry.spawned = true;
+                    if let Some(readiness) = readiness {
+                        // The Run exists but is not available yet; each child
+                        // owns its own first-attempt delay.
+                        entry.readiness = Some(readiness);
+                    }
+                    if let Some(config) = readiness_config.as_ref()
+                        && let Some(tracking) = entry.readiness.as_mut()
+                    {
+                        tracking.activate(config, now, spawn_now_ms);
+                    } else if entry.lifecycle == super::core::Lifecycle::Starting
+                        && entry.readiness.is_none()
+                    {
+                        // A Service without readiness becomes Running at spawn;
+                        // its label projects as Ready.
+                        entry.lifecycle = super::core::Lifecycle::Running;
+                    }
                 }
-                if let Some(config) = readiness_config.as_ref()
-                    && let Some(tracking) = entry.readiness.as_mut()
+                if self.entries[index].lifecycle == super::core::Lifecycle::Running
+                    && self.entries[index]
+                        .readiness
+                        .as_ref()
+                        .is_none_or(|tracking| {
+                            tracking.state() == super::readiness::ReadinessState::Passing
+                        })
                 {
-                    tracking.activate(config, now, spawn_now_ms);
-                } else if entry.lifecycle == super::core::Lifecycle::Starting
-                    && entry.readiness.is_none()
-                {
-                    // A Service without readiness becomes Running at spawn;
-                    // its label projects as Ready.
-                    entry.lifecycle = super::core::Lifecycle::Running;
+                    self.activate_liveness(index, now);
                 }
                 self.evaluate();
             }
@@ -119,7 +132,31 @@ impl Core {
                 }
                 self.evaluate();
             }
-            SeamEvent::LogMatched { work_id, .. } => {
+            SeamEvent::Liveness {
+                work_id,
+                attempt_id,
+                passing,
+                diagnostic,
+                ..
+            } => {
+                self.apply_liveness_result(
+                    index,
+                    work_id,
+                    attempt_id,
+                    passing,
+                    diagnostic,
+                    self.clock.now(),
+                );
+            }
+            SeamEvent::LogMatched {
+                work_id,
+                attempt_id,
+                ..
+            } => {
+                if let Some(attempt_id) = attempt_id {
+                    self.complete_liveness_log(index, work_id, attempt_id, self.clock.now());
+                    return;
+                }
                 let became_ready = {
                     let entry = &mut self.entries[index];
                     let Some(tracking) = entry.readiness.as_mut() else {
@@ -177,6 +214,19 @@ impl Core {
         if self.entries[index].lifecycle == super::core::Lifecycle::Starting {
             self.entries[index].lifecycle = super::core::Lifecycle::Running;
         }
+        if self.entries[index].spawned {
+            self.activate_liveness(index, self.clock.now());
+        }
+    }
+
+    fn activate_liveness(&mut self, index: usize, now: std::time::Instant) {
+        let Some(config) = self.project.processes()[index].liveness.clone() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+        if let Some(tracking) = self.entries[index].liveness.as_mut() {
+            tracking.activate(&config, now, now_ms);
+        }
     }
 
     /// Apply one authoritative finished-Run fact. Natural results are
@@ -185,6 +235,7 @@ impl Core {
     /// one serialized Supervisor turn.
     fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
         let timed_out = self.entries[index].startup_timeout_pending;
+        let unhealthy = self.entries[index].unhealthy_restart_pending;
         let restart_reason = self.restart_reason_for_terminal(
             index,
             TerminalOutcome::Finished {
@@ -212,11 +263,19 @@ impl Core {
             let cleanup_detail = finished
                 .detail
                 .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string());
-            if timed_out {
-                let failure = entry
-                    .failure
-                    .as_mut()
-                    .expect("a pending startup timeout has a recorded failure");
+            if timed_out || unhealthy {
+                let failure = entry.failure.get_or_insert(FailureSummary {
+                    kind: if unhealthy {
+                        FailureKind::Liveness
+                    } else {
+                        FailureKind::Readiness
+                    },
+                    detail: if unhealthy {
+                        "liveness failure threshold reached".to_string()
+                    } else {
+                        "readiness startup timeout".to_string()
+                    },
+                });
                 failure.detail = format!("{}; cleanup failed: {cleanup_detail}", failure.detail);
             } else {
                 entry.failure = Some(FailureSummary {
@@ -225,7 +284,7 @@ impl Core {
                 });
             }
             if entry.lifecycle != super::core::Lifecycle::Done {
-                entry.lifecycle = if timed_out {
+                entry.lifecycle = if timed_out || unhealthy {
                     super::core::Lifecycle::Stopping
                 } else {
                     super::core::Lifecycle::Stopped
@@ -233,6 +292,8 @@ impl Core {
             }
             entry.metrics = None;
             entry.readiness = None;
+            entry.liveness = None;
+            entry.spawned = false;
             self.evaluate();
             return;
         }
@@ -254,7 +315,7 @@ impl Core {
             index,
             finished.run_id,
             finished.exit_code,
-            finished.intentional_stop && !timed_out,
+            finished.intentional_stop && !timed_out && !unhealthy,
             restart_reason,
         );
     }
@@ -291,6 +352,9 @@ impl Core {
     ) -> Option<RestartReason> {
         if self.shutdown_in_progress() || self.entries[index].restart_suppressed {
             return None;
+        }
+        if self.entries[index].unhealthy_restart_pending {
+            return Some(RestartReason::Unhealthy);
         }
         let policy = self.project.processes()[index].restart.policy;
         match outcome {
@@ -346,6 +410,9 @@ impl Core {
             entry.root_pid = None;
             entry.metrics = None;
             entry.readiness = None;
+            entry.liveness = None;
+            entry.spawned = false;
+            entry.unhealthy_restart_pending = false;
             entry.cleanup_unconfirmed = false;
             entry.startup_timeout_pending = false;
             // A successful One-shot stays Done. Every other finished Run

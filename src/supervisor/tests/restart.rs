@@ -21,6 +21,7 @@ fn restart_project_with_max(
         policy,
         backoff: Duration::from_secs(2),
         max_restarts,
+        on_unhealthy: false,
     };
     EffectiveProject::new(vec![process]).expect("unique names and valid restart policy")
 }
@@ -38,6 +39,7 @@ fn startup_timeout_restart_project_with_max(
         policy,
         backoff: Duration::from_secs(2),
         max_restarts,
+        on_unhealthy: false,
     };
     process
         .readiness

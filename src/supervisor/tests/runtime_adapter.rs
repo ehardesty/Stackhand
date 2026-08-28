@@ -35,6 +35,7 @@ fn one_shot_project(command: CommandForm) -> EffectiveProject {
         input_policy: InputPolicy::Disabled,
         dependencies: Vec::new(),
         readiness: None,
+        liveness: None,
     }])
     .expect("valid one-Process Project")
 }
@@ -58,6 +59,7 @@ fn log_intent(program: &str, args: &[&str], pty: bool) -> StartIntent {
     intent.pty = pty;
     intent.log_matchers = vec![LogMatcherIntent {
         work_id: WorkId::new(9),
+        attempt_id: None,
         contains: "early-log-marker".to_string(),
     }];
     intent
@@ -96,6 +98,7 @@ fn real_log_project(marker_file: &std::path::Path) -> EffectiveProject {
             }],
             startup_timeout: None,
         }),
+        liveness: None,
     }])
     .expect("valid real log-readiness Project")
 }
@@ -547,6 +550,7 @@ fn real_pipe_log_match_is_not_limited_by_retained_history() {
     );
     start.log_matchers = vec![LogMatcherIntent {
         work_id: WorkId::new(9),
+        attempt_id: None,
         contains: MARKER.to_string(),
     }];
 

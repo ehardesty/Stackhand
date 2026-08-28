@@ -10,17 +10,20 @@ use std::sync::{Arc, Mutex};
 
 use super::start::RunOutputObserver;
 
-/// One readiness child that the live matcher reports when its literal appears.
+/// One health-check log child that the live matcher reports when its
+/// literal appears.
 #[derive(Clone, Debug)]
 pub(crate) struct LogPattern {
     pub(crate) key: u64,
     pub(crate) contains: String,
+    /// Scheduled liveness attempts carry their attempt identity. Latched
+    /// readiness observations use `None`.
+    pub(crate) attempt_id: Option<u64>,
 }
 
 /// Why a live matcher could not be constructed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogMatcherError {
-    NoPatterns,
     EmptyPattern(u64),
 }
 
@@ -32,7 +35,7 @@ pub(crate) enum LogMatcherError {
 pub(crate) struct LiveLogMatcher {
     state: Mutex<MatcherState>,
     cancelled: Arc<AtomicBool>,
-    on_match: Box<dyn Fn(u64) + Send + Sync + 'static>,
+    on_match: Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>,
 }
 
 struct MatcherState {
@@ -44,29 +47,27 @@ struct PatternState {
     key: u64,
     matcher: LiteralMatcher,
     latched: bool,
+    attempt_id: Option<u64>,
 }
 
 impl LiveLogMatcher {
+    #[cfg(test)]
     pub(crate) fn new(
         patterns: Vec<LogPattern>,
         cancelled: Arc<AtomicBool>,
         on_match: impl Fn(u64) + Send + Sync + 'static,
     ) -> Result<Arc<Self>, LogMatcherError> {
-        if patterns.is_empty() {
-            return Err(LogMatcherError::NoPatterns);
-        }
+        Self::new_with_attempts(patterns, cancelled, move |key, _| on_match(key))
+    }
+
+    pub(crate) fn new_with_attempts(
+        patterns: Vec<LogPattern>,
+        cancelled: Arc<AtomicBool>,
+        on_match: impl Fn(u64, Option<u64>) + Send + Sync + 'static,
+    ) -> Result<Arc<Self>, LogMatcherError> {
         let patterns = patterns
             .into_iter()
-            .map(|pattern| {
-                if pattern.contains.is_empty() {
-                    return Err(LogMatcherError::EmptyPattern(pattern.key));
-                }
-                Ok(PatternState {
-                    key: pattern.key,
-                    matcher: LiteralMatcher::new(normalize_literal(pattern.contains.as_bytes())),
-                    latched: false,
-                })
-            })
+            .map(pattern_state)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Arc::new(Self {
             state: Mutex::new(MatcherState {
@@ -76,6 +77,27 @@ impl LiveLogMatcher {
             cancelled,
             on_match: Box::new(on_match),
         }))
+    }
+
+    /// Replace one pattern and clear only that pattern's rolling match state.
+    /// A later liveness attempt therefore cannot be satisfied by output that
+    /// matched an older attempt.
+    pub(crate) fn replace(&self, pattern: LogPattern) -> Result<(), LogMatcherError> {
+        let replacement = pattern_state(pattern)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = state
+            .patterns
+            .iter_mut()
+            .find(|existing| existing.key == replacement.key)
+        {
+            *existing = replacement;
+        } else {
+            state.patterns.push(replacement);
+        }
+        Ok(())
     }
 }
 
@@ -104,19 +126,31 @@ impl RunOutputObserver for LiveLogMatcher {
                 for pattern in &mut state.patterns {
                     if !pattern.latched && pattern.matcher.push(byte) {
                         pattern.latched = true;
-                        matched.push(pattern.key);
+                        matched.push((pattern.key, pattern.attempt_id));
                     }
                 }
             }
         }
 
-        for key in matched {
+        for (key, attempt_id) in matched {
             if self.cancelled.load(Ordering::Acquire) {
                 return;
             }
-            (self.on_match)(key);
+            (self.on_match)(key, attempt_id);
         }
     }
+}
+
+fn pattern_state(pattern: LogPattern) -> Result<PatternState, LogMatcherError> {
+    if pattern.contains.is_empty() {
+        return Err(LogMatcherError::EmptyPattern(pattern.key));
+    }
+    Ok(PatternState {
+        key: pattern.key,
+        matcher: LiteralMatcher::new(normalize_literal(pattern.contains.as_bytes())),
+        latched: false,
+        attempt_id: pattern.attempt_id,
+    })
 }
 
 /// Normalize the literal in the same way as live carriage-return input.
@@ -321,6 +355,7 @@ mod tests {
                 .map(|(key, contains)| LogPattern {
                     key: *key,
                     contains: (*contains).to_string(),
+                    attempt_id: None,
                 })
                 .collect(),
             Arc::new(AtomicBool::new(false)),
@@ -377,6 +412,7 @@ mod tests {
             vec![LogPattern {
                 key: 7,
                 contains: "ready".into(),
+                attempt_id: None,
             }],
             Arc::clone(&cancelled),
             move |key| received.lock().unwrap().push(key),
