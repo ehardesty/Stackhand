@@ -308,7 +308,7 @@ processes.local.yaml
 
 ### 14.2 File discovery
 
-When the user supplies an explicit configuration path, the CLI uses only that base file. Otherwise, it searches the current directory and then each parent directory, stopping at the first directory that contains the base filename. It loads a local override only from that same directory and always shows the selected paths.
+When the user supplies an explicit configuration path, the CLI uses only that base file. Otherwise, it searches the current directory and then each parent directory, stopping at the first directory that contains the base filename. It then loads `stackhand.local.yaml`, when present, only from that same directory. It does not search child directories, parent directories, the home directory, or the current working directory for another override. Validation reports the selected source paths in precedence order.
 
 Relative paths are resolved against the directory containing the base configuration file, not the process's current shell directory.
 
@@ -349,6 +349,10 @@ A local override is intended for gitignored machine-specific changes:
 - adjust environment variables.
 
 The shared base config should not need to know the machine-specific domain concept.
+
+A local override is a partial YAML mapping. It may omit `version`; if present,
+`version` must be `1`. It cannot define `profiles`. It uses the same deep-map,
+scalar-replacement, list-replacement, and `null` clearing rules as profiles.
 
 ---
 

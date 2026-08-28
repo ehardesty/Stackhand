@@ -28,4 +28,7 @@ pub use app::{
     run_discovered_project_with_profiles, run_project, run_project_with_profile,
     run_project_with_profiles,
 };
-pub use config::{validate_project, validate_project_with_profile, validate_project_with_profiles};
+pub use config::{
+    validate_project, validate_project_sources_with_profiles, validate_project_with_profile,
+    validate_project_with_profiles,
+};

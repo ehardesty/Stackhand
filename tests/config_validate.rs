@@ -83,12 +83,47 @@ fn config_validate_uses_an_explicit_path_without_discovery() {
     )
     .expect("discovered config writes");
     write_valid_project(&explicit);
+    let explicit_local = explicit
+        .parent()
+        .expect("explicit parent exists")
+        .join("stackhand.local.yaml");
+    fs::write(
+        &explicit_local,
+        "processes:\n  local-only:\n    command: [/bin/true]\n",
+    )
+    .expect("explicit local override writes");
 
     let output = run_validate(&current, Some(&explicit));
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(&explicit.display().to_string()), "{stdout}");
     assert!(!stdout.contains(&current.join("stackhand.yaml").display().to_string()));
+    assert!(!stdout.contains(&explicit_local.display().to_string()));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_reports_discovered_sources_in_precedence_order() {
+    let root = unique_directory("sources");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).expect("nested directory creates");
+    let base = root.join("stackhand.yaml");
+    let local = root.join("stackhand.local.yaml");
+    write_valid_project(&base);
+    fs::write(&local, "processes:\n  web:\n    command: [/bin/true]\n")
+        .expect("local override writes");
+
+    let output = run_validate(&nested, None);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let base_position = stdout
+        .find(&base.display().to_string())
+        .expect("base source is reported");
+    let local_position = stdout
+        .find(&local.display().to_string())
+        .expect("local source is reported");
+    assert!(base_position < local_position, "{stdout}");
 
     fs::remove_dir_all(root).ok();
 }

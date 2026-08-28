@@ -10,9 +10,14 @@ fn main() -> Result<()> {
             None => stackhand::run_discovered_project_with_profiles(&profiles),
         },
         Mode::ConfigValidate { path, profiles } => {
-            let base = stackhand::validate_project_with_profiles(path.as_deref(), &profiles)
-                .map_err(|error| anyhow!("configuration error: {error}"))?;
-            println!("Project configuration is valid: {}", base.display());
+            let sources =
+                stackhand::validate_project_sources_with_profiles(path.as_deref(), &profiles)
+                    .map_err(|error| anyhow!("configuration error: {error}"))?;
+            println!("Project configuration is valid:");
+            println!("  base: {}", sources.base.display());
+            if let Some(local) = sources.local {
+                println!("  local override: {}", local.display());
+            }
             Ok(())
         }
         Mode::FixtureProject { path, profiles } => {

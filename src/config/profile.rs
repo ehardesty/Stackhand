@@ -47,6 +47,58 @@ fn normalize_process_entries(document: &mut Value) {
     }
 }
 
+/// Apply one same-directory local override with the same merge rules as a
+/// profile. A local file may repeat the schema version, but it cannot select
+/// profiles or replace a complete Process with null.
+pub(super) fn apply_local_override(document: &mut Value, local: &Value) -> Result<(), ConfigError> {
+    let Some(root) = local.as_mapping() else {
+        return Err(ConfigError {
+            message: "local override must be a mapping".to_string(),
+        });
+    };
+    if root.contains_key(yaml_key("profiles")) {
+        return Err(ConfigError {
+            message: "local override cannot define profiles".to_string(),
+        });
+    }
+    if root.get(yaml_key("processes")).is_some_and(Value::is_null) {
+        return Err(ConfigError {
+            message: "local override processes cannot be null".to_string(),
+        });
+    }
+    if let Some(version) = root.get(yaml_key("version")) {
+        let version =
+            serde_yaml::from_value::<u64>(version.clone()).map_err(|error| ConfigError {
+                message: format!("local override version must be an unsigned integer: {error}"),
+            })?;
+        if version != 1 {
+            return Err(ConfigError {
+                message: format!("local override cannot change schema version from 1 to {version}"),
+            });
+        }
+    }
+    reject_null_processes(root)?;
+    normalize_process_entries(document);
+    merge_yaml(document, local.clone());
+    normalize_process_entries(document);
+    Ok(())
+}
+
+fn reject_null_processes(root: &Mapping) -> Result<(), ConfigError> {
+    let Some(processes) = root.get(yaml_key("processes")).and_then(Value::as_mapping) else {
+        return Ok(());
+    };
+    for (name, process) in processes {
+        if process.is_null() {
+            let name = name.as_str().unwrap_or("<non-string>");
+            return Err(ConfigError {
+                message: format!("local override Process '{name}' must define a complete Process"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn apply_profile(
     document: &mut Value,
     profile: &Value,

@@ -11,6 +11,8 @@ mod readiness;
 #[cfg(test)]
 mod exit_tests;
 #[cfg(test)]
+mod local_tests;
+#[cfg(test)]
 mod profile_tests;
 #[cfg(test)]
 mod schema_tests;
@@ -26,7 +28,7 @@ use self::file::{
     CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
     TerminalFile,
 };
-use self::profile::apply_profiles;
+use self::profile::{apply_local_override, apply_profiles};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
@@ -35,6 +37,7 @@ use crate::model::{
 
 const MAX_EXIT_CODE: i32 = 255;
 pub const BASE_FILE_NAME: &str = "stackhand.yaml";
+pub const LOCAL_FILE_NAME: &str = "stackhand.local.yaml";
 
 /// One request to resolve a Project before the Supervisor starts.
 #[derive(Clone, Debug)]
@@ -90,6 +93,7 @@ impl ResolutionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolutionSources {
     pub base: PathBuf,
+    pub local: Option<PathBuf>,
 }
 
 /// One validated Project and the source summary that produced it.
@@ -112,22 +116,27 @@ impl ProjectResolution {
 
 /// Resolve and validate one Project before any Process starts.
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
-    let (base, profiles) = match request {
+    let (base, profiles, local) = match request {
         ResolutionRequest::Explicit { path, profiles } => (
             absolute_normalized_path(&path)
                 .with_context(|| format!("could not resolve Project path {}", path.display()))
                 .map_err(config_error)?,
             profiles,
+            None,
         ),
         ResolutionRequest::Discover {
             start_dir,
             profiles,
-        } => (discover_base(start_dir.as_deref())?, profiles),
+        } => {
+            let base = discover_base(start_dir.as_deref())?;
+            let local = discover_local_override(&base);
+            (base, profiles, local)
+        }
     };
-    let project = load_file(&base, &profiles)?;
+    let project = load_file_with_local(&base, &profiles, local.as_deref())?;
     Ok(ProjectResolution {
         project,
-        sources: ResolutionSources { base },
+        sources: ResolutionSources { base, local },
     })
 }
 
@@ -159,14 +168,32 @@ pub fn validate_project_with_profiles(
     explicit_path: Option<&Path>,
     profiles: &[String],
 ) -> Result<PathBuf, ConfigError> {
+    validate_project_sources_with_profiles(explicit_path, profiles).map(|sources| sources.base)
+}
+
+/// Resolve and validate a Project, returning every selected source in
+/// precedence order.
+pub fn validate_project_sources_with_profiles(
+    explicit_path: Option<&Path>,
+    profiles: &[String],
+) -> Result<ResolutionSources, ConfigError> {
     let request = explicit_path.map_or_else(
         || ResolutionRequest::discover_with_profiles(profiles.iter().cloned()),
         |path| ResolutionRequest::explicit_with_profiles(path, profiles.iter().cloned()),
     );
-    resolve(request).map(|resolution| resolution.sources.base)
+    resolve(request).map(|resolution| resolution.sources)
 }
 
+#[cfg(test)]
 fn load_file(path: &Path, profiles: &[String]) -> Result<EffectiveProject, ConfigError> {
+    load_file_with_local(path, profiles, None)
+}
+
+fn load_file_with_local(
+    path: &Path,
+    profiles: &[String],
+    local_path: Option<&Path>,
+) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))
@@ -180,11 +207,22 @@ fn load_file(path: &Path, profiles: &[String]) -> Result<EffectiveProject, Confi
         )));
     }
     reject_base_environment_nulls(&document)?;
-    let file: ConfigFile = if profiles.is_empty() {
+    let file: ConfigFile = if profiles.is_empty() && local_path.is_none() {
         serde_yaml::from_str(&text)
             .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?
     } else {
         apply_profiles(&mut document, profiles)?;
+        if let Some(local_path) = local_path {
+            let local_text = std::fs::read_to_string(local_path)
+                .with_context(|| format!("could not read local override {}", local_path.display()))
+                .map_err(config_error)?;
+            let local_document: Value = serde_yaml::from_str(&local_text).map_err(|error| {
+                config_error(anyhow::anyhow!(format_local_yaml_error(local_path, &error)))
+            })?;
+            apply_local_override(&mut document, &local_document).map_err(|error| ConfigError {
+                message: format!("local override '{}': {error}", local_path.display()),
+            })?;
+        }
         let merged = serde_yaml::to_string(&document)
             .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
         serde_yaml::from_str(&merged)
@@ -302,6 +340,11 @@ fn reject_environment_nulls(value: &Value, process_name: &str) -> Result<(), Con
     Ok(())
 }
 
+fn discover_local_override(base: &Path) -> Option<PathBuf> {
+    let candidate = base.parent()?.join(LOCAL_FILE_NAME);
+    candidate.is_file().then_some(candidate)
+}
+
 fn discover_base(start_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
     let starting_path = match start_dir {
         Some(path) => absolute_normalized_path(path),
@@ -376,6 +419,14 @@ fn format_yaml_error(error: &serde_yaml::Error) -> String {
 
 fn format_merged_yaml_error(error: &serde_yaml::Error) -> String {
     format_yaml_error_with_location(error, false)
+}
+
+fn format_local_yaml_error(path: &Path, error: &serde_yaml::Error) -> String {
+    format!(
+        "invalid local override '{}': {}",
+        path.display(),
+        format_yaml_error(error)
+    )
 }
 
 fn format_yaml_error_with_location(error: &serde_yaml::Error, include_location: bool) -> String {
