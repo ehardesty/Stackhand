@@ -162,14 +162,22 @@ fn only_a_mouse_press_changes_keyboard_focus() {
 }
 
 #[test]
-fn process_row_hit_testing_excludes_borders_and_empty_rows() {
+fn process_row_hit_testing_excludes_the_header_borders_and_empty_rows() {
     let list = ratatui::layout::Rect::new(0, 0, 40, 6);
 
-    assert_eq!(process_row_at(list, 0, 3), None);
-    assert_eq!(process_row_at(list, 1, 3), Some(0));
-    assert_eq!(process_row_at(list, 3, 3), Some(2));
-    assert_eq!(process_row_at(list, 4, 3), None);
-    assert_eq!(process_row_at(list, 5, 3), None);
+    assert_eq!(process_row_at(list, 0, 3, 0), None);
+    assert_eq!(process_row_at(list, 1, 3, 0), None);
+    assert_eq!(process_row_at(list, 2, 3, 0), Some(0));
+    assert_eq!(process_row_at(list, 4, 3, 0), Some(2));
+    assert_eq!(process_row_at(list, 5, 3, 0), None);
+}
+
+#[test]
+fn process_row_hit_testing_tracks_the_visible_table_offset() {
+    let list = ratatui::layout::Rect::new(0, 0, 40, 6);
+
+    assert_eq!(process_row_at(list, 2, 8, 7), Some(5));
+    assert_eq!(process_row_at(list, 4, 8, 7), Some(7));
 }
 
 #[test]

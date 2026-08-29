@@ -1,8 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
 };
 
 use crate::terminal::OwnedTerminalSnapshot;
@@ -99,10 +101,10 @@ pub struct ProcessRowView {
 /// selected console pane, one footer line below. Rendering and interaction
 /// geometry both derive from this.
 pub fn project_layout(area: Rect, process_rows: usize) -> (Rect, Rect, Rect) {
-    let list_height = (process_rows as u16 + 2)
-        .max(3)
-        .min(area.height / 3)
-        .min(area.height);
+    let available_height = area.height.saturating_sub(2).max(1);
+    let list_height = (process_rows as u16 + 3)
+        .min((area.height / 3).max(4))
+        .min(available_height);
     let list = Rect::new(area.x, area.y, area.width, list_height);
     let console_height = area
         .height
@@ -239,31 +241,7 @@ pub fn render_project(
     let (list, console_pane, footer) = project_layout(area, rows.len());
     let console_inner = pane_inner(console_pane);
 
-    let list_rows: Vec<ratatui::text::Line<'_>> = rows
-        .iter()
-        .map(|row| {
-            let style = if row.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            ratatui::text::Line::styled(row_line(row, list.width.saturating_sub(2) as usize), style)
-        })
-        .collect();
-    let list_border = if view.mode == ConsoleViewMode::ProcessList {
-        TERMINAL_THEME.focus_border()
-    } else {
-        TERMINAL_THEME.inactive_border()
-    };
-    frame.render_widget(
-        ratatui::widgets::List::new(list_rows).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_style(list_border)
-                .title(" Processes "),
-        ),
-        list,
-    );
+    render_process_table(frame, rows, list, view.mode);
     // The header names the selected Process and its live Run identity; it
     // is a projection of the immutable Supervisor snapshot, never stored
     // UI state.
@@ -319,23 +297,114 @@ static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
         mouse_tracking: false,
     });
 
-/// One Process row as text. The compact metric cells stay optional: when
-/// the terminal is too narrow for them, the row degrades to name and
-/// status instead of pushing the essential fields out.
-fn row_line(row: &ProcessRowView, usable_width: usize) -> String {
-    let base = format!(" {} · {} ", row.name, row.status);
-    let Some(cpu) = &row.cpu else {
-        return base;
-    };
-    let Some(memory) = &row.memory else {
-        return base;
-    };
-    let full = format!("{base} · {cpu} {memory}");
-    if full.chars().count() <= usable_width {
-        full
+const PROCESS_METRICS_MIN_WIDTH: u16 = 52;
+
+fn render_process_table(
+    frame: &mut Frame<'_>,
+    rows: &[ProcessRowView],
+    pane: Rect,
+    mode: ConsoleViewMode,
+) {
+    let inner = pane_inner(pane);
+    let show_metrics = inner.width >= PROCESS_METRICS_MIN_WIDTH;
+    let table_rows = rows.iter().map(|row| {
+        if show_metrics {
+            Row::new([
+                Cell::from(row.name.as_str()),
+                Cell::from(row.status.as_str()),
+                right_cell(row.cpu.as_deref().unwrap_or("")),
+                right_cell(row.memory.as_deref().unwrap_or("")),
+            ])
+        } else {
+            Row::new([
+                Cell::from(row.name.as_str()),
+                Cell::from(row.status.as_str()),
+            ])
+        }
+    });
+    let widths = if show_metrics {
+        vec![
+            Constraint::Percentage(28),
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ]
     } else {
-        base
+        vec![Constraint::Percentage(35), Constraint::Fill(1)]
+    };
+    let headings = if show_metrics {
+        Row::new([
+            Cell::from("Process"),
+            Cell::from("Status"),
+            right_cell("CPU"),
+            right_cell("Memory"),
+        ])
+    } else {
+        Row::new([Cell::from("Process"), Cell::from("Status")])
     }
+    .style(TERMINAL_THEME.secondary_text().add_modifier(Modifier::BOLD));
+    let border_style = if mode == ConsoleViewMode::ProcessList {
+        TERMINAL_THEME.focus_border()
+    } else {
+        TERMINAL_THEME.inactive_border()
+    };
+    let mut table = Table::new(table_rows, widths)
+        .column_spacing(1)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(" Processes "),
+        );
+    if process_table_header_height(pane) == 1 {
+        table = table.header(headings);
+    }
+    let selected = rows.iter().position(|row| row.selected);
+    let mut state = TableState::default()
+        .with_offset(process_table_offset(pane, rows.len(), selected))
+        .with_selected(selected);
+    frame.render_stateful_widget(table, pane, &mut state);
+}
+
+fn right_cell(text: &str) -> Cell<'_> {
+    Cell::from(Line::from(text).right_aligned())
+}
+
+fn process_table_header_height(pane: Rect) -> u16 {
+    u16::from(pane_inner(pane).height > 1)
+}
+
+fn process_table_offset(pane: Rect, process_count: usize, selected: Option<usize>) -> usize {
+    let visible_rows = usize::from(
+        pane_inner(pane)
+            .height
+            .saturating_sub(process_table_header_height(pane)),
+    );
+    selected
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(process_count.saturating_sub(visible_rows))
+}
+
+/// Return the Process row under one terminal cell. Header and scrolling
+/// rules stay with the table implementation, so mouse selection cannot
+/// drift from the rows that Ratatui renders.
+pub fn process_row_at(
+    pane: Rect,
+    row: u16,
+    process_count: usize,
+    selected: usize,
+) -> Option<usize> {
+    let inner = pane_inner(pane);
+    let first_row = inner.y.saturating_add(process_table_header_height(pane));
+    if row < first_row || row >= inner.bottom() {
+        return None;
+    }
+    let index = process_table_offset(pane, process_count, Some(selected))
+        .saturating_add(usize::from(row - first_row));
+    (index < process_count).then_some(index)
 }
 
 fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
@@ -495,6 +564,16 @@ mod tests {
         buffer.content().iter().map(|cell| cell.symbol()).collect()
     }
 
+    fn buffer_line(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (buffer.area.x..buffer.area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    fn text_end(line: &str, text: &str) -> Option<usize> {
+        line.find(text).map(|start| start + text.len())
+    }
+
     #[test]
     fn every_process_row_shows_its_name_and_status_label() {
         let rows = [
@@ -534,23 +613,27 @@ mod tests {
         let rows = [row("web", "Ready", false), row("db", "Starting", true)];
         let buffer = rendered(&rows);
 
-        // The list body starts inside its border on row 1.
-        let web_reversed = buffer[(1, 1)].modifier.contains(Modifier::REVERSED);
-        let db_reversed = buffer[(1, 2)].modifier.contains(Modifier::REVERSED);
+        // The table header occupies row 1; Process rows start on row 2.
+        let web_reversed = buffer[(1, 2)].modifier.contains(Modifier::REVERSED);
+        let db_reversed = buffer[(1, 3)].modifier.contains(Modifier::REVERSED);
         assert!(!web_reversed);
         assert!(db_reversed);
     }
 
     #[test]
-    fn metric_cells_render_when_they_fit_the_width() {
+    fn metric_cells_render_in_aligned_columns_when_they_fit() {
         let rows = [
             row_with_metrics("web", "Ready", "3.2%", "184M", true),
             row_with_metrics("worker", "Ready", "12%", "2G", false),
         ];
-        let text = buffer_text(&rendered(&rows));
-        assert!(text.contains("3.2%"), "{text:?}");
-        assert!(text.contains("184M"), "{text:?}");
-        assert!(text.contains("12%"), "{text:?}");
+        let buffer = rendered(&rows);
+        let header = buffer_line(&buffer, 1);
+        let first = buffer_line(&buffer, 2);
+
+        assert_eq!(header.find("Process"), first.find("web"));
+        assert_eq!(header.find("Status"), first.find("Ready"));
+        assert_eq!(text_end(&header, "CPU"), text_end(&first, "3.2%"));
+        assert_eq!(text_end(&header, "Memory"), text_end(&first, "184M"));
     }
 
     #[test]
@@ -587,17 +670,28 @@ mod tests {
         let rows = [row("only", "Stopped", true)];
         let buffer = rendered(&rows);
 
-        assert!(buffer[(1, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(1, 2)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_selected_process_stays_visible_when_the_table_scrolls() {
+        let rows = (0..8)
+            .map(|index| row(&format!("process-{index}"), "Ready", index == 7))
+            .collect::<Vec<_>>();
+        let text = buffer_text(&rendered(&rows));
+
+        assert!(text.contains("process-7"), "{text:?}");
+        assert!(!text.contains("process-0"), "{text:?}");
     }
 
     #[test]
     fn the_console_pane_stays_visible_on_small_screens() {
         let (_, console, footer) = project_layout(Rect::new(0, 0, 20, 6), 8);
 
-        // The list is capped at a third of the height; what remains stays
-        // visible above the footer.
+        // The table keeps room for its header and one Process while the
+        // Console remains visible above the footer.
         assert!(console.height >= 1);
-        assert_eq!(console.height + footer.height + 2, 6);
+        assert_eq!(console.height + footer.height + 4, 6);
         assert_eq!(footer.height, FOOTER_HEIGHT);
     }
 

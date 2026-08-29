@@ -16,8 +16,8 @@ use crate::supervisor::{
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
-    ConsolePaneKind, ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout,
-    render_project,
+    ConsolePaneKind, ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, process_row_at,
+    project_layout, render_project,
 };
 
 use self::input_scheduler::InputScheduler;
@@ -576,7 +576,7 @@ fn handle_app_mouse(
         let previous = *selected;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = process_row_at(list, mouse.row, process_count) {
+                if let Some(index) = process_row_at(list, mouse.row, process_count, *selected) {
                     *selected = index;
                     console.clear_pane_warning();
                 }
@@ -645,15 +645,6 @@ fn mouse_starts_console_focus(kind: MouseEventKind, mode: crate::tui::ConsoleVie
 
 fn rect_contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
-}
-
-fn process_row_at(list: ratatui::layout::Rect, row: u16, process_count: usize) -> Option<usize> {
-    let inner = pane_inner(list);
-    if row < inner.y || row >= inner.bottom() {
-        return None;
-    }
-    let index = usize::from(row - inner.y);
-    (index < process_count).then_some(index)
 }
 
 /// What the selected Process's console pane shows. A PTY Run owns a live
