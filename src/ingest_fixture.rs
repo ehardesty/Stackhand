@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
-use crate::console::{ConsoleInteraction, PipeScroll, SelectionMove};
+use crate::console::{ConsoleInteraction, SelectionMove};
 use crate::interaction_fixture::{
     WAIT, apply_move, console_text, last_tick, module_text, wait_for, wait_for_tick,
 };
 use crate::output::OutputViews;
+use crate::process_logs::ProcessLogs;
 use crate::supervisor::{Consoles, ProcessId, SupervisorHandle};
 
 /// The fixture process indexes the ingestion proof needs.
@@ -28,7 +29,7 @@ pub(crate) struct FixtureIndexes {
 
 pub(crate) fn prove_ingest(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
@@ -76,7 +77,7 @@ pub(crate) fn prove_ingest(
     for (direction, expected_selected) in moves.iter().zip(expected.iter()) {
         apply_move(
             console,
-            pipe_scroll,
+            process_logs,
             consoles,
             outputs,
             &ingest_snapshot,

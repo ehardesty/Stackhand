@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
-use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
+use crate::console::{ConsoleInteraction, LifecycleCommand, SelectionMove};
+use crate::log_view::OutputRepresentation;
+use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{Command, Consoles, Lifecycle, ProcessSnapshot, SupervisorHandle};
 use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleWarning};
 
@@ -78,7 +79,7 @@ fn prove(
     println!("interaction-started-ok");
 
     let mut console = ConsoleInteraction::default();
-    let mut pipe_scroll = vec![None; snapshot.processes.len()];
+    let mut process_logs = vec![ProcessLogs::default(); snapshot.processes.len()];
     let focused_view = consoles
         .view_process(
             snapshot.processes[focused].process_id,
@@ -126,28 +127,72 @@ fn prove(
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    let mut logs = LogView::default();
+    let logs = &mut process_logs[focused];
     assert_eq!(
-        logs.handle_key(key(KeyCode::Char('/')), true, true, &retained),
-        LogViewAction::Pause
+        logs.handle_key(
+            key(KeyCode::Char('/')),
+            true,
+            true,
+            &retained,
+            usize::from(PAGE_ROWS),
+        ),
+        LogsInput::Changed
     );
     for character in "tick-".chars() {
-        logs.handle_key(key(KeyCode::Char(character)), true, true, &retained);
+        logs.handle_key(
+            key(KeyCode::Char(character)),
+            true,
+            true,
+            &retained,
+            usize::from(PAGE_ROWS),
+        );
     }
-    assert!(matches!(
-        logs.handle_key(key(KeyCode::Enter), true, true, &retained),
-        LogViewAction::ShowMatch(_)
-    ));
-    assert_eq!(logs.representation(true), OutputRepresentation::Logs);
-    assert!(logs.status().is_some_and(|status| status.contains("1/")));
     assert_eq!(
-        logs.handle_key(key(KeyCode::Char('/')), false, true, &retained),
-        LogViewAction::Pause
+        logs.handle_key(
+            key(KeyCode::Enter),
+            true,
+            true,
+            &retained,
+            usize::from(PAGE_ROWS),
+        ),
+        LogsInput::Changed
     );
-    logs.handle_key(key(KeyCode::Char('x')), false, true, &retained);
-    assert!(logs.status().is_some_and(|status| status.contains("/x_")));
-    logs.handle_key(key(KeyCode::Esc), false, true, &retained);
-    assert!(!logs.is_editing());
+    assert_eq!(logs.representation(true), OutputRepresentation::Logs);
+    assert!(
+        logs.frame(&retained, usize::from(PAGE_ROWS))
+            .status
+            .is_some_and(|status| status.contains("1/"))
+    );
+    assert_eq!(
+        logs.handle_key(
+            key(KeyCode::Char('/')),
+            false,
+            true,
+            &retained,
+            usize::from(PAGE_ROWS),
+        ),
+        LogsInput::Changed
+    );
+    logs.handle_key(
+        key(KeyCode::Char('x')),
+        false,
+        true,
+        &retained,
+        usize::from(PAGE_ROWS),
+    );
+    assert!(
+        logs.frame(&retained, usize::from(PAGE_ROWS))
+            .status
+            .is_some_and(|status| status.contains("/x_"))
+    );
+    logs.handle_key(
+        key(KeyCode::Esc),
+        false,
+        true,
+        &retained,
+        usize::from(PAGE_ROWS),
+    );
+    assert!(!logs.is_search_editing());
     println!("interaction-logs-ok");
 
     // The Process list owns the keyboard at startup. Ctrl-A moves focus to
@@ -159,7 +204,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -167,7 +212,7 @@ fn prove(
             true,
             key(KeyCode::Char('x')),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -175,7 +220,7 @@ fn prove(
             true,
             key(KeyCode::Enter),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -188,7 +233,7 @@ fn prove(
             true,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -196,7 +241,7 @@ fn prove(
             true,
             key(KeyCode::Enter),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -209,7 +254,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -220,7 +265,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -238,7 +283,7 @@ fn prove(
             false,
             key(KeyCode::Char('x')),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -251,7 +296,7 @@ fn prove(
             false,
             leader(),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -262,7 +307,7 @@ fn prove(
             false,
             leader(),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -280,7 +325,7 @@ fn prove(
         false,
         key(KeyCode::Char('x')),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
     assert_eq!(
@@ -293,7 +338,7 @@ fn prove(
         false,
         leader(),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
     assert_eq!(console.view().mode, ConsoleViewMode::ProcessList);
@@ -302,7 +347,7 @@ fn prove(
         false,
         key(KeyCode::Char('v')),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
     assert_eq!(
@@ -317,7 +362,7 @@ fn prove(
         false,
         key(KeyCode::Char('x')),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
     assert_eq!(
@@ -329,11 +374,11 @@ fn prove(
         false,
         key(KeyCode::PageUp),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
     assert!(
-        !pipe_scroll[piped].as_ref().unwrap().following(),
+        !process_logs[piped].following(),
         "one pipe page pauses the view above the tail"
     );
     assert!(console.route_pane_key(
@@ -341,10 +386,10 @@ fn prove(
         false,
         key(KeyCode::Char('f')),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     ));
-    assert!(pipe_scroll[piped].as_ref().unwrap().following());
+    assert!(process_logs[piped].following());
     println!("interaction-reject-ok");
 
     // Scroll and follow are per Process view, proved across a real
@@ -360,7 +405,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -368,7 +413,7 @@ fn prove(
             true,
             key(KeyCode::PageUp),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -376,7 +421,7 @@ fn prove(
             true,
             key(KeyCode::PageUp),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -384,7 +429,7 @@ fn prove(
     // Move the selection to the other terminal through the command path.
     apply_move(
         &mut console,
-        &mut pipe_scroll,
+        &mut process_logs,
         consoles,
         outputs,
         &snapshot,
@@ -399,7 +444,7 @@ fn prove(
             false,
             leader(),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -407,7 +452,7 @@ fn prove(
             false,
             key(KeyCode::PageUp),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -415,7 +460,7 @@ fn prove(
             false,
             key(KeyCode::PageUp),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -423,7 +468,7 @@ fn prove(
     // Move back: both views keep the scroll each one was left at.
     apply_move(
         &mut console,
-        &mut pipe_scroll,
+        &mut process_logs,
         consoles,
         outputs,
         &snapshot,
@@ -447,7 +492,7 @@ fn prove(
             false,
             key(KeyCode::Char('f')),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -457,7 +502,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -476,7 +521,7 @@ fn prove(
             true,
             leader(),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
         console.route_pane_key(
@@ -484,7 +529,7 @@ fn prove(
             true,
             key(KeyCode::Char('f')),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -510,7 +555,7 @@ fn prove(
     // back, and a clean cycle leaves no failure behind.
     crate::lifecycle_fixture::prove_lifecycle(
         &mut console,
-        &mut pipe_scroll[..],
+        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -529,7 +574,7 @@ fn prove(
     crate::lifecycle_fixture::prove_metrics_degradation(supervisor, focused)?;
     crate::lifecycle_fixture::prove_metrics(
         &mut console,
-        &mut pipe_scroll[..],
+        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -542,7 +587,7 @@ fn prove(
     // seam, and check its bounded Run summaries and output markers.
     crate::lifecycle_fixture::prove_rerun(
         &mut console,
-        &mut pipe_scroll[..],
+        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -553,7 +598,7 @@ fn prove(
 
     crate::ingest_fixture::prove_ingest(
         &mut console,
-        &mut pipe_scroll[..],
+        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -575,7 +620,7 @@ fn prove(
 /// moved selection clears the pane-scoped warning.
 pub(crate) fn apply_move(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &crate::output::OutputViews,
     snapshot: &crate::supervisor::ProjectSnapshot,
@@ -584,7 +629,7 @@ pub(crate) fn apply_move(
 ) {
     move_selection_key(
         console,
-        pipe_scroll,
+        process_logs,
         consoles,
         outputs,
         snapshot,
@@ -601,7 +646,7 @@ pub(crate) fn apply_move(
 /// app event loop does.
 fn move_selection_key(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &crate::output::OutputViews,
     snapshot: &crate::supervisor::ProjectSnapshot,
@@ -627,7 +672,7 @@ fn move_selection_key(
                             process.input_focused,
                             leader(),
                             Some(session),
-                            &mut pipe_scroll[selected],
+                            &mut process_logs[selected],
                             PAGE_ROWS,
                         );
                     }
@@ -636,7 +681,7 @@ fn move_selection_key(
                         process.input_focused,
                         key(move_key),
                         Some(session),
-                        &mut pipe_scroll[selected],
+                        &mut process_logs[selected],
                         PAGE_ROWS,
                     );
                 });
@@ -656,7 +701,7 @@ fn move_selection_key(
             process.input_focused,
             leader(),
             None,
-            &mut pipe_scroll[selected],
+            &mut process_logs[selected],
             PAGE_ROWS,
         );
     }
@@ -665,7 +710,7 @@ fn move_selection_key(
         process.input_focused,
         key(move_key),
         None,
-        &mut pipe_scroll[selected],
+        &mut process_logs[selected],
         PAGE_ROWS,
     );
 }

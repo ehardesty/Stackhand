@@ -13,12 +13,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use crossterm::event::{self, Event, MouseEventKind};
 
 const INPUT_QUEUE_LIMIT: usize = 256;
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[derive(Debug)]
 pub(super) struct InputBatch {
     actions: Vec<(Event, usize)>,
 }
@@ -38,18 +38,17 @@ impl IntoIterator for InputBatch {
     }
 }
 
-/// Owns the host-input reader, bounded semantic queue, and wake notification.
-/// Dropping the scheduler stops and joins its reader before terminal cleanup.
+/// Owns the host-input reader and bounded semantic queue. Dropping the
+/// scheduler stops and joins its reader before terminal cleanup.
 pub(super) struct InputScheduler {
     shared: Arc<Shared>,
-    wake: Receiver<()>,
     reader: Option<JoinHandle<()>>,
 }
 
 struct Shared {
     state: Mutex<QueueState>,
+    ready: Condvar,
     space: Condvar,
-    wake: Sender<()>,
     shutdown: AtomicBool,
 }
 
@@ -61,11 +60,10 @@ struct QueueState {
 
 impl InputScheduler {
     pub(super) fn start() -> Result<Self> {
-        let (wake_tx, wake_rx) = bounded(1);
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
             space: Condvar::new(),
-            wake: wake_tx,
             shutdown: AtomicBool::new(false),
         });
         let reader_shared = Arc::clone(&shared);
@@ -75,7 +73,6 @@ impl InputScheduler {
             .context("could not start the terminal input reader")?;
         Ok(Self {
             shared,
-            wake: wake_rx,
             reader: Some(reader),
         })
     }
@@ -84,9 +81,15 @@ impl InputScheduler {
     /// interval ends. Every returned action is in host-observation order.
     pub(super) fn receive(&self, timeout: Duration) -> Result<InputBatch> {
         let deadline = Instant::now() + timeout;
+        let mut state = lock(&self.shared.state);
         loop {
-            if let Some(batch) = self.take_ready()? {
-                return Ok(batch);
+            if let Some(error) = state.error.take() {
+                return Err(anyhow!(error));
+            }
+            if !state.actions.is_empty() {
+                let actions = state.actions.drain(..).collect();
+                self.shared.space.notify_all();
+                return Ok(InputBatch { actions });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -94,31 +97,8 @@ impl InputScheduler {
                     actions: Vec::new(),
                 });
             }
-            match self.wake.recv_timeout(remaining) {
-                Ok(()) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    return Ok(InputBatch {
-                        actions: Vec::new(),
-                    });
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow!("the terminal input reader stopped"));
-                }
-            }
+            state = wait_timeout(&self.shared.ready, state, remaining);
         }
-    }
-
-    fn take_ready(&self) -> Result<Option<InputBatch>> {
-        let mut state = lock(&self.shared.state);
-        if let Some(error) = state.error.take() {
-            return Err(anyhow!(error));
-        }
-        if state.actions.is_empty() {
-            return Ok(None);
-        }
-        let actions = state.actions.drain(..).collect();
-        self.shared.space.notify_all();
-        Ok(Some(InputBatch { actions }))
     }
 }
 
@@ -126,7 +106,7 @@ impl Drop for InputScheduler {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.space.notify_all();
-        let _ = self.shared.wake.try_send(());
+        self.shared.ready.notify_all();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -147,7 +127,7 @@ fn read_crossterm(shared: Arc<Shared>) {
                 let mut state = lock(&shared.state);
                 state.error = Some(format!("terminal input failed: {error}"));
                 drop(state);
-                let _ = shared.wake.try_send(());
+                shared.ready.notify_one();
                 return;
             }
         }
@@ -158,7 +138,7 @@ fn push(shared: &Shared, event: Event) {
     let mut state = lock(&shared.state);
     if merge_tail(&mut state.actions, &event) {
         drop(state);
-        let _ = shared.wake.try_send(());
+        shared.ready.notify_one();
         return;
     }
 
@@ -179,7 +159,7 @@ fn push(shared: &Shared, event: Event) {
 
     state.actions.push_back((event, 1));
     drop(state);
-    let _ = shared.wake.try_send(());
+    shared.ready.notify_one();
 }
 
 fn merge_tail(actions: &mut VecDeque<(Event, usize)>, event: &Event) -> bool {
@@ -232,6 +212,17 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn wait_timeout<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> MutexGuard<'a, T> {
+    condvar
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -239,11 +230,10 @@ mod tests {
     use super::*;
 
     fn shared() -> Shared {
-        let (wake, _) = bounded(1);
         Shared {
             state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
             space: Condvar::new(),
-            wake,
             shutdown: AtomicBool::new(false),
         }
     }
@@ -319,5 +309,51 @@ mod tests {
             state.actions,
             VecDeque::from([(up.clone(), 1), (down, 1), (up, 1)])
         );
+    }
+
+    #[test]
+    fn receive_wakes_for_new_input() {
+        let shared = Arc::new(shared());
+        let scheduler = InputScheduler {
+            shared: Arc::clone(&shared),
+            reader: None,
+        };
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            push(&shared, quit());
+        });
+
+        let batch = scheduler.receive(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(batch.actions, vec![(quit(), 1)]);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn receive_returns_after_its_timeout() {
+        let scheduler = InputScheduler {
+            shared: Arc::new(shared()),
+            reader: None,
+        };
+        let started = Instant::now();
+
+        let batch = scheduler.receive(Duration::from_millis(10)).unwrap();
+
+        assert!(batch.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn receive_reports_reader_errors() {
+        let shared = Arc::new(shared());
+        lock(&shared.state).error = Some("terminal input failed: test".to_string());
+        let scheduler = InputScheduler {
+            shared,
+            reader: None,
+        };
+
+        let error = scheduler.receive(Duration::from_secs(1)).unwrap_err();
+
+        assert_eq!(error.to_string(), "terminal input failed: test");
     }
 }

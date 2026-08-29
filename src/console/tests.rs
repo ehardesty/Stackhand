@@ -3,6 +3,7 @@ use std::os::unix::net::UnixStream;
 
 use super::*;
 use crate::geometry::TerminalGeometry;
+use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::runtime::PtyIo;
 use crate::terminal::TerminalSession;
 
@@ -97,12 +98,12 @@ fn applying_selection_moves_clamps_and_preserves_process_scroll() {
     interaction.warn(ConsoleWarning::LogsCommandOnly);
     interaction.selection_requests = vec![SelectionMove::Up, SelectionMove::Down];
     let mut selected = 0;
-    let mut scroll = PipeScroll::default();
-    scroll.scroll_page(20, -1);
+    let mut logs = ProcessLogs::default();
+    logs.scroll_page(20, -1);
 
     assert!(interaction.apply_selection_moves(&mut selected, 2));
     assert_eq!(selected, 1);
-    assert!(!scroll.following());
+    assert!(!logs.following());
     assert_eq!(interaction.view().warning, None);
 
     interaction.selection_requests = vec![SelectionMove::Down];
@@ -153,34 +154,34 @@ fn disabled_input_is_rejected_only_with_console_focus() {
 fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
     let mut interaction = ConsoleInteraction::default();
     interaction.set_pane(ConsolePaneKind::Pipe);
-    let mut scroll: Option<PipeScroll> = None;
+    let mut logs = ProcessLogs::default();
 
-    assert!(interaction.handle_key_read_only(key(KeyCode::Char('j')), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(key(KeyCode::Char('j')), &mut logs, 20));
     assert_eq!(
         interaction.take_selection_moves(),
         vec![SelectionMove::Down]
     );
 
-    assert!(interaction.handle_key_read_only(key(KeyCode::PageUp), &mut scroll, 20));
-    assert!(!scroll.as_ref().unwrap().following());
+    assert!(interaction.handle_key_read_only(key(KeyCode::PageUp), &mut logs, 20));
+    assert!(!logs.following());
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
     assert!(!interaction.view().following);
 
-    assert!(interaction.handle_key_read_only(key(KeyCode::Char('f')), &mut scroll, 20));
-    assert!(scroll.as_ref().unwrap().following());
+    assert!(interaction.handle_key_read_only(key(KeyCode::Char('f')), &mut logs, 20));
+    assert!(logs.following());
     assert!(interaction.view().following);
 
-    assert!(interaction.handle_key_read_only(leader(), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(leader(), &mut logs, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::Console);
-    assert!(interaction.handle_key_read_only(key(KeyCode::Char('x')), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(key(KeyCode::Char('x')), &mut logs, 20));
     assert_eq!(
         interaction.view().warning,
         Some(ConsoleWarning::LogsCommandOnly)
     );
 
-    assert!(interaction.handle_key_read_only(leader(), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(leader(), &mut logs, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
-    assert!(interaction.handle_key_read_only(key(KeyCode::Char('x')), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(key(KeyCode::Char('x')), &mut logs, 20));
     assert_eq!(
         interaction.take_lifecycle_commands(),
         vec![LifecycleCommand::Stop]
@@ -192,7 +193,7 @@ fn focused_logs_support_navigation_and_a_direct_escape() {
     let mut interaction = ConsoleInteraction::default();
     interaction.set_pane(ConsolePaneKind::Pipe);
     interaction.focus_console(None);
-    let mut scroll: Option<PipeScroll> = None;
+    let mut logs = ProcessLogs::default();
 
     for code in [
         KeyCode::Up,
@@ -204,18 +205,18 @@ fn focused_logs_support_navigation_and_a_direct_escape() {
         KeyCode::Home,
     ] {
         assert!(
-            interaction.handle_key_read_only(key(code), &mut scroll, 20),
+            interaction.handle_key_read_only(key(code), &mut logs, 20),
             "{code:?}"
         );
         assert_eq!(interaction.view().warning, None, "{code:?}");
     }
-    assert!(!scroll.as_ref().unwrap().following());
+    assert!(!logs.following());
 
-    assert!(interaction.handle_key_read_only(key(KeyCode::End), &mut scroll, 20));
-    assert!(scroll.as_ref().unwrap().following());
+    assert!(interaction.handle_key_read_only(key(KeyCode::End), &mut logs, 20));
+    assert!(logs.following());
     assert!(interaction.view().following);
 
-    assert!(interaction.handle_key_read_only(key(KeyCode::Esc), &mut scroll, 20));
+    assert!(interaction.handle_key_read_only(key(KeyCode::Esc), &mut logs, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
 }
 
@@ -272,8 +273,8 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
         b"first\nsecond\nthird\n".to_vec(),
     );
     let retained = output.snapshot();
-    let mut scroll = Some(PipeScroll::default());
-    scroll.as_mut().unwrap().window(&retained, 3);
+    let mut logs = ProcessLogs::default();
+    logs.frame(&retained, 3);
     let mut interaction = ConsoleInteraction::default();
     interaction.set_pane(ConsolePaneKind::Pipe);
     let area = Rect::new(5, 5, 40, 3);
@@ -288,32 +289,28 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
         mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
         area,
         1,
-        &mut scroll,
+        &mut logs,
         &retained,
     ));
     assert!(interaction.handle_read_only_mouse(
         mouse(MouseEventKind::Drag(MouseButton::Left), 10, 6),
         area,
         1,
-        &mut scroll,
+        &mut logs,
         &retained,
     ));
     assert!(interaction.handle_read_only_mouse(
         mouse(MouseEventKind::Up(MouseButton::Left), 10, 6),
         area,
         1,
-        &mut scroll,
+        &mut logs,
         &retained,
     ));
 
-    assert!(
-        scroll
-            .as_ref()
-            .unwrap()
-            .selected_text(&retained)
-            .unwrap()
-            .contains('\n')
-    );
+    assert!(matches!(
+        logs.handle_key(key(KeyCode::Char('c')), true, false, &retained, 3),
+        LogsInput::Copy(text) if text.contains('\n')
+    ));
     assert!(!interaction.view().following);
 }
 

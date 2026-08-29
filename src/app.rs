@@ -6,10 +6,11 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll};
+use crate::console::{ConsoleInteraction, LifecycleCommand};
 use crate::geometry::TerminalGeometry;
-use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
+use crate::log_view::OutputRepresentation;
 use crate::output::OutputViews;
+use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{
     Command, ConsoleView, Consoles, ProcessSnapshot, ProjectShutdownSnapshot, ProjectSnapshot,
     SupervisorHandle,
@@ -137,14 +138,9 @@ fn run_event_loop(
     let mut console_area =
         pane_inner(project_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1).1);
     let mut pipe_truncation: Option<(usize, bool)> = None;
-    let mut pipe_generation: u64 = 0;
-    let mut pipe_generation_known = false;
-    // One scroll view per Process, so scrolling or re-following one pane
-    // never changes another Process's view. Resized with the snapshot.
-    let mut pipe_scroll: Vec<Option<PipeScroll>> = Vec::new();
-    // Logs representation, search, and navigation belong to each Process.
-    // Terminal viewport and selection remain in that Process's Ghostty state.
-    let mut log_views: Vec<LogView> = Vec::new();
+    // Each Process owns one Logs view. Search, navigation, selection, and
+    // following state move together and never affect another Process.
+    let mut process_logs: Vec<ProcessLogs> = Vec::new();
     // The selected idle Logs view reuses its immutable retained snapshot.
     // Wheel input changes only view state, so it must not clone all retained
     // output. One cache avoids duplicating the Project retention budget.
@@ -178,8 +174,7 @@ fn run_event_loop(
         }
         last_project_snapshot = Some(snapshot.clone());
         selected = selected.min(snapshot.processes.len() - 1);
-        pipe_scroll.resize(snapshot.processes.len(), None);
-        log_views.resize_with(snapshot.processes.len(), LogView::default);
+        process_logs.resize_with(snapshot.processes.len(), ProcessLogs::default);
         if console.apply_selection_moves(&mut selected, snapshot.processes.len()) {
             dirty = true;
         }
@@ -219,10 +214,10 @@ fn run_event_loop(
             .as_ref()
             .expect("the first Logs snapshot is always returned")
             .1;
-        if log_views[selected].refresh(retained) {
+        if process_logs[selected].refresh(retained) {
             dirty = true;
         }
-        let representation = log_views[selected].representation(has_terminal);
+        let representation = process_logs[selected].representation(has_terminal);
         let pane = selected_pane(consoles, selected_process, representation, retained);
         match &pane {
             SelectedPane::Terminal(view) => drain_console_events(&mut console, view, &mut dirty),
@@ -235,11 +230,6 @@ fn run_event_loop(
                     console.warn(ConsoleWarning::OutputTruncated);
                 }
                 pipe_truncation = Some((selected, retained.truncated));
-                if !pipe_generation_known || retained.generation != pipe_generation {
-                    pipe_generation = retained.generation;
-                    pipe_generation_known = true;
-                    dirty = true;
-                }
             }
             SelectedPane::Empty => pipe_truncation = None,
         }
@@ -257,8 +247,7 @@ fn run_event_loop(
             SelectedPane::Terminal(_) => console.set_pane(ConsolePaneKind::Terminal),
             SelectedPane::Pipe(_) => {
                 console.set_pane(ConsolePaneKind::Pipe);
-                let scroll = pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
-                console.set_following(scroll.following());
+                console.set_following(process_logs[selected].following());
             }
             SelectedPane::Empty => console.set_pane(ConsolePaneKind::Empty),
         }
@@ -276,26 +265,21 @@ fn run_event_loop(
                 SelectedPane::Terminal(view) => view.snapshot(),
                 SelectedPane::Pipe(_) | SelectedPane::Empty => None,
             };
-            let mut pipe_window: Vec<crate::tui::PipeLine> = Vec::new();
+            let logs_frame = match &pane {
+                SelectedPane::Pipe(retained) => Some(
+                    process_logs[selected].frame(retained, console_area.height.max(1) as usize),
+                ),
+                SelectedPane::Terminal(_) | SelectedPane::Empty => None,
+            };
+            if let Some(frame) = &logs_frame {
+                console.set_following(frame.following);
+            }
             let (terminal_snapshot, pipe_lines) = match &pane {
                 SelectedPane::Terminal(_) => (console_snapshot.as_ref(), None),
-                SelectedPane::Pipe(retained) => {
-                    let pane_rows = console_area.height.max(1) as usize;
-                    let scroll = pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
-                    pipe_window.extend_from_slice(scroll.window(retained, pane_rows));
-                    console.set_following(scroll.following());
-                    if let Some(current) = log_views[selected].current_match()
-                        && let Some(line) = pipe_window
-                            .iter_mut()
-                            .find(|line| line.source == Some((current.sequence, current.line)))
-                    {
-                        line.highlight = Some((
-                            line.content_offset + current.start,
-                            line.content_offset + current.end,
-                        ));
-                    }
-                    (None, Some(pipe_window.as_slice()))
-                }
+                SelectedPane::Pipe(_) => (
+                    None,
+                    logs_frame.as_ref().map(|frame| frame.lines.as_slice()),
+                ),
                 SelectedPane::Empty => (None, None),
             };
             let rows = process_rows(&snapshot, selected);
@@ -305,8 +289,10 @@ fn run_event_loop(
                 OutputRepresentation::Logs => "Logs",
             };
             header.insert_str(0, &format!("{view_label} · "));
-            if let Some(status) = log_views[selected].status() {
-                if log_views[selected].is_editing() {
+            if let Some(frame) = &logs_frame
+                && let Some(status) = &frame.status
+            {
+                if frame.editing {
                     header.insert_str(0, &format!("{status} · "));
                 } else {
                     header.push_str(&format!(" · {status}"));
@@ -316,14 +302,12 @@ fn run_event_loop(
                 header.insert_str(0, "Project shutdown in progress · ");
             }
             let mut view = console.view();
-            view.search_editing = log_views[selected].is_editing();
-            view.search_active = log_views[selected].has_search();
-            view.logs_selection = pipe_scroll[selected]
-                .as_ref()
-                .is_some_and(PipeScroll::has_selection);
-            view.logs_scrollbar = pipe_scroll[selected]
-                .as_ref()
-                .and_then(PipeScroll::scrollbar);
+            if let Some(frame) = &logs_frame {
+                view.search_editing = frame.editing;
+                view.search_active = frame.search_active;
+                view.logs_selection = frame.has_selection;
+                view.logs_scrollbar = frame.scrollbar;
+            }
             console_area =
                 render_frame(outer, &rows, terminal_snapshot, pipe_lines, view, &header)?;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
@@ -338,7 +322,11 @@ fn run_event_loop(
         for (input_event, repeats) in input_batch {
             match input_event {
                 Event::Key(key)
-                    if should_quit(key, console.view(), log_views[selected].is_editing()) =>
+                    if should_quit(
+                        key,
+                        console.view(),
+                        process_logs[selected].is_search_editing(),
+                    ) =>
                 {
                     if !shutting_down {
                         supervisor.command(Command::Shutdown {
@@ -349,51 +337,25 @@ fn run_event_loop(
                     }
                 }
                 Event::Key(key) => {
-                    let action = log_views[selected].handle_key(
+                    let logs_input = process_logs[selected].handle_key(
                         key,
                         console.view().mode == crate::tui::ConsoleViewMode::ProcessList,
                         has_terminal,
                         retained,
+                        console_area.height.max(1) as usize,
                     );
-                    if action != LogViewAction::Ignored {
-                        console.clear_warning();
-                    }
-                    match action {
-                        LogViewAction::Changed => dirty = true,
-                        LogViewAction::Pause => {
-                            let scroll = pipe_scroll[selected].get_or_insert_default();
-                            scroll.clear_selection();
-                            scroll.pause();
-                            console.set_following(false);
+                    match logs_input {
+                        LogsInput::Changed => {
+                            console.clear_warning();
+                            console.set_following(process_logs[selected].following());
                             dirty = true;
                         }
-                        LogViewAction::Follow => {
-                            pipe_scroll[selected].get_or_insert_default().follow();
-                            console.set_following(true);
-                            dirty = true;
-                        }
-                        LogViewAction::ShowMatch(found) => {
-                            pipe_scroll[selected]
-                                .get_or_insert_default()
-                                .show_source((found.sequence, found.line));
-                            console.set_following(false);
-                            dirty = true;
-                        }
-                        LogViewAction::Copy => {
-                            let rows = console_area.height.max(1) as usize;
-                            let scroll = pipe_scroll[selected].get_or_insert_default();
-                            let text = scroll.selected_text(retained).unwrap_or_else(|| {
-                                scroll
-                                    .window(retained, rows)
-                                    .iter()
-                                    .map(|line| line.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            });
+                        LogsInput::Copy(text) => {
+                            console.clear_warning();
                             console.copy_logs(text);
                             dirty = true;
                         }
-                        LogViewAction::Ignored => match &pane {
+                        LogsInput::Ignored => match &pane {
                             SelectedPane::Terminal(view) => {
                                 // This seam decides whether a key reaches the child.
                                 let changed = view.with(|session| {
@@ -402,7 +364,7 @@ fn run_event_loop(
                                         selected_process.input_focused,
                                         key,
                                         Some(session),
-                                        &mut pipe_scroll[selected],
+                                        &mut process_logs[selected],
                                         console_area.height.max(1),
                                     )
                                 });
@@ -420,7 +382,7 @@ fn run_event_loop(
                                     selected_process.input_focused,
                                     key,
                                     None,
-                                    &mut pipe_scroll[selected],
+                                    &mut process_logs[selected],
                                     console_area.height.max(1),
                                 ) {
                                     dirty = true;
@@ -429,22 +391,12 @@ fn run_event_loop(
                         },
                     }
                 }
-                Event::Paste(data) if log_views[selected].is_editing() => {
+                Event::Paste(data) if process_logs[selected].is_search_editing() => {
                     console.clear_warning();
-                    match log_views[selected].paste_search(&data, retained) {
-                        LogViewAction::ShowMatch(found) => {
-                            pipe_scroll[selected]
-                                .get_or_insert_default()
-                                .show_source((found.sequence, found.line));
-                            console.set_following(false);
-                        }
-                        LogViewAction::Ignored
-                        | LogViewAction::Changed
-                        | LogViewAction::Pause
-                        | LogViewAction::Follow
-                        | LogViewAction::Copy => {}
+                    if process_logs[selected].paste_search(&data, retained) {
+                        console.set_following(process_logs[selected].following());
+                        dirty = true;
                     }
-                    dirty = true;
                 }
                 Event::Paste(data) => match &pane {
                     SelectedPane::Terminal(view)
@@ -497,7 +449,7 @@ fn run_event_loop(
                         &mut selected,
                         child_tracks_mouse,
                         repeats,
-                        &mut pipe_scroll,
+                        &mut process_logs,
                     ) {
                         dirty = true;
                     }
@@ -523,9 +475,9 @@ fn handle_app_mouse(
     selected: &mut usize,
     child_tracks_mouse: bool,
     repeats: usize,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
 ) -> bool {
-    let process_count = pipe_scroll.len();
+    let process_count = process_logs.len();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let (list, console_outer, _) =
         project_layout(ratatui::layout::Rect::new(0, 0, cols, rows), process_count);
@@ -533,9 +485,7 @@ fn handle_app_mouse(
 
     // A Logs scrollbar drag keeps its owner when the pointer leaves the pane.
     if matches!(pane, SelectedPane::Pipe(_))
-        && pipe_scroll[*selected]
-            .as_ref()
-            .is_some_and(PipeScroll::scrollbar_gesture_active)
+        && process_logs[*selected].scrollbar_gesture_active()
         && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         && let SelectedPane::Pipe(retained) = pane
     {
@@ -543,7 +493,7 @@ fn handle_app_mouse(
             mouse,
             console_inner,
             repeats,
-            &mut pipe_scroll[*selected],
+            &mut process_logs[*selected],
             retained,
         );
     }
@@ -615,7 +565,7 @@ fn handle_app_mouse(
                 mouse,
                 console_inner,
                 repeats,
-                &mut pipe_scroll[*selected],
+                &mut process_logs[*selected],
                 match pane {
                     SelectedPane::Pipe(retained) => retained,
                     _ => unreachable!("the selected pane is Logs"),

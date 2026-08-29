@@ -1,7 +1,8 @@
-use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
+use crate::console::{ConsoleInteraction, LifecycleCommand, SelectionMove};
 use crate::interaction_fixture::{PAGE_ROWS, WAIT, apply_move, key, wait_for};
 use crate::output::OutputViews;
 use crate::output::RetainedChunk;
+use crate::process_logs::ProcessLogs;
 use crate::supervisor::{Command, Consoles, Lifecycle, RunExitDisposition, SupervisorHandle};
 use crate::tui::ConsolePaneKind;
 use anyhow::Result;
@@ -20,7 +21,7 @@ pub(crate) struct FixtureProcesses {
 
 pub(crate) fn prove_lifecycle(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
@@ -48,7 +49,7 @@ pub(crate) fn prove_lifecycle(
             true,
             key(KeyCode::Char('x')),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -72,7 +73,7 @@ pub(crate) fn prove_lifecycle(
         true,
         key(KeyCode::Char('s')),
         None,
-        &mut pipe_scroll[focused],
+        &mut process_logs[focused],
         PAGE_ROWS,
     );
     assert_eq!(
@@ -98,7 +99,7 @@ pub(crate) fn prove_lifecycle(
             true,
             key(KeyCode::Char('r')),
             Some(session),
-            &mut pipe_scroll[focused],
+            &mut process_logs[focused],
             PAGE_ROWS,
         );
     });
@@ -124,7 +125,7 @@ pub(crate) fn prove_lifecycle(
     // back.
     apply_move(
         console,
-        pipe_scroll,
+        process_logs,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
@@ -146,7 +147,7 @@ pub(crate) fn prove_lifecycle(
             false,
             key(KeyCode::Char('x')),
             Some(session),
-            &mut pipe_scroll[mute],
+            &mut process_logs[mute],
             PAGE_ROWS,
         );
     });
@@ -165,7 +166,7 @@ pub(crate) fn prove_lifecycle(
     // The pipe Process stops and restarts through its read-only pane.
     apply_move(
         console,
-        pipe_scroll,
+        process_logs,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
@@ -179,7 +180,7 @@ pub(crate) fn prove_lifecycle(
         false,
         key(KeyCode::Char('x')),
         None,
-        &mut pipe_scroll[piped],
+        &mut process_logs[piped],
         PAGE_ROWS,
     );
     assert_eq!(
@@ -197,7 +198,7 @@ pub(crate) fn prove_lifecycle(
     // Back to the first Process before the ingestion proof.
     apply_move(
         console,
-        pipe_scroll,
+        process_logs,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
@@ -206,7 +207,7 @@ pub(crate) fn prove_lifecycle(
     );
     apply_move(
         console,
-        pipe_scroll,
+        process_logs,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
@@ -278,7 +279,7 @@ pub(crate) fn prove_metrics_degradation(
 /// sampler's own run identity matches the active Run.
 pub(crate) fn prove_metrics(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
@@ -288,7 +289,7 @@ pub(crate) fn prove_metrics(
     while *selected != focused {
         apply_move(
             console,
-            pipe_scroll,
+            process_logs,
             consoles,
             outputs,
             &wait_for(supervisor, WAIT, |_| true)?,
@@ -356,7 +357,7 @@ pub(crate) fn prove_metrics(
 
 pub(crate) fn prove_rerun(
     console: &mut ConsoleInteraction,
-    pipe_scroll: &mut [Option<PipeScroll>],
+    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
@@ -370,7 +371,7 @@ pub(crate) fn prove_rerun(
     while *selected != oneoff {
         apply_move(
             console,
-            pipe_scroll,
+            process_logs,
             consoles,
             outputs,
             &snapshot,
@@ -387,7 +388,7 @@ pub(crate) fn prove_rerun(
         false,
         key(KeyCode::Char('s')),
         None,
-        &mut pipe_scroll[oneoff],
+        &mut process_logs[oneoff],
         PAGE_ROWS,
     );
     assert_eq!(
@@ -410,7 +411,7 @@ pub(crate) fn prove_rerun(
         false,
         key(KeyCode::Char('r')),
         None,
-        &mut pipe_scroll[oneoff],
+        &mut process_logs[oneoff],
         PAGE_ROWS,
     );
     assert_eq!(
@@ -464,7 +465,7 @@ pub(crate) fn prove_rerun(
     while *selected > 0 {
         apply_move(
             console,
-            pipe_scroll,
+            process_logs,
             consoles,
             outputs,
             &wait_for(supervisor, WAIT, |_| true)?,

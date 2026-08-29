@@ -6,6 +6,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 
+use crate::process_logs::{LogsNavigation, ProcessLogs};
 use crate::runtime::TerminalHandle;
 use crate::terminal::{
     CopyRequest, PasteCompletion, PasteRequest, SelectionDirection as CopyDirection,
@@ -19,8 +20,6 @@ pub enum SelectionMove {
     Up,
     Down,
 }
-
-pub use crate::pipe_scroll::PipeScroll;
 
 /// One requested lifecycle command for the currently selected Process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,7 +220,7 @@ impl ConsoleInteraction {
         input_focused: bool,
         key: KeyEvent,
         session: Option<&TerminalHandle<'_>>,
-        pipe_scroll: &mut Option<PipeScroll>,
+        logs: &mut ProcessLogs,
         page_rows: u16,
     ) -> bool {
         self.set_pane(pane);
@@ -235,7 +234,7 @@ impl ConsoleInteraction {
                 self.handle_key(key, session, page_rows)
             }
             ConsolePaneKind::Pipe | ConsolePaneKind::Empty => {
-                self.handle_key_read_only(key, pipe_scroll, page_rows)
+                self.handle_key_read_only(key, logs, page_rows)
             }
         }
     }
@@ -284,7 +283,7 @@ impl ConsoleInteraction {
     pub fn handle_key_read_only(
         &mut self,
         key: KeyEvent,
-        scroll: &mut Option<PipeScroll>,
+        logs: &mut ProcessLogs,
         page_rows: u16,
     ) -> bool {
         if key.kind != KeyEventKind::Press {
@@ -299,7 +298,7 @@ impl ConsoleInteraction {
         }
         match self.view.mode {
             ConsoleViewMode::Console if self.view.pane == ConsolePaneKind::Pipe => {
-                self.handle_logs_focus_key(key, scroll, page_rows)
+                self.handle_logs_focus_key(key, logs, page_rows)
             }
             ConsoleViewMode::Console => {
                 self.view.warning = Some(ConsoleWarning::InputDisabled);
@@ -309,7 +308,7 @@ impl ConsoleInteraction {
                 let Some(command) = process_command(key.code) else {
                     return false;
                 };
-                self.apply_read_only_command(command, scroll, page_rows)
+                self.apply_read_only_command(command, logs, page_rows)
             }
             ConsoleViewMode::Copy => {
                 self.view.mode = ConsoleViewMode::ProcessList;
@@ -345,52 +344,13 @@ impl ConsoleInteraction {
         mouse: MouseEvent,
         area: Rect,
         repeats: usize,
-        scroll: &mut Option<PipeScroll>,
+        logs: &mut ProcessLogs,
         output: &crate::output::RetainedOutput,
     ) -> bool {
-        let scroll = scroll.get_or_insert_default();
-        if scroll.handle_scrollbar_mouse(mouse, area, output) {
-            self.view.following = scroll.following();
-            self.clear_warning();
-            return true;
+        if !logs.handle_mouse(mouse, area, repeats, output) {
+            return false;
         }
-        match mouse.kind {
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    -1
-                } else {
-                    1
-                };
-                scroll.scroll_lines(3usize.saturating_mul(repeats), direction);
-                self.view.following = scroll.following();
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let Some((row, column)) = relative_mouse_position(mouse, area) else {
-                    return false;
-                };
-                scroll.begin_selection(row, column);
-                self.view.following = scroll.following();
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let Some((row, column)) = relative_mouse_position(mouse, area) else {
-                    return false;
-                };
-                if !scroll.update_selection(row, column) {
-                    return false;
-                }
-                self.view.following = false;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let Some((row, column)) = relative_mouse_position(mouse, area) else {
-                    return false;
-                };
-                if !scroll.finish_selection(row, column) {
-                    return false;
-                }
-                self.view.following = scroll.following();
-            }
-            _ => return false,
-        }
+        self.view.following = logs.following();
         self.clear_warning();
         true
     }
@@ -501,20 +461,18 @@ impl ConsoleInteraction {
     fn apply_read_only_command(
         &mut self,
         command: ProcessCommand,
-        scroll: &mut Option<PipeScroll>,
+        logs: &mut ProcessLogs,
         page_rows: u16,
     ) -> bool {
         self.clear_warning();
         match command {
             ProcessCommand::MoveSelection(direction) => self.selection_requests.push(direction),
             ProcessCommand::ScrollPage(direction) => {
-                scroll
-                    .get_or_insert_default()
-                    .scroll_page(page_rows, direction);
+                logs.scroll_page(page_rows, direction);
                 self.view.following = false;
             }
             ProcessCommand::Follow => {
-                scroll.get_or_insert_default().follow();
+                logs.follow();
                 self.view.following = true;
             }
             ProcessCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
@@ -528,33 +486,22 @@ impl ConsoleInteraction {
     fn handle_logs_focus_key(
         &mut self,
         key: KeyEvent,
-        scroll: &mut Option<PipeScroll>,
+        logs: &mut ProcessLogs,
         page_rows: u16,
     ) -> bool {
-        let scroll = scroll.get_or_insert_default();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => scroll.scroll_lines(1, -1),
-            KeyCode::Down | KeyCode::Char('j') => scroll.scroll_lines(1, 1),
-            KeyCode::PageUp => scroll.scroll_page(page_rows, -1),
-            KeyCode::PageDown => scroll.scroll_page(page_rows, 1),
-            KeyCode::Home => scroll.head(),
-            KeyCode::End | KeyCode::Char('f') => scroll.follow(),
-            KeyCode::Esc if scroll.clear_selection() => {
+        match logs.handle_navigation_key(key, page_rows) {
+            LogsNavigation::Changed => {
+                self.view.following = logs.following();
                 self.clear_warning();
-                return true;
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            LogsNavigation::Exit => {
                 self.focus_process_list(None);
                 self.clear_warning();
-                return true;
             }
-            _ => {
+            LogsNavigation::Unknown => {
                 self.view.warning = Some(ConsoleWarning::LogsCommandOnly);
-                return true;
             }
         }
-        self.view.following = scroll.following();
-        self.clear_warning();
         true
     }
 
@@ -626,12 +573,6 @@ fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEv
     !input_focused
         && view.mode == ConsoleViewMode::Console
         && !(key.kind == KeyEventKind::Press && is_focus_toggle(*key))
-}
-
-fn relative_mouse_position(mouse: MouseEvent, area: Rect) -> Option<(usize, usize)> {
-    let row = mouse.row.checked_sub(area.y)?;
-    let column = mouse.column.checked_sub(area.x)?;
-    (row < area.height && column < area.width).then_some((usize::from(row), usize::from(column)))
 }
 
 fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {

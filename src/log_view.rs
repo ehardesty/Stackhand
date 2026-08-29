@@ -1,9 +1,8 @@
-//! Per-Process Logs navigation state.
+//! Logs search and representation state used inside `ProcessLogs`.
 //!
-//! The interface accepts key events and retained snapshots. It hides search
-//! editing, bounded result refresh, eviction invalidation, match navigation,
-//! and the active Terminal/Logs representation. The output owner remains the
-//! source of retained text.
+//! This implementation hides search editing, bounded result refresh, eviction
+//! invalidation, match navigation, and the active Terminal/Logs representation.
+//! The retained output module remains the source of text.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

@@ -13,6 +13,7 @@ mod mouse_fixture;
 mod output;
 mod output_pressure;
 mod pipe_scroll;
+mod process_logs;
 pub mod project_fixture;
 pub mod prototype;
 mod runtime;
