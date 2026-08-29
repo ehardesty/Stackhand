@@ -10,17 +10,20 @@ The project is an idea under validation. All current milestones are prototype wo
 - [Prototype implementation plan](./docs/implementation-plan.md): flexible milestones, spikes, tests, risks, and open questions.
 - [Domain language](./CONTEXT.md): the canonical terms used by the project.
 - [Architecture decisions](./docs/adr/): decisions that are difficult to reverse and need their reasons preserved.
+- [Milestone 3 macOS validation](./docs/implementation/milestone-3-validation.md): the current end-to-end Project and Quadrant evidence.
 
 The specification controls when it conflicts with the implementation plan. Prototype evidence can change the plan. A change to product behavior or a normative architecture contract requires a specification update.
 
 ## Current prototype
 
-Milestone 2 provides an integrated macOS prototype. It loads one YAML Project,
+The current prototype discovers the nearest `stackhand.yaml` from the working
+directory, or accepts an explicit Project path. It layers ordered profiles and,
+for discovered Projects, a same-directory `stackhand.local.yaml` override. It
 starts and supervises Services and One-shots, applies Dependency, readiness,
 liveness, and restart rules, renders pipe or PTY output, accepts focused
 terminal input, reports basic metrics, and performs controlled Project
 shutdown. It is validation software, not a supported release. See the example
-Projects below for the current behavior.
+Projects and the Milestone 3 validation record for the current behavior.
 
 ## Build and run the Project prototype
 
@@ -32,8 +35,14 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
 PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run -- examples/basic.yaml
 ```
 
-Stackhand loads one explicit YAML Project file. It starts enabled autostart
-Processes with the Process list focused. Use `j` or `k` to select a Process,
+Stackhand discovers the nearest `stackhand.yaml` when no path is given. Pass
+a Project path to disable discovery. Use repeated `--profile` options to select
+profiles in order. A same-directory `stackhand.local.yaml` is applied only to
+discovered Projects. `config validate` and `config show` use the same resolution
+rules without starting Processes.
+
+Stackhand starts enabled autostart Processes with the Process list focused. Use
+`j` or `k` to select a Process,
 `s` to start, `x` to stop, and `r` to restart a Service or rerun a One-shot.
 Press `Ctrl-A` to focus the selected console and send keys to an input-enabled
 PTY. Press `Ctrl-A` again to return to the Process list. Press `q` from the
@@ -41,8 +50,7 @@ Process list, or `Ctrl-Q` from anywhere, to stop the Project and restore the
 outer terminal.
 
 For ready-to-run Projects and manual checks, see
-[Example Projects](./examples/README.md). For the macOS lifecycle validation
-record, see [Milestone 2 validation](./docs/implementation/milestone-2-validation.md).
+[Example Projects](./examples/README.md). For the macOS lifecycle validation record, see [Milestone 3 validation](./docs/implementation/milestone-3-validation.md).
 
 Press `v` from the Process list to enter Copy mode for a PTY console. Use
 `h`/`j`/`k`/`l` or the arrow keys to move, and press `v` again to begin the
