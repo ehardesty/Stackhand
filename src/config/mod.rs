@@ -251,13 +251,10 @@ fn load_file_with_local(
         ));
     }
     validate_shapes(&document, &base_source)?;
+    let base_only = profiles.is_empty() && local_path.is_none();
     let mut last_layer = base_source.clone();
-    let file: ConfigFile = if profiles.is_empty() && local_path.is_none() {
-        serde_yaml::from_str(&text).map_err(|error| {
-            config_error(anyhow::anyhow!(diagnostics::format_yaml_error(
-                path, &error
-            )))
-        })?
+    let effective_text = if base_only {
+        text
     } else {
         apply_profiles(&mut document, profiles)?;
         if let Some(profile) = profiles.last() {
@@ -284,22 +281,23 @@ fn load_file_with_local(
             last_layer = local_source;
         }
         validate_shapes(&document, &last_layer)?;
-        let merged = serde_yaml::to_string(&document).map_err(|error| {
+        serde_yaml::to_string(&document).map_err(|error| {
             diagnostics::with_source(
                 config_error(anyhow::anyhow!(format!(
                     "could not serialize effective YAML: {error}"
                 ))),
                 &last_layer,
             )
-        })?;
-        serde_yaml::from_str(&merged).map_err(|error| {
-            config_error(anyhow::anyhow!(diagnostics::format_merged_yaml_error(
-                path,
-                &last_layer,
-                &error
-            )))
         })?
     };
+    let file: ConfigFile = serde_yaml::from_str(&effective_text).map_err(|error| {
+        let message = if base_only {
+            diagnostics::format_yaml_error(path, &error)
+        } else {
+            diagnostics::format_merged_yaml_error(path, &last_layer, &error)
+        };
+        config_error(anyhow::anyhow!(message))
+    })?;
     let shell = build_shell(file.settings.as_ref())
         .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let project_environment = load_files(
