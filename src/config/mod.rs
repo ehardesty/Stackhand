@@ -4,6 +4,7 @@
 //! The resolver applies selected profiles to the canonical base file before
 //! lowering the result into the validated Project model.
 
+mod diagnostics;
 mod env;
 mod file;
 mod paths;
@@ -230,53 +231,83 @@ fn load_file_with_local(
     local_path: Option<&Path>,
 ) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
+    let base_source = format!("base Project '{}'", path.display());
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))
         .map_err(config_error)?;
-    let mut document: Value = serde_yaml::from_str(&text)
-        .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
-    let version = read_version(&document)?;
+    let mut document: Value = serde_yaml::from_str(&text).map_err(|error| {
+        config_error(anyhow::anyhow!(diagnostics::format_yaml_error(
+            path, &error
+        )))
+    })?;
+    let version =
+        read_version(&document).map_err(|error| diagnostics::with_source(error, &base_source))?;
     if version != 1 {
-        return Err(config_error(anyhow::anyhow!(
-            "unsupported schema version {version}: this Stackhand reads version 1"
-        )));
+        return Err(diagnostics::with_source(
+            config_error(anyhow::anyhow!(
+                "unsupported schema version {version}: this Stackhand reads version 1"
+            )),
+            &base_source,
+        ));
     }
-    validate_shapes(&document, "base Project")?;
+    validate_shapes(&document, &base_source)?;
+    let mut last_layer = base_source.clone();
     let file: ConfigFile = if profiles.is_empty() && local_path.is_none() {
-        serde_yaml::from_str(&text)
-            .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?
+        serde_yaml::from_str(&text).map_err(|error| {
+            config_error(anyhow::anyhow!(diagnostics::format_yaml_error(
+                path, &error
+            )))
+        })?
     } else {
         apply_profiles(&mut document, profiles)?;
+        if let Some(profile) = profiles.last() {
+            last_layer = format!("profile '{profile}'");
+        }
         if let Some(local_path) = local_path {
+            let local_source = format!("local override '{}'", local_path.display());
             let local_text = std::fs::read_to_string(local_path)
-                .with_context(|| format!("could not read local override {}", local_path.display()))
+                .with_context(|| format!("could not read {local_source}"))
                 .map_err(config_error)?;
             let local_document: Value = serde_yaml::from_str(&local_text).map_err(|error| {
-                config_error(anyhow::anyhow!(format_local_yaml_error(local_path, &error)))
+                config_error(anyhow::anyhow!(diagnostics::format_local_yaml_error(
+                    local_path, &error
+                )))
             })?;
             if let Some(processes) = local_document
                 .as_mapping()
                 .and_then(|root| root.get(Value::String("processes".to_string())))
             {
-                let source = format!("local override '{}'", local_path.display());
-                self::env::validate_process_overrides(processes, &source)?;
+                self::env::validate_process_overrides(processes, &local_source)?;
             }
-            apply_local_override(&mut document, &local_document).map_err(|error| ConfigError {
-                message: format!("local override '{}': {error}", local_path.display()),
-            })?;
+            apply_local_override(&mut document, &local_document)
+                .map_err(|error| diagnostics::with_source(error, &local_source))?;
+            last_layer = local_source;
         }
-        validate_shapes(&document, "merged Project")?;
-        let merged = serde_yaml::to_string(&document)
-            .map_err(|error| config_error(anyhow::anyhow!(format_yaml_error(&error))))?;
-        serde_yaml::from_str(&merged)
-            .map_err(|error| config_error(anyhow::anyhow!(format_merged_yaml_error(&error))))?
+        validate_shapes(&document, &last_layer)?;
+        let merged = serde_yaml::to_string(&document).map_err(|error| {
+            diagnostics::with_source(
+                config_error(anyhow::anyhow!(format!(
+                    "could not serialize effective YAML: {error}"
+                ))),
+                &last_layer,
+            )
+        })?;
+        serde_yaml::from_str(&merged).map_err(|error| {
+            config_error(anyhow::anyhow!(diagnostics::format_merged_yaml_error(
+                path,
+                &last_layer,
+                &error
+            )))
+        })?
     };
-    let shell = build_shell(file.settings.as_ref())?;
+    let shell = build_shell(file.settings.as_ref())
+        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let project_environment = load_files(
         base_dir,
         file.env_files.as_deref().unwrap_or_default(),
         "Project",
-    )?;
+    )
+    .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let processes = file
         .processes
         .entries
@@ -285,42 +316,40 @@ fn load_file_with_local(
             let ProcessEntry { key, process } = entry;
             build_spec(&process, key, base_dir, &project_environment)
         })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    EffectiveProject::with_shell(processes, shell).map_err(|error| match error {
-        crate::model::ProjectError::DuplicateName(name) => {
-            config_error(anyhow::anyhow!("duplicate Process name '{name}'"))
-        }
-        crate::model::ProjectError::UnknownDependency {
-            process,
-            dependency,
-        } => config_error(anyhow::anyhow!(
-            "Process '{process}': dependency '{dependency}' does not match any configured Process"
-        )),
-        crate::model::ProjectError::InvalidCondition {
-            process,
-            dependency,
-            condition,
-        } => config_error(anyhow::anyhow!(
-            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'exited' and 'completed_successfully' are valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
-        )),
-        crate::model::ProjectError::ReadinessOnOneShot { process } => config_error(
-            anyhow::anyhow!(
+        .collect::<Result<Vec<_>, ConfigError>>()
+        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
+    EffectiveProject::with_shell(processes, shell).map_err(|error| {
+        let detail = match error {
+            crate::model::ProjectError::DuplicateName(name) => {
+                format!("duplicate Process name '{name}'")
+            }
+            crate::model::ProjectError::UnknownDependency {
+                process,
+                dependency,
+            } => format!(
+                "Process '{process}': dependency '{dependency}' does not match any configured Process"
+            ),
+            crate::model::ProjectError::InvalidCondition {
+                process,
+                dependency,
+                condition,
+            } => format!(
+                "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'exited' and 'completed_successfully' are valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
+            ),
+            crate::model::ProjectError::ReadinessOnOneShot { process } => format!(
                 "Process '{process}': readiness is valid only on Services; a One-shot completes instead of becoming ready"
             ),
-        ),
-        crate::model::ProjectError::LivenessOnOneShot { process } => config_error(
-            anyhow::anyhow!(
+            crate::model::ProjectError::LivenessOnOneShot { process } => format!(
                 "Process '{process}': liveness is valid only on Services; a One-shot cannot have ongoing health checks"
             ),
-        ),
-        crate::model::ProjectError::InvalidRestartPolicy { process, policy } => config_error(
-            anyhow::anyhow!(
+            crate::model::ProjectError::InvalidRestartPolicy { process, policy } => format!(
                 "Process '{process}': restart.policy '{policy}' is valid only for Services"
             ),
-        ),
-        crate::model::ProjectError::DependencyCycle(path) => {
-            config_error(anyhow::anyhow!("dependency cycle: {}", path.join(" -> ")))
-        }
+            crate::model::ProjectError::DependencyCycle(path) => {
+                format!("dependency cycle: {}", path.join(" -> "))
+            }
+        };
+        diagnostics::with_source(config_error(anyhow::anyhow!(detail)), &last_layer)
     })
 }
 
@@ -389,81 +418,6 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
-
-fn format_yaml_error(error: &serde_yaml::Error) -> String {
-    format_yaml_error_with_location(error, true)
-}
-
-fn format_merged_yaml_error(error: &serde_yaml::Error) -> String {
-    format_yaml_error_with_location(error, false)
-}
-
-fn format_local_yaml_error(path: &Path, error: &serde_yaml::Error) -> String {
-    format!(
-        "invalid local override '{}': {}",
-        path.display(),
-        format_yaml_error(error)
-    )
-}
-
-fn format_yaml_error_with_location(error: &serde_yaml::Error, include_location: bool) -> String {
-    let detail = error.to_string();
-    let detail = match yaml_duplicate_hint(&detail) {
-        Some(hint) => hint,
-        None => detail,
-    };
-    let detail = match yaml_replacement_hint(&detail) {
-        Some(hint) => format!("{detail}; {hint}"),
-        None => detail,
-    };
-    if include_location && let Some(location) = error.location() {
-        return format!(
-            "invalid configuration at line {}, column {}: {detail}",
-            location.line(),
-            location.column(),
-        );
-    }
-    format!("invalid configuration: {detail}")
-}
-
-fn yaml_duplicate_hint(detail: &str) -> Option<String> {
-    if !detail.contains("duplicate entry with key")
-        || !(detail.starts_with("processes:") || detail.contains(".overrides:"))
-    {
-        return None;
-    }
-    let name = detail.split_once("key \"")?.1.split_once('"')?.0;
-    Some(format!("duplicate Process name '{name}'"))
-}
-
-fn yaml_replacement_hint(detail: &str) -> Option<&'static str> {
-    let location = detail
-        .split_once(": unknown field")
-        .map(|(location, _)| location)
-        .unwrap_or_default();
-    let process_fields = location
-        .strip_prefix("processes.")
-        .is_some_and(|path| !path.contains('.'));
-    let exec_fields = location.ends_with(".ready.exec") || location.ends_with(".liveness.exec");
-
-    if detail.contains("unknown field `readiness`") {
-        Some("use `ready` instead")
-    } else if detail.contains("unknown field `interval_ms`") {
-        Some("use `interval` instead")
-    } else if detail.contains("unknown field `timeout_ms`") {
-        Some("use `timeout` instead")
-    } else if detail.contains("unknown field `working_dir`") && (process_fields || exec_fields) {
-        Some("use `cwd` instead")
-    } else if detail.contains("unknown field `env`") && (process_fields || exec_fields) {
-        Some("use `environment` instead")
-    } else if detail.contains("unknown field `input`") && process_fields {
-        Some("put `input` under the `terminal` mapping instead")
-    } else if detail.contains("unknown field `name`") && process_fields {
-        Some("put the Process name in the `processes` map key instead")
-    } else {
-        None
-    }
-}
 
 fn build_shell(settings: Option<&SettingsFile>) -> Result<ShellConfig, ConfigError> {
     let Some(shell) = settings.and_then(|settings| settings.shell.as_ref()) else {

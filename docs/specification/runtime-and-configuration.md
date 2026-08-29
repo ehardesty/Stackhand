@@ -350,6 +350,14 @@ Process starts. Resolution failures use the same diagnostic path.
 
 This is important because profile and local-overlay behavior otherwise becomes difficult to debug.
 
+Configuration failures identify the contributing layer and effective field. YAML
+errors include the source path and line and column when available. Profile,
+local-override, environment-file, path, and Dependency graph errors identify
+the selected profile, source file, Process, or affected Processes. Diagnostics
+are concise and do not print complete files or environment values. Resolution
+finishes before the Supervisor starts, so an invalid layered Project starts no
+Process.
+
 ### 14.5 Local override
 
 A local override is intended for gitignored machine-specific changes:

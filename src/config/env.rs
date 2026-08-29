@@ -20,13 +20,13 @@ pub(super) fn load_files(
         let path = resolve(base_dir, Path::new(configured));
         let bytes = fs::read(&path).map_err(|error| ConfigError {
             message: format!(
-                "could not read {owner} environment file '{}': {error}",
+                "could not read {owner} environment file '{configured}' (resolved to '{}'): {error}",
                 path.display()
             ),
         })?;
         let text = String::from_utf8(bytes).map_err(|error| ConfigError {
             message: format!(
-                "invalid UTF-8 in {owner} environment file '{}' at byte {}",
+                "invalid UTF-8 in {owner} environment file '{configured}' (resolved to '{}') at byte {}",
                 path.display(),
                 error.utf8_error().valid_up_to()
             ),
@@ -34,7 +34,7 @@ pub(super) fn load_files(
         for (line_index, line) in text.lines().enumerate() {
             if let Some((key, value)) = parse_line(line).map_err(|detail| ConfigError {
                 message: format!(
-                    "invalid {owner} environment file '{}' at line {}: {detail}",
+                    "invalid {owner} environment file '{configured}' (resolved to '{}') at line {}: {detail}",
                     path.display(),
                     line_index + 1
                 ),
