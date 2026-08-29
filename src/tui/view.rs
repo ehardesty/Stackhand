@@ -1,7 +1,9 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use crate::terminal::OwnedTerminalSnapshot;
 
@@ -46,6 +48,13 @@ pub enum ConsolePaneKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogsScrollbar {
+    pub position: usize,
+    pub content_length: usize,
+    pub viewport_length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsoleViewState {
     pub mode: ConsoleViewMode,
     pub following: bool,
@@ -55,6 +64,7 @@ pub struct ConsoleViewState {
     pub search_editing: bool,
     pub search_active: bool,
     pub logs_selection: bool,
+    pub logs_scrollbar: Option<LogsScrollbar>,
 }
 
 impl Default for ConsoleViewState {
@@ -68,6 +78,7 @@ impl Default for ConsoleViewState {
             search_editing: false,
             search_active: false,
             logs_selection: false,
+            logs_scrollbar: None,
         }
     }
 }
@@ -134,14 +145,39 @@ pub struct PipeLine {
 /// The selected pipe-mode Process's retained output, tail-following: the
 /// newest lines fill the pane and older lines stay in the module, not in
 /// render state. Run markers render dimmed so attempts stay distinguishable.
-fn render_pipe_console(frame: &mut Frame<'_>, lines: &[PipeLine], pane: Rect) {
+fn render_pipe_console(
+    frame: &mut Frame<'_>,
+    lines: &[PipeLine],
+    scrollbar: Option<LogsScrollbar>,
+    pane: Rect,
+) {
     if pane.height == 0 {
         return;
     }
-    let start = lines.len().saturating_sub(pane.height as usize);
+    let text_pane = if scrollbar.is_some() && pane.width > 1 {
+        Rect::new(pane.x, pane.y, pane.width - 1, pane.height)
+    } else {
+        pane
+    };
+    let start = lines.len().saturating_sub(text_pane.height as usize);
     let tail = &lines[start..];
     let rows: Vec<ratatui::text::Line<'_>> = tail.iter().map(styled_pipe_line).collect();
-    frame.render_widget(Paragraph::new(rows), pane);
+    frame.render_widget(Paragraph::new(rows), text_pane);
+
+    if let Some(scrollbar) = scrollbar.filter(|_| pane.width > 1) {
+        let mut state = ScrollbarState::new(scrollbar.content_length)
+            .position(scrollbar.position)
+            .viewport_content_length(scrollbar.viewport_length);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(TERMINAL_THEME.secondary_text())
+                .thumb_style(TERMINAL_THEME.focus_border()),
+            pane,
+            &mut state,
+        );
+    }
 }
 
 fn styled_pipe_line(line: &PipeLine) -> ratatui::text::Line<'_> {
@@ -248,7 +284,7 @@ pub fn render_project(
 
     let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
     if let Some(lines) = pipe_lines {
-        render_pipe_console(frame, lines, console_inner);
+        render_pipe_console(frame, lines, view.logs_scrollbar, console_inner);
     } else {
         blit_console(
             frame,
@@ -614,6 +650,44 @@ mod tests {
     }
 
     #[test]
+    fn logs_scrollbar_uses_a_reserved_right_column() {
+        let backend = ratatui::backend::TestBackend::new(10, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let lines = (0..4)
+            .map(|index| PipeLine {
+                text: format!("line-{index:04}"),
+                marker: false,
+                source: Some((index, 0)),
+                content_offset: 0,
+                highlight: None,
+                selection: None,
+            })
+            .collect::<Vec<_>>();
+
+        terminal
+            .draw(|frame| {
+                render_pipe_console(
+                    frame,
+                    &lines,
+                    Some(LogsScrollbar {
+                        position: 4,
+                        content_length: 5,
+                        viewport_length: 4,
+                    }),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(8, 0)].symbol(), "0");
+        assert!(
+            (0..4).all(|row| buffer[(9, row)].symbol() != " "),
+            "the scrollbar track and thumb must remain visible"
+        );
+    }
+
+    #[test]
     fn logs_mouse_selection_is_rendered_as_selected_text() {
         let line = PipeLine {
             text: "select me".to_string(),
@@ -683,6 +757,7 @@ mod tests {
                 search_editing: false,
                 search_active: false,
                 logs_selection: false,
+                logs_scrollbar: None,
             },
             false,
         );
@@ -763,6 +838,7 @@ mod tests {
                 search_editing: false,
                 search_active: false,
                 logs_selection: false,
+                logs_scrollbar: None,
             },
             false,
         );
@@ -783,6 +859,7 @@ mod tests {
                 search_editing: false,
                 search_active: false,
                 logs_selection: false,
+                logs_scrollbar: None,
             },
             false,
         );
@@ -801,6 +878,7 @@ mod tests {
                 search_editing: false,
                 search_active: false,
                 logs_selection: false,
+                logs_scrollbar: None,
             },
             true,
         );

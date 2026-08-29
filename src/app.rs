@@ -134,7 +134,8 @@ fn run_event_loop(
     let mut console = ConsoleInteraction::default();
     let mut selected: usize = 0;
     let mut pending_resize = PendingResize::default();
-    let mut console_pane = project_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1).1;
+    let mut console_area =
+        pane_inner(project_layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1).1);
     let mut pipe_truncation: Option<(usize, bool)> = None;
     let mut pipe_generation: u64 = 0;
     let mut pipe_generation_known = false;
@@ -279,7 +280,7 @@ fn run_event_loop(
             let (terminal_snapshot, pipe_lines) = match &pane {
                 SelectedPane::Terminal(_) => (console_snapshot.as_ref(), None),
                 SelectedPane::Pipe(retained) => {
-                    let pane_rows = console_pane.height.saturating_sub(2).max(1) as usize;
+                    let pane_rows = console_area.height.max(1) as usize;
                     let scroll = pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
                     pipe_window.extend_from_slice(scroll.window(retained, pane_rows));
                     console.set_following(scroll.following());
@@ -320,8 +321,11 @@ fn run_event_loop(
             view.logs_selection = pipe_scroll[selected]
                 .as_ref()
                 .is_some_and(PipeScroll::has_selection);
-            let pane = render_frame(outer, &rows, terminal_snapshot, pipe_lines, view, &header)?;
-            console_pane = pane;
+            view.logs_scrollbar = pipe_scroll[selected]
+                .as_ref()
+                .and_then(PipeScroll::scrollbar);
+            console_area =
+                render_frame(outer, &rows, terminal_snapshot, pipe_lines, view, &header)?;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
             outer.set_cursor_shape(cursor)?;
         }
@@ -376,7 +380,7 @@ fn run_event_loop(
                             dirty = true;
                         }
                         LogViewAction::Copy => {
-                            let rows = console_pane.height.saturating_sub(2).max(1) as usize;
+                            let rows = console_area.height.max(1) as usize;
                             let scroll = pipe_scroll[selected].get_or_insert_default();
                             let text = scroll.selected_text(retained).unwrap_or_else(|| {
                                 scroll
@@ -399,7 +403,7 @@ fn run_event_loop(
                                         key,
                                         Some(session),
                                         &mut pipe_scroll[selected],
-                                        console_pane.height.saturating_sub(2).max(1),
+                                        console_area.height.max(1),
                                     )
                                 });
                                 if changed.unwrap_or(false) {
@@ -417,7 +421,7 @@ fn run_event_loop(
                                     key,
                                     None,
                                     &mut pipe_scroll[selected],
-                                    console_pane.height.saturating_sub(2).max(1),
+                                    console_area.height.max(1),
                                 ) {
                                     dirty = true;
                                 }
@@ -527,6 +531,23 @@ fn handle_app_mouse(
         project_layout(ratatui::layout::Rect::new(0, 0, cols, rows), process_count);
     let console_inner = pane_inner(console_outer);
 
+    // A Logs scrollbar drag keeps its owner when the pointer leaves the pane.
+    if matches!(pane, SelectedPane::Pipe(_))
+        && pipe_scroll[*selected]
+            .as_ref()
+            .is_some_and(PipeScroll::scrollbar_gesture_active)
+        && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+        && let SelectedPane::Pipe(retained) = pane
+    {
+        return console.handle_read_only_mouse(
+            mouse,
+            console_inner,
+            repeats,
+            &mut pipe_scroll[*selected],
+            retained,
+        );
+    }
+
     // A console-owned drag keeps its original owner when the pointer leaves
     // the pane. Deliver Drag and Up before hit-testing another surface.
     if console.mouse_gesture_active()
@@ -595,6 +616,10 @@ fn handle_app_mouse(
                 console_inner,
                 repeats,
                 &mut pipe_scroll[*selected],
+                match pane {
+                    SelectedPane::Pipe(retained) => retained,
+                    _ => unreachable!("the selected pane is Logs"),
+                },
             ) || mouse_changes_focus(mouse.kind)
         }
         SelectedPane::Empty => {

@@ -346,8 +346,14 @@ impl ConsoleInteraction {
         area: Rect,
         repeats: usize,
         scroll: &mut Option<PipeScroll>,
+        output: &crate::output::RetainedOutput,
     ) -> bool {
         let scroll = scroll.get_or_insert_default();
+        if scroll.handle_scrollbar_mouse(mouse, area, output) {
+            self.view.following = scroll.following();
+            self.clear_warning();
+            return true;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {

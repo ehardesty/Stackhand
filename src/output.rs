@@ -141,6 +141,40 @@ impl RetainedOutput {
         found.then_some(lines)
     }
 
+    /// Return the zero-based rendered line position and total rendered lines
+    /// for one retained source. `None` selects the retained head, including
+    /// its synthetic history-limit line when older Logs were removed.
+    pub(crate) fn display_position(&self, source: Option<(u64, usize)>) -> Option<(usize, usize)> {
+        let mut total = usize::from(self.truncated);
+        let mut position = source.is_none().then_some(0);
+        for chunk in &self.chunks {
+            let count = displayed_line_count(chunk);
+            if position.is_none()
+                && let Some((target_sequence, target_line)) = source
+                && target_sequence == sequence(chunk)
+                && target_line < count
+            {
+                position = Some(total + target_line);
+            }
+            total = total.saturating_add(count);
+        }
+        position.map(|position| (position, total))
+    }
+
+    /// Return the retained source at one zero-based rendered line position.
+    /// The synthetic history-limit line has no source.
+    pub(crate) fn display_source_at(&self, position: usize) -> Option<(u64, usize)> {
+        let mut remaining = position.checked_sub(usize::from(self.truncated))?;
+        for chunk in &self.chunks {
+            let count = displayed_line_count(chunk);
+            if remaining < count {
+                return Some((sequence(chunk), remaining));
+            }
+            remaining = remaining.saturating_sub(count);
+        }
+        None
+    }
+
     /// Find case-sensitive literal substrings in all retained normalized text.
     /// Search uses the immutable snapshot, so ingestion never waits for it.
     pub fn search(&self, query: &str) -> LogSearch {
@@ -456,6 +490,13 @@ fn history_limit_line() -> crate::tui::PipeLine {
         content_offset: 0,
         highlight: None,
         selection: None,
+    }
+}
+
+fn displayed_line_count(chunk: &RetainedChunk) -> usize {
+    match chunk {
+        RetainedChunk::Marker { .. } => 1,
+        RetainedChunk::Data { text, .. } => text.split_terminator('\n').count(),
     }
 }
 

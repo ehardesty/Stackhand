@@ -5,10 +5,12 @@
 //! without moving that anchor. If retention evicts the anchor, the viewport
 //! moves to the retained head instead of guessing from the live tail.
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 use crate::output::RetainedOutput;
-use crate::tui::PipeLine;
+use crate::tui::{LogsScrollbar, PipeLine};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Position {
@@ -39,6 +41,12 @@ struct LogSelection {
     dragging: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollbarGesture {
+    Track,
+    Thumb { grab_row: usize },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PipeScroll {
     position: Position,
@@ -47,6 +55,8 @@ pub struct PipeScroll {
     visible: Vec<PipeLine>,
     held: bool,
     selection: Option<LogSelection>,
+    scrollbar: Option<LogsScrollbar>,
+    scrollbar_gesture: Option<ScrollbarGesture>,
 }
 
 impl PipeScroll {
@@ -175,6 +185,66 @@ impl PipeScroll {
             .is_some_and(|selection| selection.anchor != selection.cursor)
     }
 
+    pub fn scrollbar(&self) -> Option<LogsScrollbar> {
+        self.scrollbar
+    }
+
+    pub fn scrollbar_gesture_active(&self) -> bool {
+        self.scrollbar_gesture.is_some()
+    }
+
+    /// Own pane-scrollbar hit testing and drag mapping. The caller only sends
+    /// mouse input and the current immutable Logs snapshot.
+    pub fn handle_scrollbar_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        output: &RetainedOutput,
+    ) -> bool {
+        let Some(scrollbar) = self.scrollbar else {
+            return false;
+        };
+        if area.width <= 1 || area.height == 0 {
+            return false;
+        }
+        let track_rows = usize::from(area.height);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.column == area.right().saturating_sub(1)
+                    && mouse.row >= area.y
+                    && mouse.row < area.bottom() =>
+            {
+                let row = usize::from(mouse.row - area.y);
+                let (thumb_start, thumb_len) = scrollbar_thumb(scrollbar, track_rows);
+                if row >= thumb_start && row < thumb_start + thumb_len {
+                    self.scrollbar_gesture = Some(ScrollbarGesture::Thumb {
+                        grab_row: row - thumb_start,
+                    });
+                } else {
+                    let centered = row.saturating_sub(thumb_len / 2);
+                    self.set_scrollbar_thumb(output, track_rows, centered);
+                    self.scrollbar_gesture = Some(ScrollbarGesture::Track);
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.scrollbar_gesture {
+                Some(ScrollbarGesture::Thumb { grab_row }) => {
+                    let row = usize::from(
+                        mouse.row.clamp(area.y, area.bottom().saturating_sub(1)) - area.y,
+                    );
+                    self.set_scrollbar_thumb(output, track_rows, row.saturating_sub(grab_row));
+                    true
+                }
+                Some(ScrollbarGesture::Track) => true,
+                None => false,
+            },
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_gesture.take().is_some() => {
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn selected_text(&self, output: &RetainedOutput) -> Option<String> {
         let (start, end) = self.selection_range()?;
         if start == end {
@@ -212,6 +282,8 @@ impl PipeScroll {
     pub fn window<'a>(&'a mut self, output: &RetainedOutput, pane_rows: usize) -> &'a [PipeLine] {
         if pane_rows == 0 {
             self.visible.clear();
+            self.scrollbar = None;
+            self.scrollbar_gesture = None;
             return &self.visible;
         }
         if !self.selection_is_retained(output) {
@@ -225,7 +297,54 @@ impl PipeScroll {
             self.refresh(output, pane_rows);
         }
         self.apply_selection();
+        self.update_scrollbar(output, pane_rows);
         &self.visible
+    }
+
+    fn update_scrollbar(&mut self, output: &RetainedOutput, pane_rows: usize) {
+        let first_source = self.visible.first().and_then(|line| line.source);
+        let metrics = output.display_position(first_source);
+        self.scrollbar = metrics.and_then(|(position, content_length)| {
+            (content_length > pane_rows).then_some(LogsScrollbar {
+                position,
+                content_length: content_length
+                    .saturating_sub(self.visible.len())
+                    .saturating_add(1),
+                viewport_length: self.visible.len(),
+            })
+        });
+        if self.scrollbar.is_none() {
+            self.scrollbar_gesture = None;
+        }
+    }
+
+    fn set_scrollbar_thumb(
+        &mut self,
+        output: &RetainedOutput,
+        track_rows: usize,
+        thumb_start: usize,
+    ) {
+        let Some(scrollbar) = self.scrollbar else {
+            return;
+        };
+        let (_, thumb_len) = scrollbar_thumb(scrollbar, track_rows);
+        let max_thumb_start = track_rows.saturating_sub(thumb_len);
+        let max_position = scrollbar.content_length.saturating_sub(1);
+        let thumb_start = thumb_start.min(max_thumb_start);
+        let position = scale(thumb_start, max_position, max_thumb_start);
+        self.position = if position == 0 && output.truncated {
+            Position::Head
+        } else {
+            let Some(source) = output.display_source_at(position) else {
+                return;
+            };
+            Position::Source(source)
+        };
+        self.pending.clear();
+        self.target = None;
+        self.refresh(output, scrollbar.viewport_length);
+        self.apply_selection();
+        self.update_scrollbar(output, scrollbar.viewport_length);
     }
 
     fn refresh(&mut self, output: &RetainedOutput, pane_rows: usize) {
@@ -408,6 +527,40 @@ impl PipeScroll {
     }
 }
 
+fn scrollbar_thumb(scrollbar: LogsScrollbar, track_rows: usize) -> (usize, usize) {
+    if track_rows == 0 {
+        return (0, 0);
+    }
+    // Match Ratatui's independent rounded endpoints so pointer hit testing
+    // always agrees with the rendered thumb.
+    let max_position = scrollbar.content_length.saturating_sub(1);
+    let position = scrollbar.position.min(max_position);
+    let total_length = max_position.saturating_add(scrollbar.viewport_length);
+    let thumb_start = rounded_scale(position, track_rows, total_length).min(track_rows - 1);
+    let thumb_end = rounded_scale(
+        position.saturating_add(scrollbar.viewport_length),
+        track_rows,
+        total_length,
+    )
+    .min(track_rows);
+    (thumb_start, thumb_end.saturating_sub(thumb_start).max(1))
+}
+
+fn rounded_scale(value: usize, target: usize, source: usize) -> usize {
+    if source == 0 {
+        return 0;
+    }
+    let numerator = value as u128 * target as u128;
+    ((numerator + source as u128 / 2) / source as u128) as usize
+}
+
+fn scale(value: usize, target: usize, source: usize) -> usize {
+    if source == 0 {
+        return 0;
+    }
+    ((value as u128 * target as u128) / source as u128) as usize
+}
+
 fn byte_at_column(text: &str, column: usize, include_character: bool) -> usize {
     let mut width = 0;
     let mut characters = text.char_indices().peekable();
@@ -556,6 +709,112 @@ mod tests {
         assert!(selected.contains("line-00029"));
         assert!(!selected.contains("line-00028"));
         assert!(selected.contains("line-00037"));
+    }
+
+    #[test]
+    fn scrollbar_reports_the_retained_viewport_and_hides_when_logs_fit() {
+        let retained = output(0..40, 1);
+        let mut scroll = PipeScroll::default();
+
+        scroll.window(&retained, 10);
+
+        assert_eq!(
+            scroll.scrollbar(),
+            Some(LogsScrollbar {
+                position: 30,
+                content_length: 31,
+                viewport_length: 10,
+            })
+        );
+        let short = output(0..10, 2);
+        scroll.follow();
+        scroll.window(&short, 10);
+        assert_eq!(scroll.scrollbar(), None);
+    }
+
+    #[test]
+    fn scrollbar_thumb_drag_maps_to_a_stable_logs_position() {
+        let retained = output(0..40, 1);
+        let mut scroll = PipeScroll::default();
+        let area = Rect::new(5, 5, 20, 10);
+        scroll.window(&retained, 10);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 24, 13),
+            area,
+            &retained,
+        ));
+        assert!(scroll.scrollbar_gesture_active());
+        assert!(scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 30, 8),
+            area,
+            &retained,
+        ));
+        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((11, 0)));
+        assert_eq!(
+            scroll.scrollbar(),
+            Some(LogsScrollbar {
+                position: 11,
+                content_length: 31,
+                viewport_length: 10,
+            })
+        );
+        assert!(scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 30, 2),
+            area,
+            &retained,
+        ));
+        assert!(!scroll.scrollbar_gesture_active());
+
+        assert!(scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 24, 14),
+            area,
+            &retained,
+        ));
+        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((30, 0)));
+        assert!(scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            area,
+            &retained,
+        ));
+        assert!(!scroll.scrollbar_gesture_active());
+    }
+
+    #[test]
+    fn scrollbar_navigation_preserves_a_finished_logs_selection() {
+        let retained = output(0..40, 1);
+        let mut scroll = PipeScroll::default();
+        let area = Rect::new(0, 0, 20, 10);
+        scroll.window(&retained, 10);
+        scroll.begin_selection(5, 0);
+        scroll.update_selection(6, 5);
+        scroll.finish_selection(6, 5);
+        let selected = scroll.selected_text(&retained);
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: 19,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0),
+            area,
+            &retained,
+        );
+        scroll.handle_scrollbar_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0),
+            area,
+            &retained,
+        );
+
+        assert_eq!(scroll.selected_text(&retained), selected);
     }
 
     #[test]

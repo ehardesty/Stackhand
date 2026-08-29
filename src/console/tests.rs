@@ -289,18 +289,21 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
         area,
         1,
         &mut scroll,
+        &retained,
     ));
     assert!(interaction.handle_read_only_mouse(
         mouse(MouseEventKind::Drag(MouseButton::Left), 10, 6),
         area,
         1,
         &mut scroll,
+        &retained,
     ));
     assert!(interaction.handle_read_only_mouse(
         mouse(MouseEventKind::Up(MouseButton::Left), 10, 6),
         area,
         1,
         &mut scroll,
+        &retained,
     ));
 
     assert!(
