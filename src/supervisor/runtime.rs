@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use crate::geometry::TerminalGeometry;
-use crate::output::OutputViews;
+use crate::output::{OutputViews, ProcessOutput};
 use crate::runtime::{
     LiveLogMatcher, LogPattern, OsPid, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId,
     RunMode, RunOutputObserver, RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand,
@@ -100,8 +100,16 @@ impl RunSeam for RealRunSeam {
         let record = Arc::new(RunRecord::spawning());
         #[cfg(test)]
         let record = Arc::new(RunRecord::spawning_with_test_hooks(self.test_hooks.clone()));
-        let output_observer = build_output_observer(&intent, record.cancellation_flag(), events);
-        record.set_log_matcher(output_observer.clone());
+        let log_matcher = build_output_observer(&intent, record.cancellation_flag(), events);
+        record.set_log_matcher(log_matcher.clone());
+        let output_observer = build_run_output_observer(
+            intent.pty,
+            intent.run_id,
+            self.outputs
+                .for_process_id(intent.process_id)
+                .expect("the registry covers every configured Process"),
+            log_matcher,
+        );
         let mut runs = self
             .runs
             .lock()
@@ -119,8 +127,13 @@ impl RunSeam for RealRunSeam {
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             let (output_tx, output_rx) = crate::runtime::output_channel();
-            let output_observer =
-                output_observer.map(|observer| observer as Arc<dyn RunOutputObserver>);
+            // Mark the Run before starting its readers. This gives every
+            // observed byte, including immediate PTY output, a preceding Run
+            // boundary in Logs view.
+            outputs
+                .for_process_id(intent.process_id)
+                .expect("the registry covers every configured Process")
+                .mark_run(intent.run_id.get());
             let request = RunStartRequest {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
@@ -147,10 +160,6 @@ impl RunSeam for RealRunSeam {
                     }
                     let root_pid = run.root_pid();
                     record.install(run, || {
-                        outputs
-                            .for_process_id(intent.process_id)
-                            .expect("the registry covers every configured Process")
-                            .mark_run(intent.run_id.get());
                         drain_retained_output(output_rx, outputs, intent.process_id);
                     });
                     own_run(key, root_pid, record, events, event_rx);
@@ -242,6 +251,57 @@ fn build_output_observer(
     })
     .expect("validated log health patterns create a matcher");
     Some(matcher)
+}
+
+/// PTY output has one combined stream. This observer projects it into the
+/// same bounded Logs owner as pipe output without routing bytes through the
+/// Supervisor. A fan-out is real here: readiness matching and Logs retention
+/// are independent consumers at the existing Run output seam.
+struct PtyLogsObserver {
+    output: Arc<ProcessOutput>,
+    run_id: RuntimeRunId,
+}
+
+impl RunOutputObserver for PtyLogsObserver {
+    fn observe(&self, data: &[u8]) {
+        self.output.append(
+            self.run_id.get(),
+            crate::runtime::OutputStream::Combined,
+            data.to_vec(),
+        );
+    }
+}
+
+struct OutputObserverFanout {
+    observers: Vec<Arc<dyn RunOutputObserver>>,
+}
+
+impl RunOutputObserver for OutputObserverFanout {
+    fn observe(&self, data: &[u8]) {
+        for observer in &self.observers {
+            observer.observe(data);
+        }
+    }
+}
+
+fn build_run_output_observer(
+    pty: bool,
+    run_id: RuntimeRunId,
+    output: Arc<ProcessOutput>,
+    matcher: Option<Arc<LiveLogMatcher>>,
+) -> Option<Arc<dyn RunOutputObserver>> {
+    let mut observers: Vec<Arc<dyn RunOutputObserver>> = matcher
+        .into_iter()
+        .map(|observer| observer as Arc<dyn RunOutputObserver>)
+        .collect();
+    if pty {
+        observers.push(Arc::new(PtyLogsObserver { output, run_id }));
+    }
+    match observers.len() {
+        0 => None,
+        1 => observers.pop(),
+        _ => Some(Arc::new(OutputObserverFanout { observers })),
+    }
 }
 
 /// Drain output independently of the cancellation latch. Output is a
@@ -359,6 +419,7 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
             run_id,
             cpu_percent: metrics.cpu_percent,
             rss_kib: metrics.rss_kib,
+            best_effort: metrics.best_effort,
         },
     };
     events.send(seam_event);

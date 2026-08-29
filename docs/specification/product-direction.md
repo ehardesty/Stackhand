@@ -133,6 +133,8 @@ The project MUST NOT reimplement a terminal emulator or a general TUI framework.
 - Automatically discovered gitignored local overlay.
 - Ordinary supervised helper processes for long-running machine-specific work.
 - Scripts remain valid commands and extension points.
+- Domain-specific initialization and validation remain in Project commands or
+  scripts.
 - No first-class SSH, Docker, VPN, cloud-authentication, or emulator-specific process types.
 
 #### 2.1.6 A relatively small, maintainable codebase
@@ -330,7 +332,20 @@ The Quadrant Aspire AppHost expresses two important relationships directly:
 
 This distinction MUST be supported.
 
-Quadrant is a validation fixture, not a reason to make the core a workflow engine. Expressing roughly 85–90% of common lifecycle behavior directly, while allowing the remainder to stay in scripts and hooks, is preferable to adding domain-specific subsystems.
+Quadrant is a validation fixture, not a reason to make the core a workflow
+engine. Stackhand SHOULD replace generic coordination that starts, waits for,
+restarts, or stops Processes. Quadrant-specific actions that create resources,
+configure application data, or validate application behavior MUST remain in
+Quadrant commands or scripts.
+
+Running a domain tool as an ordinary command does not add that tool to the
+Stackhand model. For example, Stackhand may supervise a `docker compose`
+command or a Cosmos initialization script. Stackhand does not need to
+understand Docker Compose or Cosmos.
+
+When a script mixes generic coordination with domain-specific work, move only
+the generic coordination into Stackhand configuration. Keep the remaining
+domain-specific command small and explicit.
 
 Quadrant remains a continuing validation case for the model. Proposed lifecycle or configuration changes SHOULD be checked against both a small synthetic Quadrant-like graph and the real repository workflow before they become durable product concepts.
 

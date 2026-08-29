@@ -35,6 +35,7 @@ fn stale_metrics_cannot_change_a_newer_run() {
         run_id: RunId::new(1),
         cpu_percent: 5.0,
         rss_kib: 1024,
+        best_effort: false,
     });
 
     // The Run ends and the replacement Run begins: the old sample's
@@ -48,6 +49,7 @@ fn stale_metrics_cannot_change_a_newer_run() {
         run_id: RunId::new(1),
         cpu_percent: 99.0,
         rss_kib: 1 << 20,
+        best_effort: false,
     });
 
     let snapshot = h.process("api");
@@ -62,6 +64,7 @@ fn stale_metrics_cannot_change_a_newer_run() {
         run_id: RunId::new(2),
         cpu_percent: 7.5,
         rss_kib: 2048,
+        best_effort: false,
     });
     let sample = h
         .process("api")

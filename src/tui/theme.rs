@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 /// Semantic colors for Stackhand-owned UI. ANSI named colors let each
 /// terminal palette choose the exact RGB values while these roles keep
@@ -32,6 +32,16 @@ impl Theme {
 
     pub(super) fn secondary_text(&self) -> Style {
         Style::default().fg(self.secondary)
+    }
+
+    pub(super) fn search_match(&self) -> Style {
+        Style::default()
+            .fg(self.copy)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    }
+
+    pub(super) fn selection(&self) -> Style {
+        Style::default().add_modifier(Modifier::REVERSED)
     }
 
     pub(super) fn footer(&self, warning: bool) -> Style {

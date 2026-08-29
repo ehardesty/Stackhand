@@ -181,6 +181,23 @@ The supervisor should be testable with a fake clock and fake runtime so these ra
 - no task/channel count grows over repeated runs;
 - responsive controlled shutdown.
 
+### 4.11 Human daily-use validation
+
+Run Milestone 4B only after the Milestone 4A automated suite passes. Have a
+human use the complete workflow with representative quiet, noisy, failing, and
+interactive Processes. Record:
+
+- whether modes and actions are easy to discover;
+- whether search, selection, and copy match the user's intent;
+- whether warnings and metrics are clear without excessive noise;
+- whether Terminal and Logs views support real diagnostic work;
+- friction that requires a fix before continued daily use; and
+- deliberate deferrals with their reasons.
+
+Automated tests can prove correctness, bounds, and deterministic interaction
+behavior. They cannot prove that the UX is clear or comfortable for a human
+user. The human validation record must give a go or no-go recommendation.
+
 ---
 
 ## 5. Prototype validation criteria
@@ -240,7 +257,7 @@ Implementation work should follow these constraints unless concrete evidence jus
 14. **Do not blindly grant terminal OSC clipboard access.**
 15. **Do not build a daemon, API, web UI, or plugin system before the local TUI is excellent.**
 16. **Do not over-design profile inheritance or list merge operators.**
-17. **Do not require users to rewrite every lifecycle script declaratively.**
+17. **Move generic Process coordination into configuration when the existing model represents it cleanly. Keep domain-specific work in Project commands or scripts.**
 18. **Do not steal Ctrl-C from a focused interactive child.**
 19. **Do not treat process spawn as equivalent to readiness when a readiness probe exists.**
 20. **Do not treat a service exit as successful oneshot completion.**

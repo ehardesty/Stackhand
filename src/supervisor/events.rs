@@ -186,6 +186,7 @@ impl Core {
                 run_id,
                 cpu_percent,
                 rss_kib,
+                best_effort,
                 ..
             } => {
                 // The stale-event gate already matched the Run; the stamp
@@ -194,6 +195,7 @@ impl Core {
                     run_id: run_id.get(),
                     cpu_percent,
                     rss_kib,
+                    best_effort,
                 });
             }
             SeamEvent::OutputFailure { detail, .. } => {

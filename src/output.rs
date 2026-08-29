@@ -1,252 +1,590 @@
-//! One bounded per-Process output module.
+//! Bounded Project Logs history.
 //!
-//! Every Process has exactly one module for the whole session; it spans
-//! Runs but owns no Process Tree shutdown. Pipe output arrives as owned
-//! chunks that keep their stream identity; one marker chunk separates the
-//! output of each Run attempt. PTY output stays inside the fresh terminal
-//! session that each Run owns, so this module retains no PTY bytes, only
-//! markers and truncation state. Output bytes travel through this module
-//! only — never through the Supervisor control queue.
+//! One deep module owns normalized Logs output for every Process. Callers append
+//! observed bytes and take immutable snapshots. The implementation hides lossy
+//! UTF-8 conversion, long-line splitting, per-Process limits, the hard Project
+//! limit, oldest-first eviction, timestamps, stream labels, and literal search.
+//! Output bytes do not enter the Supervisor control queue.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime::{OutputStream, ProcessId};
 
-/// The maximum retained output bytes for one Process.
+/// Maximum retained Logs bytes for one Process.
 pub const RETAINED_BYTES: usize = 1024 * 1024;
-/// The maximum retained output chunks for one Process.
+/// Maximum retained Logs units for one Process.
 pub const RETAINED_CHUNKS: usize = 4096;
+/// Hard retained Logs byte limit for the complete Project.
+pub const PROJECT_RETAINED_BYTES: usize = 8 * RETAINED_BYTES;
+/// Hard retained Logs unit limit for the complete Project.
+pub const PROJECT_RETAINED_CHUNKS: usize = 16_384;
+/// Maximum bytes accepted for one displayed part of a logical line.
+pub const LOGICAL_LINE_BYTES: usize = 16 * 1024;
+/// Search never builds an unbounded result list.
+pub const SEARCH_MATCH_LIMIT: usize = 1_000;
+const LONG_LINE_MARKER: &str = " … [line continued at 16 KiB]";
 
-/// One retained output unit.
+/// One retained Logs unit. Data retains its Run, observation order, observation
+/// time, and stream identity. PTY output uses [`OutputStream::Combined`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RetainedChunk {
-    /// The synthetic divider recorded when one Run attempt starts.
-    Marker { run_id: u64, label: String },
-    /// Pipe output with its stream identity preserved.
+    Marker {
+        run_id: u64,
+        label: String,
+        sequence: u64,
+        observed_at_ms: u64,
+    },
     Data {
         run_id: u64,
         stream: OutputStream,
         text: String,
+        sequence: u64,
+        observed_at_ms: u64,
+        continued: bool,
     },
 }
 
-/// One owned view of a Process's retained output. Views and renderers may
-/// hold these freely; they cannot mutate the module.
+/// One literal match in retained normalized Logs text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogMatch {
+    pub sequence: u64,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogSearch {
+    pub matches: Vec<LogMatch>,
+    pub limited: bool,
+}
+
+/// One owned snapshot of a Process's retained Logs history.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RetainedOutput {
     pub chunks: Vec<RetainedChunk>,
-    /// The most recent marked Run, when any.
     pub latest_run: Option<u64>,
-    /// Whether older output was dropped at the retention bounds.
     pub truncated: bool,
-    /// How many chunks were dropped so far.
     pub dropped_chunks: u64,
-    /// How many retained bytes were dropped so far.
     pub dropped_bytes: u64,
-    /// Bumped on every retained mutation; a cheap change signal for views.
     pub generation: u64,
 }
 
 impl RetainedOutput {
-    /// Flatten the newest retained chunks into display lines in order.
-    /// Run markers keep their marker identity; a data chunk prefixes its
-    /// stream identity on the first line. Only `tail_limit` lines of work
-    /// happen: older lines stay in the module. A zero limit shows
-    /// nothing; one data chunk is the only fully materialized slice, and
-    /// it is bounded by the reader's read buffer.
+    /// Format only the newest required lines. Timestamps use UTC time-of-day
+    /// derived from the recorded Unix time, so fixed test times are independent
+    /// of the host clock and time zone.
     pub fn display_lines(&self, tail_limit: usize) -> Vec<crate::tui::PipeLine> {
-        use crate::tui::PipeLine;
         if tail_limit == 0 {
             return Vec::new();
         }
-        let mut lines: Vec<PipeLine> = Vec::new();
+        let mut lines = Vec::new();
         for chunk in self.chunks.iter().rev() {
-            match chunk {
-                RetainedChunk::Marker { label, .. } => {
-                    lines.push(PipeLine {
-                        text: label.clone(),
-                        marker: true,
-                    });
-                    if lines.len() >= tail_limit {
-                        break;
-                    }
-                }
-                RetainedChunk::Data { stream, text, .. } => {
-                    let prefix = match stream {
-                        OutputStream::Stdout => "out: ",
-                        OutputStream::Stderr => "err: ",
-                    };
-                    let mut chunk_lines = text.split_terminator('\n').rev().peekable();
-                    while lines.len() < tail_limit {
-                        let Some(line) = chunk_lines.next() else {
-                            break;
-                        };
-                        let is_first = chunk_lines.peek().is_none();
-                        lines.push(PipeLine {
-                            text: if is_first && !line.is_empty() {
-                                format!("{prefix}{line}")
-                            } else {
-                                line.to_string()
-                            },
-                            marker: false,
-                        });
-                    }
-                    if lines.len() >= tail_limit {
-                        break;
-                    }
+            let mut chunk_lines = formatted_lines(chunk);
+            while let Some(line) = chunk_lines.pop() {
+                lines.push(line);
+                if lines.len() == tail_limit {
+                    break;
                 }
             }
+            if lines.len() == tail_limit {
+                break;
+            }
+        }
+        if self.truncated && lines.len() < tail_limit {
+            lines.push(history_limit_line());
         }
         lines.reverse();
         lines
     }
+
+    /// Format one visible window from the retained head or one stable source
+    /// position. `None` selects the retained head. A missing source returns
+    /// `None`, so a paused view can detect eviction without tail-relative
+    /// offset guesses.
+    pub fn display_window_from(
+        &self,
+        anchor: Option<(u64, usize)>,
+        limit: usize,
+    ) -> Option<Vec<crate::tui::PipeLine>> {
+        if limit == 0 {
+            return Some(Vec::new());
+        }
+        let mut lines = Vec::with_capacity(limit.min(self.chunks.len().saturating_add(1)));
+        if anchor.is_none() && self.truncated {
+            lines.push(history_limit_line());
+            if lines.len() == limit {
+                return Some(lines);
+            }
+        }
+
+        let mut found = anchor.is_none();
+        for chunk in &self.chunks {
+            if !found && Some(sequence(chunk)) != anchor.map(|position| position.0) {
+                continue;
+            }
+            for line in formatted_lines(chunk) {
+                if !found {
+                    if line.source != anchor {
+                        continue;
+                    }
+                    found = true;
+                }
+                lines.push(line);
+                if lines.len() == limit {
+                    return Some(lines);
+                }
+            }
+        }
+        found.then_some(lines)
+    }
+
+    /// Find case-sensitive literal substrings in all retained normalized text.
+    /// Search uses the immutable snapshot, so ingestion never waits for it.
+    pub fn search(&self, query: &str) -> LogSearch {
+        if query.is_empty() {
+            return LogSearch::default();
+        }
+        let mut found = LogSearch::default();
+        'chunks: for chunk in &self.chunks {
+            let RetainedChunk::Data { text, sequence, .. } = chunk else {
+                continue;
+            };
+            for (line, value) in text.split_terminator('\n').enumerate() {
+                for (start, _) in value.match_indices(query) {
+                    if found.matches.len() == SEARCH_MATCH_LIMIT {
+                        found.limited = true;
+                        break 'chunks;
+                    }
+                    found.matches.push(LogMatch {
+                        sequence: *sequence,
+                        line,
+                        start,
+                        end: start + query.len(),
+                    });
+                }
+            }
+        }
+        found
+    }
 }
 
-/// The retained output of one Process across its Runs.
+/// A handle to one Process inside the Project Logs owner.
 pub struct ProcessOutput {
-    inner: Mutex<Inner>,
+    process: usize,
+    project: Arc<Mutex<ProjectHistory>>,
 }
 
-struct Inner {
+struct ProcessHistory {
     chunks: VecDeque<RetainedChunk>,
+    pending: [Option<PendingLine>; 3],
     bytes: usize,
     dropped_chunks: u64,
     dropped_bytes: u64,
-    /// The newest marked Run. A drain tail from an older Run that lands
-    /// after this marker would corrupt marker order, so it is dropped.
     latest_run: Option<u64>,
-    /// Bumped on every append or marker.
     generation: u64,
 }
 
+struct PendingLine {
+    run_id: u64,
+    stream: OutputStream,
+    bytes: Vec<u8>,
+    sequence: u64,
+    observed_at_ms: u64,
+}
+
+struct ProjectHistory {
+    processes: Vec<ProcessHistory>,
+    bytes: usize,
+    chunks: usize,
+    next_sequence: u64,
+}
+
 impl ProcessOutput {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(Inner {
-                chunks: VecDeque::new(),
-                bytes: 0,
-                dropped_chunks: 0,
-                dropped_bytes: 0,
-                latest_run: None,
-                generation: 0,
-            }),
-        }
-    }
-
-    /// Retain one pipe-mode chunk. The chunk's Run identity is checked
-    /// against the newest marked Run; a stale tail from an ended attempt
-    /// never reorders behind a newer marker. Crates outside the data path
-    /// must read through [`Self::snapshot`] only.
     pub(crate) fn append(&self, run_id: u64, stream: OutputStream, data: Vec<u8>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.latest_run.is_some_and(|latest| run_id < latest) {
-            return;
-        }
-        let text = String::from_utf8_lossy(&data).into_owned();
-        let size = text.len();
-        inner.chunks.push_back(RetainedChunk::Data {
-            run_id,
-            stream,
-            text,
-        });
-        inner.bytes += size;
-        inner.enforce_bounds();
-        inner.generation += 1;
+        self.append_at(run_id, stream, observation_millis(), data);
     }
 
-    /// Record that one Run attempt started. The marker is visible in
-    /// snapshots and separates the attempts' output.
+    pub(crate) fn append_at(
+        &self,
+        run_id: u64,
+        stream: OutputStream,
+        observed_at_ms: u64,
+        data: Vec<u8>,
+    ) {
+        let mut project = lock(&self.project);
+        if project.processes[self.process]
+            .latest_run
+            .is_some_and(|latest| run_id < latest)
+        {
+            return;
+        }
+        let stream_index = stream_index(stream);
+        if project.processes[self.process].pending[stream_index]
+            .as_ref()
+            .is_some_and(|pending| pending.run_id != run_id)
+        {
+            project.flush_pending(self.process, stream_index, false);
+        }
+        for byte in data {
+            if project.processes[self.process].pending[stream_index].is_none() {
+                let sequence = project.next_sequence;
+                project.next_sequence = project.next_sequence.wrapping_add(1);
+                project.processes[self.process].pending[stream_index] = Some(PendingLine {
+                    run_id,
+                    stream,
+                    bytes: Vec::with_capacity(LOGICAL_LINE_BYTES.min(4096)),
+                    sequence,
+                    observed_at_ms,
+                });
+                project.chunks += 1;
+            }
+            project.processes[self.process].pending[stream_index]
+                .as_mut()
+                .expect("the pending line exists")
+                .bytes
+                .push(byte);
+            project.processes[self.process].bytes += 1;
+            project.bytes += 1;
+            let newline = byte == b'\n';
+            let full = project.processes[self.process].pending[stream_index]
+                .as_ref()
+                .is_some_and(|pending| pending.bytes.len() == LOGICAL_LINE_BYTES);
+            if newline || full {
+                project.flush_pending(self.process, stream_index, full && !newline);
+            }
+        }
+        project.processes[self.process].generation =
+            project.processes[self.process].generation.wrapping_add(1);
+        project.enforce(self.process);
+    }
+
     pub(crate) fn mark_run(&self, run_id: u64) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.latest_run.is_some_and(|latest| run_id <= latest) {
-            return;
-        }
-        let label = format!("── Run {run_id} started ──");
-        let size = label.len();
-        inner.chunks.push_back(RetainedChunk::Marker {
-            run_id,
-            label: label.clone(),
-        });
-        inner.bytes += size;
-        inner.latest_run = Some(run_id);
-        inner.enforce_bounds();
-        inner.generation += 1;
+        self.mark_run_at(run_id, observation_millis());
     }
 
-    /// One owned snapshot of the retained output.
-    pub fn snapshot(&self) -> RetainedOutput {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        RetainedOutput {
-            chunks: inner.chunks.iter().cloned().collect(),
-            latest_run: inner.latest_run,
-            truncated: inner.dropped_chunks > 0,
-            dropped_chunks: inner.dropped_chunks,
-            dropped_bytes: inner.dropped_bytes,
-            generation: inner.generation,
+    pub(crate) fn mark_run_at(&self, run_id: u64, observed_at_ms: u64) {
+        let mut project = lock(&self.project);
+        if project.processes[self.process]
+            .latest_run
+            .is_some_and(|latest| run_id <= latest)
+        {
+            return;
         }
+        for stream_index in 0..3 {
+            project.flush_pending(self.process, stream_index, false);
+        }
+        let sequence = project.next_sequence;
+        project.next_sequence = project.next_sequence.wrapping_add(1);
+        project.processes[self.process].latest_run = Some(run_id);
+        project.push(
+            self.process,
+            RetainedChunk::Marker {
+                run_id,
+                label: format!("── Run {run_id} started ──"),
+                sequence,
+                observed_at_ms,
+            },
+        );
+        project.processes[self.process].generation =
+            project.processes[self.process].generation.wrapping_add(1);
+        project.enforce(self.process);
+    }
+
+    pub fn snapshot(&self) -> RetainedOutput {
+        self.snapshot_if_changed(None)
+            .expect("an unconditional Logs snapshot is always returned")
+    }
+
+    /// Return a new immutable snapshot only when this Process changed. Idle
+    /// view operations can reuse their prior snapshot instead of cloning the
+    /// full retained history for every input batch.
+    pub fn snapshot_if_changed(&self, known_generation: Option<u64>) -> Option<RetainedOutput> {
+        let project = lock(&self.project);
+        let process = &project.processes[self.process];
+        if known_generation == Some(process.generation) {
+            return None;
+        }
+        let mut chunks: Vec<_> = process.chunks.iter().cloned().collect();
+        chunks.extend(process.pending.iter().flatten().map(pending_chunk));
+        chunks.sort_by_key(sequence);
+        Some(RetainedOutput {
+            chunks,
+            latest_run: process.latest_run,
+            truncated: process.dropped_chunks > 0,
+            dropped_chunks: process.dropped_chunks,
+            dropped_bytes: process.dropped_bytes,
+            generation: process.generation,
+        })
     }
 }
 
-impl Inner {
-    /// Drop the oldest retained units until both bounds hold. Dropped
-    /// amounts are counted so truncation stays observable.
-    fn enforce_bounds(&mut self) {
-        while self.bytes > RETAINED_BYTES || self.chunks.len() > RETAINED_CHUNKS {
-            let Some(chunk) = self.chunks.pop_front() else {
+impl ProjectHistory {
+    fn flush_pending(&mut self, process: usize, stream: usize, continued: bool) {
+        let Some(pending) = self.processes[process].pending[stream].take() else {
+            return;
+        };
+        let raw_bytes = pending.bytes.len();
+        self.processes[process].bytes = self.processes[process].bytes.saturating_sub(raw_bytes);
+        self.bytes = self.bytes.saturating_sub(raw_bytes);
+        self.chunks = self.chunks.saturating_sub(1);
+        let mut text = String::from_utf8_lossy(&pending.bytes).into_owned();
+        if continued {
+            text.push_str(LONG_LINE_MARKER);
+            text.push('\n');
+        }
+        self.push(
+            process,
+            RetainedChunk::Data {
+                run_id: pending.run_id,
+                stream: pending.stream,
+                text,
+                sequence: pending.sequence,
+                observed_at_ms: pending.observed_at_ms,
+                continued,
+            },
+        );
+    }
+
+    fn push(&mut self, process: usize, chunk: RetainedChunk) {
+        let bytes = retained_size(&chunk);
+        self.processes[process].chunks.push_back(chunk);
+        self.processes[process].bytes += bytes;
+        self.bytes += bytes;
+        self.chunks += 1;
+    }
+
+    fn enforce(&mut self, changed: usize) {
+        while self.processes[changed].bytes > RETAINED_BYTES
+            || process_chunk_count(&self.processes[changed]) > RETAINED_CHUNKS
+        {
+            self.evict_from(changed);
+        }
+        while self.bytes > PROJECT_RETAINED_BYTES || self.chunks > PROJECT_RETAINED_CHUNKS {
+            let Some(oldest) = self
+                .processes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, process)| {
+                    oldest_sequence(process).map(|sequence| (index, sequence))
+                })
+                .min_by_key(|(_, sequence)| *sequence)
+                .map(|(index, _)| index)
+            else {
                 break;
             };
-            let (chunk_bytes, chunk_count) = retained_size(&chunk);
-            self.bytes = self.bytes.saturating_sub(chunk_bytes);
-            self.dropped_chunks += chunk_count as u64;
-            self.dropped_bytes += chunk_bytes as u64;
+            self.evict_from(oldest);
+        }
+    }
+
+    fn evict_from(&mut self, process: usize) {
+        let oldest = oldest_sequence(&self.processes[process]);
+        let front_is_oldest = self.processes[process]
+            .chunks
+            .front()
+            .is_some_and(|chunk| Some(sequence(chunk)) == oldest);
+        let bytes = if front_is_oldest {
+            let chunk = self.processes[process]
+                .chunks
+                .pop_front()
+                .expect("the oldest chunk exists");
+            retained_size(&chunk)
+        } else {
+            let Some(stream) = self.processes[process].pending.iter().position(|pending| {
+                pending
+                    .as_ref()
+                    .is_some_and(|line| Some(line.sequence) == oldest)
+            }) else {
+                return;
+            };
+            self.processes[process].pending[stream]
+                .take()
+                .expect("the oldest pending line exists")
+                .bytes
+                .len()
+        };
+        let history = &mut self.processes[process];
+        history.bytes = history.bytes.saturating_sub(bytes);
+        history.dropped_chunks += 1;
+        history.dropped_bytes += bytes as u64;
+        history.generation = history.generation.wrapping_add(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.chunks = self.chunks.saturating_sub(1);
+    }
+}
+
+fn pending_chunk(pending: &PendingLine) -> RetainedChunk {
+    RetainedChunk::Data {
+        run_id: pending.run_id,
+        stream: pending.stream,
+        text: String::from_utf8_lossy(&pending.bytes).into_owned(),
+        sequence: pending.sequence,
+        observed_at_ms: pending.observed_at_ms,
+        continued: false,
+    }
+}
+
+fn stream_index(stream: OutputStream) -> usize {
+    match stream {
+        OutputStream::Stdout => 0,
+        OutputStream::Stderr => 1,
+        OutputStream::Combined => 2,
+    }
+}
+
+fn process_chunk_count(process: &ProcessHistory) -> usize {
+    process.chunks.len() + process.pending.iter().flatten().count()
+}
+
+fn oldest_sequence(process: &ProcessHistory) -> Option<u64> {
+    process
+        .chunks
+        .front()
+        .map(sequence)
+        .into_iter()
+        .chain(process.pending.iter().flatten().map(|line| line.sequence))
+        .min()
+}
+
+fn history_limit_line() -> crate::tui::PipeLine {
+    crate::tui::PipeLine {
+        text: "[history limit: older Logs output removed]".to_string(),
+        marker: true,
+        source: None,
+        content_offset: 0,
+        highlight: None,
+        selection: None,
+    }
+}
+
+fn formatted_lines(chunk: &RetainedChunk) -> Vec<crate::tui::PipeLine> {
+    use crate::tui::PipeLine;
+    match chunk {
+        RetainedChunk::Marker {
+            label,
+            sequence,
+            observed_at_ms,
+            ..
+        } => vec![PipeLine {
+            text: format!("{} {label}", timestamp(*observed_at_ms)),
+            marker: true,
+            source: Some((*sequence, 0)),
+            content_offset: 0,
+            highlight: None,
+            selection: None,
+        }],
+        RetainedChunk::Data {
+            stream,
+            text,
+            sequence,
+            observed_at_ms,
+            ..
+        } => {
+            let label = match stream {
+                OutputStream::Stdout => "out",
+                OutputStream::Stderr => "err",
+                OutputStream::Combined => "pty",
+            };
+            text.split_terminator('\n')
+                .enumerate()
+                .map(|(line, value)| {
+                    let prefix = format!("{} {label}: ", timestamp(*observed_at_ms));
+                    let content_offset = prefix.len();
+                    PipeLine {
+                        text: format!("{prefix}{value}"),
+                        marker: false,
+                        source: Some((*sequence, line)),
+                        content_offset,
+                        highlight: None,
+                        selection: None,
+                    }
+                })
+                .collect()
         }
     }
 }
 
-/// The retention cost of one unit: markers count their label, data counts
-/// its text. Chunk counts are always one.
-fn retained_size(chunk: &RetainedChunk) -> (usize, usize) {
+fn timestamp(unix_ms: u64) -> String {
+    let day_ms = unix_ms % 86_400_000;
+    let hours = day_ms / 3_600_000;
+    let minutes = day_ms / 60_000 % 60;
+    let seconds = day_ms / 1_000 % 60;
+    let millis = day_ms % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn observation_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn sequence(chunk: &RetainedChunk) -> u64 {
     match chunk {
-        RetainedChunk::Marker { label, .. } => (label.len(), 1),
-        RetainedChunk::Data { text, .. } => (text.len(), 1),
+        RetainedChunk::Marker { sequence, .. } | RetainedChunk::Data { sequence, .. } => *sequence,
     }
 }
 
-/// The registry of one module per Process. Built with the Supervisor so
-/// every Process has its retained output in exactly one place.
+fn retained_size(chunk: &RetainedChunk) -> usize {
+    match chunk {
+        RetainedChunk::Marker { label, .. } => label.len(),
+        RetainedChunk::Data { text, .. } => text.len(),
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Registry of one Logs handle per Process and one hard Project budget.
 #[derive(Clone)]
 pub struct OutputViews {
-    inner: Arc<Vec<Arc<ProcessOutput>>>,
+    handles: Arc<Vec<Arc<ProcessOutput>>>,
 }
 
 impl OutputViews {
     pub fn new(process_count: usize) -> Self {
+        let project = Arc::new(Mutex::new(ProjectHistory {
+            processes: (0..process_count)
+                .map(|_| ProcessHistory {
+                    chunks: VecDeque::new(),
+                    pending: std::array::from_fn(|_| None),
+                    bytes: 0,
+                    dropped_chunks: 0,
+                    dropped_bytes: 0,
+                    latest_run: None,
+                    generation: 0,
+                })
+                .collect(),
+            bytes: 0,
+            chunks: 0,
+            next_sequence: 0,
+        }));
         Self {
-            inner: Arc::new(
+            handles: Arc::new(
                 (0..process_count)
-                    .map(|_| Arc::new(ProcessOutput::new()))
+                    .map(|process| {
+                        Arc::new(ProcessOutput {
+                            process,
+                            project: Arc::clone(&project),
+                        })
+                    })
                     .collect(),
             ),
         }
     }
 
-    /// The module for one Process, by its stable session identity.
     pub fn for_process_id(&self, process_id: ProcessId) -> Option<Arc<ProcessOutput>> {
-        self.inner.get(process_id.get() as usize).cloned()
+        self.handles.get(process_id.get() as usize).cloned()
     }
 
-    /// The module for one Process, by its stable scalar session identity.
-    /// Kept for caller compatibility; internal callers use [`Self::for_process_id`].
     pub fn for_process(&self, process_id: u32) -> Option<Arc<ProcessOutput>> {
         self.for_process_id(ProcessId::new(process_id))
     }
@@ -256,299 +594,129 @@ impl OutputViews {
 mod tests {
     use super::*;
 
-    #[test]
-    fn append_keeps_stream_identity_and_run_marker_order() {
-        let output = ProcessOutput::new();
-        output.mark_run(1);
-        output.append(1, OutputStream::Stdout, b"first".to_vec());
-        output.append(1, OutputStream::Stderr, b"second".to_vec());
-        output.mark_run(2);
-        output.append(2, OutputStream::Stdout, b"third".to_vec());
+    fn output() -> Arc<ProcessOutput> {
+        OutputViews::new(1).for_process(0).unwrap()
+    }
 
-        let snapshot = output.snapshot();
-        assert_eq!(snapshot.latest_run, Some(2));
-        let rendered: Vec<String> = snapshot
-            .chunks
-            .iter()
-            .map(|chunk| match chunk {
-                RetainedChunk::Marker { label, .. } => format!("MARK {label}"),
-                RetainedChunk::Data { stream, text, .. } => {
-                    let stream = match stream {
-                        OutputStream::Stdout => "out",
-                        OutputStream::Stderr => "err",
-                    };
-                    format!("{stream}: {text}")
-                }
-            })
+    #[test]
+    fn logs_format_fixed_timestamps_streams_runs_and_invalid_utf8() {
+        let output = output();
+        output.mark_run_at(1, 3_723_004);
+        output.append_at(1, OutputStream::Stdout, 3_723_005, b"ok\n".to_vec());
+        output.append_at(1, OutputStream::Stderr, 3_723_006, vec![b'x', 0xff, b'\n']);
+        let text: Vec<_> = output
+            .snapshot()
+            .display_lines(10)
+            .into_iter()
+            .map(|line| line.text)
             .collect();
         assert_eq!(
-            rendered,
-            vec![
-                "MARK ── Run 1 started ──",
-                "out: first",
-                "err: second",
-                "MARK ── Run 2 started ──",
-                "out: third",
+            text,
+            [
+                "01:02:03.004 ── Run 1 started ──",
+                "01:02:03.005 out: ok",
+                "01:02:03.006 err: x�",
             ]
         );
-        assert!(!snapshot.truncated);
     }
 
     #[test]
-    fn retention_bounds_drop_the_oldest_first_and_count_the_loss() {
-        let output = ProcessOutput::new();
-        // Two chunks that together just exceed the byte bound: the oldest
-        // unit goes and the loss is counted.
-        output.append(1, OutputStream::Stdout, vec![b'a'; RETAINED_BYTES - 100]);
-        output.append(1, OutputStream::Stdout, vec![b'b'; 101]);
+    fn long_lines_are_split_visibly_and_later_output_survives() {
+        let output = output();
+        let mut data = vec![b'a'; LOGICAL_LINE_BYTES + 1];
+        data.extend_from_slice(b"\nafter\n");
+        output.append_at(1, OutputStream::Combined, 0, data);
+        let lines = output.snapshot().display_lines(10);
+        assert!(lines[0].text.contains("[line continued at 16 KiB]"));
+        assert!(lines.last().unwrap().text.ends_with("pty: after"));
+    }
 
+    #[test]
+    fn normalization_spans_reader_chunks_without_breaking_utf8_or_line_bounds() {
+        let output = output();
+        let euro = "€".as_bytes();
+        output.append_at(1, OutputStream::Combined, 0, euro[..1].to_vec());
+        output.append_at(1, OutputStream::Combined, 1, euro[1..].to_vec());
+        for _ in 0..LOGICAL_LINE_BYTES {
+            output.append_at(1, OutputStream::Combined, 2, vec![b'x']);
+        }
+        output.append_at(1, OutputStream::Combined, 3, b"\nafter\n".to_vec());
+
+        let lines = output.snapshot().display_lines(10);
+        assert!(lines.iter().any(|line| line.text.contains('€')));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("[line continued at 16 KiB]"))
+        );
+        assert!(lines.last().unwrap().text.ends_with("pty: after"));
+    }
+
+    #[test]
+    fn unchanged_logs_do_not_clone_another_snapshot() {
+        let output = output();
+        let first = output
+            .snapshot_if_changed(None)
+            .expect("the first snapshot is returned");
+
+        assert!(output.snapshot_if_changed(Some(first.generation)).is_none());
+
+        output.append_at(1, OutputStream::Stdout, 0, b"later\n".to_vec());
+        let changed = output
+            .snapshot_if_changed(Some(first.generation))
+            .expect("new output returns a new snapshot");
+        assert_ne!(changed.generation, first.generation);
+    }
+
+    #[test]
+    fn literal_search_is_case_sensitive_and_bounded_to_retained_text() {
+        let output = output();
+        output.append_at(
+            1,
+            OutputStream::Stdout,
+            0,
+            b"needle Needle needle\n".to_vec(),
+        );
+        let search = output.snapshot().search("needle");
+        assert_eq!(search.matches.len(), 2);
+        assert!(!search.limited);
+        assert!(output.snapshot().search("NEEDLE").matches.is_empty());
+    }
+
+    #[test]
+    fn per_process_bound_evicts_oldest_and_shows_the_history_marker() {
+        let output = output();
+        output.append_at(1, OutputStream::Stdout, 0, vec![b'a'; RETAINED_BYTES]);
+        output.append_at(1, OutputStream::Stdout, 1, b"new\n".to_vec());
         let snapshot = output.snapshot();
         assert!(snapshot.truncated);
-        assert_eq!(snapshot.dropped_bytes, (RETAINED_BYTES - 100) as u64);
-        assert_eq!(snapshot.chunks.len(), 1);
-
-        // The chunk bound applies even for tiny chunks.
-        let tiny = ProcessOutput::new();
-        for _ in 0..=RETAINED_CHUNKS {
-            tiny.append(1, OutputStream::Stdout, b"a".to_vec());
-        }
-        let tiny_snapshot = tiny.snapshot();
-        assert!(tiny_snapshot.truncated);
-        assert_eq!(tiny_snapshot.chunks.len(), RETAINED_CHUNKS);
-        assert_eq!(tiny_snapshot.dropped_chunks, 1);
-    }
-
-    #[test]
-    fn a_stale_tail_from_ended_runs_never_reorders_behind_a_newer_marker() {
-        let output = ProcessOutput::new();
-        output.mark_run(1);
-        output.append(1, OutputStream::Stdout, b"old".to_vec());
-        output.mark_run(2);
-        // The finished drain of Run 1 lands after Run 2's marker.
-        output.append(1, OutputStream::Stdout, b"stale tail".to_vec());
-
-        let snapshot = output.snapshot();
-        assert_eq!(
-            snapshot.chunks,
-            vec![
-                RetainedChunk::Marker {
-                    run_id: 1,
-                    label: "── Run 1 started ──".to_string()
-                },
-                RetainedChunk::Data {
-                    run_id: 1,
-                    stream: OutputStream::Stdout,
-                    text: "old".to_string()
-                },
-                RetainedChunk::Marker {
-                    run_id: 2,
-                    label: "── Run 2 started ──".to_string()
-                },
-            ]
+        assert!(
+            snapshot
+                .chunks
+                .iter()
+                .any(|chunk| matches!(chunk, RetainedChunk::Data { text, .. } if text == "new\n"))
+        );
+        assert!(
+            snapshot.display_lines(100)[0]
+                .text
+                .contains("history limit")
         );
     }
 
     #[test]
-    fn duplicate_and_out_of_order_markers_are_ignored() {
-        let output = ProcessOutput::new();
-        output.mark_run(2);
-        output.mark_run(1);
-        output.mark_run(2);
-
-        let snapshot = output.snapshot();
-        assert_eq!(
-            snapshot.chunks,
-            vec![RetainedChunk::Marker {
-                run_id: 2,
-                label: "── Run 2 started ──".to_string()
-            }]
-        );
-        assert_eq!(snapshot.latest_run, Some(2));
-    }
-
-    #[test]
-    fn display_lines_keep_line_order_within_and_between_chunks() {
-        let lines = RetainedOutput {
-            chunks: vec![
-                RetainedChunk::Data {
-                    run_id: 1,
-                    stream: OutputStream::Stdout,
-                    text: "a\nb\n".to_string(),
-                },
-                RetainedChunk::Data {
-                    run_id: 2,
-                    stream: OutputStream::Stderr,
-                    text: "c\nd\n".to_string(),
-                },
-            ],
-            ..Default::default()
+    fn project_bound_evicts_the_oldest_process_even_when_another_is_selected() {
+        let views = OutputViews::new(9);
+        for process in 0..9 {
+            views.for_process(process).unwrap().append_at(
+                1,
+                OutputStream::Stdout,
+                process as u64,
+                vec![b'a' + process as u8; RETAINED_BYTES],
+            );
         }
-        .display_lines(10);
-        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
-
-        assert_eq!(text, vec!["out: a", "b", "err: c", "d"]);
-    }
-
-    #[test]
-    fn display_lines_zero_limit_shows_nothing() {
-        let output = RetainedOutput {
-            chunks: vec![RetainedChunk::Data {
-                run_id: 1,
-                stream: OutputStream::Stdout,
-                text: "a\nb\n".to_string(),
-            }],
-            ..Default::default()
-        };
-
-        assert!(output.display_lines(0).is_empty());
-    }
-
-    #[test]
-    fn display_lines_tail_limit_keeps_the_newest_lines() {
-        let lines = RetainedOutput {
-            chunks: vec![
-                RetainedChunk::Data {
-                    run_id: 1,
-                    stream: OutputStream::Stdout,
-                    text: "a\nb\n".to_string(),
-                },
-                RetainedChunk::Data {
-                    run_id: 2,
-                    stream: OutputStream::Stdout,
-                    text: "c\nd\n".to_string(),
-                },
-            ],
-            ..Default::default()
-        }
-        .display_lines(2);
-        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
-
-        // The kept tail starts inside the second chunk: its first line
-        // keeps the stream label, and the older chunk drops out.
-        assert_eq!(text, vec!["out: c", "d"]);
-    }
-
-    #[test]
-    fn display_lines_keeps_markers_and_handles_chunks_without_trailing_newline() {
-        let lines = RetainedOutput {
-            chunks: vec![
-                RetainedChunk::Data {
-                    run_id: 1,
-                    stream: OutputStream::Stdout,
-                    text: "a\nb".to_string(),
-                },
-                RetainedChunk::Marker {
-                    run_id: 2,
-                    label: "── Run 2 started ──".to_string(),
-                },
-                RetainedChunk::Data {
-                    run_id: 2,
-                    stream: OutputStream::Stderr,
-                    text: "c".to_string(),
-                },
-            ],
-            ..Default::default()
-        }
-        .display_lines(10);
-        let text: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
-        let markers: Vec<bool> = lines.iter().map(|line| line.marker).collect();
-
-        assert_eq!(text, vec!["out: a", "b", "── Run 2 started ──", "err: c"]);
-        assert_eq!(markers, vec![false, false, true, false]);
-    }
-
-    /// A simple full projection used only as a differential oracle for the
-    /// bounded reverse-tail implementation.
-    fn materialized_display_lines(
-        output: &RetainedOutput,
-        tail_limit: usize,
-    ) -> Vec<crate::tui::PipeLine> {
-        use crate::tui::PipeLine;
-
-        let mut lines = Vec::new();
-        for chunk in &output.chunks {
-            match chunk {
-                RetainedChunk::Marker { label, .. } => lines.push(PipeLine {
-                    text: label.clone(),
-                    marker: true,
-                }),
-                RetainedChunk::Data { stream, text, .. } => {
-                    let prefix = match stream {
-                        OutputStream::Stdout => "out: ",
-                        OutputStream::Stderr => "err: ",
-                    };
-                    let mut split: Vec<&str> = text.split('\n').collect();
-                    if split.last() == Some(&"") {
-                        split.pop();
-                    }
-                    lines.extend(split.into_iter().enumerate().map(|(index, line)| PipeLine {
-                        text: if index == 0 && !line.is_empty() {
-                            format!("{prefix}{line}")
-                        } else {
-                            line.to_string()
-                        },
-                        marker: false,
-                    }));
-                }
-            }
-        }
-        let keep_from = lines.len().saturating_sub(tail_limit);
-        lines.into_iter().skip(keep_from).collect()
-    }
-
-    #[test]
-    fn display_lines_matches_a_full_projection_for_line_boundaries_and_tails() {
-        let text_cases = [
-            "",
-            "\n",
-            "\n\n",
-            "first",
-            "first\n",
-            "first\nsecond",
-            "first\n\n",
-            "\nsecond",
-            "\nsecond\n",
-        ];
-        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
-            for text in text_cases {
-                let output = RetainedOutput {
-                    chunks: vec![
-                        RetainedChunk::Marker {
-                            run_id: 1,
-                            label: "── Run 1 started ──".to_string(),
-                        },
-                        RetainedChunk::Data {
-                            run_id: 1,
-                            stream: OutputStream::Stdout,
-                            text: "older\nlines\n".to_string(),
-                        },
-                        RetainedChunk::Data {
-                            run_id: 2,
-                            stream,
-                            text: text.to_string(),
-                        },
-                        RetainedChunk::Marker {
-                            run_id: 3,
-                            label: "── Run 3 started ──".to_string(),
-                        },
-                        RetainedChunk::Data {
-                            run_id: 3,
-                            stream: OutputStream::Stderr,
-                            text: "newest\nwithout-newline".to_string(),
-                        },
-                    ],
-                    ..Default::default()
-                };
-                for tail_limit in 0..=12 {
-                    let actual = output.display_lines(tail_limit);
-                    assert_eq!(
-                        actual,
-                        materialized_display_lines(&output, tail_limit),
-                        "stream {stream:?}, text {text:?}, tail {tail_limit}"
-                    );
-                    assert!(actual.len() <= tail_limit);
-                }
-            }
-        }
+        let oldest = views.for_process(0).unwrap().snapshot();
+        let newest = views.for_process(8).unwrap().snapshot();
+        assert!(oldest.truncated);
+        assert!(!newest.chunks.is_empty());
     }
 }

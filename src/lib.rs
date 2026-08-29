@@ -7,6 +7,7 @@ mod geometry;
 mod ingest_fixture;
 pub mod interaction_fixture;
 mod lifecycle_fixture;
+mod log_view;
 pub mod model;
 mod mouse_fixture;
 mod output;

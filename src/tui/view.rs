@@ -28,8 +28,9 @@ pub enum ConsoleWarning {
     PasteDeliveryFailed,
     ClipboardFailed,
     NothingSelected,
+    NoLogsToCopy,
     InputDisabled,
-    PipeReadOnly,
+    LogsCommandOnly,
     SelectionUnavailable,
 }
 
@@ -51,6 +52,9 @@ pub struct ConsoleViewState {
     pub warning: Option<ConsoleWarning>,
     pub stackhand_mouse_gesture: bool,
     pub pane: ConsolePaneKind,
+    pub search_editing: bool,
+    pub search_active: bool,
+    pub logs_selection: bool,
 }
 
 impl Default for ConsoleViewState {
@@ -61,6 +65,9 @@ impl Default for ConsoleViewState {
             warning: None,
             stackhand_mouse_gesture: false,
             pane: ConsolePaneKind::default(),
+            search_editing: false,
+            search_active: false,
+            logs_selection: false,
         }
     }
 }
@@ -112,6 +119,16 @@ pub fn pane_inner(pane: Rect) -> Rect {
 pub struct PipeLine {
     pub text: String,
     pub marker: bool,
+    /// Retained Logs source location: observation sequence and line index.
+    /// Synthetic truncation markers have no source.
+    pub source: Option<(u64, usize)>,
+    /// Byte offset where normalized output text starts after timestamp and
+    /// stream chrome.
+    pub content_offset: usize,
+    /// Byte range of the current literal match in the formatted line.
+    pub highlight: Option<(usize, usize)>,
+    /// Byte range selected by a Logs mouse gesture.
+    pub selection: Option<(usize, usize)>,
 }
 
 /// The selected pipe-mode Process's retained output, tail-following: the
@@ -123,17 +140,47 @@ fn render_pipe_console(frame: &mut Frame<'_>, lines: &[PipeLine], pane: Rect) {
     }
     let start = lines.len().saturating_sub(pane.height as usize);
     let tail = &lines[start..];
-    let rows: Vec<ratatui::text::Line<'_>> = tail
-        .iter()
-        .map(|line| {
-            if line.marker {
-                ratatui::text::Line::styled(line.text.as_str(), TERMINAL_THEME.secondary_text())
-            } else {
-                ratatui::text::Line::from(line.text.as_str())
-            }
-        })
-        .collect();
+    let rows: Vec<ratatui::text::Line<'_>> = tail.iter().map(styled_pipe_line).collect();
     frame.render_widget(Paragraph::new(rows), pane);
+}
+
+fn styled_pipe_line(line: &PipeLine) -> ratatui::text::Line<'_> {
+    use ratatui::text::Span;
+
+    let mut breaks = vec![0, line.text.len()];
+    for (start, end) in [line.highlight, line.selection].into_iter().flatten() {
+        breaks.push(start.min(line.text.len()));
+        breaks.push(end.min(line.text.len()));
+    }
+    breaks.sort_unstable();
+    breaks.dedup();
+    let spans = breaks
+        .windows(2)
+        .filter(|range| range[0] < range[1])
+        .map(|range| {
+            let start = range[0];
+            let end = range[1];
+            let mut style = if line.marker {
+                TERMINAL_THEME.secondary_text()
+            } else {
+                Style::default()
+            };
+            if line
+                .highlight
+                .is_some_and(|(from, to)| start >= from && end <= to)
+            {
+                style = style.patch(TERMINAL_THEME.search_match());
+            }
+            if line
+                .selection
+                .is_some_and(|(from, to)| start >= from && end <= to)
+            {
+                style = style.patch(TERMINAL_THEME.selection());
+            }
+            Span::styled(&line.text[start..end], style)
+        })
+        .collect::<Vec<_>>();
+    ratatui::text::Line::from(spans)
 }
 
 /// The PTY geometry matching the console pane for a Project with this many
@@ -268,6 +315,9 @@ fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console
 }
 
 fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
+    if view.search_editing {
+        return "MODE: SEARCH · type query · Enter: apply · Esc/Ctrl-C: cancel".to_string();
+    }
     let focus = match view.mode {
         ConsoleViewMode::ProcessList => "FOCUS: PROCESSES",
         ConsoleViewMode::Console => "FOCUS: CONSOLE",
@@ -296,14 +346,15 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             ConsoleWarning::NothingSelected => {
                 "WARNING: no terminal text is selected · v: start selection"
             }
+            ConsoleWarning::NoLogsToCopy => "WARNING: no Logs text is available to copy",
             ConsoleWarning::InputDisabled => {
                 "WARNING: input is not enabled for this Process · Ctrl-A: Process list"
             }
-            ConsoleWarning::PipeReadOnly => {
-                "WARNING: pipe output is read-only · Ctrl-A: Process list"
+            ConsoleWarning::LogsCommandOnly => {
+                "WARNING: Logs accepts commands, not Process input · /: search · Esc: Processes"
             }
             ConsoleWarning::SelectionUnavailable => {
-                "WARNING: text selection is available only in a PTY console"
+                "WARNING: terminal selection is available only in Terminal view"
             }
         };
         return format!(
@@ -311,25 +362,36 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             mouse_owner_text(view, child_mouse_tracking)
         );
     }
+    if view.logs_selection {
+        return "MODE: SELECT LOGS · drag: adjust · c/y: copy · Esc: clear".to_string();
+    }
 
+    let match_control = if view.search_active {
+        " · n/N: match"
+    } else {
+        ""
+    };
     let controls = match view.mode {
-        ConsoleViewMode::ProcessList => {
-            "j/k or ↑↓: select · s: start · x: stop · r: restart · v: copy · Ctrl-A: console · q: quit"
-        }
+        ConsoleViewMode::ProcessList => format!(
+            "j/k: select · l: Terminal/Logs · /: search{match_control} · f: live · s/x/r: lifecycle · q: quit"
+        ),
         ConsoleViewMode::Console => match view.pane {
-            ConsolePaneKind::Terminal => "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit",
-            ConsolePaneKind::Pipe => "read-only output · Ctrl-A: Process list · Ctrl-Q: quit",
-            ConsolePaneKind::Empty => "no active Run · Ctrl-A: Process list · Ctrl-Q: quit",
+            ConsolePaneKind::Terminal => {
+                "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit".to_string()
+            }
+            ConsolePaneKind::Pipe => format!(
+                "↑↓/j/k: scroll · PgUp/PgDn: page · /: search{match_control} · f: live · c/y: copy · Esc: Processes"
+            ),
+            ConsolePaneKind::Empty => {
+                "no active Run · Ctrl-A: Process list · Ctrl-Q: quit".to_string()
+            }
         },
         ConsoleViewMode::Copy => {
             "h/j/k/l or arrows: move · v: select/unselect · c/y: copy · a: all · q/Esc: exit"
+                .to_string()
         }
     };
-    let tail = if view.following {
-        "LIVE"
-    } else {
-        "NOT FOLLOWING"
-    };
+    let tail = if view.following { "LIVE" } else { "PAUSED" };
     format!(
         "{} · {focus} · {controls} · {tail}",
         mouse_owner_text(view, child_mouse_tracking)
@@ -516,6 +578,63 @@ mod tests {
     }
 
     #[test]
+    fn logs_current_match_is_visibly_distinct() {
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let lines = [PipeLine {
+            text: "00:00:00.000 out: before needle after".to_string(),
+            marker: false,
+            source: Some((1, 0)),
+            content_offset: 18,
+            highlight: Some((25, 31)),
+            selection: None,
+        }];
+        terminal
+            .draw(|frame| {
+                render_project(
+                    frame,
+                    &[],
+                    None,
+                    Some(&lines),
+                    ConsoleViewState {
+                        pane: ConsolePaneKind::Pipe,
+                        ..ConsoleViewState::default()
+                    },
+                    "Logs · demo · search: /needle · 1/1",
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::REVERSED) && cell.symbol() == "n")
+        );
+    }
+
+    #[test]
+    fn logs_mouse_selection_is_rendered_as_selected_text() {
+        let line = PipeLine {
+            text: "select me".to_string(),
+            marker: false,
+            source: Some((1, 0)),
+            content_offset: 0,
+            highlight: None,
+            selection: Some((0, 6)),
+        };
+        let styled = styled_pipe_line(&line);
+
+        assert!(
+            styled.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(styled.spans[0].content, "select");
+    }
+
+    #[test]
     fn copy_mode_positions_the_terminal_owned_keyboard_cursor() {
         let backend = ratatui::backend::TestBackend::new(40, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -561,13 +680,75 @@ mod tests {
                 warning: None,
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
+                search_editing: false,
+                search_active: false,
+                logs_selection: false,
             },
             false,
         );
 
         assert!(text.contains("FOCUS: PROCESSES"), "{text}");
-        assert!(text.contains("NOT FOLLOWING"), "{text}");
-        assert!(text.contains("j/k or ↑↓: select"), "{text}");
+        assert!(text.contains("PAUSED"), "{text}");
+        assert!(text.contains("j/k: select"), "{text}");
+    }
+
+    #[test]
+    fn search_footer_always_shows_submit_and_cancel_actions() {
+        let text = footer_text(
+            ConsoleViewState {
+                search_editing: true,
+                warning: Some(ConsoleWarning::LogsCommandOnly),
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+
+        assert!(text.contains("MODE: SEARCH"), "{text}");
+        assert!(text.contains("Enter: apply"), "{text}");
+        assert!(text.contains("Esc/Ctrl-C: cancel"), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
+    }
+
+    #[test]
+    fn footer_hides_match_navigation_without_an_active_search() {
+        let text = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                mode: ConsoleViewMode::Console,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+
+        assert!(!text.contains("n/N: match"), "{text}");
+
+        let active = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                mode: ConsoleViewMode::Console,
+                search_active: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(active.contains("n/N: match"), "{active}");
+    }
+
+    #[test]
+    fn logs_selection_footer_shows_copy_and_clear_actions() {
+        let text = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                mode: ConsoleViewMode::Console,
+                logs_selection: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+
+        assert!(text.contains("MODE: SELECT LOGS"), "{text}");
+        assert!(text.contains("c/y: copy"), "{text}");
+        assert!(text.contains("Esc: clear"), "{text}");
     }
 
     #[test]
@@ -579,6 +760,9 @@ mod tests {
                 warning: Some(ConsoleWarning::PasteRejected),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
+                search_editing: false,
+                search_active: false,
+                logs_selection: false,
             },
             false,
         );
@@ -596,6 +780,9 @@ mod tests {
                 warning: Some(ConsoleWarning::PasteDeliveryFailed),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
+                search_editing: false,
+                search_active: false,
+                logs_selection: false,
             },
             false,
         );
@@ -611,6 +798,9 @@ mod tests {
                 warning: Some(ConsoleWarning::ClipboardFailed),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
+                search_editing: false,
+                search_active: false,
+                logs_selection: false,
             },
             true,
         );
@@ -683,7 +873,8 @@ mod tests {
             },
             false,
         );
-        assert!(pipe_footer.contains("read-only output"), "{pipe_footer}");
+        assert!(pipe_footer.contains("↑↓/j/k: scroll"), "{pipe_footer}");
+        assert!(pipe_footer.contains("Esc: Processes"), "{pipe_footer}");
 
         let empty_footer = footer_text(
             ConsoleViewState {
@@ -700,10 +891,10 @@ mod tests {
     fn footer_makes_input_rejections_visible() {
         for (warning, needle) in [
             (ConsoleWarning::InputDisabled, "input is not enabled"),
-            (ConsoleWarning::PipeReadOnly, "pipe output is read-only"),
+            (ConsoleWarning::LogsCommandOnly, "Logs accepts commands"),
             (
                 ConsoleWarning::SelectionUnavailable,
-                "text selection is available only in a PTY console",
+                "terminal selection is available only in Terminal view",
             ),
         ] {
             let state = ConsoleViewState {

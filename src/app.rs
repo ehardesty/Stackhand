@@ -3,28 +3,31 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 
 use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll};
 use crate::geometry::TerminalGeometry;
+use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
 use crate::output::OutputViews;
 use crate::supervisor::{
     Command, ConsoleView, Consoles, ProcessSnapshot, ProjectShutdownSnapshot, ProjectSnapshot,
     SupervisorHandle,
 };
-use crate::supervisor::{Lifecycle, LivenessState};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
     ConsolePaneKind, ConsoleWarning, OuterTerminal, ProcessRowView, pane_inner, project_layout,
     render_project,
 };
 
-use self::input_batch::{coalesce_adjacent_events, collect_input_batch};
+use self::input_scheduler::InputScheduler;
 use self::resize::PendingResize;
 
-mod input_batch;
+mod input_scheduler;
 mod resize;
+mod view_model;
+
+use view_model::{process_rows, selected_header};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
@@ -138,10 +141,18 @@ fn run_event_loop(
     // One scroll view per Process, so scrolling or re-following one pane
     // never changes another Process's view. Resized with the snapshot.
     let mut pipe_scroll: Vec<Option<PipeScroll>> = Vec::new();
+    // Logs representation, search, and navigation belong to each Process.
+    // Terminal viewport and selection remain in that Process's Ghostty state.
+    let mut log_views: Vec<LogView> = Vec::new();
+    // The selected idle Logs view reuses its immutable retained snapshot.
+    // Wheel input changes only view state, so it must not clone all retained
+    // output. One cache avoids duplicating the Project retention budget.
+    let mut retained_view: Option<(crate::runtime::ProcessId, crate::output::RetainedOutput)> =
+        None;
     let mut last_project_snapshot: Option<ProjectSnapshot> = None;
     let mut shutting_down = false;
     let mut dirty = true;
-    let mut pending_input_event: Option<Event> = None;
+    let input = InputScheduler::start()?;
 
     loop {
         if console.poll_requests() {
@@ -167,6 +178,7 @@ fn run_event_loop(
         last_project_snapshot = Some(snapshot.clone());
         selected = selected.min(snapshot.processes.len() - 1);
         pipe_scroll.resize(snapshot.processes.len(), None);
+        log_views.resize_with(snapshot.processes.len(), LogView::default);
         if console.apply_selection_moves(&mut selected, snapshot.processes.len()) {
             dirty = true;
         }
@@ -191,7 +203,26 @@ fn run_event_loop(
             });
         }
         let selected_process = &snapshot.processes[selected];
-        let pane = selected_pane(consoles, outputs, selected_process);
+        let has_terminal = selected_process.terminal_mode == crate::model::TerminalMode::Pty;
+        let output = outputs
+            .for_process_id(selected_process.process_id)
+            .expect("the Logs registry covers every configured Process");
+        let known_generation = retained_view
+            .as_ref()
+            .filter(|(process_id, _)| *process_id == selected_process.process_id)
+            .map(|(_, retained)| retained.generation);
+        if let Some(changed) = output.snapshot_if_changed(known_generation) {
+            retained_view = Some((selected_process.process_id, changed));
+        }
+        let retained = &retained_view
+            .as_ref()
+            .expect("the first Logs snapshot is always returned")
+            .1;
+        if log_views[selected].refresh(retained) {
+            dirty = true;
+        }
+        let representation = log_views[selected].representation(has_terminal);
+        let pane = selected_pane(consoles, selected_process, representation, retained);
         match &pane {
             SelectedPane::Terminal(view) => drain_console_events(&mut console, view, &mut dirty),
             SelectedPane::Pipe(retained) => {
@@ -221,31 +252,15 @@ fn run_event_loop(
             dirty = true;
         }
 
-        let console_snapshot = match &pane {
-            SelectedPane::Terminal(view) => view.snapshot(),
-            SelectedPane::Pipe(_) | SelectedPane::Empty => None,
-        };
-        let mut pipe_window: Vec<crate::tui::PipeLine> = Vec::new();
-        let (terminal_snapshot, pipe_lines) = match &pane {
-            SelectedPane::Terminal(_) => {
-                console.set_pane(ConsolePaneKind::Terminal);
-                (console_snapshot.as_ref(), None)
-            }
-            SelectedPane::Pipe(retained) => {
+        match &pane {
+            SelectedPane::Terminal(_) => console.set_pane(ConsolePaneKind::Terminal),
+            SelectedPane::Pipe(_) => {
                 console.set_pane(ConsolePaneKind::Pipe);
-                let pane_rows = console_pane.height.saturating_sub(2).max(1) as usize;
-                let scroll = &pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
+                let scroll = pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
                 console.set_following(scroll.following());
-                pipe_window.clear();
-                pipe_window
-                    .extend(retained.display_lines(pane_rows.saturating_add(scroll.offset())));
-                (None, Some(scroll.window(&pipe_window, pane_rows)))
             }
-            SelectedPane::Empty => {
-                console.set_pane(ConsolePaneKind::Empty);
-                (None, None)
-            }
-        };
+            SelectedPane::Empty => console.set_pane(ConsolePaneKind::Empty),
+        }
         if dirty
             || matches!(
                 &pane,
@@ -253,78 +268,73 @@ fn run_event_loop(
             )
         {
             dirty = false;
+            // Terminal snapshots and formatted Logs lines exist only for a
+            // frame that will be drawn. Mouse-motion input that changes no
+            // view state must not rebuild retained output.
+            let console_snapshot = match &pane {
+                SelectedPane::Terminal(view) => view.snapshot(),
+                SelectedPane::Pipe(_) | SelectedPane::Empty => None,
+            };
+            let mut pipe_window: Vec<crate::tui::PipeLine> = Vec::new();
+            let (terminal_snapshot, pipe_lines) = match &pane {
+                SelectedPane::Terminal(_) => (console_snapshot.as_ref(), None),
+                SelectedPane::Pipe(retained) => {
+                    let pane_rows = console_pane.height.saturating_sub(2).max(1) as usize;
+                    let scroll = pipe_scroll[selected].get_or_insert_with(PipeScroll::default);
+                    pipe_window.extend_from_slice(scroll.window(retained, pane_rows));
+                    console.set_following(scroll.following());
+                    if let Some(current) = log_views[selected].current_match()
+                        && let Some(line) = pipe_window
+                            .iter_mut()
+                            .find(|line| line.source == Some((current.sequence, current.line)))
+                    {
+                        line.highlight = Some((
+                            line.content_offset + current.start,
+                            line.content_offset + current.end,
+                        ));
+                    }
+                    (None, Some(pipe_window.as_slice()))
+                }
+                SelectedPane::Empty => (None, None),
+            };
             let rows = process_rows(&snapshot, selected);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
+            let view_label = match representation {
+                OutputRepresentation::Terminal => "Terminal",
+                OutputRepresentation::Logs => "Logs",
+            };
+            header.insert_str(0, &format!("{view_label} · "));
+            if let Some(status) = log_views[selected].status() {
+                if log_views[selected].is_editing() {
+                    header.insert_str(0, &format!("{status} · "));
+                } else {
+                    header.push_str(&format!(" · {status}"));
+                }
+            }
             if shutting_down {
                 header.insert_str(0, "Project shutdown in progress · ");
             }
-            let pane = render_frame(
-                outer,
-                &rows,
-                terminal_snapshot,
-                pipe_lines,
-                console.view(),
-                &header,
-            )?;
+            let mut view = console.view();
+            view.search_editing = log_views[selected].is_editing();
+            view.search_active = log_views[selected].has_search();
+            view.logs_selection = pipe_scroll[selected]
+                .as_ref()
+                .is_some_and(PipeScroll::has_selection);
+            let pane = render_frame(outer, &rows, terminal_snapshot, pipe_lines, view, &header)?;
             console_pane = pane;
             let cursor = terminal_snapshot.and_then(|snap| snap.cursor);
             outer.set_cursor_shape(cursor)?;
         }
 
-        let first_input_event = if let Some(event) = pending_input_event.take() {
-            event
-        } else {
-            if !event::poll(pending_resize.poll_interval(Instant::now()))? {
-                continue;
-            }
-            event::read()?
-        };
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (list_area, console_area, _) = project_layout(
-            ratatui::layout::Rect::new(0, 0, cols, rows),
-            snapshot.processes.len(),
-        );
-        let mode = console.view().mode;
-        let (input_events, deferred_event) = collect_input_batch(
-            first_input_event,
-            list_area,
-            console_area,
-            |mouse| {
-                if mode != crate::tui::ConsoleViewMode::Console
-                    || !selected_process.input_focused
-                    || mouse
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::SHIFT)
-                {
-                    return true;
-                }
-                match &pane {
-                    SelectedPane::Terminal(view) => !view.mouse_tracking(),
-                    SelectedPane::Pipe(_) | SelectedPane::Empty => true,
-                }
-            },
-            || {
-                if event::poll(Duration::ZERO)? {
-                    Ok(Some(event::read()?))
-                } else {
-                    Ok(None)
-                }
-            },
-        )?;
-        pending_input_event = deferred_event;
-        let can_coalesce_wheels = mode != crate::tui::ConsoleViewMode::Console
-            || !selected_process.input_focused
-            || !matches!(&pane, SelectedPane::Terminal(_));
-        let input_actions = if can_coalesce_wheels {
-            coalesce_adjacent_events(input_events)
-        } else {
-            input_events.into_iter().map(|event| (event, 1)).collect()
-        };
+        let input_batch = input.receive(pending_resize.poll_interval(Instant::now()))?;
+        if input_batch.is_empty() {
+            continue;
+        }
 
-        for (input_event, repeats) in input_actions {
+        for (input_event, repeats) in input_batch {
             match input_event {
                 Event::Key(key)
-                    if key.kind == KeyEventKind::Press && is_quit(key, console.view()) =>
+                    if should_quit(key, console.view(), log_views[selected].is_editing()) =>
                 {
                     if !shutting_down {
                         supervisor.command(Command::Shutdown {
@@ -334,43 +344,104 @@ fn run_event_loop(
                         dirty = true;
                     }
                 }
-                Event::Key(key) => match &pane {
-                    SelectedPane::Terminal(view) => {
-                        // The pane key seam is the one production boundary that
-                        // decides whether the event reaches the PTY child:
-                        // focused input enabled, or it is rejected visibly.
-                        let changed = view.with(|session| {
-                            console.route_pane_key(
-                                ConsolePaneKind::Terminal,
-                                selected_process.input_focused,
-                                key,
-                                Some(session),
-                                &mut pipe_scroll[selected],
-                                console_pane.height.saturating_sub(2).max(1),
-                            )
-                        });
-                        if changed.unwrap_or(false) {
+                Event::Key(key) => {
+                    let action = log_views[selected].handle_key(
+                        key,
+                        console.view().mode == crate::tui::ConsoleViewMode::ProcessList,
+                        has_terminal,
+                        retained,
+                    );
+                    if action != LogViewAction::Ignored {
+                        console.clear_warning();
+                    }
+                    match action {
+                        LogViewAction::Changed => dirty = true,
+                        LogViewAction::Pause => {
+                            let scroll = pipe_scroll[selected].get_or_insert_default();
+                            scroll.clear_selection();
+                            scroll.pause();
+                            console.set_following(false);
                             dirty = true;
                         }
-                    }
-                    SelectedPane::Pipe(_) | SelectedPane::Empty => {
-                        let kind = match &pane {
-                            SelectedPane::Pipe(_) => ConsolePaneKind::Pipe,
-                            _ => ConsolePaneKind::Empty,
-                        };
-                        let changed = console.route_pane_key(
-                            kind,
-                            selected_process.input_focused,
-                            key,
-                            None,
-                            &mut pipe_scroll[selected],
-                            console_pane.height.saturating_sub(2).max(1),
-                        );
-                        if changed {
+                        LogViewAction::Follow => {
+                            pipe_scroll[selected].get_or_insert_default().follow();
+                            console.set_following(true);
                             dirty = true;
                         }
+                        LogViewAction::ShowMatch(found) => {
+                            pipe_scroll[selected]
+                                .get_or_insert_default()
+                                .show_source((found.sequence, found.line));
+                            console.set_following(false);
+                            dirty = true;
+                        }
+                        LogViewAction::Copy => {
+                            let rows = console_pane.height.saturating_sub(2).max(1) as usize;
+                            let scroll = pipe_scroll[selected].get_or_insert_default();
+                            let text = scroll.selected_text(retained).unwrap_or_else(|| {
+                                scroll
+                                    .window(retained, rows)
+                                    .iter()
+                                    .map(|line| line.text.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            });
+                            console.copy_logs(text);
+                            dirty = true;
+                        }
+                        LogViewAction::Ignored => match &pane {
+                            SelectedPane::Terminal(view) => {
+                                // This seam decides whether a key reaches the child.
+                                let changed = view.with(|session| {
+                                    console.route_pane_key(
+                                        ConsolePaneKind::Terminal,
+                                        selected_process.input_focused,
+                                        key,
+                                        Some(session),
+                                        &mut pipe_scroll[selected],
+                                        console_pane.height.saturating_sub(2).max(1),
+                                    )
+                                });
+                                if changed.unwrap_or(false) {
+                                    dirty = true;
+                                }
+                            }
+                            SelectedPane::Pipe(_) | SelectedPane::Empty => {
+                                let kind = match &pane {
+                                    SelectedPane::Pipe(_) => ConsolePaneKind::Pipe,
+                                    _ => ConsolePaneKind::Empty,
+                                };
+                                if console.route_pane_key(
+                                    kind,
+                                    selected_process.input_focused,
+                                    key,
+                                    None,
+                                    &mut pipe_scroll[selected],
+                                    console_pane.height.saturating_sub(2).max(1),
+                                ) {
+                                    dirty = true;
+                                }
+                            }
+                        },
                     }
-                },
+                }
+                Event::Paste(data) if log_views[selected].is_editing() => {
+                    console.clear_warning();
+                    match log_views[selected].paste_search(&data, retained) {
+                        LogViewAction::ShowMatch(found) => {
+                            pipe_scroll[selected]
+                                .get_or_insert_default()
+                                .show_source((found.sequence, found.line));
+                            console.set_following(false);
+                        }
+                        LogViewAction::Ignored
+                        | LogViewAction::Changed
+                        | LogViewAction::Pause
+                        | LogViewAction::Follow
+                        | LogViewAction::Copy => {}
+                    }
+                    dirty = true;
+                }
                 Event::Paste(data) => match &pane {
                     SelectedPane::Terminal(view)
                         if console.accepts_child_input(selected_process.input_focused) =>
@@ -444,7 +515,7 @@ fn run_event_loop(
 fn handle_app_mouse(
     console: &mut ConsoleInteraction,
     mouse: MouseEvent,
-    pane: &SelectedPane,
+    pane: &SelectedPane<'_>,
     selected: &mut usize,
     child_tracks_mouse: bool,
     repeats: usize,
@@ -519,9 +590,12 @@ fn handle_app_mouse(
             if mouse_starts_console_focus(mouse.kind, console.view().mode) {
                 console.focus_console(None);
             }
-            (0..repeats).fold(false, |changed, _| {
-                console.handle_read_only_mouse(mouse, &mut pipe_scroll[*selected]) || changed
-            }) || mouse_changes_focus(mouse.kind)
+            console.handle_read_only_mouse(
+                mouse,
+                console_inner,
+                repeats,
+                &mut pipe_scroll[*selected],
+            ) || mouse_changes_focus(mouse.kind)
         }
         SelectedPane::Empty => {
             if mouse_changes_focus(mouse.kind) {
@@ -561,32 +635,30 @@ fn process_row_at(list: ratatui::layout::Rect, row: u16, process_count: usize) -
 /// terminal session; a pipe Process owns nothing to focus, so its pane
 /// renders the Process's retained output — which spans Runs, so it stays
 /// visible after a Run ends.
-enum SelectedPane {
+enum SelectedPane<'a> {
     Terminal(ConsoleView),
-    Pipe(crate::output::RetainedOutput),
+    Pipe(&'a crate::output::RetainedOutput),
     Empty,
 }
 
-fn selected_pane(
+fn selected_pane<'a>(
     consoles: &Consoles,
-    outputs: &OutputViews,
     process: &ProcessSnapshot,
-) -> SelectedPane {
-    match process.terminal_mode {
-        crate::model::TerminalMode::Pty => {
-            let Some(run_id) = process.current_run else {
-                return SelectedPane::Empty;
-            };
-            match consoles.view_process(process.process_id, run_id) {
-                Some(view) => SelectedPane::Terminal(view),
-                None => SelectedPane::Empty,
-            }
-        }
-        crate::model::TerminalMode::Pipe => match outputs.for_process_id(process.process_id) {
-            Some(module) => SelectedPane::Pipe(module.snapshot()),
-            None => SelectedPane::Empty,
-        },
+    representation: OutputRepresentation,
+    retained: &'a crate::output::RetainedOutput,
+) -> SelectedPane<'a> {
+    if representation == OutputRepresentation::Logs
+        || process.terminal_mode == crate::model::TerminalMode::Pipe
+    {
+        return SelectedPane::Pipe(retained);
     }
+    let Some(run_id) = process.current_run else {
+        return SelectedPane::Empty;
+    };
+    consoles
+        .view_process(process.process_id, run_id)
+        .map(SelectedPane::Terminal)
+        .unwrap_or(SelectedPane::Empty)
 }
 
 fn drain_console_events(console: &mut ConsoleInteraction, view: &ConsoleView, dirty: &mut bool) {
@@ -607,173 +679,6 @@ fn drain_console_events(console: &mut ConsoleInteraction, view: &ConsoleView, di
             // the structured exit state visible.
             TerminalEvent::Exited | TerminalEvent::StateChanged => *dirty = true,
         }
-    }
-}
-
-fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
-    snapshot
-        .processes
-        .iter()
-        .enumerate()
-        .map(|(index, process)| ProcessRowView {
-            name: process.name.clone(),
-            status: status_label(process),
-            cpu: process
-                .metrics
-                .map(|metrics| format_cpu(metrics.cpu_percent)),
-            memory: process.metrics.map(|metrics| format_rss(metrics.rss_kib)),
-            selected: index == selected,
-        })
-        .collect()
-}
-
-/// A compact CPU column: one decimal place at most, no more precision than
-/// the sample claims.
-fn format_cpu(percent: f64) -> String {
-    if percent >= 10.0 {
-        format!("{}%", percent.round())
-    } else {
-        format!("{percent:.1}%")
-    }
-}
-
-/// A compact resident-memory column in powers of 1024.
-fn format_rss(kib: u64) -> String {
-    const MIB: u64 = 1024;
-    const GIB: u64 = 1024 * MIB;
-    match kib {
-        0 => "0".to_string(),
-        value if value < MIB => format!("{kib}K"),
-        value if value < GIB => format!("{}M", value / MIB),
-        value => format!("{:.1}G", value as f64 / GIB as f64),
-    }
-}
-
-/// Project structured lifecycle state into the concise row label. The label
-/// is a projection; the snapshot remains the authority.
-fn status_label(process: &ProcessSnapshot) -> String {
-    if !process.enabled {
-        return "Disabled".to_string();
-    }
-    if process.lifecycle == Lifecycle::Done {
-        return "Done".to_string();
-    }
-    // A liveness failure is a health result while the Run remains active.
-    // Controlled recovery uses Stopping or RestartBackoff instead.
-    if process.lifecycle == Lifecycle::Running
-        && process
-            .liveness
-            .as_ref()
-            .is_some_and(|liveness| liveness.state == LivenessState::Failing)
-    {
-        return "Unhealthy".to_string();
-    }
-    // A failure stays visible while the Process is not mid-shutdown or
-    // waiting through an automatic restart delay. Those states project their
-    // own reason into the label.
-    if !matches!(
-        process.lifecycle,
-        Lifecycle::Stopping | Lifecycle::RestartBackoff
-    ) && let Some(failure) = &process.failure
-    {
-        return format!("Failed ({})", short_reason(&failure.detail));
-    }
-    match process.lifecycle {
-        // Done returns above; this arm keeps the match exhaustive.
-        Lifecycle::Done | Lifecycle::Idle | Lifecycle::Stopped => "Stopped".to_string(),
-        Lifecycle::Starting => "Starting".to_string(),
-        Lifecycle::Running => "Ready".to_string(),
-        Lifecycle::Waiting => match &process.blocked_reason {
-            Some(reason) => format!("Waiting ({})", short_reason(reason)),
-            None => "Waiting".to_string(),
-        },
-        Lifecycle::Stopping => {
-            if let Some(failure) = &process.failure {
-                format!("Stopping ({})", short_reason(&failure.detail))
-            } else {
-                "Stopping".to_string()
-            }
-        }
-        Lifecycle::RestartBackoff => match &process.restart_backoff {
-            Some(backoff) => format!("Restarting ({})", short_reason(&backoff.reason)),
-            None => "Restarting".to_string(),
-        },
-    }
-}
-
-/// A bounded, character-safe reason for one row.
-fn short_reason(detail: &str) -> String {
-    let mut truncated: String = detail.chars().take(40).collect();
-    if detail.chars().count() > 40 {
-        truncated.push('…');
-    }
-    truncated
-}
-
-/// Project the selected Process into the console pane's header: name, the
-/// live Run identity and PID when one exists, the concise status label,
-/// the Run's age and compact metrics when sampled, and the bounded
-/// diagnostic (a blocked reason or failure detail) when one is present.
-/// The header is a projection of the immutable Supervisor snapshot.
-fn selected_header(process: &ProcessSnapshot, now_ms: u64) -> String {
-    let mut header = process.name.clone();
-    if let Some(run_id) = process.current_run {
-        header.push_str(&format!(" · run {run_id}"));
-    }
-    if let Some(pid) = process.root_pid {
-        header.push_str(&format!(" · PID {pid}"));
-    }
-    header.push_str(&format!(" · {}", status_label(process)));
-    let budget = &process.automatic_restart_budget;
-    if budget.automatic_retries_used > 0 || budget.exhausted {
-        header.push_str(&format!(
-            " · automatic retries {}/{}",
-            budget.automatic_retries_used, budget.max_restarts
-        ));
-    }
-    if let Some(started_at_ms) = process.run_started_at_ms {
-        let age_ms = now_ms.saturating_sub(started_at_ms);
-        header.push_str(&format!(" · {}", format_age(age_ms)));
-    }
-    if let Some(metrics) = &process.metrics {
-        header.push_str(&format!(" · {}", format_rss(metrics.rss_kib)));
-        header.push_str(&format!(" · {} CPU", format_cpu(metrics.cpu_percent)));
-    }
-    if process.lifecycle == Lifecycle::Waiting {
-        if let Some(reason) = &process.blocked_reason {
-            header.push_str(&format!(" · {reason}"));
-        }
-    } else if process.lifecycle == Lifecycle::RestartBackoff {
-        if let Some(backoff) = &process.restart_backoff {
-            header.push_str(&format!(
-                " · {} · next restart at {}ms",
-                backoff.reason, backoff.next_attempt_at_ms
-            ));
-        }
-    } else if let Some(readiness) = &process.readiness {
-        if let Some(last_error) = &readiness.last_error {
-            header.push_str(&format!(
-                " · readiness attempt {}: {}",
-                readiness.attempts,
-                short_reason(last_error)
-            ));
-        }
-    } else if process.lifecycle != Lifecycle::Stopping
-        && let Some(failure) = &process.failure
-    {
-        header.push_str(&format!(" · {}", short_reason(&failure.detail)));
-    }
-    header
-}
-
-/// A compact Run age: seconds under a minute, then whole minutes.
-fn format_age(age_ms: u64) -> String {
-    let seconds = age_ms / 1000;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else {
-        let minutes = seconds / 60;
-        format!("{minutes}m{}s", seconds % 60)
     }
 }
 
@@ -800,6 +705,15 @@ fn render_frame(
         })
         .map_err(|error| anyhow!("render failed: {error}"))?;
     pane.ok_or_else(|| anyhow!("the frame did not render"))
+}
+
+fn should_quit(key: KeyEvent, view: crate::tui::ConsoleViewState, search_editing: bool) -> bool {
+    key.kind == KeyEventKind::Press
+        && is_quit(key, view)
+        && (!search_editing
+            || key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL))
 }
 
 fn is_quit(key: KeyEvent, view: crate::tui::ConsoleViewState) -> bool {

@@ -399,7 +399,11 @@ processes:
       cosmos-init: completed_successfully
 ```
 
-Existing `run.sh` and `prepare.sh` scripts remain valid processes. The tool should improve orchestration incrementally rather than requiring immediate declarative decomposition.
+Existing `run.sh` and `prepare.sh` scripts remain valid during migration and as
+fallback commands. The normal validated workflow SHOULD move their generic
+startup coordination into visible Processes, Dependencies, probes, and
+One-shots. Quadrant-specific initialization scripts remain ordinary commands;
+their behavior does not belong in the Stackhand core.
 
 ---
 
@@ -429,6 +433,13 @@ The core differentiator is:
 ---
 
 ## 36. Change history
+
+### Revision 5 — 2026-08-28
+
+Clarified the boundary between generic Process coordination and
+Project-specific commands. Quadrant remains a real-world validation case, but
+its application-specific initialization and validation do not become
+Stackhand features.
 
 ### Revision 4 — 2026-08-24
 

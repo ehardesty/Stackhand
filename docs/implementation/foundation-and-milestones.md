@@ -35,7 +35,8 @@ The current working baseline is:
 - a project-owned safe terminal adapter;
 - an event-driven supervisor with immutable UI snapshots;
 - per-process output histories and per-Run terminal sessions outside the lifecycle control queue;
-- macOS and Linux as the first prototype runtime targets;
+- macOS as the current real-world prototype target;
+- Linux in a dedicated portability and validation milestone;
 - Windows after explicit ConPTY, Job Object, input, shutdown, and packaging validation.
 
 These are implementation choices for the current plan. Any change that alters a normative contract in the companion specification requires a specification revision.
@@ -336,12 +337,19 @@ Add and test:
 - richer probe diagnostics;
 - cancellation of all run-scoped tasks.
 
-### Milestone 3 — hooks and configuration extensibility
+Evidence and the macOS-scoped go recommendation are recorded in
+[Milestone 2 validation](milestone-2-validation.md).
+
+### Milestone 3 — declarative Projects and real-world macOS use
+
+Make Stackhand useful for daily development with one complex real Project.
+Use Quadrant to validate the generic product model. Do not add
+Quadrant-specific behavior to Stackhand.
 
 Add:
 
-- bounded lifecycle hooks;
-- hook output/run markers;
+- base Project discovery from the current directory and its parents;
+- explicit Project paths that disable base-file discovery;
 - local override discovery;
 - named profiles applied in CLI order;
 - deterministic merge rules;
@@ -350,7 +358,49 @@ Add:
 - effective graph validation after merge;
 - source-aware configuration diagnostics.
 
-### Milestone 4 — output and observability polish
+Create and exercise a representative Project configuration in
+`alyzenmed/QUADRANT`. Use generic Stackhand features to replace startup scripts
+that only coordinate Processes. The normal workflow should use:
+
+- direct commands for Services and One-shots;
+- HTTP, TCP, exec, log, and composite probes;
+- Dependencies for startup ordering;
+- One-shots for visible initialization and smoke checks;
+- restart rules and controlled Project shutdown;
+- environment files and inline environment values;
+- profiles for common development modes;
+- explicit shell configuration only when a command requires a shell.
+
+Keep Quadrant-specific work in Quadrant commands or scripts. Stackhand must not
+gain built-in knowledge of Docker Compose, Azure Functions, Service Bus,
+Azurite, Cosmos, or other parts of the validation Project. Running one of those
+tools as an ordinary command does not make it part of the Stackhand model.
+
+Prototype bounded lifecycle hooks only if the real Project shows a generic
+lifecycle need that a Service, One-shot, Dependency, probe, restart rule,
+profile, or local override cannot represent cleanly. If hooks are necessary,
+bound their runtime and output, and add visible Run markers.
+
+Milestone 3 is complete when:
+
+- a developer can start the normal local Quadrant workflow with Stackhand on
+  the validated macOS host;
+- that workflow does not call `emulators/run.sh` or `emulators/prepare.sh` for
+  generic startup coordination;
+- required initialization remains visible as One-shots;
+- optional Processes can start without editing the base Project file;
+- failed probes and blocked Dependencies identify the failed condition;
+- stopping Stackhand cleans up its Process Trees, and supervised commands stop
+  the external services that they started;
+- direct commands do not depend on the user's login shell; and
+- Quadrant-specific initialization remains outside the Stackhand core.
+
+Keep the old helper scripts during initial validation. Simplify or remove them
+only after the declarative workflow gives equivalent behavior.
+
+### Milestone 4A — automated UX and observability foundation
+
+Build and verify the behavior that does not require human judgment.
 
 Add or improve:
 
@@ -366,24 +416,69 @@ Add or improve:
 - keyboard selection mode;
 - terminal/log copy polish.
 
-### Milestone 5 — Quadrant prototype validation
+Use deterministic fixtures, scripted input, terminal snapshots, synthetic
+output pressure, resource measurements, and cleanup checks. Verify:
 
-Create and exercise a representative configuration in `alyzenmed/QUADRANT`.
+- search results and next/previous navigation;
+- timestamps and stream labels;
+- memory and line-length limits;
+- invalid UTF-8 normalization;
+- aggregate Process Tree metrics;
+- control responsiveness during output flood;
+- history truncation state and warnings;
+- terminal scrollback compression;
+- keyboard selection state transitions; and
+- copied text across wrapped lines and continued output.
+
+Milestone 4A is complete when the automated acceptance suite passes and no
+known correctness or resource-bound defect remains in scope. It does not claim
+that the UX is clear or comfortable for a human user.
+
+### Milestone 4B — human daily-use UX validation
+
+Have a human use Stackhand during representative Quadrant development
+sessions. Validate:
+
+- whether Terminal and Logs views are easy to understand and switch;
+- whether search is easy to discover and operate;
+- whether the current match and navigation direction are clear;
+- whether keyboard selection feels natural;
+- whether copied text matches the user's intent;
+- whether truncation and failure warnings are useful without excessive noise;
+- whether metrics help without reducing console readability;
+- whether control remains comfortable during noisy output; and
+- whether the UI remains usable in narrow and small terminals.
+
+Fix high-frequency friction found during these sessions when the fix stays
+inside the accepted product model. A new configuration or lifecycle concept
+requires separate review before implementation.
+
+Milestone 4B is complete when the human validation record lists the scenarios,
+observed friction, completed fixes, deliberate deferrals, and a human go or
+no-go recommendation for continued daily use.
+
+Do not add configuration or lifecycle concepts only to fix a Quadrant-specific
+problem. Keep domain-specific work in Project commands and scripts.
+
+### Milestone 5 — Linux portability and validation
+
+Run the same lifecycle, terminal, configuration, and cleanup acceptance suite
+on the selected Linux targets.
 
 Confirm:
 
-- default API/web/emulator workflow;
-- opt-in worker/functions processes;
-- long emulator startup;
-- HTTP/TCP readiness;
-- storage/Cosmos oneshot initialization gating;
-- failure diagnostics;
-- interactive console quality;
-- output search;
-- project-wide shutdown and cleanup;
-- local profile/overlay behavior.
+- pipe and PTY Process Tree ownership;
+- signal and shutdown behavior;
+- keyboard, mouse, paste, focus, and resize behavior;
+- readiness, liveness, restart, and Dependency behavior;
+- profile, local override, environment, and path behavior;
+- direct-command behavior with non-POSIX login shells;
+- aggregate Process Tree metrics;
+- clean contributor builds and packaged artifacts; and
+- real Project startup and cleanup where the required services are available.
 
-Do not force all existing scripts into declarative processes if doing so would require core bloat.
+Fix Linux-specific defects found by this work. Do not describe Linux as
+validated until the selected targets pass the applicable acceptance suite.
 
 ### Milestone 6 — Windows validation spike and implementation
 

@@ -3,7 +3,9 @@ use std::sync::mpsc::Sender as CompletionSender;
 use anyhow::{Result, anyhow};
 use libghostty_vt::key;
 use libghostty_vt::render::RenderState;
-use libghostty_vt::terminal::{ScrollViewport, Terminal};
+use libghostty_vt::terminal::{
+    CompressionActivity, CompressionMode, CompressionResult, ScrollViewport, Terminal,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 
@@ -49,6 +51,16 @@ impl TerminalState {
             focused: true,
             geometry,
         })
+    }
+
+    pub fn compression_activity(&self) -> Result<CompressionActivity> {
+        Ok(self.terminal.compression_activity()?)
+    }
+
+    /// Perform one Ghostty-bounded idle compression step. Logical terminal
+    /// content and the viewport do not change.
+    pub fn compress_scrollback(&mut self) -> Result<CompressionResult> {
+        Ok(self.terminal.compress(CompressionMode::Incremental)?)
     }
 
     pub fn apply_command(

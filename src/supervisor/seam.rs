@@ -114,6 +114,7 @@ pub enum SeamEvent {
         run_id: RunId,
         cpu_percent: f64,
         rss_kib: u64,
+        best_effort: bool,
     },
     /// One bounded readiness attempt finished for the current Run. `passing`
     /// is true only when the probe succeeded; a failure carries one bounded

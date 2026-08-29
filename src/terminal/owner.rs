@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::TryRecvError;
 use libghostty_vt::terminal::{
-    ClipboardWrite, ClipboardWriteError, Options as TerminalOptions, Terminal,
+    ClipboardWrite, ClipboardWriteError, CompressionResult, Options as TerminalOptions, Terminal,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -30,6 +30,7 @@ const INPUT_WORK_BUDGET: usize = super::command_gate::COMMAND_QUEUE_SLOTS;
 const EFFECT_BUFFER_BYTES: usize = 256 * 1_024;
 const OWNER_EVENT_SLOTS: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
+const SCROLLBACK_COMPRESSION_IDLE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum OwnerEvent {
@@ -321,6 +322,9 @@ fn run_owner(
     let mut pending_input: Option<PendingInput> = None;
     let mut pending_effect: Option<Vec<u8>> = None;
     let mut next_selection_tick = Instant::now() + SELECTION_AUTOSCROLL_INTERVAL;
+    let mut compression_activity = state.compression_activity().ok();
+    let mut compression_complete = false;
+    let mut compression_due = Instant::now() + SCROLLBACK_COMPRESSION_IDLE;
 
     while !shared.shutdown.load(Ordering::Acquire) {
         let mut did_work = false;
@@ -393,9 +397,23 @@ fn run_owner(
         }
 
         if did_work {
+            // Output, input, selection, and effects always take priority.
+            // A changed Ghostty activity token restarts the idle delay.
+            let activity = state.compression_activity().ok();
+            if activity != compression_activity {
+                compression_activity = activity;
+                compression_complete = false;
+            }
+            compression_due = Instant::now() + SCROLLBACK_COMPRESSION_IDLE;
             render(&mut state, shared);
             shared.record(OwnerEvent::StateChanged);
             wake();
+        } else if !compression_complete && Instant::now() >= compression_due {
+            // One incremental call is the complete maintenance turn. The next
+            // loop checks output and input again before any continuation.
+            compression_complete =
+                !matches!(state.compress_scrollback()?, CompressionResult::Pending);
+            compression_due = Instant::now() + Duration::from_millis(1);
         } else {
             thread::sleep(Duration::from_millis(1));
         }

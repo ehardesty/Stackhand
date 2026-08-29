@@ -1,8 +1,8 @@
 # Stackhand — Product and Technical Specification
 
-**Revision:** 4
+**Revision:** 5
 **Status:** Proposed north-star product and architecture specification
-**Last revised:** 2026-08-24
+**Last revised:** 2026-08-28
 **Audience:** Maintainers, contributors, designers, and reviewers
 **Product name:** Stackhand
 **Primary implementation language:** Rust

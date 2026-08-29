@@ -162,7 +162,12 @@ docker-compose.local.yml
 docs/dev/local-development-prerequisites.md
 ```
 
-Use these to validate realistic orchestration without introducing Quadrant-specific concepts into the core.
+Use these to validate realistic orchestration without introducing
+Quadrant-specific concepts into the core. Move startup ordering, probes,
+restart rules, environment loading, and shutdown coordination into generic
+configuration where the model represents them cleanly. Keep resource creation,
+application initialization, and application validation in Quadrant commands or
+scripts.
 
 ---
 
@@ -196,6 +201,18 @@ Preferred working pattern:
 ---
 
 ## 13. Change history
+
+### Revision 4 — 2026-08-29
+
+Split Milestone 4 into automated implementation and verification in Milestone
+4A, followed by real human-use validation and evidence-based UX fixes in
+Milestone 4B.
+
+### Revision 3 — 2026-08-28
+
+Moved real-world Quadrant use into Milestone 3. Made Quadrant a validation case
+for generic declarative Projects rather than a source of product-specific
+features. Moved full Linux portability and validation into Milestone 5.
 
 ### Revision 2 — 2026-08-24
 

@@ -1,3 +1,6 @@
+use super::view_model::{
+    format_age, format_cpu, format_rss, metric_precision, selected_header, status_label,
+};
 use super::*;
 
 #[test]
@@ -26,6 +29,8 @@ fn metric_and_age_labels_use_compact_units() {
     assert_eq!(format_rss(768), "768K");
     assert_eq!(format_rss(180 * 1024), "180M");
     assert_eq!(format_rss(1024 * 1024), "1.0G");
+    assert_eq!(metric_precision("12%".to_string(), true), "~12%");
+    assert_eq!(metric_precision("12%".to_string(), false), "12%");
     assert_eq!(format_age(59_000), "59s");
     assert_eq!(format_age(61_000), "1m1s");
 }
@@ -134,6 +139,8 @@ fn plain_q_quits_only_from_process_list_focus() {
     assert!(!is_quit(plain_q, console));
     assert!(is_quit(ctrl_q, list));
     assert!(is_quit(ctrl_q, console));
+    assert!(!should_quit(plain_q, list, true));
+    assert!(should_quit(ctrl_q, console, true));
 }
 
 #[test]

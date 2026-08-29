@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand, PipeScroll, SelectionMove};
+use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
 use crate::supervisor::{Command, Consoles, Lifecycle, ProcessSnapshot, SupervisorHandle};
 use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleWarning};
 
@@ -98,6 +99,56 @@ fn prove(
     // visible view (the ready banners may already have scrolled off).
     wait_for_tick(&focused_view, "tick-", 2)?;
     wait_for_tick(&mute_view, "tick-", 2)?;
+
+    // The PTY's first live output point also feeds the bounded Logs
+    // projection. Script the production Logs command interface and prove that
+    // entering search changes representation without changing Ghostty state.
+    let focused_output = outputs
+        .for_process_id(snapshot.processes[focused].process_id)
+        .ok_or_else(|| anyhow!("no Logs output module for focused"))?;
+    let logs_deadline = Instant::now() + WAIT;
+    let retained = loop {
+        let retained = focused_output.snapshot();
+        if retained.chunks.iter().any(|chunk| {
+            matches!(
+                chunk,
+                crate::output::RetainedChunk::Data {
+                    stream: crate::runtime::OutputStream::Combined,
+                    text,
+                    ..
+                } if text.contains("tick-")
+            )
+        }) {
+            break retained;
+        }
+        if Instant::now() >= logs_deadline {
+            bail!("focused PTY output did not reach Logs view");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let mut logs = LogView::default();
+    assert_eq!(
+        logs.handle_key(key(KeyCode::Char('/')), true, true, &retained),
+        LogViewAction::Pause
+    );
+    for character in "tick-".chars() {
+        logs.handle_key(key(KeyCode::Char(character)), true, true, &retained);
+    }
+    assert!(matches!(
+        logs.handle_key(key(KeyCode::Enter), true, true, &retained),
+        LogViewAction::ShowMatch(_)
+    ));
+    assert_eq!(logs.representation(true), OutputRepresentation::Logs);
+    assert!(logs.status().is_some_and(|status| status.contains("1/")));
+    assert_eq!(
+        logs.handle_key(key(KeyCode::Char('/')), false, true, &retained),
+        LogViewAction::Pause
+    );
+    logs.handle_key(key(KeyCode::Char('x')), false, true, &retained);
+    assert!(logs.status().is_some_and(|status| status.contains("/x_")));
+    logs.handle_key(key(KeyCode::Esc), false, true, &retained);
+    assert!(!logs.is_editing());
+    println!("interaction-logs-ok");
 
     // The Process list owns the keyboard at startup. Ctrl-A moves focus to
     // the selected console before child input can cross the pane-key seam.
@@ -232,7 +283,10 @@ fn prove(
         &mut pipe_scroll[piped],
         PAGE_ROWS,
     ));
-    assert_eq!(console.view().warning, Some(ConsoleWarning::PipeReadOnly));
+    assert_eq!(
+        console.view().warning,
+        Some(ConsoleWarning::LogsCommandOnly)
+    );
     console.clear_pane_warning();
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
@@ -278,10 +332,9 @@ fn prove(
         &mut pipe_scroll[piped],
         PAGE_ROWS,
     ));
-    assert_eq!(
-        pipe_scroll[piped].unwrap().offset(),
-        (PAGE_ROWS - 1) as usize,
-        "one pipe page moves the view one page above the tail"
+    assert!(
+        !pipe_scroll[piped].as_ref().unwrap().following(),
+        "one pipe page pauses the view above the tail"
     );
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
@@ -291,7 +344,7 @@ fn prove(
         &mut pipe_scroll[piped],
         PAGE_ROWS,
     ));
-    assert!(pipe_scroll[piped].unwrap().following());
+    assert!(pipe_scroll[piped].as_ref().unwrap().following());
     println!("interaction-reject-ok");
 
     // Scroll and follow are per Process view, proved across a real

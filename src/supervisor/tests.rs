@@ -544,6 +544,7 @@ fn stale_events_cannot_change_current_state() {
         run_id: RunId::new(999),
         cpu_percent: 99.0,
         rss_kib: 1 << 20,
+        best_effort: false,
     });
     h.event(SeamEvent::Finished(FinishedRun {
         process_id: ProcessId::new(99),
@@ -575,6 +576,7 @@ fn current_run_metrics_update_metadata_and_stop_clears_it() {
         run_id: RunId::new(1),
         cpu_percent: 12.5,
         rss_kib: 2048,
+        best_effort: false,
     });
 
     assert_eq!(h.process("api").metrics.map(|m| m.cpu_percent), Some(12.5));

@@ -94,7 +94,7 @@ fn process_navigation_works_before_ctrl_a_and_never_reaches_the_child() {
 #[test]
 fn applying_selection_moves_clamps_and_preserves_process_scroll() {
     let mut interaction = ConsoleInteraction::default();
-    interaction.warn(ConsoleWarning::PipeReadOnly);
+    interaction.warn(ConsoleWarning::LogsCommandOnly);
     interaction.selection_requests = vec![SelectionMove::Up, SelectionMove::Down];
     let mut selected = 0;
     let mut scroll = PipeScroll::default();
@@ -102,7 +102,7 @@ fn applying_selection_moves_clamps_and_preserves_process_scroll() {
 
     assert!(interaction.apply_selection_moves(&mut selected, 2));
     assert_eq!(selected, 1);
-    assert_eq!(scroll.offset(), 19);
+    assert!(!scroll.following());
     assert_eq!(interaction.view().warning, None);
 
     interaction.selection_requests = vec![SelectionMove::Down];
@@ -162,12 +162,12 @@ fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
     );
 
     assert!(interaction.handle_key_read_only(key(KeyCode::PageUp), &mut scroll, 20));
-    assert_eq!(scroll.unwrap().offset(), 19);
+    assert!(!scroll.as_ref().unwrap().following());
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
     assert!(!interaction.view().following);
 
     assert!(interaction.handle_key_read_only(key(KeyCode::Char('f')), &mut scroll, 20));
-    assert_eq!(scroll.unwrap().offset(), 0);
+    assert!(scroll.as_ref().unwrap().following());
     assert!(interaction.view().following);
 
     assert!(interaction.handle_key_read_only(leader(), &mut scroll, 20));
@@ -175,7 +175,7 @@ fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
     assert!(interaction.handle_key_read_only(key(KeyCode::Char('x')), &mut scroll, 20));
     assert_eq!(
         interaction.view().warning,
-        Some(ConsoleWarning::PipeReadOnly)
+        Some(ConsoleWarning::LogsCommandOnly)
     );
 
     assert!(interaction.handle_key_read_only(leader(), &mut scroll, 20));
@@ -184,6 +184,50 @@ fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
     assert_eq!(
         interaction.take_lifecycle_commands(),
         vec![LifecycleCommand::Stop]
+    );
+}
+
+#[test]
+fn focused_logs_support_navigation_and_a_direct_escape() {
+    let mut interaction = ConsoleInteraction::default();
+    interaction.set_pane(ConsolePaneKind::Pipe);
+    interaction.focus_console(None);
+    let mut scroll: Option<PipeScroll> = None;
+
+    for code in [
+        KeyCode::Up,
+        KeyCode::Char('k'),
+        KeyCode::Down,
+        KeyCode::Char('j'),
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Home,
+    ] {
+        assert!(
+            interaction.handle_key_read_only(key(code), &mut scroll, 20),
+            "{code:?}"
+        );
+        assert_eq!(interaction.view().warning, None, "{code:?}");
+    }
+    assert!(!scroll.as_ref().unwrap().following());
+
+    assert!(interaction.handle_key_read_only(key(KeyCode::End), &mut scroll, 20));
+    assert!(scroll.as_ref().unwrap().following());
+    assert!(interaction.view().following);
+
+    assert!(interaction.handle_key_read_only(key(KeyCode::Esc), &mut scroll, 20));
+    assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
+}
+
+#[test]
+fn empty_logs_copy_uses_a_logs_specific_recovery_message() {
+    let mut interaction = ConsoleInteraction::default();
+
+    interaction.copy_logs(String::new());
+
+    assert_eq!(
+        interaction.view().warning,
+        Some(ConsoleWarning::NoLogsToCopy)
     );
 }
 
@@ -216,6 +260,58 @@ fn copy_mode_supports_vim_navigation_and_copy_aliases() {
 
     drop(peer);
     session.shutdown().unwrap();
+}
+
+#[test]
+fn logs_mouse_drag_selects_visible_text_for_copy() {
+    let output = crate::output::OutputViews::new(1).for_process(0).unwrap();
+    output.append_at(
+        1,
+        crate::runtime::OutputStream::Stdout,
+        0,
+        b"first\nsecond\nthird\n".to_vec(),
+    );
+    let retained = output.snapshot();
+    let mut scroll = Some(PipeScroll::default());
+    scroll.as_mut().unwrap().window(&retained, 3);
+    let mut interaction = ConsoleInteraction::default();
+    interaction.set_pane(ConsolePaneKind::Pipe);
+    let area = Rect::new(5, 5, 40, 3);
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(interaction.handle_read_only_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+        area,
+        1,
+        &mut scroll,
+    ));
+    assert!(interaction.handle_read_only_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 10, 6),
+        area,
+        1,
+        &mut scroll,
+    ));
+    assert!(interaction.handle_read_only_mouse(
+        mouse(MouseEventKind::Up(MouseButton::Left), 10, 6),
+        area,
+        1,
+        &mut scroll,
+    ));
+
+    assert!(
+        scroll
+            .as_ref()
+            .unwrap()
+            .selected_text(&retained)
+            .unwrap()
+            .contains('\n')
+    );
+    assert!(!interaction.view().following);
 }
 
 #[test]

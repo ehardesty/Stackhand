@@ -147,6 +147,9 @@ fn terminal_operation_across_process_selection() {
     // All three Processes are up: two PTY Services (focused input,
     // disabled input) and one fast pipe Service.
     assert!(stdout.contains("interaction-started-ok"), "{stdout}");
+    // PTY output reaches the separate bounded Logs projection. Scripted
+    // search changes the representation and selects a retained match.
+    assert!(stdout.contains("interaction-logs-ok"), "{stdout}");
     // Input reaches the selected focused PTY through the pane key seam,
     // child Ctrl-C stays child input, and the Ctrl-A leader round-trips.
     assert!(stdout.contains("interaction-input-ok"), "{stdout}");

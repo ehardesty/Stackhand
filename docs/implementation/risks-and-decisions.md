@@ -76,7 +76,7 @@ The preferred answer format is a small proof of concept and measured behavior, n
 
 The following should be treated as current project decisions:
 
-1. macOS and Linux are the initial prototype platforms; Windows follows dedicated validation.
+1. macOS is the current real-world prototype target. Linux has a dedicated portability and validation milestone. Windows follows dedicated validation.
 2. Ratatui owns application UI.
 3. `libghostty-vt` owns terminal semantics.
 4. Ghostty integration is isolated behind an internal adapter.

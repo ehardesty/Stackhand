@@ -59,6 +59,8 @@ pub struct MetricsMetadata {
     pub run_id: u64,
     pub cpu_percent: f64,
     pub rss_kib: u64,
+    /// True when the platform could not prove complete Process Tree coverage.
+    pub best_effort: bool,
 }
 
 /// The disposition of a finished Run.

@@ -24,6 +24,9 @@ use crate::runtime::{RunEvent, RunEventKind, RunId, RunOutputObserver};
 pub enum OutputStream {
     Stdout,
     Stderr,
+    /// PTY output is one combined stream. It is used by the Logs projection,
+    /// never by the separate stdout and stderr pipe readers.
+    Combined,
 }
 
 /// One high-volume output chunk. Output bytes travel only through this path,
@@ -388,6 +391,7 @@ fn spawn_stream_reader(
     let name = match stream_kind {
         OutputStream::Stdout => "pipe-stdout",
         OutputStream::Stderr => "pipe-stderr",
+        OutputStream::Combined => unreachable!("pipe readers never use the PTY stream"),
     };
     std::thread::Builder::new()
         .name(name.to_string())

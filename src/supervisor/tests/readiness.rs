@@ -388,6 +388,7 @@ fn cancellation_records_work_identity_and_rejects_a_released_result() {
         run_id: request.run_id,
         cpu_percent: 99.0,
         rss_kib: 9999,
+        best_effort: false,
     });
     h.event(SeamEvent::OutputFailure {
         process_id: request.process_id,

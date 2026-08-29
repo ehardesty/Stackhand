@@ -117,12 +117,16 @@ impl ConsoleInteraction {
         Self::clear_pane_warnings(&mut self.view);
     }
 
+    pub fn clear_warning(&mut self) {
+        self.view.warning = None;
+    }
+
     fn clear_pane_warnings(view: &mut ConsoleViewState) {
         if matches!(
             view.warning,
             Some(
                 ConsoleWarning::InputDisabled
-                    | ConsoleWarning::PipeReadOnly
+                    | ConsoleWarning::LogsCommandOnly
                     | ConsoleWarning::SelectionUnavailable
                     | ConsoleWarning::PasteRejected
             )
@@ -294,12 +298,11 @@ impl ConsoleInteraction {
             return true;
         }
         match self.view.mode {
+            ConsoleViewMode::Console if self.view.pane == ConsolePaneKind::Pipe => {
+                self.handle_logs_focus_key(key, scroll, page_rows)
+            }
             ConsoleViewMode::Console => {
-                self.view.warning = Some(if self.view.pane == ConsolePaneKind::Pipe {
-                    ConsoleWarning::PipeReadOnly
-                } else {
-                    ConsoleWarning::InputDisabled
-                });
+                self.view.warning = Some(ConsoleWarning::InputDisabled);
                 true
             }
             ConsoleViewMode::ProcessList => {
@@ -315,6 +318,18 @@ impl ConsoleInteraction {
         }
     }
 
+    /// Copy the visible Logs projection. Logs coordinates never cross the
+    /// terminal seam, and a clipboard failure leaves the visible text intact.
+    pub fn copy_logs(&mut self, text: String) {
+        self.view.warning = if text.is_empty() {
+            Some(ConsoleWarning::NoLogsToCopy)
+        } else {
+            write_clipboard(text)
+                .err()
+                .map(|_| ConsoleWarning::ClipboardFailed)
+        };
+    }
+
     pub fn handle_paste(&mut self, data: &str, session: &TerminalHandle<'_>) {
         match session.send_paste(data) {
             Ok(request) => {
@@ -328,16 +343,49 @@ impl ConsoleInteraction {
     pub fn handle_read_only_mouse(
         &mut self,
         mouse: MouseEvent,
+        area: Rect,
+        repeats: usize,
         scroll: &mut Option<PipeScroll>,
     ) -> bool {
-        let direction = match mouse.kind {
-            MouseEventKind::ScrollUp => -1,
-            MouseEventKind::ScrollDown => 1,
-            _ => return false,
-        };
         let scroll = scroll.get_or_insert_default();
-        scroll.scroll_lines(3, direction);
-        self.view.following = scroll.following();
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                scroll.scroll_lines(3usize.saturating_mul(repeats), direction);
+                self.view.following = scroll.following();
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((row, column)) = relative_mouse_position(mouse, area) else {
+                    return false;
+                };
+                scroll.begin_selection(row, column);
+                self.view.following = scroll.following();
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((row, column)) = relative_mouse_position(mouse, area) else {
+                    return false;
+                };
+                if !scroll.update_selection(row, column) {
+                    return false;
+                }
+                self.view.following = false;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some((row, column)) = relative_mouse_position(mouse, area) else {
+                    return false;
+                };
+                if !scroll.finish_selection(row, column) {
+                    return false;
+                }
+                self.view.following = scroll.following();
+            }
+            _ => return false,
+        }
+        self.clear_warning();
         true
     }
 
@@ -399,7 +447,7 @@ impl ConsoleInteraction {
             self.view.warning = Some(ConsoleWarning::InputRejected);
             true
         } else {
-            false
+            self.view.warning.take().is_some()
         }
     }
 
@@ -450,6 +498,7 @@ impl ConsoleInteraction {
         scroll: &mut Option<PipeScroll>,
         page_rows: u16,
     ) -> bool {
+        self.clear_warning();
         match command {
             ProcessCommand::MoveSelection(direction) => self.selection_requests.push(direction),
             ProcessCommand::ScrollPage(direction) => {
@@ -467,6 +516,39 @@ impl ConsoleInteraction {
                 self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
             }
         }
+        true
+    }
+
+    fn handle_logs_focus_key(
+        &mut self,
+        key: KeyEvent,
+        scroll: &mut Option<PipeScroll>,
+        page_rows: u16,
+    ) -> bool {
+        let scroll = scroll.get_or_insert_default();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => scroll.scroll_lines(1, -1),
+            KeyCode::Down | KeyCode::Char('j') => scroll.scroll_lines(1, 1),
+            KeyCode::PageUp => scroll.scroll_page(page_rows, -1),
+            KeyCode::PageDown => scroll.scroll_page(page_rows, 1),
+            KeyCode::Home => scroll.head(),
+            KeyCode::End | KeyCode::Char('f') => scroll.follow(),
+            KeyCode::Esc if scroll.clear_selection() => {
+                self.clear_warning();
+                return true;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.focus_process_list(None);
+                self.clear_warning();
+                return true;
+            }
+            _ => {
+                self.view.warning = Some(ConsoleWarning::LogsCommandOnly);
+                return true;
+            }
+        }
+        self.view.following = scroll.following();
+        self.clear_warning();
         true
     }
 
@@ -538,6 +620,12 @@ fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEv
     !input_focused
         && view.mode == ConsoleViewMode::Console
         && !(key.kind == KeyEventKind::Press && is_focus_toggle(*key))
+}
+
+fn relative_mouse_position(mouse: MouseEvent, area: Rect) -> Option<(usize, usize)> {
+    let row = mouse.row.checked_sub(area.y)?;
+    let column = mouse.column.checked_sub(area.x)?;
+    (row < area.height && column < area.width).then_some((usize::from(row), usize::from(column)))
 }
 
 fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {

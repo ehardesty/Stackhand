@@ -171,6 +171,7 @@ fn duplicate_current_run_events_are_harmless() {
         run_id: RunId::new(1),
         cpu_percent: 12.5,
         rss_kib: 2048,
+        best_effort: false,
     };
     metrics.event(metrics_event.clone());
     let metrics_snapshot = metrics.process("api");
@@ -260,6 +261,7 @@ fn old_run_events_of_every_kind_cannot_change_a_replacement() {
         run_id: RunId::new(1),
         cpu_percent: 99.0,
         rss_kib: 9999,
+        best_effort: false,
     });
     h.event(SeamEvent::Readiness {
         process_id: ProcessId::new(0),

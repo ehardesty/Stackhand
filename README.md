@@ -25,6 +25,11 @@ terminal input, reports basic metrics, and performs controlled Project
 shutdown. It is validation software, not a supported release. See the example
 Projects and the Milestone 3 validation record for the current behavior.
 
+The next roadmap stage will make Stackhand usable with a complex real Project
+on macOS. Quadrant is the validation case. Stackhand will replace generic
+startup coordination with configuration, but it will not add
+Quadrant-specific behavior to the core.
+
 ## Build and run the Project prototype
 
 The current Ghostty revision requires Rust 1.93 or newer and Zig 0.15.2. On macOS with Homebrew:
@@ -52,7 +57,16 @@ outer terminal.
 For ready-to-run Projects and manual checks, see
 [Example Projects](./examples/README.md). For the macOS lifecycle validation record, see [Milestone 3 validation](./docs/implementation/milestone-3-validation.md).
 
-Press `v` from the Process list to enter Copy mode for a PTY console. Use
+Press `l` from the Process list to switch a PTY Process between Terminal and
+Logs view. Press `/` to open Logs search, type a case-sensitive literal, and
+press Enter. Use `n` and `N` for the next and previous retained match. Press
+`f` to return to the live tail. Logs show UTC timestamps, `out`, `err`, or
+combined `pty` stream labels, and Run boundaries. Invalid UTF-8 uses the
+standard replacement character (`�`). Long logical lines are split at 16 KiB
+with a visible continuation marker. Logs keep at most 1 MiB per Process and
+8 MiB for the Project, and show a history-limit marker after eviction.
+
+Press `v` from the Process list to enter Copy mode for a PTY Terminal view. Use
 `h`/`j`/`k`/`l` or the arrow keys to move, and press `v` again to begin the
 selection endpoint. You can also click and drag to enter Copy mode directly.
 A double click selects a word. A triple click selects a logical line. Press
