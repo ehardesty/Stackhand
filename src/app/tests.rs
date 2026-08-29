@@ -1,7 +1,11 @@
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+
+use super::interaction::{is_quit, mouse_changes_focus, mouse_starts_console_focus, should_quit};
 use super::view_model::{
     format_age, format_cpu, format_rss, metric_precision, selected_header, status_label,
 };
 use super::*;
+use crate::tui::process_row_at;
 
 #[test]
 fn shutdown_result_keeps_failures_and_remaining_pids() {

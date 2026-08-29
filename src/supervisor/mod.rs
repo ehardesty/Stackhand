@@ -33,6 +33,7 @@ mod events;
 mod exec;
 mod liveness;
 mod probe;
+mod process_lifecycle;
 mod readiness;
 mod run_record;
 mod runtime;

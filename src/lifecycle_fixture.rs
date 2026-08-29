@@ -1,10 +1,9 @@
-use crate::console::{ConsoleInteraction, LifecycleCommand, SelectionMove};
-use crate::interaction_fixture::{PAGE_ROWS, WAIT, apply_move, key, wait_for};
+use crate::app::interaction::ProjectInteraction;
+use crate::console::SelectionMove;
+use crate::interaction_fixture::{WAIT, apply_move, key, route_project_key, wait_for};
 use crate::output::OutputViews;
 use crate::output::RetainedChunk;
-use crate::process_logs::ProcessLogs;
 use crate::supervisor::{Command, Consoles, Lifecycle, RunExitDisposition, SupervisorHandle};
-use crate::tui::ConsolePaneKind;
 use anyhow::Result;
 use crossterm::event::KeyCode;
 
@@ -20,44 +19,27 @@ pub(crate) struct FixtureProcesses {
 }
 
 pub(crate) fn prove_lifecycle(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
     processes: FixtureProcesses,
-    selected: &mut usize,
+    interaction: &mut ProjectInteraction,
 ) -> Result<()> {
     let FixtureProcesses {
         focused,
         mute,
         piped,
     } = processes;
-    let focused_snapshot = wait_for(supervisor, WAIT, |_| true)?;
-    let focused_view = consoles
-        .view_process(
-            focused_snapshot.processes[focused].process_id,
-            focused_snapshot.processes[focused]
-                .current_run
-                .expect("the focused Process keeps a live Run"),
-        )
-        .expect("the focused Process has a live console");
-    focused_view.with(|session| {
-        console.focus_process_list(Some(session));
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            true,
-            key(KeyCode::Char('x')),
-            Some(session),
-            &mut process_logs[focused],
-            PAGE_ROWS,
-        );
-    });
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Stop]
+
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('x'),
     );
-    supervisor.command(Command::Stop("focused".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[focused].lifecycle == Lifecycle::Stopped
     })?;
@@ -65,50 +47,32 @@ pub(crate) fn prove_lifecycle(
         wait_for(supervisor, WAIT, |_| true)?.processes[focused].failure,
         None
     );
-    // While stopped its pane is empty; commands still queue through the
-    // read-only path.
-    console.focus_process_list(None);
-    console.route_pane_key(
-        ConsolePaneKind::Empty,
-        true,
-        key(KeyCode::Char('s')),
-        None,
-        &mut process_logs[focused],
-        PAGE_ROWS,
+
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('s'),
     );
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Start]
-    );
-    supervisor.command(Command::Start("focused".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[focused].lifecycle == Lifecycle::Running
     })?;
-    // Restart brings back the next Run ID through the same pane seam.
+
     let live_snapshot = wait_for(supervisor, WAIT, |_| true)?;
-    let focused_run = live_snapshot.processes[focused]
+    let run_before_restart = live_snapshot.processes[focused]
         .current_run
         .expect("the restarted Process has a live Run");
-    let focused_live = consoles
-        .view_process(live_snapshot.processes[focused].process_id, focused_run)
-        .expect("the restarted Process has a live console");
-    focused_live.with(|session| {
-        console.focus_process_list(Some(session));
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            true,
-            key(KeyCode::Char('r')),
-            Some(session),
-            &mut process_logs[focused],
-            PAGE_ROWS,
-        );
-    });
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Restart]
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &live_snapshot,
+        KeyCode::Char('r'),
     );
-    let run_before_restart = focused_run;
-    supervisor.command(Command::Restart("focused".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         let process = &snapshot.processes[focused];
         process
@@ -121,101 +85,102 @@ pub(crate) fn prove_lifecycle(
         None,
         "a clean stop and restart leaves no failure behind"
     );
-    // Stop the other terminal Process through its own pane, then bring it
-    // back.
+
     apply_move(
-        console,
-        process_logs,
+        interaction,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
-        selected,
         SelectionMove::Down,
     );
-    assert_eq!(*selected, mute);
-    let live_snapshot = wait_for(supervisor, WAIT, |_| true)?;
-    let mute_run = live_snapshot.processes[mute]
-        .current_run
-        .expect("the muted Process has a live Run");
-    let mute_live = consoles
-        .view_process(live_snapshot.processes[mute].process_id, mute_run)
-        .expect("the muted Process has a live console");
-    mute_live.with(|session| {
-        console.focus_process_list(Some(session));
-        console.route_pane_key(
-            ConsolePaneKind::Terminal,
-            false,
-            key(KeyCode::Char('x')),
-            Some(session),
-            &mut process_logs[mute],
-            PAGE_ROWS,
-        );
-    });
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Stop]
+    assert_eq!(interaction.selected(), mute);
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('x'),
     );
-    supervisor.command(Command::Stop("mute".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[mute].lifecycle == Lifecycle::Stopped
     })?;
-    supervisor.command(Command::Start("mute".into()));
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('s'),
+    );
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[mute].lifecycle == Lifecycle::Running
     })?;
-    // The pipe Process stops and restarts through its read-only pane.
+
     apply_move(
-        console,
-        process_logs,
+        interaction,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
-        selected,
         SelectionMove::Down,
     );
-    assert_eq!(*selected, piped);
-    console.focus_process_list(None);
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        key(KeyCode::Char('x')),
-        None,
-        &mut process_logs[piped],
-        PAGE_ROWS,
+    assert_eq!(interaction.selected(), piped);
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('x'),
     );
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Stop]
-    );
-    supervisor.command(Command::Stop("piped".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[piped].lifecycle == Lifecycle::Stopped
     })?;
-    supervisor.command(Command::Start("piped".into()));
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('s'),
+    );
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[piped].lifecycle == Lifecycle::Running
     })?;
-    // Back to the first Process before the ingestion proof.
+
     apply_move(
-        console,
-        process_logs,
+        interaction,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
-        selected,
         SelectionMove::Up,
     );
     apply_move(
-        console,
-        process_logs,
+        interaction,
         consoles,
         outputs,
         &wait_for(supervisor, WAIT, |_| true)?,
-        selected,
         SelectionMove::Up,
     );
-    assert_eq!(*selected, focused);
+    assert_eq!(interaction.selected(), focused);
     Ok(())
+}
+
+fn dispatch_project_key(
+    interaction: &mut ProjectInteraction,
+    consoles: &Consoles,
+    outputs: &OutputViews,
+    supervisor: &SupervisorHandle,
+    snapshot: &crate::supervisor::ProjectSnapshot,
+    code: KeyCode,
+) {
+    for command in route_project_key(interaction, consoles, outputs, snapshot, key(code)) {
+        supervisor.command(command);
+    }
 }
 
 /// Prove the One-shot rerun ACs of issue #32: the first attempt starts
@@ -278,22 +243,18 @@ pub(crate) fn prove_metrics_degradation(
 /// fresh Run, the live sample projects into the immutable snapshot and the
 /// sampler's own run identity matches the active Run.
 pub(crate) fn prove_metrics(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
     focused: usize,
-    selected: &mut usize,
+    interaction: &mut ProjectInteraction,
 ) -> Result<()> {
-    while *selected != focused {
+    while interaction.selected() != focused {
         apply_move(
-            console,
-            process_logs,
+            interaction,
             consoles,
             outputs,
             &wait_for(supervisor, WAIT, |_| true)?,
-            selected,
             SelectionMove::Up,
         );
     }
@@ -356,46 +317,35 @@ pub(crate) fn prove_metrics(
 }
 
 pub(crate) fn prove_rerun(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
     oneoff: usize,
-    selected: &mut usize,
+    interaction: &mut ProjectInteraction,
 ) -> Result<()> {
     // The selection rests on the first Process after the metrics proof;
     // walk down to the idle One-shot, whose pane is the retained pipe
     // view.
     let mut snapshot = wait_for(supervisor, WAIT, |_| true)?;
-    while *selected != oneoff {
+    while interaction.selected() != oneoff {
         apply_move(
-            console,
-            process_logs,
+            interaction,
             consoles,
             outputs,
             &snapshot,
-            selected,
             SelectionMove::Down,
         );
         snapshot = wait_for(supervisor, WAIT, |_| true)?;
     }
-    // Start the first attempt through the pane seam; the app dispatches
-    // Start for the selected Process.
-    console.focus_process_list(None);
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        key(KeyCode::Char('s')),
-        None,
-        &mut process_logs[oneoff],
-        PAGE_ROWS,
+    // Start the first attempt through the production interaction seam.
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('s'),
     );
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Start]
-    );
-    supervisor.command(Command::Start("oneoff".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[oneoff].lifecycle == Lifecycle::Done
     })?;
@@ -403,22 +353,17 @@ pub(crate) fn prove_rerun(
         wait_for(supervisor, WAIT, |_| true)?.processes[oneoff].failure,
         None
     );
-    // Rerun: the app maps `r` on a One-shot to the Supervisor's Rerun
-    // command, and the new attempt receives the next Run ID.
-    console.focus_process_list(None);
-    console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        key(KeyCode::Char('r')),
-        None,
-        &mut process_logs[oneoff],
-        PAGE_ROWS,
+    // Rerun: the production interaction seam maps `r` on a One-shot to
+    // the Supervisor's Rerun command.
+    let snapshot = wait_for(supervisor, WAIT, |_| true)?;
+    dispatch_project_key(
+        interaction,
+        consoles,
+        outputs,
+        supervisor,
+        &snapshot,
+        KeyCode::Char('r'),
     );
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Restart]
-    );
-    supervisor.command(Command::Rerun("oneoff".into()));
     wait_for(supervisor, WAIT, |snapshot| {
         snapshot.processes[oneoff].current_run == Some(2)
     })?;
@@ -462,14 +407,12 @@ pub(crate) fn prove_rerun(
         "the One-shot's output stays retained"
     );
 
-    while *selected > 0 {
+    while interaction.selected() > 0 {
         apply_move(
-            console,
-            process_logs,
+            interaction,
             consoles,
             outputs,
             &wait_for(supervisor, WAIT, |_| true)?,
-            selected,
             SelectionMove::Up,
         );
     }

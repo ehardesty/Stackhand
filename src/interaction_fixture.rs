@@ -7,9 +7,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::console::{ConsoleInteraction, LifecycleCommand, SelectionMove};
+use crate::app::interaction::ProjectInteraction;
+use crate::console::{ConsoleInteraction, SelectionMove};
 use crate::log_view::OutputRepresentation;
 use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{Command, Consoles, Lifecycle, ProcessSnapshot, SupervisorHandle};
@@ -80,6 +81,9 @@ fn prove(
 
     let mut console = ConsoleInteraction::default();
     let mut process_logs = vec![ProcessLogs::default(); snapshot.processes.len()];
+    let mut interaction = ProjectInteraction::default();
+    interaction.update_project(&snapshot);
+    assert_eq!(interaction.selected(), focused);
     let focused_view = consoles
         .view_process(
             snapshot.processes[focused].process_id,
@@ -355,20 +359,6 @@ fn prove(
         Some(ConsoleWarning::SelectionUnavailable)
     );
     console.clear_pane_warning();
-    // Lifecycle commands work from a read-only pane: they are
-    // application commands, never child input.
-    assert!(console.route_pane_key(
-        ConsolePaneKind::Pipe,
-        false,
-        key(KeyCode::Char('x')),
-        None,
-        &mut process_logs[piped],
-        PAGE_ROWS,
-    ));
-    assert_eq!(
-        console.take_lifecycle_commands(),
-        vec![LifecycleCommand::Stop]
-    );
     assert!(console.route_pane_key(
         ConsolePaneKind::Pipe,
         false,
@@ -396,8 +386,6 @@ fn prove(
     // selection move: paging the focused terminal into its history, then
     // moving to the other terminal, operating on it, and moving back must
     // leave both views where they were left.
-    let mut selected = focused;
-
     // Page the focused terminal up into its history.
     focused_view.with(|session| {
         console.route_pane_key(
@@ -428,15 +416,13 @@ fn prove(
     wait_for_console_text(&focused_view, "focused-ready")?;
     // Move the selection to the other terminal through the command path.
     apply_move(
-        &mut console,
-        &mut process_logs,
+        &mut interaction,
         consoles,
         outputs,
         &snapshot,
-        &mut selected,
         SelectionMove::Down,
     );
-    assert_eq!(selected, mute);
+    assert_eq!(interaction.selected(), mute);
     // Scroll the muted terminal's own history through its own pane.
     mute_view.with(|session| {
         console.route_pane_key(
@@ -467,15 +453,13 @@ fn prove(
     wait_for_console_text(&mute_view, "mute-ready")?;
     // Move back: both views keep the scroll each one was left at.
     apply_move(
-        &mut console,
-        &mut process_logs,
+        &mut interaction,
         consoles,
         outputs,
         &snapshot,
-        &mut selected,
         SelectionMove::Up,
     );
-    assert_eq!(selected, focused);
+    assert_eq!(interaction.selected(), focused);
     assert!(
         console_text(&focused_view).contains("focused-ready"),
         "the selection move reset the focused Process's scroll"
@@ -554,8 +538,6 @@ fn prove(
     // Supervisor: stop finishes as Stopped, restart brings the next Run
     // back, and a clean cycle leaves no failure behind.
     crate::lifecycle_fixture::prove_lifecycle(
-        &mut console,
-        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -564,7 +546,7 @@ fn prove(
             mute,
             piped,
         },
-        &mut selected,
+        &mut interaction,
     )?;
     println!("interaction-lifecycle-ok");
 
@@ -573,32 +555,20 @@ fn prove(
     // do not fit.
     crate::lifecycle_fixture::prove_metrics_degradation(supervisor, focused)?;
     crate::lifecycle_fixture::prove_metrics(
-        &mut console,
-        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
         focused,
-        &mut selected,
+        &mut interaction,
     )?;
     println!("interaction-metrics-ok");
 
     // The One-shot proof: start it once, rerun it through the pane key
     // seam, and check its bounded Run summaries and output markers.
-    crate::lifecycle_fixture::prove_rerun(
-        &mut console,
-        &mut process_logs[..],
-        consoles,
-        outputs,
-        supervisor,
-        oneoff,
-        &mut selected,
-    )?;
+    crate::lifecycle_fixture::prove_rerun(consoles, outputs, supervisor, oneoff, &mut interaction)?;
     println!("interaction-rerun-ok");
 
     crate::ingest_fixture::prove_ingest(
-        &mut console,
-        &mut process_logs[..],
         consoles,
         outputs,
         supervisor,
@@ -608,111 +578,59 @@ fn prove(
             piped,
             oneoff,
         },
-        &mut selected,
+        &mut interaction,
     )?;
     println!("interaction-ingest-ok");
     Ok(())
 }
 
-/// Route one selection move through the production pane key seam from
-/// the currently selected pane, then apply the drained request exactly
-/// like the app event loop does: moves clamp at the list ends, and a
-/// moved selection clears the pane-scoped warning.
+/// Route one selection move through the same interaction owner as the
+/// application event loop.
 pub(crate) fn apply_move(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
+    interaction: &mut ProjectInteraction,
     consoles: &Consoles,
     outputs: &crate::output::OutputViews,
     snapshot: &crate::supervisor::ProjectSnapshot,
-    selected: &mut usize,
-    direction: SelectionMove,
-) {
-    move_selection_key(
-        console,
-        process_logs,
-        consoles,
-        outputs,
-        snapshot,
-        *selected,
-        direction,
-    );
-    console.apply_selection_moves(selected, snapshot.processes.len());
-}
-
-/// Send one selection move through the production pane key seam, from
-/// whichever pane currently owns the keys: the terminal session path for
-/// a PTY Process, or the read-only path for the pipe Process. The move
-/// request is only applied when the fixture drains it, exactly like the
-/// app event loop does.
-fn move_selection_key(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
-    consoles: &Consoles,
-    outputs: &crate::output::OutputViews,
-    snapshot: &crate::supervisor::ProjectSnapshot,
-    selected: usize,
     direction: SelectionMove,
 ) {
     let move_key = match direction {
         SelectionMove::Down => KeyCode::Char('j'),
         SelectionMove::Up => KeyCode::Char('k'),
     };
-    let process = &snapshot.processes[selected];
-    let pane = if process.terminal_mode == crate::model::TerminalMode::Pty {
-        let live = matches!(process.lifecycle, Lifecycle::Starting | Lifecycle::Running)
-            .then(|| process.current_run)
-            .flatten()
-            .and_then(|run_id| consoles.view_process(process.process_id, run_id));
-        match live {
-            Some(view) => {
-                view.with(|session| {
-                    if console.view().mode != ConsoleViewMode::ProcessList {
-                        console.route_pane_key(
-                            ConsolePaneKind::Terminal,
-                            process.input_focused,
-                            leader(),
-                            Some(session),
-                            &mut process_logs[selected],
-                            PAGE_ROWS,
-                        );
-                    }
-                    console.route_pane_key(
-                        ConsolePaneKind::Terminal,
-                        process.input_focused,
-                        key(move_key),
-                        Some(session),
-                        &mut process_logs[selected],
-                        PAGE_ROWS,
-                    );
-                });
-                return;
-            }
-            None => ConsolePaneKind::Empty,
-        }
-    } else {
-        outputs
-            .for_process_id(process.process_id)
-            .expect("the fixture's pipe Process has a module");
-        ConsolePaneKind::Pipe
-    };
-    if console.view().mode != ConsoleViewMode::ProcessList {
-        console.route_pane_key(
-            pane,
-            process.input_focused,
-            leader(),
-            None,
-            &mut process_logs[selected],
-            PAGE_ROWS,
-        );
-    }
-    console.route_pane_key(
-        pane,
-        process.input_focused,
-        key(move_key),
-        None,
-        &mut process_logs[selected],
-        PAGE_ROWS,
+    assert!(route_project_key(interaction, consoles, outputs, snapshot, key(move_key)).is_empty());
+}
+
+/// Route one key and drain its effects through the production interaction
+/// seam. Acceptance proofs do not reproduce selection or lifecycle mapping.
+pub(crate) fn route_project_key(
+    interaction: &mut ProjectInteraction,
+    consoles: &Consoles,
+    outputs: &crate::output::OutputViews,
+    snapshot: &crate::supervisor::ProjectSnapshot,
+    key: KeyEvent,
+) -> Vec<Command> {
+    let pending = interaction.update_project(snapshot);
+    assert!(
+        pending.commands.is_empty(),
+        "fixture left commands undrained"
     );
+    let process = &snapshot.processes[interaction.selected()];
+    let retained = outputs
+        .for_process_id(process.process_id)
+        .expect("fixture Processes have retained output modules")
+        .snapshot();
+    interaction.refresh_logs(&retained);
+    let pane = interaction.pane(consoles, process, &retained);
+    interaction.update_pane(&pane);
+    interaction.route_input(
+        Event::Key(key),
+        1,
+        &pane,
+        process,
+        &retained,
+        ratatui::layout::Rect::new(0, 0, 80, PAGE_ROWS),
+    );
+    interaction.update_project(snapshot).commands
 }
 
 fn shutdown(supervisor: SupervisorHandle, proof_ok: bool) -> Result<()> {

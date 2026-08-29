@@ -13,9 +13,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::core::{
-    Core, DesiredState, FailureKind, FailureSummary, Lifecycle, RestartBackoff, RestartReason,
-};
+use super::core::{Core, DesiredState, Lifecycle};
+use super::process_lifecycle::RestartReason;
 use super::readiness::ReadinessState;
 use crate::model::{DependencyCondition, Enabled};
 use crate::runtime::RunId;
@@ -28,15 +27,7 @@ impl Core {
         if !self.is_enabled(index) {
             return;
         }
-        if trigger == RunTrigger::Manual {
-            let entry = &mut self.entries[index];
-            let timeout_cleanup = entry.startup_timeout_pending;
-            entry.clear_restart_state();
-            entry.restart_budget.reset();
-            entry.pending_trigger = trigger;
-            entry.restart_suppressed = timeout_cleanup;
-            entry.exited = false;
-        }
+        self.lifecycles[index].prepare_start_request(trigger);
         self.require_running(index, trigger);
         self.evaluate();
     }
@@ -50,27 +41,12 @@ impl Core {
         if !self.is_enabled(index) {
             return;
         }
-        {
-            let entry = &mut self.entries[index];
-            let timeout_cleanup = entry.startup_timeout_pending;
-            entry.pending_trigger = trigger;
-            entry.clear_restart_state();
-            if matches!(trigger, RunTrigger::Restart | RunTrigger::Rerun) {
-                entry.restart_budget.reset();
-            }
-            entry.restart_suppressed = timeout_cleanup;
-            entry.exited = false;
-        }
+        self.lifecycles[index].prepare_restart_request(trigger);
         self.require_running(index, trigger);
-        let entry = &mut self.entries[index];
-        if let Some(run_id) = entry.current_run.filter(|_| !entry.cleanup_unconfirmed) {
+        if let Some((process_id, run_id)) = self.lifecycles[index].begin_replacement_cleanup() {
             // A stopping Run releases its identity on the finished report;
             // that pass starts the replacement through the scheduler. The
             // stop is intentional: its summary must not read as a failure.
-            let process_id = entry.process_id;
-            entry.lifecycle = Lifecycle::Stopping;
-            entry.blocked = None;
-            let _ = entry;
             self.cancel_run_work(index);
             self.seam.stop(process_id, run_id, None, &self.events);
         }
@@ -85,12 +61,9 @@ impl Core {
         if !self.is_enabled(index) {
             return;
         }
-        let entry = &mut self.entries[index];
-        if entry.desired == DesiredState::Running {
+        if !self.lifecycles[index].require_running(trigger) {
             return;
         }
-        entry.desired = DesiredState::Running;
-        entry.pending_trigger = trigger;
         let dependency_indices = self
             .project
             .resolved_dependencies(index)
@@ -105,7 +78,7 @@ impl Core {
     /// desires Running with no current Run and satisfied Dependencies, and
     /// give the rest a visible Waiting reason.
     pub(super) fn evaluate(&mut self) {
-        for index in 0..self.entries.len() {
+        for index in 0..self.lifecycles.len() {
             match self.blocked_reason(index) {
                 None => self.begin_desired_run(index),
                 Some(reason) => self.mark_blocked(index, reason),
@@ -115,7 +88,7 @@ impl Core {
 
     fn begin_desired_run(&mut self, index: usize) {
         let can_start = {
-            let entry = &self.entries[index];
+            let entry = &self.lifecycles[index];
             entry.current_run.is_none()
                 && entry.desired == DesiredState::Running
                 && !entry.awaiting_manual_restart
@@ -124,10 +97,11 @@ impl Core {
         if !can_start {
             return;
         }
-        let automatic_retry = self.entries[index].pending_trigger == RunTrigger::AutomaticRestart;
+        let automatic_retry =
+            self.lifecycles[index].pending_trigger == RunTrigger::AutomaticRestart;
         if automatic_retry {
             let max_restarts = self.project.processes()[index].restart.max_restarts;
-            if !self.entries[index].restart_budget.consume(max_restarts) {
+            if !self.lifecycles[index].admit_automatic_retry(max_restarts) {
                 self.mark_restart_limit(index);
                 return;
             }
@@ -148,42 +122,15 @@ impl Core {
             .flatten();
         let liveness = self.new_liveness_tracking(index, self.clock.now());
         let now_ms = self.now_ms();
-        let entry = &mut self.entries[index];
-        let run_id = RunId::new(entry.next_run);
-        entry.next_run += 1;
-        entry.current_run = Some(run_id);
-        entry.lifecycle = Lifecycle::Starting;
-        entry.failure = None;
-        entry.metrics = None;
-        entry.exited = false;
-        entry.startup_timeout_pending = false;
-        entry.clear_restart_state();
-        entry.run_cancelled = false;
-        entry.blocked = None;
-        // Starting is the immediate invalidation of an earlier successful
-        // One-shot completion represented by Done.
-        entry.run_started_at_ms = Some(now_ms);
-        entry.run_trigger = entry.pending_trigger;
-        entry.readiness = readiness;
-        entry.liveness = liveness;
-        entry.spawned = false;
-        entry.unhealthy_restart_pending = false;
+        // Starting immediately invalidates an earlier successful One-shot
+        // completion represented by Done.
+        let run_id = self.lifecycles[index].begin_run(now_ms, readiness, liveness);
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }
 
     fn mark_blocked(&mut self, index: usize, reason: String) {
-        let entry = &mut self.entries[index];
-        if entry.current_run.is_some()
-            || entry.desired != DesiredState::Running
-            || entry.restart_backoff.is_some()
-        {
-            return;
-        }
-        entry.lifecycle = Lifecycle::Waiting;
-        // A previous Run's failure must not mask the current waiting state.
-        entry.failure = None;
-        entry.blocked = Some(reason);
+        self.lifecycles[index].wait_for_dependency(reason);
     }
 
     /// Why this Process cannot start yet, or `None` when every Dependency
@@ -197,7 +144,7 @@ impl Core {
                 // A visible reason names the Dependency and its condition;
                 // a failed dependency adds its bounded failure summary.
                 let mut reason = format!("{}: {}", dependency.name, dependency.condition.label());
-                if let Some(failure) = &self.entries[dependency_index].failure {
+                if let Some(failure) = &self.lifecycles[dependency_index].failure {
                     reason.push_str(&format!(" ({})", failure.detail));
                 }
                 return Some(reason);
@@ -218,7 +165,7 @@ impl Core {
     /// `started` holds only while the dependency has an active Run that is
     /// Starting or Running. A Stopping Run or an ended Run never satisfies.
     fn started_condition_satisfied(&self, index: usize) -> bool {
-        let entry = &self.entries[index];
+        let entry = &self.lifecycles[index];
         entry.current_run.is_some()
             && matches!(entry.lifecycle, Lifecycle::Starting | Lifecycle::Running)
     }
@@ -228,7 +175,7 @@ impl Core {
     /// and later readiness loss removes `ready` for any new dependent without
     /// stopping an already-running dependent.
     fn ready_condition_satisfied(&self, index: usize) -> bool {
-        let entry = &self.entries[index];
+        let entry = &self.lifecycles[index];
         if entry.current_run.is_none() || entry.lifecycle != Lifecycle::Running {
             return false;
         }
@@ -242,13 +189,13 @@ impl Core {
     /// cleanup, whether its exit succeeded or failed. Starting a later Run
     /// immediately clears the condition.
     fn exited_condition_satisfied(&self, index: usize) -> bool {
-        self.entries[index].exited
+        self.lifecycles[index].exited
     }
 
     /// `completed_successfully` holds while the dependency's authoritative
     /// lifecycle is Done. Starting a later Run immediately replaces Done.
     fn completed_condition_satisfied(&self, index: usize) -> bool {
-        self.entries[index].lifecycle == Lifecycle::Done
+        self.lifecycles[index].lifecycle == Lifecycle::Done
     }
 
     /// Hold one automatic retry behind the configured fixed delay. The
@@ -261,7 +208,7 @@ impl Core {
         reason: RestartReason,
     ) {
         let max_restarts = self.project.processes()[index].restart.max_restarts;
-        if !self.entries[index]
+        if !self.lifecycles[index]
             .restart_budget
             .has_remaining(max_restarts)
         {
@@ -269,32 +216,12 @@ impl Core {
             return;
         }
         let deadline = self.clock.now() + self.project.processes()[index].restart.backoff;
-        let entry = &mut self.entries[index];
-        entry.desired = DesiredState::Running;
-        entry.lifecycle = Lifecycle::RestartBackoff;
-        entry.blocked = None;
-        entry.clear_restart_state();
-        entry.restart_backoff = Some(RestartBackoff {
-            failed_run_id,
-            deadline,
-            reason,
-        });
+        self.lifecycles[index].wait_for_automatic_restart(failed_run_id, deadline, reason);
     }
 
     fn mark_restart_limit(&mut self, index: usize) {
         let max_restarts = self.project.processes()[index].restart.max_restarts;
-        let entry = &mut self.entries[index];
-        entry.restart_budget.exhaust();
-        entry.desired = DesiredState::Running;
-        entry.lifecycle = Lifecycle::Stopped;
-        entry.blocked = None;
-        entry.awaiting_manual_restart = true;
-        entry.restart_backoff = None;
-        entry.unhealthy_restart_pending = false;
-        entry.failure = Some(FailureSummary {
-            kind: FailureKind::RestartLimit,
-            detail: format!("Restart limit reached after {max_restarts} automatic attempts"),
-        });
+        self.lifecycles[index].exhaust_restart_budget(max_restarts);
     }
 
     /// Release automatic retries whose fixed delay has expired. Only the
@@ -302,18 +229,16 @@ impl Core {
     /// inert rather than being allowed to start a newer or stopped Run.
     pub(super) fn poll_restart_timers(&mut self, now: Instant) {
         let expired = self
-            .entries
+            .lifecycles
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let deadline = valid_restart_deadline(entry)?;
+                let deadline = entry.valid_restart_deadline()?;
                 (deadline <= now).then_some(index)
             })
             .collect::<Vec<_>>();
         for index in expired.iter().copied() {
-            let entry = &mut self.entries[index];
-            entry.restart_backoff = None;
-            entry.pending_trigger = RunTrigger::AutomaticRestart;
+            self.lifecycles[index].release_restart_backoff();
         }
         if !expired.is_empty() {
             self.evaluate();
@@ -323,9 +248,9 @@ impl Core {
     /// How long until a still-authoritative automatic retry is due.
     pub(super) fn restart_time_until_next_timer(&self) -> Option<Duration> {
         let now = self.clock.now();
-        self.entries
+        self.lifecycles
             .iter()
-            .filter_map(valid_restart_deadline)
+            .filter_map(|lifecycle| lifecycle.valid_restart_deadline())
             .map(|deadline| deadline.saturating_duration_since(now))
             .min()
     }
@@ -333,13 +258,4 @@ impl Core {
     pub(super) fn is_enabled(&self, index: usize) -> bool {
         matches!(self.project.processes()[index].enabled, Enabled::Yes)
     }
-}
-
-fn valid_restart_deadline(entry: &super::core::Entry) -> Option<Instant> {
-    let backoff = entry.restart_backoff?;
-    (entry.current_run.is_none()
-        && entry.desired == DesiredState::Running
-        && entry.lifecycle == Lifecycle::RestartBackoff
-        && entry.next_run == backoff.failed_run_id.get().saturating_add(1))
-    .then_some(backoff.deadline)
 }

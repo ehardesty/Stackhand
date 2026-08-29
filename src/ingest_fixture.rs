@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
-use crate::console::{ConsoleInteraction, SelectionMove};
+use crate::app::interaction::ProjectInteraction;
+use crate::console::SelectionMove;
 use crate::interaction_fixture::{
     WAIT, apply_move, console_text, last_tick, module_text, wait_for, wait_for_tick,
 };
 use crate::output::OutputViews;
-use crate::process_logs::ProcessLogs;
 use crate::supervisor::{Consoles, ProcessId, SupervisorHandle};
 
 /// The fixture process indexes the ingestion proof needs.
@@ -28,13 +28,11 @@ pub(crate) struct FixtureIndexes {
 }
 
 pub(crate) fn prove_ingest(
-    console: &mut ConsoleInteraction,
-    process_logs: &mut [ProcessLogs],
     consoles: &Consoles,
     outputs: &OutputViews,
     supervisor: &SupervisorHandle,
     indexes: FixtureIndexes,
-    selected: &mut usize,
+    interaction: &mut ProjectInteraction,
 ) -> Result<()> {
     let ingest_snapshot = wait_for(supervisor, WAIT, |_| true)?;
     let focused_live = consoles
@@ -75,17 +73,10 @@ pub(crate) fn prove_ingest(
         indexes.mute,
     ];
     for (direction, expected_selected) in moves.iter().zip(expected.iter()) {
-        apply_move(
-            console,
-            process_logs,
-            consoles,
-            outputs,
-            &ingest_snapshot,
-            selected,
-            *direction,
-        );
+        apply_move(interaction, consoles, outputs, &ingest_snapshot, *direction);
         assert_eq!(
-            *selected, *expected_selected,
+            interaction.selected(),
+            *expected_selected,
             "the selection must move and clamp exactly like the app"
         );
         std::thread::sleep(Duration::from_millis(500));

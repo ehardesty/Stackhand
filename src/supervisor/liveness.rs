@@ -209,7 +209,7 @@ impl Core {
     }
 
     fn active_liveness(&self) -> impl Iterator<Item = (usize, RunId, &LivenessTracking)> + '_ {
-        self.entries
+        self.lifecycles
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
@@ -237,8 +237,8 @@ impl Core {
         let Some(check_config) = config.checks.get(check_index) else {
             return;
         };
-        let process_id = self.entries[index].process_id;
-        let Some(run_id) = self.entries[index].current_run else {
+        let process_id = self.lifecycles[index].process_id;
+        let Some(run_id) = self.lifecycles[index].current_run else {
             return;
         };
         let exec_context =
@@ -249,7 +249,7 @@ impl Core {
                 shell: self.project.shell().clone(),
             });
         if matches!(check_config.probe, ReadinessProbe::Log { .. }) {
-            let Some(intent) = self.entries[index]
+            let Some(intent) = self.lifecycles[index]
                 .liveness
                 .as_mut()
                 .and_then(|tracking| tracking.begin_log(check_index, &config, now))
@@ -259,9 +259,13 @@ impl Core {
             self.seam.arm_log_matcher(process_id, run_id, intent);
             return;
         }
-        let Some(intent) = self.entries[index].liveness.as_mut().and_then(|tracking| {
-            tracking.begin_probe(check_index, process_id, run_id, &config, exec_context)
-        }) else {
+        let Some(intent) = self.lifecycles[index]
+            .liveness
+            .as_mut()
+            .and_then(|tracking| {
+                tracking.begin_probe(check_index, process_id, run_id, &config, exec_context)
+            })
+        else {
             return;
         };
         self.probes.probe(intent, &self.events);
@@ -279,13 +283,16 @@ impl Core {
         let Some(config) = self.project.processes()[index].liveness.as_ref() else {
             return;
         };
-        let before = self.entries[index]
+        let before = self.lifecycles[index]
             .liveness
             .as_ref()
             .map(LivenessTracking::state);
-        let after = self.entries[index].liveness.as_mut().and_then(|tracking| {
-            tracking.apply_result(config, work_id, attempt_id, now, passing, diagnostic)
-        });
+        let after = self.lifecycles[index]
+            .liveness
+            .as_mut()
+            .and_then(|tracking| {
+                tracking.apply_result(config, work_id, attempt_id, now, passing, diagnostic)
+            });
         let Some(after) = after else {
             return;
         };
@@ -307,11 +314,11 @@ impl Core {
         let Some(config) = self.project.processes()[index].liveness.as_ref() else {
             return;
         };
-        let before = self.entries[index]
+        let before = self.lifecycles[index]
             .liveness
             .as_ref()
             .map(LivenessTracking::state);
-        let after = self.entries[index]
+        let after = self.lifecycles[index]
             .liveness
             .as_mut()
             .and_then(|tracking| tracking.complete_log_match(config, work_id, attempt_id, now));
@@ -327,7 +334,7 @@ impl Core {
     }
 
     fn handle_liveness_failure(&mut self, index: usize) {
-        let detail = self.entries[index]
+        let detail = self.lifecycles[index]
             .liveness
             .as_ref()
             .and_then(|tracking| {
@@ -342,36 +349,17 @@ impl Core {
                     .last_error
             })
             .unwrap_or_else(|| "liveness failure threshold reached".to_string());
-        self.entries[index].failure = Some(super::core::FailureSummary {
-            kind: super::core::FailureKind::Liveness,
-            detail,
-        });
-        if !self.project.processes()[index].restart.on_unhealthy {
-            return;
-        }
-        let Some(run_id) = self.entries[index].current_run else {
+        let restart_on_unhealthy = self.project.processes()[index].restart.on_unhealthy;
+        let cleanup = self.lifecycles[index].fail_liveness(detail, restart_on_unhealthy);
+        let Some((process_id, run_id)) = cleanup else {
             return;
         };
-        let process_id = self.entries[index].process_id;
-        {
-            let entry = &mut self.entries[index];
-            entry.unhealthy_restart_pending = true;
-            entry.desired = super::core::DesiredState::Stopped;
-            entry.lifecycle = super::core::Lifecycle::Stopping;
-            entry.blocked = None;
-        }
         self.cancel_run_work(index);
         self.seam.stop(process_id, run_id, None, &self.events);
     }
 
     fn recover_liveness(&mut self, index: usize) {
-        if self.entries[index]
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.kind == super::core::FailureKind::Liveness)
-        {
-            self.entries[index].failure = None;
-        }
+        self.lifecycles[index].recover_liveness();
     }
 
     pub(super) fn liveness_time_until_next_timer(&self) -> Option<Duration> {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::RunId;
 
-use super::core::{Core, DesiredState, Lifecycle};
+use super::core::Core;
 
 /// One Process cleanup that did not finish cleanly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +38,7 @@ impl Core {
         }
         self.seam.begin_shutdown(deadline);
         let remaining: BTreeSet<usize> = self
-            .entries
+            .lifecycles
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| entry.current_run.map(|_| index))
@@ -54,20 +54,8 @@ impl Core {
             timed_out: false,
         });
 
-        for entry in &mut self.entries {
-            entry.desired = DesiredState::Stopped;
-            entry.blocked = None;
-            entry.readiness = None;
-            entry.restart_backoff = None;
-            entry.restart_suppressed = true;
-            if entry.current_run.is_none()
-                && matches!(
-                    entry.lifecycle,
-                    Lifecycle::Waiting | Lifecycle::RestartBackoff
-                )
-            {
-                entry.lifecycle = Lifecycle::Stopped;
-            }
+        for lifecycle in &mut self.lifecycles {
+            lifecycle.begin_project_shutdown();
         }
         self.dispatch_shutdown_wave();
     }
@@ -133,11 +121,11 @@ impl Core {
         // to be skipped when an earlier dependent did not finish.
         let deadline = state.deadline;
         for index in unattempted {
-            let entry = &mut self.entries[index];
-            entry.lifecycle = Lifecycle::Stopping;
+            let lifecycle = &mut self.lifecycles[index];
+            lifecycle.begin_shutdown_cleanup();
             self.seam.stop(
-                entry.process_id,
-                entry.current_run.expect("shutdown tracks active Runs"),
+                lifecycle.process_id,
+                lifecycle.current_run.expect("shutdown tracks active Runs"),
                 Some(deadline),
                 &self.events,
             );
@@ -147,7 +135,7 @@ impl Core {
         state.timed_out = true;
         state.remaining.clear();
         for index in unfinished {
-            let entry = &self.entries[index];
+            let entry = &self.lifecycles[index];
             state.failures.push(ProcessShutdownFailure {
                 process: self.project.processes()[index].name.clone(),
                 detail: "Project shutdown deadline expired".to_string(),
@@ -179,7 +167,7 @@ impl Core {
         let deadline = state.deadline;
 
         for index in candidates {
-            let run_id: RunId = self.entries[index]
+            let run_id: RunId = self.lifecycles[index]
                 .current_run
                 .expect("shutdown tracks only active Runs");
             self.shutdown
@@ -187,10 +175,10 @@ impl Core {
                 .expect("shutdown remains active")
                 .dispatched
                 .insert(index);
-            let entry = &mut self.entries[index];
-            entry.lifecycle = Lifecycle::Stopping;
+            let lifecycle = &mut self.lifecycles[index];
+            lifecycle.begin_shutdown_cleanup();
             self.seam
-                .stop(entry.process_id, run_id, Some(deadline), &self.events);
+                .stop(lifecycle.process_id, run_id, Some(deadline), &self.events);
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::supervisor::seam::{
     AttemptId, ExecContext, LogMatcherIntent, ProbeIntent, ProbeScope, ProbeSeam, WorkId,
 };
 
-use super::core::{Core, FailureKind, FailureSummary, Lifecycle};
+use super::core::Core;
 use super::snapshot::{ReadinessChildStatus, ReadinessStatus};
 
 pub use super::checks::ReadinessState;
@@ -200,7 +200,7 @@ impl Core {
     /// reported Spawned. Log work may exist before that fact so early output
     /// has stable identities, but its timer must still start at Spawned.
     fn active_readiness(&self) -> impl Iterator<Item = (usize, RunId, &ReadinessTracking)> + '_ {
-        self.entries
+        self.lifecycles
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
@@ -217,17 +217,12 @@ impl Core {
             .as_ref()
             .and_then(|config| config.startup_timeout)
             .expect("a startup deadline has a configured timeout");
-        let process_id = self.entries[index].process_id;
+        let process_id = self.lifecycles[index].process_id;
         self.cancel_run_work(index);
-        let entry = &mut self.entries[index];
-        entry.startup_timeout_pending = true;
-        entry.failure = Some(FailureSummary {
-            kind: FailureKind::Readiness,
-            detail: format!("readiness startup timeout after {} ms", timeout.as_millis()),
-        });
-        entry.desired = super::core::DesiredState::Stopped;
-        entry.lifecycle = Lifecycle::Stopping;
-        entry.blocked = None;
+        self.lifecycles[index].timeout_startup(format!(
+            "readiness startup timeout after {} ms",
+            timeout.as_millis()
+        ));
         self.seam.stop(process_id, run_id, None, &self.events);
     }
 
@@ -255,11 +250,11 @@ impl Core {
             env_remove: self.project.processes()[index].env_remove.clone(),
             shell: self.project.shell().clone(),
         });
-        let process_id = self.entries[index].process_id;
-        let Some(run_id) = self.entries[index].current_run else {
+        let process_id = self.lifecycles[index].process_id;
+        let Some(run_id) = self.lifecycles[index].current_run else {
             return;
         };
-        let Some(tracking) = self.entries[index].readiness.as_mut() else {
+        let Some(tracking) = self.lifecycles[index].readiness.as_mut() else {
             return;
         };
         let Some(intent) =

@@ -8,7 +8,8 @@ use crate::model::{ProcessKind, RestartPolicy};
 use crate::runtime::RunId;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
-use super::core::{Core, FailureKind, FailureSummary, MetricsMetadata, RestartReason};
+use super::core::{Core, FailureKind, MetricsMetadata};
+use super::process_lifecycle::RestartReason;
 
 #[derive(Clone, Copy)]
 enum TerminalOutcome {
@@ -29,18 +30,18 @@ impl Core {
         let Some(index) = self.index_of(event.process_id()) else {
             return;
         };
-        if Some(event.run_id()) != self.entries[index].current_run {
+        if Some(event.run_id()) != self.lifecycles[index].current_run {
             return;
         }
         // While a cleanup retry is held, only the confirming completion of
         // the held Run is meaningful; stale reports for it stay stale.
-        if self.entries[index].cleanup_unconfirmed && !matches!(event, SeamEvent::Finished(_)) {
+        if self.lifecycles[index].cleanup_unconfirmed && !matches!(event, SeamEvent::Finished(_)) {
             return;
         }
         // Stop/restart/shutdown cancellation closes every observational
         // result. A cleanup failure still has authority to finish shutdown;
         // all other late observations are discarded.
-        if self.entries[index].run_cancelled
+        if self.lifecycles[index].run_cancelled
             && !matches!(event, SeamEvent::Finished(_))
             && !(self.shutdown_in_progress() && matches!(event, SeamEvent::Failed { .. }))
         {
@@ -64,44 +65,30 @@ impl Core {
         }
         match event {
             SeamEvent::Spawned { root_pid, .. } => {
-                if self.entries[index].spawned {
+                if self.lifecycles[index].spawned {
                     // A Run has one authoritative spawn fact. Repeated
                     // callbacks must not overwrite its PID or reinitialize
                     // Run-scoped work.
                     return;
                 }
                 let now = self.clock.now();
-                let initialize_readiness = self.entries[index].lifecycle
+                let initialize_readiness = self.lifecycles[index].lifecycle
                     == super::core::Lifecycle::Starting
-                    && self.entries[index].readiness.is_none();
+                    && self.lifecycles[index].readiness.is_none();
                 let readiness = initialize_readiness
                     .then(|| self.new_readiness_tracking(index, now, true))
                     .flatten();
                 let spawn_now_ms = self.now_ms();
                 let readiness_config = self.project.processes()[index].readiness.clone();
-                {
-                    let entry = &mut self.entries[index];
-                    entry.root_pid = root_pid.map(|pid| pid.get());
-                    entry.spawned = true;
-                    if let Some(readiness) = readiness {
-                        // The Run exists but is not available yet; each child
-                        // owns its own first-attempt delay.
-                        entry.readiness = Some(readiness);
-                    }
-                    if let Some(config) = readiness_config.as_ref()
-                        && let Some(tracking) = entry.readiness.as_mut()
-                    {
-                        tracking.activate(config, now, spawn_now_ms);
-                    } else if entry.lifecycle == super::core::Lifecycle::Starting
-                        && entry.readiness.is_none()
-                    {
-                        // A Service without readiness becomes Running at spawn;
-                        // its label projects as Ready.
-                        entry.lifecycle = super::core::Lifecycle::Running;
-                    }
-                }
-                if self.entries[index].lifecycle == super::core::Lifecycle::Running
-                    && self.entries[index]
+                self.lifecycles[index].record_spawn(
+                    root_pid.map(|pid| pid.get()),
+                    readiness,
+                    readiness_config.as_ref(),
+                    now,
+                    spawn_now_ms,
+                );
+                if self.lifecycles[index].lifecycle == super::core::Lifecycle::Running
+                    && self.lifecycles[index]
                         .readiness
                         .as_ref()
                         .is_none_or(|tracking| {
@@ -124,7 +111,7 @@ impl Core {
                 };
                 let now = self.clock.now();
                 let became_ready = {
-                    let entry = &mut self.entries[index];
+                    let entry = &mut self.lifecycles[index];
                     let Some(tracking) = entry.readiness.as_mut() else {
                         return;
                     };
@@ -164,7 +151,7 @@ impl Core {
                     return;
                 }
                 let became_ready = {
-                    let entry = &mut self.entries[index];
+                    let entry = &mut self.lifecycles[index];
                     let Some(tracking) = entry.readiness.as_mut() else {
                         return;
                     };
@@ -191,7 +178,7 @@ impl Core {
             } => {
                 // The stale-event gate already matched the Run; the stamp
                 // keeps the sample attributable to exactly that Run.
-                self.entries[index].metrics = Some(MetricsMetadata {
+                self.lifecycles[index].record_metrics(MetricsMetadata {
                     run_id: run_id.get(),
                     cpu_percent,
                     rss_kib,
@@ -201,13 +188,7 @@ impl Core {
             SeamEvent::OutputFailure { detail, .. } => {
                 // Output-path failure: record it without flipping a healthy
                 // Run's lifecycle, and never clobber a real failure.
-                let entry = &mut self.entries[index];
-                if entry.failure.is_none() {
-                    entry.failure = Some(FailureSummary {
-                        kind: FailureKind::Output,
-                        detail,
-                    });
-                }
+                self.lifecycles[index].record_output_failure(detail);
             }
         }
     }
@@ -216,13 +197,7 @@ impl Core {
     /// identity and child state are handled by each event arm before this
     /// shared effect runs.
     fn promote_ready(&mut self, index: usize) {
-        if let Some(tracking) = self.entries[index].readiness.as_mut() {
-            tracking.clear_startup_deadline();
-        }
-        if self.entries[index].lifecycle == super::core::Lifecycle::Starting {
-            self.entries[index].lifecycle = super::core::Lifecycle::Running;
-        }
-        if self.entries[index].spawned {
+        if self.lifecycles[index].promote_ready() {
             self.activate_liveness(index, self.clock.now());
         }
     }
@@ -232,7 +207,7 @@ impl Core {
             return;
         };
         let now_ms = self.now_ms();
-        if let Some(tracking) = self.entries[index].liveness.as_mut() {
+        if let Some(tracking) = self.lifecycles[index].liveness.as_mut() {
             tracking.activate(&config, now, now_ms);
         }
     }
@@ -242,8 +217,8 @@ impl Core {
     /// held cleanup, recent history, and replacement scheduling change in
     /// one serialized Supervisor turn.
     fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
-        let timed_out = self.entries[index].startup_timeout_pending;
-        let unhealthy = self.entries[index].unhealthy_restart_pending;
+        let timed_out = self.lifecycles[index].startup_timeout_pending;
+        let unhealthy = self.lifecycles[index].unhealthy_restart_pending;
         let restart_reason = self.restart_reason_for_terminal(
             index,
             TerminalOutcome::Finished {
@@ -264,61 +239,16 @@ impl Core {
         }
 
         if !finished.cleanup_confirmed {
-            let entry = &mut self.entries[index];
-            // Hold the Run identity. A later Stop retries the same adapter
-            // owner; no replacement Run can start before confirmation.
-            entry.cleanup_unconfirmed = true;
             let cleanup_detail = finished
                 .detail
                 .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string());
-            if timed_out || unhealthy {
-                let failure = entry.failure.get_or_insert(FailureSummary {
-                    kind: if unhealthy {
-                        FailureKind::Liveness
-                    } else {
-                        FailureKind::Readiness
-                    },
-                    detail: if unhealthy {
-                        "liveness failure threshold reached".to_string()
-                    } else {
-                        "readiness startup timeout".to_string()
-                    },
-                });
-                failure.detail = format!("{}; cleanup failed: {cleanup_detail}", failure.detail);
-            } else {
-                entry.failure = Some(FailureSummary {
-                    kind: FailureKind::Shutdown,
-                    detail: cleanup_detail,
-                });
-            }
-            if entry.lifecycle != super::core::Lifecycle::Done {
-                entry.lifecycle = if timed_out || unhealthy {
-                    super::core::Lifecycle::Stopping
-                } else {
-                    super::core::Lifecycle::Stopped
-                };
-            }
-            entry.metrics = None;
-            entry.readiness = None;
-            entry.liveness = None;
-            entry.spawned = false;
+            self.lifecycles[index].hold_unconfirmed_cleanup(timed_out, unhealthy, cleanup_detail);
             self.evaluate();
             return;
         }
 
-        {
-            let entry = &mut self.entries[index];
-            if self.project.processes()[index].kind == ProcessKind::OneShot {
-                entry.exited = true;
-            }
-            if timed_out {
-                let failure = entry
-                    .failure
-                    .as_mut()
-                    .expect("a pending startup timeout has a recorded failure");
-                failure.detail.push_str("; cleanup confirmed");
-            }
-        }
+        let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
+        self.lifecycles[index].confirm_cleanup(one_shot, timed_out);
         self.finalize_confirmed_run(
             index,
             finished.run_id,
@@ -334,22 +264,12 @@ impl Core {
     fn apply_failed_run(&mut self, index: usize, kind: FailureKind, detail: String) {
         let restart_reason =
             self.restart_reason_for_terminal(index, TerminalOutcome::Failed { kind });
-        let failed_run_id = self.entries[index]
+        let failed_run_id = self.lifecycles[index]
             .current_run
             .expect("a failed event belongs to the current Run");
         self.cancel_run_work(index);
         let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
-        {
-            let entry = &mut self.entries[index];
-            if one_shot {
-                // A spawn failure still ends the scheduled One-shot Run;
-                // `exited` does not require successful process creation.
-                entry.exited = true;
-            }
-            entry.failure = Some(FailureSummary { kind, detail });
-            entry.desired = super::core::DesiredState::Stopped;
-            entry.lifecycle = super::core::Lifecycle::Stopped;
-        }
+        self.lifecycles[index].fail_run(one_shot, kind, detail);
         self.finalize_confirmed_run(index, failed_run_id, None, false, restart_reason);
     }
 
@@ -358,10 +278,10 @@ impl Core {
         index: usize,
         outcome: TerminalOutcome,
     ) -> Option<RestartReason> {
-        if self.shutdown_in_progress() || self.entries[index].restart_suppressed {
+        if self.shutdown_in_progress() || self.lifecycles[index].restart_suppressed {
             return None;
         }
-        if self.entries[index].unhealthy_restart_pending {
+        if self.lifecycles[index].unhealthy_restart_pending {
             return Some(RestartReason::Unhealthy);
         }
         let policy = self.project.processes()[index].restart.policy;
@@ -410,31 +330,13 @@ impl Core {
         restart_reason: Option<RestartReason>,
     ) {
         let now_ms = self.now_ms();
-        {
-            let entry = &mut self.entries[index];
-            debug_assert_eq!(entry.current_run, Some(run_id));
-            entry.record_finished_run(now_ms, exit_code, intentional_stop);
-            entry.current_run = None;
-            entry.root_pid = None;
-            entry.metrics = None;
-            entry.readiness = None;
-            entry.liveness = None;
-            entry.spawned = false;
-            entry.unhealthy_restart_pending = false;
-            entry.cleanup_unconfirmed = false;
-            entry.startup_timeout_pending = false;
-            // A successful One-shot stays Done. Every other finished Run
-            // settles at Stopped after its result has been recorded.
-            if entry.lifecycle != super::core::Lifecycle::Done {
-                entry.lifecycle = super::core::Lifecycle::Stopped;
-            }
-        }
+        self.lifecycles[index].finish_confirmed_run(run_id, now_ms, exit_code, intentional_stop);
         if let Some(reason) = restart_reason {
             // The terminal Run identity is the timer's guard. The Run has
             // been released before the replacement timer is installed.
             self.schedule_automatic_restart(index, run_id, reason);
         } else {
-            self.entries[index].restart_suppressed = false;
+            self.lifecycles[index].clear_restart_suppression();
         }
         self.evaluate();
     }
@@ -454,22 +356,7 @@ impl Core {
     /// any other code fails it. Desired State reverts to Stopped either way.
     fn complete_one_shot(&mut self, index: usize, code: Option<i32>) {
         let success = self.exit_code_succeeds(index, code);
-        let entry = &mut self.entries[index];
-        if success {
-            entry.lifecycle = super::core::Lifecycle::Done;
-            entry.failure = None;
-        } else {
-            entry.lifecycle = super::core::Lifecycle::Stopped;
-            entry.failure = Some(FailureSummary {
-                kind: FailureKind::ProcessExit,
-                detail: match code {
-                    Some(exit_code) => format!("exited with code {exit_code}"),
-                    None => "exited without an exit code".to_string(),
-                },
-            });
-        }
-        entry.desired = super::core::DesiredState::Stopped;
-        entry.blocked = None;
+        self.lifecycles[index].complete_one_shot(success, code);
     }
 
     /// Record a Service's unexpected natural result. The Run identity stays
@@ -477,17 +364,6 @@ impl Core {
     /// Running so later restart policy can make an explicit decision; until
     /// then the scheduler waits for a manual start or restart.
     fn observe_service_exit(&mut self, index: usize, code: Option<i32>) {
-        let entry = &mut self.entries[index];
-        if entry.desired == super::core::DesiredState::Running {
-            entry.failure = Some(FailureSummary {
-                kind: FailureKind::ProcessExit,
-                detail: match code {
-                    Some(code) => format!("exited unexpectedly with code {code}"),
-                    None => "exited unexpectedly".to_string(),
-                },
-            });
-            entry.awaiting_manual_restart = true;
-            entry.blocked = None;
-        }
+        self.lifecycles[index].observe_service_exit(code);
     }
 }
