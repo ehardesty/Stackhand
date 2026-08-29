@@ -11,6 +11,12 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(5);
 const FIXTURE_WAIT: Duration = Duration::from_secs(120);
 
+#[allow(dead_code)]
+enum FixtureSource<'a> {
+    Explicit(&'a Path),
+    Discovered(&'a Path),
+}
+
 /// Owns a loopback listener worker and joins it when the test drops the listener.
 pub struct OwnedListener {
     port: u16,
@@ -89,13 +95,49 @@ pub fn run_fixture_with_profiles(
     fixture_flag: &str,
     config_path: &Path,
     profiles: &[&str],
+    on_checkpoint: impl FnMut(&str),
+) -> String {
+    run_fixture_command(
+        fixture_flag,
+        FixtureSource::Explicit(config_path),
+        profiles,
+        on_checkpoint,
+    )
+}
+
+#[allow(dead_code)]
+pub fn run_discovered_fixture_with_profiles(
+    fixture_flag: &str,
+    start_directory: &Path,
+    profiles: &[&str],
+    on_checkpoint: impl FnMut(&str),
+) -> String {
+    run_fixture_command(
+        fixture_flag,
+        FixtureSource::Discovered(start_directory),
+        profiles,
+        on_checkpoint,
+    )
+}
+
+fn run_fixture_command(
+    fixture_flag: &str,
+    source: FixtureSource<'_>,
+    profiles: &[&str],
     mut on_checkpoint: impl FnMut(&str),
 ) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stackhand"));
     command
         .env("SHELL", "/path/that/does/not/exist")
-        .arg(fixture_flag)
-        .arg(config_path);
+        .arg(fixture_flag);
+    match source {
+        FixtureSource::Explicit(config_path) => {
+            command.arg(config_path);
+        }
+        FixtureSource::Discovered(start_directory) => {
+            command.current_dir(start_directory);
+        }
+    }
     for profile in profiles {
         command.arg("--profile").arg(profile);
     }

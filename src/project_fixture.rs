@@ -1,6 +1,6 @@
-//! The integrated Project fixture: a headless proof of the full Milestone 2
-//! user path through production configuration, Supervisor, Run adapters,
-//! readiness and liveness checks, output, and controlled shutdown.
+//! The integrated Project fixture: a headless proof of the full Milestone 3
+//! user path through layered production configuration, Supervisor, Run
+//! adapters, readiness and liveness checks, output, and controlled shutdown.
 
 use std::io::Write;
 use std::path::Path;
@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail, ensure};
 
 use crate::supervisor::{
-    Command, DesiredState, FailureKind, Lifecycle, OutputViews, ProcessId, ProcessSnapshot,
-    ProjectSnapshot, ReadinessCheckKind, ReadinessState, SupervisorHandle,
+    Command, DesiredState, FailureKind, Lifecycle, OutputViews, ProcessSnapshot, ProjectSnapshot,
+    ReadinessCheckKind, ReadinessState, SupervisorHandle,
 };
+
+mod output_proof;
 
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const TRANSITION_WAIT: Duration = Duration::from_secs(15);
@@ -21,6 +23,13 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// Console text that proves inline environment reached the child.
 const ENV_PROOF: &str = "fixture-token-stackhand-env-ok";
+const ENV_VALUE_PROOF: &str = "fixture-env-value-inline-value";
+const PROJECT_ENV_PROOF: &str = "fixture-project-only-project-file";
+const PROCESS_ENV_PROOF: &str = "fixture-process-only-process-file";
+const LOCAL_PRECEDENCE_PROOF: &str = "fixture-local-precedence-local-file";
+const PROCESS_PRECEDENCE_PROOF: &str = "fixture-process-precedence-process-file";
+const PROFILE_ENV_PROOF: &str = "fixture-profile-value-second-profile";
+const LOCAL_ENV_PROOF: &str = "fixture-local-value-local-override";
 
 /// Console text that proves a shell pipeline ran end to end.
 const PIPELINE_PROOF: &str = "FIXTURE-PIPELINE-LOWER";
@@ -29,6 +38,13 @@ const PIPELINE_PROOF: &str = "FIXTURE-PIPELINE-LOWER";
 const CONSOLE_PROOFS: &[(&str, &str)] = &[
     ("hello", "fixture-marker"),
     ("hello", ENV_PROOF),
+    ("hello", ENV_VALUE_PROOF),
+    ("hello", PROJECT_ENV_PROOF),
+    ("hello", PROCESS_ENV_PROOF),
+    ("hello", LOCAL_PRECEDENCE_PROOF),
+    ("hello", PROCESS_PRECEDENCE_PROOF),
+    ("hello", PROFILE_ENV_PROOF),
+    ("hello", LOCAL_ENV_PROOF),
     ("shelled", PIPELINE_PROOF),
 ];
 
@@ -63,13 +79,24 @@ pub fn run_with_profiles(config_path: &Path, profiles: &[String]) -> Result<()> 
         config_path,
         profiles.iter().cloned(),
     );
+    run_request(request, !profiles.is_empty())
+}
+
+/// Discover the base Project from the current directory and run the fixture.
+pub fn run_discovered_with_profiles(profiles: &[String]) -> Result<()> {
+    let request =
+        crate::config::ResolutionRequest::discover_with_profiles(profiles.iter().cloned());
+    run_request(request, !profiles.is_empty())
+}
+
+fn run_request(request: crate::config::ResolutionRequest, profile_selected: bool) -> Result<()> {
     let resolution =
         crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
     let output_lifetime = std::sync::Arc::downgrade(&outputs);
     supervisor.command(Command::StartAutostart);
 
-    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs, !profiles.is_empty())?;
+    let descendant_pid = prove_slice(&supervisor, &consoles, &outputs, profile_selected)?;
     shutdown(supervisor)?;
     wait_for_pid_exit(descendant_pid)?;
 
@@ -89,16 +116,42 @@ fn prove_slice(
     outputs: &OutputViews,
     profile_selected: bool,
 ) -> Result<u32> {
-    // Configuration order puts this dependent before its One-shot. Its
-    // snapshot proves a failed completion dependency is visible and remains
-    // desired-running until the One-shot is rerun.
+    // The fixture observes these dependents while their required Dependencies
+    // are still blocked. Their immutable snapshots prove both blocked reasons
+    // before the readiness gate is released.
     wait_for(supervisor, STARTUP_WAIT, |snapshot| {
         snapshot.named("rerun-dependent").is_some_and(|process| {
             process.lifecycle == Lifecycle::Waiting
                 && process.blocked_reason.as_deref() == Some("rerun-setup: completed_successfully")
-        })
+        }) && snapshot.named("initialization").is_some_and(|process| {
+            process.lifecycle == Lifecycle::Waiting
+                && process.blocked_reason.as_deref() == Some("initialization-gate: ready")
+        }) && snapshot
+            .named("initialized-dependent")
+            .is_some_and(|process| {
+                process.lifecycle == Lifecycle::Waiting
+                    && process.blocked_reason.as_deref()
+                        == Some("initialization: completed_successfully")
+            })
     })?;
     checkpoint("fixture-blocked-ok");
+    checkpoint("fixture-initialization-ready");
+    let initialized = wait_for(supervisor, STARTUP_WAIT, |snapshot| {
+        completed(snapshot, "initialization", Some(0)) && running(snapshot, "initialized-dependent")
+    })?;
+    let initialization = process(&initialized, "initialization");
+    let initialization_end = initialization
+        .recent_runs
+        .first()
+        .expect("the initialization One-shot has a Run summary")
+        .ended_at_ms;
+    ensure!(
+        process(&initialized, "initialized-dependent")
+            .run_started_at_ms
+            .is_some_and(|started_at| started_at >= initialization_end),
+        "the initialized dependent started before its One-shot completed"
+    );
+    checkpoint("fixture-initialization-ok");
 
     // Wait for the stable startup evidence. The processes that intentionally
     // fail are checked below through their structured snapshots instead of
@@ -119,13 +172,16 @@ fn prove_slice(
             && running(snapshot, "shelled")
             && running(snapshot, "piped")
             && running(snapshot, "noisy")
+            && completed(snapshot, "direct", Some(0))
             && completed(snapshot, "accepted", Some(42))
             && running(snapshot, "completed-dependent")
             && failed_exit(snapshot, "exited-source", Some(7))
             && running(snapshot, "exited-dependent")
             && failed_exit(snapshot, "rerun-setup", Some(7))
             && waiting(snapshot, "rerun-dependent")
-            && (!profile_selected || completed(snapshot, "profile-added", Some(0)))
+            && completed(snapshot, "initialization", Some(0))
+            && running(snapshot, "initialized-dependent")
+            && (!profile_selected || completed(snapshot, "optional", Some(0)))
             && startup_timed_out(snapshot, "startup-timeout")
             && snapshot.named("shutdown-restart").is_some_and(|process| {
                 process.lifecycle == Lifecycle::RestartBackoff
@@ -141,13 +197,14 @@ fn prove_slice(
     assert_startup_snapshot(&snapshot)?;
     checkpoint("fixture-started-ok");
 
-    prove_console_output(&snapshot, consoles)?;
+    output_proof::prove_console_output(&snapshot, consoles)?;
     checkpoint("fixture-output-ok");
-    let descendant_pid = prove_pipe_output(&snapshot, outputs)?;
-    prove_noisy_output(outputs, process(&snapshot, "noisy").process_id)?;
+    let descendant_pid = output_proof::prove_pipe_output(&snapshot, outputs)?;
+    output_proof::prove_direct_output(&snapshot, outputs)?;
+    output_proof::prove_noisy_output(outputs, process(&snapshot, "noisy").process_id)?;
     checkpoint("fixture-pipe-output-ok");
 
-    let timeout_pid = retained_pid(
+    let timeout_pid = output_proof::retained_pid(
         outputs,
         process(&snapshot, "startup-timeout").process_id,
         "startup-timeout",
@@ -322,7 +379,7 @@ fn prove_slice(
             .as_ref()
             .is_some_and(|failure| failure.detail.contains("Restart limit"))
     );
-    prove_restart_output(outputs, budget.process_id)?;
+    output_proof::prove_restart_output(outputs, budget.process_id)?;
     checkpoint("fixture-restart-budget-ok");
 
     // The failed One-shot remains desired-running through its blocked
@@ -406,170 +463,6 @@ fn assert_startup_snapshot(snapshot: &ProjectSnapshot) -> Result<()> {
     assert!(!disabled.enabled);
     assert_eq!(disabled.current_run, None);
     Ok(())
-}
-
-fn prove_console_output(
-    snapshot: &ProjectSnapshot,
-    consoles: &crate::supervisor::Consoles,
-) -> Result<()> {
-    for (name, needle) in CONSOLE_PROOFS {
-        let process = process(snapshot, name);
-        let run_id = current_run(snapshot, name)?;
-        let view = consoles
-            .view_process(process.process_id, run_id)
-            .ok_or_else(|| anyhow!("no live console view for {name}"))?;
-        wait_for_console_text(view, needle)?;
-    }
-    Ok(())
-}
-
-fn prove_pipe_output(snapshot: &ProjectSnapshot, outputs: &OutputViews) -> Result<u32> {
-    for (name, needle, stream) in PIPE_PROOFS {
-        let process = process(snapshot, name);
-        let run_id = current_run(snapshot, name)?;
-        let module = outputs
-            .for_process_id(process.process_id)
-            .ok_or_else(|| anyhow!("no retained output module for {name}"))?;
-        wait_for_retained_text(&module, *stream, needle, run_id)?;
-    }
-    let process = process(snapshot, "piped");
-    retained_pid(
-        outputs,
-        process.process_id,
-        process.name.as_str(),
-        "fixture-descendant-pid-",
-    )
-}
-
-fn prove_noisy_output(outputs: &OutputViews, process_id: ProcessId) -> Result<()> {
-    let module = outputs
-        .for_process_id(process_id)
-        .ok_or_else(|| anyhow!("the noisy Process output module is missing"))?;
-    let snapshot = module.snapshot();
-    let bytes = retained_bytes(&snapshot);
-    ensure!(
-        bytes <= crate::supervisor::RETAINED_BYTES,
-        "noisy Process output exceeded its bound: {bytes}"
-    );
-    ensure!(
-        snapshot.chunks.iter().any(|chunk| {
-            matches!(chunk, crate::supervisor::RetainedChunk::Data { text, .. } if text.contains("fixture-noisy"))
-        }),
-        "noisy Process output did not reach retained history"
-    );
-    Ok(())
-}
-
-fn prove_restart_output(outputs: &OutputViews, process_id: ProcessId) -> Result<()> {
-    let module = outputs
-        .for_process_id(process_id)
-        .ok_or_else(|| anyhow!("the restart Process output module is missing"))?;
-    let snapshot = module.snapshot();
-    let marker_count = snapshot
-        .chunks
-        .iter()
-        .filter(|chunk| matches!(chunk, crate::supervisor::RetainedChunk::Marker { .. }))
-        .count();
-    ensure!(
-        marker_count >= 3,
-        "restart output lost Run boundaries: {snapshot:?}"
-    );
-    ensure!(
-        retained_bytes(&snapshot) <= crate::supervisor::RETAINED_BYTES,
-        "restart output exceeded its bound"
-    );
-    Ok(())
-}
-
-fn retained_pid(
-    outputs: &OutputViews,
-    process_id: ProcessId,
-    name: &str,
-    prefix: &str,
-) -> Result<u32> {
-    let module = outputs
-        .for_process_id(process_id)
-        .ok_or_else(|| anyhow!("the {name} output module is missing"))?;
-    let deadline = Instant::now() + OUTPUT_WAIT;
-    loop {
-        let snapshot = module.snapshot();
-        if let Some(pid) = snapshot.chunks.iter().find_map(|chunk| match chunk {
-            crate::supervisor::RetainedChunk::Data { text, .. } => text
-                .split(prefix)
-                .nth(1)
-                .and_then(|value| value.lines().next())
-                .and_then(|value| value.trim().parse::<u32>().ok()),
-            crate::supervisor::RetainedChunk::Marker { .. } => None,
-        }) {
-            return Ok(pid);
-        }
-        if Instant::now() >= deadline {
-            bail!("the {name} output did not contain a PID marker: {snapshot:?}");
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
-fn retained_bytes(snapshot: &crate::supervisor::RetainedOutput) -> usize {
-    snapshot
-        .chunks
-        .iter()
-        .map(|chunk| match chunk {
-            crate::supervisor::RetainedChunk::Data { text, .. } => text.len(),
-            crate::supervisor::RetainedChunk::Marker { label, .. } => label.len(),
-        })
-        .sum()
-}
-
-fn wait_for_retained_text(
-    module: &crate::supervisor::ProcessOutput,
-    stream: crate::runtime::OutputStream,
-    needle: &str,
-    run_id: u64,
-) -> Result<()> {
-    let deadline = Instant::now() + OUTPUT_WAIT;
-    loop {
-        let snapshot = module.snapshot();
-        let marker_present = snapshot.chunks.iter().any(|chunk| {
-            matches!(chunk, crate::supervisor::RetainedChunk::Marker { run_id: marked, .. } if *marked == run_id)
-        });
-        let proof_present = snapshot.chunks.iter().any(|chunk| {
-            matches!(
-                chunk,
-                crate::supervisor::RetainedChunk::Data {
-                    run_id: marked,
-                    stream: chunk_stream,
-                    text,
-                    ..
-                } if *marked == run_id && *chunk_stream == stream && text.contains(needle)
-            )
-        });
-        if marker_present && proof_present {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the retained proof '{needle}' never reached the module (marker: {marker_present})"
-            );
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
-fn wait_for_console_text(view: crate::supervisor::ConsoleView, needle: &str) -> Result<()> {
-    let deadline = Instant::now() + OUTPUT_WAIT;
-    loop {
-        if view
-            .snapshot()
-            .is_some_and(|snapshot| buffer_text(&snapshot).contains(needle))
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("the fixture proof '{needle}' never reached the console");
-        }
-        std::thread::sleep(POLL);
-    }
 }
 
 fn shutdown(supervisor: SupervisorHandle) -> Result<()> {
@@ -715,16 +608,6 @@ fn startup_timed_out(snapshot: &ProjectSnapshot, name: &str) -> bool {
         && process.failure.as_ref().is_some_and(|failure| {
             failure.kind == FailureKind::Readiness && failure.detail.contains("startup timeout")
         })
-}
-
-/// Flatten a terminal snapshot into plain text for marker assertions.
-fn buffer_text(snapshot: &crate::terminal::OwnedTerminalSnapshot) -> String {
-    snapshot
-        .buffer
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect()
 }
 
 fn checkpoint(label: &str) {

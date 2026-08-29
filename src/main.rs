@@ -26,9 +26,10 @@ fn main() -> Result<()> {
             print!("{}", view.yaml);
             Ok(())
         }
-        Mode::FixtureProject { path, profiles } => {
-            stackhand::project_fixture::run_with_profiles(&path, &profiles)
-        }
+        Mode::FixtureProject { path, profiles } => match path {
+            Some(path) => stackhand::project_fixture::run_with_profiles(&path, &profiles),
+            None => stackhand::project_fixture::run_discovered_with_profiles(&profiles),
+        },
         Mode::FixtureRoundTrip(text) => stackhand::prototype::run_fixture_round_trip(&text),
         Mode::FixtureInput => stackhand::prototype::run_fixture_input(),
         Mode::FixturePaste => stackhand::prototype::run_fixture_paste(),
@@ -54,7 +55,7 @@ enum Mode {
         profiles: Vec<String>,
     },
     FixtureProject {
-        path: PathBuf,
+        path: Option<PathBuf>,
         profiles: Vec<String>,
     },
     FixtureRoundTrip(String),
@@ -90,7 +91,6 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
 
     if first == "--fixture-project" {
         let (path, profiles) = parse_path_and_profiles(args.collect(), "--fixture-project")?;
-        let path = path.context("--fixture-project requires a YAML path")?;
         return Ok(Mode::FixtureProject { path, profiles });
     }
 
