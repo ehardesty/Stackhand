@@ -9,6 +9,7 @@ mod file;
 mod paths;
 mod profile;
 mod readiness;
+mod show;
 
 #[cfg(test)]
 mod exit_tests;
@@ -98,6 +99,7 @@ impl ResolutionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolutionSources {
     pub base: PathBuf,
+    pub profiles: Vec<String>,
     pub local: Option<PathBuf>,
 }
 
@@ -141,7 +143,11 @@ pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigEr
     let project = load_file_with_local(&base, &profiles, local.as_deref())?;
     Ok(ProjectResolution {
         project,
-        sources: ResolutionSources { base, local },
+        sources: ResolutionSources {
+            base,
+            profiles,
+            local,
+        },
     })
 }
 
@@ -182,11 +188,35 @@ pub fn validate_project_sources_with_profiles(
     explicit_path: Option<&Path>,
     profiles: &[String],
 ) -> Result<ResolutionSources, ConfigError> {
-    let request = explicit_path.map_or_else(
+    resolve(resolution_request(explicit_path, profiles)).map(|resolution| resolution.sources)
+}
+
+/// The source summary and redacted normalized YAML for one resolved Project.
+#[derive(Debug)]
+pub struct EffectiveProjectView {
+    pub sources: ResolutionSources,
+    pub yaml: String,
+}
+
+/// Resolve one Project and render the effective canonical configuration
+/// without starting the Supervisor or any Process.
+pub fn show_project_with_profiles(
+    explicit_path: Option<&Path>,
+    profiles: &[String],
+) -> Result<EffectiveProjectView, ConfigError> {
+    let resolution = resolve(resolution_request(explicit_path, profiles))?;
+    let yaml = show::render(&resolution.project)?;
+    Ok(EffectiveProjectView {
+        sources: resolution.sources,
+        yaml,
+    })
+}
+
+fn resolution_request(explicit_path: Option<&Path>, profiles: &[String]) -> ResolutionRequest {
+    explicit_path.map_or_else(
         || ResolutionRequest::discover_with_profiles(profiles.iter().cloned()),
         |path| ResolutionRequest::explicit_with_profiles(path, profiles.iter().cloned()),
-    );
-    resolve(request).map(|resolution| resolution.sources)
+    )
 }
 
 #[cfg(test)]

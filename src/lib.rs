@@ -29,6 +29,7 @@ pub use app::{
     run_project_with_profiles,
 };
 pub use config::{
-    validate_project, validate_project_sources_with_profiles, validate_project_with_profile,
+    EffectiveProjectView, ResolutionSources, show_project_with_profiles, validate_project,
+    validate_project_sources_with_profiles, validate_project_with_profile,
     validate_project_with_profiles,
 };

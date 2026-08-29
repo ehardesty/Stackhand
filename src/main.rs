@@ -14,10 +14,16 @@ fn main() -> Result<()> {
                 stackhand::validate_project_sources_with_profiles(path.as_deref(), &profiles)
                     .map_err(|error| anyhow!("configuration error: {error}"))?;
             println!("Project configuration is valid:");
-            println!("  base: {}", sources.base.display());
-            if let Some(local) = sources.local {
-                println!("  local override: {}", local.display());
-            }
+            print_sources(&sources);
+            Ok(())
+        }
+        Mode::ConfigShow { path, profiles } => {
+            let view = stackhand::show_project_with_profiles(path.as_deref(), &profiles)
+                .map_err(|error| anyhow!("configuration error: {error}"))?;
+            println!("Project sources (precedence order):");
+            print_sources(&view.sources);
+            println!("Effective Project:");
+            print!("{}", view.yaml);
             Ok(())
         }
         Mode::FixtureProject { path, profiles } => {
@@ -40,6 +46,10 @@ enum Mode {
         profiles: Vec<String>,
     },
     ConfigValidate {
+        path: Option<PathBuf>,
+        profiles: Vec<String>,
+    },
+    ConfigShow {
         path: Option<PathBuf>,
         profiles: Vec<String>,
     },
@@ -67,11 +77,15 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
 
     if first == "config" {
         let command = args.next().context("config requires a subcommand")?;
-        if command != "validate" {
-            bail!("unknown config command: {}", command.to_string_lossy());
+        if command == "validate" {
+            let (path, profiles) = parse_path_and_profiles(args.collect(), "config validate")?;
+            return Ok(Mode::ConfigValidate { path, profiles });
         }
-        let (path, profiles) = parse_path_and_profiles(args.collect(), "config validate")?;
-        return Ok(Mode::ConfigValidate { path, profiles });
+        if command == "show" {
+            let (path, profiles) = parse_path_and_profiles(args.collect(), "config show")?;
+            return Ok(Mode::ConfigShow { path, profiles });
+        }
+        bail!("unknown config command: {}", command.to_string_lossy());
     }
 
     if first == "--fixture-project" {
@@ -178,6 +192,16 @@ fn parse_path_and_profiles(
         path = Some(PathBuf::from(argument));
     }
     Ok((path, profiles))
+}
+
+fn print_sources(sources: &stackhand::ResolutionSources) {
+    println!("  base: {}", sources.base.display());
+    for profile in &sources.profiles {
+        println!("  profile: {profile}");
+    }
+    if let Some(local) = &sources.local {
+        println!("  local override: {}", local.display());
+    }
 }
 
 fn profile_name(value: OsString) -> Result<String> {

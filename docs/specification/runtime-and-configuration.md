@@ -295,11 +295,11 @@ top-level `input`, and scalar terminal values are rejected. The validation
 message names the canonical replacement to use.
 
 A Project may define named profiles. Select profiles explicitly with one or
-more `--profile NAME` options on the normal run command or on `config validate`.
-Profiles apply in the order of the options. No profile is selected by default. A
-profile may use `enable`, `disable`, `settings`, and name-keyed `overrides`; an
-override can replace Process fields or add a complete Process. The selected
-result is validated before any Process starts.
+more `--profile NAME` options on the normal run command, `config validate`, or
+`config show`. Profiles apply in the order of the options. No profile is
+selected by default. A profile may use `enable`, `disable`, `settings`, and
+name-keyed `overrides`; an override can replace Process fields or add a complete
+Process. The selected result is validated before any Process starts.
 
 The final filename remains open. Examples in this document use:
 
@@ -329,14 +329,24 @@ Validation and dependency graph compilation occur only after the full merge.
 
 ### 14.4 Effective configuration diagnostics
 
-Provide a non-interactive command such as:
+Provide these non-interactive commands:
 
 ```text
 <tool> config show
 <tool> config validate
 ```
 
-It should display or emit the effective configuration and identify which layers contributed to a value where practical.
+`config show` reports the base Project, selected profiles, and local override in
+precedence order. It then prints the normalized canonical YAML for the effective
+Project. The output includes resolved paths and effective defaults. Loaded
+environment files are represented by their effective keys, but every value uses
+a redaction marker. Removed environment keys are shown as YAML `null`.
+Profile definitions and environment-file paths are not copied into the
+effective YAML.
+
+`config validate` reports the same selected sources without printing the
+configuration. Both commands use the shared resolver and finish before any
+Process starts. Resolution failures use the same diagnostic path.
 
 This is important because profile and local-overlay behavior otherwise becomes difficult to debug.
 
