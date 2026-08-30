@@ -13,8 +13,9 @@ use super::ConfigError;
 use super::paths::resolve_directory;
 
 const DURATION_FORMAT_ERROR: &str = "use a nonnegative whole number with an ms, s, m, or h suffix";
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_SUCCESS_THRESHOLD: u32 = 1;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 1;
 
@@ -53,19 +54,13 @@ pub(super) fn build_readiness(
     base_dir: &Path,
 ) -> Result<ReadinessConfig, ConfigError> {
     reject_any_form(process_name, file, READINESS_LABELS)?;
-    let startup_timeout = file
-        .startup_timeout
-        .as_deref()
-        .map(|value| {
-            positive_duration(
-                process_name,
-                "startup_timeout",
-                Some(value),
-                Duration::ZERO,
-                READINESS_LABELS,
-            )
-        })
-        .transpose()?;
+    let startup_timeout = Some(positive_duration(
+        process_name,
+        "startup_timeout",
+        file.startup_timeout.as_deref(),
+        DEFAULT_STARTUP_TIMEOUT,
+        READINESS_LABELS,
+    )?);
     let checks = build_checks(process_name, file, base_dir, READINESS_LABELS)?;
     Ok(ReadinessConfig {
         checks,

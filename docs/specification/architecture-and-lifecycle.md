@@ -493,15 +493,17 @@ Composite `any` is optional and is not required by this specification.
 
 #### 9.14.2 Common probe scheduling
 
-A probe supports:
+A probe supports these scheduling fields. Their built-in defaults are:
 
 ```yaml
-initial_delay: 1s
+initial_delay: 0s
 interval: 2s
 timeout: 5s
 success_threshold: 1
-failure_threshold: 3
+failure_threshold: 1
 ```
+
+Readiness also has a default `startup_timeout` of `10m`. Liveness does not use a startup timeout.
 
 Rules:
 

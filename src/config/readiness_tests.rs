@@ -34,8 +34,12 @@ fn http_readiness_parses_the_url_into_its_connect_target() {
             path: "/healthz?probe=1".into(),
         }
     );
-    assert_eq!(check.interval, Duration::from_millis(1_000));
-    assert_eq!(check.timeout, Duration::from_millis(2_000));
+    assert_eq!(check.interval, Duration::from_secs(2));
+    assert_eq!(check.timeout, Duration::from_secs(5));
+    assert_eq!(
+        readiness.startup_timeout,
+        Some(Duration::from_secs(10 * 60))
+    );
 
     // The default port and path come from the URL.
     let bare = write_and_load(
@@ -96,8 +100,12 @@ fn tcp_readiness_parses_with_bounded_defaults() {
             port: 5432
         }
     );
-    assert_eq!(check.interval, Duration::from_millis(1_000));
-    assert_eq!(check.timeout, Duration::from_millis(2_000));
+    assert_eq!(check.interval, Duration::from_secs(2));
+    assert_eq!(check.timeout, Duration::from_secs(5));
+    assert_eq!(
+        readiness.startup_timeout,
+        Some(Duration::from_secs(10 * 60))
+    );
 }
 
 #[test]
@@ -492,7 +500,7 @@ fn log_readiness_accepts_one_nonempty_literal() {
         }
     );
     assert_eq!(check.initial_delay, Duration::ZERO);
-    assert_eq!(check.interval, Duration::from_secs(1));
+    assert_eq!(check.interval, Duration::from_secs(2));
 }
 
 #[test]
@@ -582,7 +590,7 @@ fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
     ));
     assert_eq!(liveness.checks[0].initial_delay, Duration::ZERO);
     assert_eq!(liveness.checks[0].interval, Duration::from_secs(3));
-    assert_eq!(liveness.checks[0].timeout, Duration::from_secs(2));
+    assert_eq!(liveness.checks[0].timeout, Duration::from_secs(5));
 }
 
 #[test]

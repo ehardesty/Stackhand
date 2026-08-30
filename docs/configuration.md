@@ -133,13 +133,18 @@ A `ready` or `liveness` block contains one `tcp`, `http`, `exec`, or `log` check
 ready:
   http:
     url: http://127.0.0.1:8080/health
-  initial_delay: 0s
-  interval: 1s
-  timeout: 2s
-  success_threshold: 1
-  failure_threshold: 1
-  startup_timeout: 1m
 ```
+
+The scheduling defaults are:
+
+| Field | Default |
+| --- | --- |
+| `initial_delay` | `0s` |
+| `interval` | `2s` |
+| `timeout` | `5s` |
+| `success_threshold` | `1` |
+| `failure_threshold` | `1` |
+| `startup_timeout` | `10m` for readiness only |
 
 `startup_timeout` is available only on `ready`. Readiness and liveness checks are available only for Services.
 
