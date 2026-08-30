@@ -24,14 +24,13 @@ mod pty_seam_tests {
                 process_id: ProcessId::new(7),
                 run_id: RunId::new(42),
                 command,
-                mode: RunMode::Pty {
+                transport: RunTransport::Pty {
                     initial_geometry: TerminalGeometry::DEFAULT,
+                    on_output_wake: None,
                 },
                 events,
-                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("fixture run started");
@@ -56,14 +55,13 @@ mod pty_seam_tests {
                 process_id: ProcessId::new(3),
                 run_id: RunId::new(9),
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 30"),
-                mode: RunMode::Pty {
+                transport: RunTransport::Pty {
                     initial_geometry: TerminalGeometry::DEFAULT,
+                    on_output_wake: None,
                 },
                 events: mpsc::channel().0,
-                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
-                on_output_wake: None,
                 output_observer: None,
             })
             .unwrap();
@@ -135,12 +133,10 @@ mod pipe_tests {
                 process_id: ProcessId::new(11),
                 run_id: RunId::new(77),
                 command,
-                mode: RunMode::Pipe,
+                transport: RunTransport::Pipe { output },
                 events,
-                output,
                 ladder: Default::default(),
                 metrics_interval: None,
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("pipe run started");
@@ -284,12 +280,10 @@ mod process_tree_tests {
                 process_id: ProcessId::new(21),
                 run_id: RunId::new(88),
                 command,
-                mode: RunMode::Pipe,
+                transport: RunTransport::Pipe { output },
                 events,
-                output,
                 ladder: Default::default(),
                 metrics_interval: None,
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("pipe run started");
@@ -588,14 +582,13 @@ wait";
                 process_id: ProcessId::new(22),
                 run_id: RunId::new(89),
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 300"),
-                mode: RunMode::Pty {
+                transport: RunTransport::Pty {
                     initial_geometry: geometry,
+                    on_output_wake: None,
                 },
                 events,
-                output: output_channel().0,
                 ladder: Default::default(),
                 metrics_interval: None,
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("pty run started");

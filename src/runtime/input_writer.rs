@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::byte_budget::ByteBudget;
@@ -60,7 +60,7 @@ impl WriterStatus {
 
 pub struct PtyWriterOwner {
     status: Arc<WriterStatus>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    worker: crate::worker_handle::WorkerHandle,
 }
 
 impl PtyWriterOwner {
@@ -69,15 +69,7 @@ impl PtyWriterOwner {
     }
 
     pub fn join(&self) -> io::Result<()> {
-        let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        else {
-            return Ok(());
-        };
-        thread
+        self.worker
             .join()
             .map_err(|_| io::Error::other("PTY writer thread panicked"))
     }
@@ -86,39 +78,14 @@ impl PtyWriterOwner {
     /// operating-system write is detached after the deadline and reported by
     /// the caller instead of extending Run shutdown indefinitely.
     pub fn join_until(&self, deadline: Instant) -> io::Result<bool> {
-        loop {
-            let finished = self
-                .thread
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-                .is_none_or(JoinHandle::is_finished);
-            if finished {
-                self.join()?;
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                return Ok(self.abandon_nonblocking());
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
+        self.worker
+            .join_until(deadline)
+            .map_err(|_| io::Error::other("PTY writer thread panicked"))
     }
 
     /// Detach a writer that is still blocked. Returns whether it joined.
     pub fn abandon_nonblocking(&self) -> bool {
-        let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        else {
-            return true;
-        };
-        if thread.is_finished() {
-            thread.join().is_ok()
-        } else {
-            false
-        }
+        self.worker.abandon_nonblocking()
     }
 }
 
@@ -272,7 +239,7 @@ pub(crate) fn spawn_bounded_pty_writer(
     };
     let owner = PtyWriterOwner {
         status,
-        thread: Mutex::new(Some(thread)),
+        worker: crate::worker_handle::WorkerHandle::new(thread),
     };
     Ok((queued_writer, owner))
 }

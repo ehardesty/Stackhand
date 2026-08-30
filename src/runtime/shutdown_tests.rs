@@ -37,12 +37,10 @@ fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> StartedRun {
             process_id: ProcessId::new(31),
             run_id: RunId::new(101),
             command,
-            mode: RunMode::Pipe,
+            transport: RunTransport::Pipe { output },
             events,
-            output,
             ladder,
             metrics_interval: None,
-            on_output_wake: None,
             output_observer: None,
         })
         .expect("pipe run started");
@@ -217,14 +215,13 @@ fn input_and_resize_are_rejected_after_shutdown_starts() {
             process_id: ProcessId::new(32),
             run_id: RunId::new(102),
             command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 60"),
-            mode: RunMode::Pty {
+            transport: RunTransport::Pty {
                 initial_geometry: geometry,
+                on_output_wake: None,
             },
             events,
-            output: output_channel().0,
             ladder: quick_ladder(100, 100),
             metrics_interval: None,
-            on_output_wake: None,
             output_observer: None,
         })
         .expect("pty run started");

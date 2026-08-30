@@ -186,6 +186,16 @@ pub(crate) struct LogMatcherIntent {
     pub(crate) contains: String,
 }
 
+/// The transport and resources selected for one Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartTransport {
+    Pipe,
+    Pty {
+        /// The PTY geometry of the rendered console pane at request time.
+        initial_geometry: TerminalGeometry,
+    },
+}
+
 /// One request to begin a Run. The Supervisor allocates the Run identity;
 /// adapters perform the actual spawn off the control task.
 #[derive(Clone, Debug)]
@@ -201,9 +211,7 @@ pub struct StartIntent {
     pub env: Vec<(String, String)>,
     /// Keys removed from the inherited parent environment.
     pub env_remove: Vec<String>,
-    /// The PTY geometry of the rendered console pane at request time.
-    pub initial_geometry: TerminalGeometry,
-    pub pty: bool,
+    pub transport: StartTransport,
     /// Literal log checks to attach before this Run is spawned. Liveness
     /// entries are placeholders until the first attempt is armed.
     pub(crate) log_matchers: Vec<LogMatcherIntent>,

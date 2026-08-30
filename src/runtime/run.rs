@@ -25,7 +25,7 @@ use crate::runtime::pipe::PipeRun;
 use crate::runtime::process_tree::{SemanticSignal, SignalError, UnixProcessTree};
 use crate::terminal::{InputRejection as SessionInputRejection, TerminalSession};
 
-use super::start::RunStartRequest;
+use super::start::{RunStartRequest, RunTransport};
 use super::terminal_handle::TerminalHandle;
 
 /// Identifies one supervised Process across Runs.
@@ -69,16 +69,6 @@ impl RunId {
     pub fn get(self) -> u64 {
         self.0
     }
-}
-
-/// The transport mode requested for one Run.
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Pipe mode is exercised through tests today and by the Supervisor next.
-pub enum RunMode {
-    /// Interactive transport with terminal semantics.
-    Pty { initial_geometry: TerminalGeometry },
-    /// Non-interactive transport with separate stdout and stderr drains.
-    Pipe,
 }
 
 /// A low-volume Run lifecycle event. Every event carries the `RunId`.
@@ -150,11 +140,23 @@ pub struct RunRuntime;
 
 impl RunRuntime {
     pub fn start(&self, request: RunStartRequest) -> Result<OwnedRun> {
-        let output_observer = request.output_observer.clone();
-        let inner = match request.mode {
-            RunMode::Pty { initial_geometry } => {
-                let spawned = PtyProcess::spawn(request.command, initial_geometry)?;
-                let wake = request.on_output_wake.unwrap_or_else(|| Box::new(|| {}));
+        let RunStartRequest {
+            process_id,
+            run_id,
+            command,
+            transport,
+            events,
+            ladder,
+            metrics_interval,
+            output_observer,
+        } = request;
+        let (tree, inner) = match transport {
+            RunTransport::Pty {
+                initial_geometry,
+                on_output_wake,
+            } => {
+                let spawned = PtyProcess::spawn(command, initial_geometry)?;
+                let wake = on_output_wake.unwrap_or_else(|| Box::new(|| {}));
                 let session = TerminalSession::spawn_with_observer(
                     spawned.io,
                     initial_geometry,
@@ -170,48 +172,42 @@ impl RunRuntime {
                     },
                 )
             }
-            RunMode::Pipe => {
-                let pipe = PipeRun::spawn(
-                    &request.command,
-                    request.run_id,
-                    request.events.clone(),
-                    request.output.clone(),
-                    output_observer,
-                )?;
+            RunTransport::Pipe { output } => {
+                let pipe =
+                    PipeRun::spawn(&command, run_id, events.clone(), output, output_observer)?;
                 let tree = pipe.root_pid().map(UnixProcessTree::from_root);
                 (tree, RunInner::Pipe(pipe))
             }
         };
-        let (tree, inner) = inner;
         let root_pid = match &inner {
             RunInner::Pty { process, .. } => process.process_id(),
             RunInner::Pipe(pipe) => pipe.root_pid(),
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let metrics = root_pid.and_then(|root_pid| {
-            request.metrics_interval.map(|interval| {
+            metrics_interval.map(|interval| {
                 MetricsSampler::spawn(
                     root_pid,
-                    request.process_id,
-                    request.run_id,
+                    process_id,
+                    run_id,
                     interval,
                     Arc::clone(&stopping),
-                    request.events.clone(),
+                    events.clone(),
                 )
             })
         });
         let run = OwnedRun {
-            process_id: request.process_id,
-            run_id: request.run_id,
+            process_id,
+            run_id,
             inner: Some(inner),
             tree,
-            ladder: request.ladder,
+            ladder,
             stopping,
             signals_stopped: AtomicBool::new(false),
             signal_failure: Mutex::new(None),
             metrics,
             retired_pty: None,
-            events: request.events,
+            events,
             outcome: None,
         };
         run.emit(RunEventKind::Spawned {

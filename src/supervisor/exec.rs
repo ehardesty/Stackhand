@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::ReadinessProbe;
 use crate::runtime::{
-    RunMode, RunOutputReceiver, RunRuntime, RunStartRequest, ShutdownLadder, SpawnCommand,
+    RunOutputReceiver, RunRuntime, RunStartRequest, RunTransport, ShutdownLadder, SpawnCommand,
     root_exit_pending,
 };
 use crate::supervisor::seam::ProbeIntent;
@@ -48,12 +48,10 @@ pub(crate) fn attempt(intent: &ProbeIntent, canceled: &AtomicBool) -> Result<(),
         process_id: intent.process_id,
         run_id: intent.run_id,
         command,
-        mode: RunMode::Pipe,
+        transport: RunTransport::Pipe { output: output_tx },
         events: event_tx,
-        output: output_tx,
         ladder: EXEC_CLEANUP_LADDER,
         metrics_interval: None,
-        on_output_wake: None,
         output_observer: None,
     };
     let mut run = RunRuntime

@@ -36,12 +36,10 @@ fn start_pipe(command: SpawnCommand, ladder: ShutdownLadder) -> PipeRunFixture {
             process_id: ProcessId::new(51),
             run_id: RunId::new(301),
             command,
-            mode: RunMode::Pipe,
+            transport: RunTransport::Pipe { output },
             events,
-            output,
             ladder,
             metrics_interval: None,
-            on_output_wake: None,
             output_observer: None,
         })
         .expect("pipe run started");
@@ -169,7 +167,6 @@ fn run_pty_pressure_case() {
     let wake_count = Arc::new(AtomicUsize::new(0));
     let wake_counter = Arc::clone(&wake_count);
     let (events, _event_log) = mpsc::channel();
-    let (output, _output_log) = output_channel();
     let mut run = RunRuntime
         .start(RunStartRequest {
             process_id: ProcessId::new(53),
@@ -177,20 +174,19 @@ fn run_pty_pressure_case() {
             command: SpawnCommand::new("/bin/sh").arg("-c").arg(
                 "stty raw -echo; i=0; while :; do printf 'pty-flood-%06d\\r\\n' \"$i\"; i=$((i+1)); done",
             ),
-            mode: RunMode::Pty {
+            transport: RunTransport::Pty {
                 initial_geometry: TerminalGeometry::DEFAULT,
+                on_output_wake: Some(Box::new(move || {
+                    wake_counter.fetch_add(1, Ordering::Relaxed);
+                })),
             },
             events,
-            output,
             ladder: ShutdownLadder {
                 graceful_timeout: Duration::from_millis(100),
                 terminate_timeout: Duration::from_millis(100),
                 final_deadline: Duration::from_secs(1),
             },
             metrics_interval: None,
-            on_output_wake: Some(Box::new(move || {
-                wake_counter.fetch_add(1, Ordering::Relaxed);
-            })),
             output_observer: None,
         })
         .expect("PTY pressure Run started");
@@ -327,12 +323,10 @@ fn noisy_run_does_not_delay_another_runs_interrupt_and_shutdown() {
             process_id: ProcessId::new(52),
             run_id: RunId::new(302),
             command: quiet_command,
-            mode: RunMode::Pipe,
+            transport: RunTransport::Pipe { output: output_b },
             events: events_b,
-            output: output_b,
             ladder: quick_ladder(100, 100),
             metrics_interval: None,
-            on_output_wake: None,
             output_observer: None,
         })
         .expect("quiet run started");
@@ -411,17 +405,16 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
     const PIPE_CYCLES: u32 = 25;
     for cycle in 0..PIPE_CYCLES {
         let (events, _log) = mpsc::channel();
+        let (output, _output_log) = output_channel();
         let mut run = RunRuntime
             .start(RunStartRequest {
                 process_id: ProcessId::new(cycle + 1),
                 run_id: RunId::new(u64::from(cycle) + 400),
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("true"),
-                mode: RunMode::Pipe,
+                transport: RunTransport::Pipe { output },
                 events,
-                output: output_channel().0,
                 ladder: quick_ladder(50, 50),
                 metrics_interval: Some(Duration::from_millis(40)),
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("cycle run started");
@@ -442,14 +435,13 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
                 process_id: ProcessId::new(cycle + 1),
                 run_id: RunId::new(u64::from(cycle) + 500),
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("true"),
-                mode: RunMode::Pty {
+                transport: RunTransport::Pty {
                     initial_geometry: geometry,
+                    on_output_wake: None,
                 },
                 events,
-                output: output_channel().0,
                 ladder: quick_ladder(50, 50),
                 metrics_interval: Some(Duration::from_millis(40)),
-                on_output_wake: None,
                 output_observer: None,
             })
             .expect("pty cycle run started");

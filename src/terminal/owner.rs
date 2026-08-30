@@ -111,7 +111,7 @@ impl SharedOwner {
 
 pub struct OwnerHandle {
     shared: Arc<SharedOwner>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    worker: crate::worker_handle::WorkerHandle,
 }
 
 impl OwnerHandle {
@@ -161,7 +161,7 @@ impl OwnerHandle {
             .context("could not start the terminal owner")?;
         Ok(Self {
             shared,
-            thread: Mutex::new(Some(thread)),
+            worker: crate::worker_handle::WorkerHandle::new(thread),
         })
     }
 
@@ -206,59 +206,20 @@ impl OwnerHandle {
         self.shared.shutdown.store(true, Ordering::Release);
     }
 
-    pub fn join(&self) -> Result<()> {
-        let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        else {
-            return Ok(());
-        };
-        thread
-            .join()
-            .map_err(|_| anyhow!("terminal owner thread panicked"))
-    }
-
     /// Join the owner thread only while the supplied deadline remains. The
     /// owner can be blocked in its PTY reader when a survivor keeps the
     /// terminal open; after the deadline the thread is detached and the
     /// caller retains a structured worker failure.
     pub fn join_until(&self, deadline: Instant) -> Result<bool> {
-        loop {
-            let finished = self
-                .thread
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-                .is_none_or(|handle| handle.is_finished());
-            if finished {
-                self.join()?;
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                return Ok(self.abandon_nonblocking());
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
+        self.worker
+            .join_until(deadline)
+            .map_err(|_| anyhow!("terminal owner thread panicked"))
     }
 
     /// Detach an owner thread that is still blocked. Returns whether it
     /// joined cleanly.
     pub fn abandon_nonblocking(&self) -> bool {
-        let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        else {
-            return true;
-        };
-        if thread.is_finished() {
-            thread.join().is_ok()
-        } else {
-            false
-        }
+        self.worker.abandon_nonblocking()
     }
 }
 
@@ -330,9 +291,6 @@ fn run_owner(
         let mut did_work = false;
 
         did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
-        if effects.borrow().overflowed {
-            bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
-        }
 
         // Output gets one bounded turn. Service the input gate between small
         // output slices so a busy PTY cannot monopolise the owner. A blocked
@@ -367,9 +325,6 @@ fn run_owner(
 
             if output_slice_work == OUTPUT_SLICE_WORK_BUDGET {
                 did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
-                if effects.borrow().overflowed {
-                    bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
-                }
                 if pending_effect.is_none() {
                     did_work |= service_input(&mut state, &writer, &commands, &mut pending_input)?;
                 }
@@ -378,9 +333,6 @@ fn run_owner(
         }
 
         did_work |= service_effect(&writer, &effects, &mut pending_effect)?;
-        if effects.borrow().overflowed {
-            bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
-        }
 
         if pending_effect.is_none() {
             // Scroll bursts change terminal state many times but need only one
@@ -434,17 +386,21 @@ fn service_effect(
     if pending_effect.is_none() {
         *pending_effect = effects.borrow_mut().pop();
     }
-    let Some(data) = pending_effect.take() else {
-        return Ok(false);
+    let serviced = match pending_effect.take() {
+        None => false,
+        Some(data) => match writer.try_enqueue(&data) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                *pending_effect = Some(data);
+                false
+            }
+            Err(error) => return Err(error.into()),
+        },
     };
-    match writer.try_enqueue(&data) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            *pending_effect = Some(data);
-            Ok(false)
-        }
-        Err(error) => Err(error.into()),
+    if effects.borrow().overflowed {
+        bail!("terminal effect buffer exceeded {EFFECT_BUFFER_BYTES} bytes");
     }
+    Ok(serviced)
 }
 
 fn service_input_batch(

@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use crate::runtime::{
-    OwnedRun, ProcessId, RunId, RunMode, RunRuntime, RunStartRequest, SpawnCommand, TerminalHandle,
+    OwnedRun, ProcessId, RunId, RunRuntime, RunStartRequest, RunTransport, SpawnCommand,
+    TerminalHandle,
 };
 use crate::terminal::{
     OwnedTerminalSnapshot, PASTE_LIMIT_BYTES, PasteCompletion, PasteRejection, PasteRequest,
@@ -26,20 +27,18 @@ pub(crate) fn start_fixture_run(
     on_output_wake: Option<Box<dyn Fn() + Send + 'static>>,
 ) -> Result<OwnedRun> {
     let (events, _run_event_log) = mpsc::channel();
-    let (output, _output_log) = crate::runtime::output_channel();
     let run_id = FIXTURE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     RunRuntime.start(RunStartRequest {
         process_id: ProcessId::new(u32::try_from(run_id).expect("fixture run id fits u32")),
         run_id: RunId::new(run_id),
         command,
-        mode: RunMode::Pty {
+        transport: RunTransport::Pty {
             initial_geometry: geometry,
+            on_output_wake,
         },
         events,
-        output,
         ladder: Default::default(),
         metrics_interval: None,
-        on_output_wake,
         output_observer: None,
     })
 }

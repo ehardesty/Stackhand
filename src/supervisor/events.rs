@@ -217,21 +217,20 @@ impl Core {
     /// held cleanup, recent history, and replacement scheduling change in
     /// one serialized Supervisor turn.
     fn apply_finished_run(&mut self, index: usize, finished: FinishedRun) {
-        let timed_out = self.lifecycles[index].startup_timeout_pending;
-        let unhealthy = self.lifecycles[index].unhealthy_restart_pending;
+        let cleanup = self.lifecycles[index].cleanup_decision();
         let restart_reason = self.restart_reason_for_terminal(
             index,
             TerminalOutcome::Finished {
                 exit_code: finished.exit_code,
                 intentional_stop: finished.intentional_stop,
-                timed_out,
+                timed_out: cleanup.timed_out,
             },
         );
         // Natural exit also ends any probe that is still in flight. The
         // identity gate below makes a result released after this point
         // harmless.
         self.cancel_run_work(index);
-        if !finished.intentional_stop && !timed_out {
+        if !finished.intentional_stop && !cleanup.timed_out {
             match self.project.processes()[index].kind {
                 ProcessKind::OneShot => self.complete_one_shot(index, finished.exit_code),
                 ProcessKind::Service => self.observe_service_exit(index, finished.exit_code),
@@ -242,18 +241,22 @@ impl Core {
             let cleanup_detail = finished
                 .detail
                 .unwrap_or_else(|| "Run cleanup did not fully confirm".to_string());
-            self.lifecycles[index].hold_unconfirmed_cleanup(timed_out, unhealthy, cleanup_detail);
+            self.lifecycles[index].hold_unconfirmed_cleanup(
+                cleanup.timed_out,
+                cleanup.unhealthy,
+                cleanup_detail,
+            );
             self.evaluate();
             return;
         }
 
         let one_shot = self.project.processes()[index].kind == ProcessKind::OneShot;
-        self.lifecycles[index].confirm_cleanup(one_shot, timed_out);
+        self.lifecycles[index].confirm_cleanup(one_shot, cleanup.timed_out);
         self.finalize_confirmed_run(
             index,
             finished.run_id,
             finished.exit_code,
-            finished.intentional_stop && !timed_out && !unhealthy,
+            finished.intentional_stop && !cleanup.timed_out && !cleanup.unhealthy,
             restart_reason,
         );
     }
@@ -278,10 +281,11 @@ impl Core {
         index: usize,
         outcome: TerminalOutcome,
     ) -> Option<RestartReason> {
-        if self.shutdown_in_progress() || self.lifecycles[index].restart_suppressed {
+        let cleanup = self.lifecycles[index].cleanup_decision();
+        if self.shutdown_in_progress() || cleanup.automatic_restart_suppressed {
             return None;
         }
-        if self.lifecycles[index].unhealthy_restart_pending {
+        if cleanup.unhealthy {
             return Some(RestartReason::Unhealthy);
         }
         let policy = self.project.processes()[index].restart.policy;
@@ -335,8 +339,6 @@ impl Core {
             // The terminal Run identity is the timer's guard. The Run has
             // been released before the replacement timer is installed.
             self.schedule_automatic_restart(index, run_id, reason);
-        } else {
-            self.lifecycles[index].clear_restart_suppression();
         }
         self.evaluate();
     }

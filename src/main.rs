@@ -95,38 +95,23 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
     }
 
     if first == "--fixture-rendering" {
-        if args.next().is_some() {
-            bail!("--fixture-rendering does not accept arguments");
-        }
-        return Ok(Mode::FixtureRendering);
+        return zero_argument_mode(&mut args, "--fixture-rendering", Mode::FixtureRendering);
     }
 
     if first == "--fixture-input" {
-        if args.next().is_some() {
-            bail!("--fixture-input does not accept arguments");
-        }
-        return Ok(Mode::FixtureInput);
+        return zero_argument_mode(&mut args, "--fixture-input", Mode::FixtureInput);
     }
 
     if first == "--fixture-paste" {
-        if args.next().is_some() {
-            bail!("--fixture-paste does not accept arguments");
-        }
-        return Ok(Mode::FixturePaste);
+        return zero_argument_mode(&mut args, "--fixture-paste", Mode::FixturePaste);
     }
 
     if first == "--fixture-scrollback" {
-        if args.next().is_some() {
-            bail!("--fixture-scrollback does not accept arguments");
-        }
-        return Ok(Mode::FixtureScrollback);
+        return zero_argument_mode(&mut args, "--fixture-scrollback", Mode::FixtureScrollback);
     }
 
     if first == "--fixture-mouse" {
-        if args.next().is_some() {
-            bail!("--fixture-mouse does not accept arguments");
-        }
-        return Ok(Mode::FixtureMouse);
+        return zero_argument_mode(&mut args, "--fixture-mouse", Mode::FixtureMouse);
     }
 
     if first == "--fixture-smoke" {
@@ -159,6 +144,17 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
     project_arguments.extend(args);
     let (path, profiles) = parse_path_and_profiles(project_arguments, "Project")?;
     Ok(Mode::Project { path, profiles })
+}
+
+fn zero_argument_mode(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+    mode: Mode,
+) -> Result<Mode> {
+    if args.next().is_some() {
+        bail!("{flag} does not accept arguments");
+    }
+    Ok(mode)
 }
 
 fn parse_path_and_profiles(

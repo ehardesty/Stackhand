@@ -14,18 +14,16 @@ struct StartedRun {
 
 fn start_sampled(command: SpawnCommand) -> StartedRun {
     let (events, event_receiver) = mpsc::channel();
-    let (_output, _output_log) = crate::runtime::output_channel();
+    let (output, _output_log) = crate::runtime::output_channel();
     let run = RunRuntime
         .start(RunStartRequest {
             process_id: ProcessId::new(41),
             run_id: RunId::new(202),
             command,
-            mode: RunMode::Pipe,
+            transport: RunTransport::Pipe { output },
             events,
-            output: crate::runtime::output_channel().0,
             ladder: quick_ladder(100, 100),
             metrics_interval: Some(Duration::from_millis(20)),
-            on_output_wake: None,
             output_observer: None,
         })
         .expect("sampled run started");

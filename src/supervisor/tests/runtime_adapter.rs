@@ -9,7 +9,7 @@ use crate::model::{
 use crate::supervisor::clock::SystemClock;
 use crate::supervisor::core::Core;
 use crate::supervisor::runtime::RealRunSeam;
-use crate::supervisor::seam::{LogMatcherIntent, ProbeIntent, ProbeSeam};
+use crate::supervisor::seam::{LogMatcherIntent, ProbeIntent, ProbeSeam, StartTransport};
 use crate::supervisor::{Command, Lifecycle, ReadinessState};
 
 struct NoProbes;
@@ -50,15 +50,20 @@ fn intent(program: &str, args: &[&str]) -> StartIntent {
         working_dir: std::env::temp_dir(),
         env: Vec::new(),
         env_remove: Vec::new(),
-        initial_geometry: TerminalGeometry::DEFAULT,
-        pty: false,
+        transport: StartTransport::Pipe,
         log_matchers: Vec::new(),
     }
 }
 
 fn log_intent(program: &str, args: &[&str], pty: bool) -> StartIntent {
     let mut intent = intent(program, args);
-    intent.pty = pty;
+    intent.transport = if pty {
+        StartTransport::Pty {
+            initial_geometry: TerminalGeometry::DEFAULT,
+        }
+    } else {
+        StartTransport::Pipe
+    };
     intent.log_matchers = vec![LogMatcherIntent {
         work_id: WorkId::new(9),
         attempt_id: None,

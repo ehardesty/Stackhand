@@ -13,7 +13,9 @@ use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
 use crate::supervisor::command::Command;
 use crate::supervisor::process_lifecycle::ProcessLifecycle;
-use crate::supervisor::seam::{ProbeSeam, RunSeam, SeamSender, StartIntent, WorkId};
+use crate::supervisor::seam::{
+    ProbeSeam, RunSeam, SeamSender, StartIntent, StartTransport, WorkId,
+};
 use crate::supervisor::snapshot::{ProcessSnapshot, ProjectSnapshot, RestartBackoffStatus};
 
 /// The user's current intent for a Process.
@@ -303,8 +305,12 @@ impl Core {
             working_dir: spec.working_dir.clone(),
             env: spec.env.clone(),
             env_remove: spec.env_remove.clone(),
-            initial_geometry: self.initial_geometry,
-            pty: matches!(spec.terminal_mode, crate::model::TerminalMode::Pty),
+            transport: match spec.terminal_mode {
+                crate::model::TerminalMode::Pipe => StartTransport::Pipe,
+                crate::model::TerminalMode::Pty => StartTransport::Pty {
+                    initial_geometry: self.initial_geometry,
+                },
+            },
             log_matchers,
         }
     }

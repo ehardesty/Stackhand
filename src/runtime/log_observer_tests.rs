@@ -10,10 +10,15 @@ use crate::geometry::TerminalGeometry;
 const MATCH_KEY: u64 = 7;
 const MATCH_TEXT: &str = "early-log-marker";
 
+enum TestTransport {
+    Pipe,
+    Pty,
+}
+
 fn start_observed_run(
-    mode: RunMode,
+    selected: TestTransport,
     command: SpawnCommand,
-) -> (OwnedRun, Receiver<u64>, RunOutputReceiver) {
+) -> (OwnedRun, Receiver<u64>, Option<RunOutputReceiver>) {
     let (matched_tx, matched_rx) = mpsc::channel();
     let observer = LiveLogMatcher::new(
         vec![LogPattern {
@@ -29,29 +34,39 @@ fn start_observed_run(
     .expect("valid live matcher");
     let output_observer: Arc<dyn RunOutputObserver> = observer;
     let (events, _event_receiver) = mpsc::channel();
-    let (output, output_receiver) = output_channel();
+    let (transport, output_receiver) = match selected {
+        TestTransport::Pipe => {
+            let (output, receiver) = output_channel();
+            (RunTransport::Pipe { output }, Some(receiver))
+        }
+        TestTransport::Pty => (
+            RunTransport::Pty {
+                initial_geometry: TerminalGeometry::DEFAULT,
+                on_output_wake: None,
+            },
+            None,
+        ),
+    };
     let run = RunRuntime
         .start(RunStartRequest {
             process_id: ProcessId::new(1),
             run_id: RunId::new(1),
             command,
-            mode,
+            transport,
             events,
-            output,
             ladder: ShutdownLadder::default(),
             metrics_interval: None,
-            on_output_wake: None,
             output_observer: Some(output_observer),
         })
         .expect("observed Run started");
     (run, matched_rx, output_receiver)
 }
 
-fn assert_early_output_is_observed(mode: RunMode) {
+fn assert_early_output_is_observed(transport: TestTransport) {
     let command = SpawnCommand::new("/bin/sh")
         .arg("-c")
         .arg("printf 'early-log-marker'; sleep 30");
-    let (mut run, matched, _output) = start_observed_run(mode, command);
+    let (mut run, matched, _output) = start_observed_run(transport, command);
 
     assert_eq!(
         matched
@@ -68,14 +83,12 @@ fn assert_early_output_is_observed(mode: RunMode) {
 
 #[test]
 fn pipe_observer_sees_output_from_the_start_of_the_run() {
-    assert_early_output_is_observed(RunMode::Pipe);
+    assert_early_output_is_observed(TestTransport::Pipe);
 }
 
 #[test]
 fn pty_observer_sees_output_from_the_start_of_the_run() {
-    assert_early_output_is_observed(RunMode::Pty {
-        initial_geometry: TerminalGeometry::DEFAULT,
-    });
+    assert_early_output_is_observed(TestTransport::Pty);
 }
 
 #[test]

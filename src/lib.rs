@@ -24,6 +24,7 @@ pub mod supervisor;
 mod sync_fixture;
 mod terminal;
 mod tui;
+mod worker_handle;
 
 pub use app::{
     run_discovered_project, run_discovered_project_with_profile,

@@ -14,12 +14,13 @@ use crate::geometry::TerminalGeometry;
 use crate::output::{OutputViews, ProcessOutput};
 use crate::runtime::{
     LiveLogMatcher, LogPattern, OsPid, ProcessId, RunEvent, RunEventKind, RunId as RuntimeRunId,
-    RunMode, RunOutputObserver, RunOutputReceiver, RunRuntime, RunStartRequest, SpawnCommand,
+    RunOutputObserver, RunOutputReceiver, RunRuntime, RunStartRequest, RunTransport, SpawnCommand,
     root_exit_pending,
 };
 use crate::supervisor::FailureKind;
 use crate::supervisor::seam::{
-    AttemptId, FinishedRun, LogMatcherIntent, RunSeam, SeamEvent, SeamSender, StartIntent, WorkId,
+    AttemptId, FinishedRun, LogMatcherIntent, RunSeam, SeamEvent, SeamSender, StartIntent,
+    StartTransport, WorkId,
 };
 
 use super::consoles::Consoles;
@@ -102,14 +103,18 @@ impl RunSeam for RealRunSeam {
         let record = Arc::new(RunRecord::spawning_with_test_hooks(self.test_hooks.clone()));
         let log_matcher = build_output_observer(&intent, record.cancellation_flag(), events);
         record.set_log_matcher(log_matcher.clone());
-        let output_observer = build_run_output_observer(
-            intent.pty,
-            intent.run_id,
-            self.outputs
-                .for_process_id(intent.process_id)
-                .expect("the registry covers every configured Process"),
-            log_matcher,
-        );
+        let process_output = self
+            .outputs
+            .for_process_id(intent.process_id)
+            .expect("the registry covers every configured Process");
+        let output_observer = match intent.transport {
+            StartTransport::Pipe => {
+                log_matcher.map(|observer| observer as Arc<dyn RunOutputObserver>)
+            }
+            StartTransport::Pty { .. } => {
+                build_pty_output_observer(intent.run_id, process_output, log_matcher)
+            }
+        };
         let mut runs = self
             .runs
             .lock()
@@ -126,7 +131,6 @@ impl RunSeam for RealRunSeam {
         let outputs = Arc::clone(&self.outputs);
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
-            let (output_tx, output_rx) = crate::runtime::output_channel();
             // Mark the Run before starting its readers. This gives every
             // observed byte, including immediate PTY output, a preceding Run
             // boundary in Logs view.
@@ -134,22 +138,27 @@ impl RunSeam for RealRunSeam {
                 .for_process_id(intent.process_id)
                 .expect("the registry covers every configured Process")
                 .mark_run(intent.run_id.get());
+            let (transport, output_rx) = match intent.transport {
+                StartTransport::Pipe => {
+                    let (output, receiver) = crate::runtime::output_channel();
+                    (RunTransport::Pipe { output }, Some(receiver))
+                }
+                StartTransport::Pty { initial_geometry } => (
+                    RunTransport::Pty {
+                        initial_geometry,
+                        on_output_wake: None,
+                    },
+                    None,
+                ),
+            };
             let request = RunStartRequest {
                 process_id: intent.process_id,
                 run_id: intent.run_id,
                 command: build_command(&intent),
-                mode: if intent.pty {
-                    RunMode::Pty {
-                        initial_geometry: intent.initial_geometry,
-                    }
-                } else {
-                    RunMode::Pipe
-                },
+                transport,
                 events: event_tx,
-                output: output_tx,
                 ladder: Default::default(),
                 metrics_interval: Some(METRICS_INTERVAL),
-                on_output_wake: None,
                 output_observer,
             };
             match RunRuntime.start(request) {
@@ -160,7 +169,9 @@ impl RunSeam for RealRunSeam {
                     }
                     let root_pid = run.root_pid();
                     record.install(run, || {
-                        drain_retained_output(output_rx, outputs, intent.process_id);
+                        if let Some(output_rx) = output_rx {
+                            drain_retained_output(output_rx, outputs, intent.process_id);
+                        }
                     });
                     own_run(key, root_pid, record, events, event_rx);
                 }
@@ -284,8 +295,7 @@ impl RunOutputObserver for OutputObserverFanout {
     }
 }
 
-fn build_run_output_observer(
-    pty: bool,
+fn build_pty_output_observer(
     run_id: RuntimeRunId,
     output: Arc<ProcessOutput>,
     matcher: Option<Arc<LiveLogMatcher>>,
@@ -294,9 +304,7 @@ fn build_run_output_observer(
         .into_iter()
         .map(|observer| observer as Arc<dyn RunOutputObserver>)
         .collect();
-    if pty {
-        observers.push(Arc::new(PtyLogsObserver { output, run_id }));
-    }
+    observers.push(Arc::new(PtyLogsObserver { output, run_id }));
     match observers.len() {
         0 => None,
         1 => observers.pop(),

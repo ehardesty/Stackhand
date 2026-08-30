@@ -46,9 +46,9 @@ pub use pipe::{
 };
 #[allow(unused_imports)]
 pub use run::{
-    InputRejected, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunMode, RunRuntime,
+    InputRejected, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunRuntime,
 };
-pub use start::{RunOutputObserver, RunStartRequest};
+pub use start::{RunOutputObserver, RunStartRequest, RunTransport};
 pub use terminal_handle::TerminalHandle;
 
 /// Whether one Run's root child has exited but is not yet reaped. The

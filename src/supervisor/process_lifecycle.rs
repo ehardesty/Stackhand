@@ -40,6 +40,80 @@ impl RestartReason {
     }
 }
 
+/// Why the current Run is ending. This remains authoritative until cleanup
+/// confirms or the Run identity stays held for a cleanup retry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CleanupPurpose {
+    #[default]
+    Ordinary,
+    ManualStop,
+    ExplicitReplacement,
+    StartupTimeout,
+    StartupTimeoutSuppressed,
+    UnhealthyReplacement,
+    UnhealthySuppressed,
+    ProjectShutdown,
+    ProjectShutdownAfterStartupTimeout,
+    ProjectShutdownAfterUnhealthy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CleanupDecision {
+    pub(super) timed_out: bool,
+    pub(super) unhealthy: bool,
+    pub(super) automatic_restart_suppressed: bool,
+}
+
+impl CleanupPurpose {
+    fn decision(self) -> CleanupDecision {
+        CleanupDecision {
+            timed_out: matches!(
+                self,
+                Self::StartupTimeout
+                    | Self::StartupTimeoutSuppressed
+                    | Self::ProjectShutdownAfterStartupTimeout
+            ),
+            unhealthy: matches!(
+                self,
+                Self::UnhealthyReplacement
+                    | Self::UnhealthySuppressed
+                    | Self::ProjectShutdownAfterUnhealthy
+            ),
+            automatic_restart_suppressed: matches!(
+                self,
+                Self::ManualStop
+                    | Self::StartupTimeoutSuppressed
+                    | Self::UnhealthySuppressed
+                    | Self::ProjectShutdown
+                    | Self::ProjectShutdownAfterStartupTimeout
+                    | Self::ProjectShutdownAfterUnhealthy
+            ),
+        }
+    }
+
+    fn suppress_automatic_restart(self) -> Self {
+        match self {
+            Self::StartupTimeout | Self::StartupTimeoutSuppressed => Self::StartupTimeoutSuppressed,
+            Self::UnhealthyReplacement | Self::UnhealthySuppressed => Self::UnhealthySuppressed,
+            Self::ProjectShutdown
+            | Self::ProjectShutdownAfterStartupTimeout
+            | Self::ProjectShutdownAfterUnhealthy => self,
+            Self::Ordinary | Self::ManualStop | Self::ExplicitReplacement => Self::ManualStop,
+        }
+    }
+
+    fn begin_project_shutdown(self) -> Self {
+        let decision = self.decision();
+        if decision.timed_out {
+            Self::ProjectShutdownAfterStartupTimeout
+        } else if decision.unhealthy {
+            Self::ProjectShutdownAfterUnhealthy
+        } else {
+            Self::ProjectShutdown
+        }
+    }
+}
+
 /// One pending automatic restart. The failed Run identity makes the timer
 /// specific to the Run that created it even though no Run is current during
 /// the backoff.
@@ -108,9 +182,8 @@ pub(super) struct ProcessLifecycle {
     pub(super) liveness: Option<LivenessTracking>,
     /// True after the adapter reports that the current Run has spawned.
     pub(super) spawned: bool,
-    /// True while an unhealthy Run is being shut down for an automatic
-    /// replacement, including while cleanup confirmation is pending.
-    pub(super) unhealthy_restart_pending: bool,
+    /// Why the current Run is ending and how its terminal fact is classified.
+    cleanup_purpose: CleanupPurpose,
     /// The previous Run's cleanup finished unconfirmed: its Run identity
     /// stays held so a manual Stop can retry the bounded cleanup, and no
     /// new Run may replace it until that retry confirms.
@@ -128,8 +201,6 @@ pub(super) struct ProcessLifecycle {
     pub(super) root_pid: Option<u32>,
     /// True after a One-shot Run has ended and its cleanup is confirmed.
     pub(super) exited: bool,
-    /// True while cleanup for a readiness startup timeout is still pending.
-    pub(super) startup_timeout_pending: bool,
     /// A naturally ended Service stays desired-running but waits for an
     /// explicit start or restart when automatic restart is disabled.
     pub(super) awaiting_manual_restart: bool,
@@ -137,8 +208,6 @@ pub(super) struct ProcessLifecycle {
     pub(super) restart_backoff: Option<RestartBackoff>,
     /// The per-Process automatic retry budget for this Project session.
     pub(super) restart_budget: RestartBudget,
-    /// An explicit action can suppress automatic restart for its cleanup.
-    pub(super) restart_suppressed: bool,
     /// Work identities allocated for this Process. They are monotonic across
     /// Runs so a late result cannot become current through reuse.
     pub(super) next_work_id: u64,
@@ -161,7 +230,7 @@ impl ProcessLifecycle {
             readiness: None,
             liveness: None,
             spawned: false,
-            unhealthy_restart_pending: false,
+            cleanup_purpose: CleanupPurpose::Ordinary,
             cleanup_unconfirmed: false,
             runs: VecDeque::new(),
             run_started_at_ms: None,
@@ -169,11 +238,9 @@ impl ProcessLifecycle {
             run_trigger: RunTrigger::Dependency,
             root_pid: None,
             exited: false,
-            startup_timeout_pending: false,
             awaiting_manual_restart: false,
             restart_backoff: None,
             restart_budget: RestartBudget::default(),
-            restart_suppressed: false,
             next_work_id: 1,
             run_cancelled: false,
         }
@@ -184,23 +251,31 @@ impl ProcessLifecycle {
         if trigger != RunTrigger::Manual {
             return;
         }
-        let timeout_cleanup = self.startup_timeout_pending;
+        let timed_out = self.cleanup_purpose.decision().timed_out;
         self.clear_restart_state();
         self.restart_budget.reset();
         self.pending_trigger = trigger;
-        self.restart_suppressed = timeout_cleanup;
+        self.cleanup_purpose = if timed_out {
+            CleanupPurpose::StartupTimeoutSuppressed
+        } else {
+            CleanupPurpose::Ordinary
+        };
         self.exited = false;
     }
 
     /// Apply one restart or rerun request before cleanup and scheduling.
     pub(super) fn prepare_restart_request(&mut self, trigger: RunTrigger) {
-        let timeout_cleanup = self.startup_timeout_pending;
+        let timed_out = self.cleanup_purpose.decision().timed_out;
         self.pending_trigger = trigger;
         self.clear_restart_state();
         if matches!(trigger, RunTrigger::Restart | RunTrigger::Rerun) {
             self.restart_budget.reset();
         }
-        self.restart_suppressed = timeout_cleanup;
+        self.cleanup_purpose = if timed_out {
+            CleanupPurpose::StartupTimeoutSuppressed
+        } else {
+            CleanupPurpose::ExplicitReplacement
+        };
         self.exited = false;
     }
 
@@ -254,7 +329,7 @@ impl ProcessLifecycle {
         self.failure = None;
         self.metrics = None;
         self.exited = false;
-        self.startup_timeout_pending = false;
+        self.cleanup_purpose = CleanupPurpose::Ordinary;
         self.clear_restart_state();
         self.run_cancelled = false;
         self.blocked = None;
@@ -263,7 +338,6 @@ impl ProcessLifecycle {
         self.readiness = readiness;
         self.liveness = liveness;
         self.spawned = false;
-        self.unhealthy_restart_pending = false;
         run_id
     }
 
@@ -327,16 +401,15 @@ impl ProcessLifecycle {
             let run_id = self
                 .current_run
                 .expect("an unconfirmed cleanup holds its Run identity");
-            let replacement_pending = self.unhealthy_restart_pending
+            let decision = self.cleanup_purpose.decision();
+            let replacement_pending = decision.unhealthy
                 || matches!(
                     self.pending_trigger,
                     RunTrigger::Restart | RunTrigger::Rerun
                 );
-            self.restart_suppressed = if replacement_pending {
-                self.startup_timeout_pending
-            } else {
-                true
-            };
+            if !replacement_pending || decision.timed_out {
+                self.cleanup_purpose = self.cleanup_purpose.suppress_automatic_restart();
+            }
             if !replacement_pending {
                 self.desired = DesiredState::Stopped;
             }
@@ -352,7 +425,7 @@ impl ProcessLifecycle {
         }
         if self.current_run.is_some() && self.lifecycle == Lifecycle::Stopping {
             self.desired = DesiredState::Stopped;
-            self.restart_suppressed = true;
+            self.cleanup_purpose = self.cleanup_purpose.suppress_automatic_restart();
             self.blocked = None;
             return None;
         }
@@ -367,7 +440,7 @@ impl ProcessLifecycle {
         };
         self.desired = DesiredState::Stopped;
         self.lifecycle = Lifecycle::Stopping;
-        self.restart_suppressed = true;
+        self.cleanup_purpose = CleanupPurpose::ManualStop;
         self.blocked = None;
         Some((self.process_id, run_id))
     }
@@ -382,7 +455,7 @@ impl ProcessLifecycle {
 
     /// Start cleanup after readiness did not pass before its deadline.
     pub(super) fn timeout_startup(&mut self, detail: String) {
-        self.startup_timeout_pending = true;
+        self.cleanup_purpose = CleanupPurpose::StartupTimeout;
         self.failure = Some(FailureSummary {
             kind: FailureKind::Readiness,
             detail,
@@ -407,7 +480,7 @@ impl ProcessLifecycle {
             return None;
         }
         let run_id = self.current_run?;
-        self.unhealthy_restart_pending = true;
+        self.cleanup_purpose = CleanupPurpose::UnhealthyReplacement;
         self.desired = DesiredState::Stopped;
         self.lifecycle = Lifecycle::Stopping;
         self.blocked = None;
@@ -446,7 +519,7 @@ impl ProcessLifecycle {
         self.blocked = None;
         self.readiness = None;
         self.restart_backoff = None;
-        self.restart_suppressed = true;
+        self.cleanup_purpose = self.cleanup_purpose.begin_project_shutdown();
         if self.current_run.is_none()
             && matches!(
                 self.lifecycle,
@@ -461,6 +534,10 @@ impl ProcessLifecycle {
     pub(super) fn begin_shutdown_cleanup(&mut self) {
         debug_assert!(self.current_run.is_some());
         self.lifecycle = Lifecycle::Stopping;
+    }
+
+    pub(super) fn cleanup_decision(&self) -> CleanupDecision {
+        self.cleanup_purpose.decision()
     }
 
     /// Hold a Run identity when adapter cleanup did not confirm.
@@ -579,9 +656,8 @@ impl ProcessLifecycle {
         self.readiness = None;
         self.liveness = None;
         self.spawned = false;
-        self.unhealthy_restart_pending = false;
+        self.cleanup_purpose = CleanupPurpose::Ordinary;
         self.cleanup_unconfirmed = false;
-        self.startup_timeout_pending = false;
         if self.lifecycle != Lifecycle::Done {
             self.lifecycle = Lifecycle::Stopped;
         }
@@ -613,17 +689,11 @@ impl ProcessLifecycle {
         self.blocked = None;
         self.awaiting_manual_restart = true;
         self.restart_backoff = None;
-        self.unhealthy_restart_pending = false;
+        self.cleanup_purpose = CleanupPurpose::Ordinary;
         self.failure = Some(FailureSummary {
             kind: FailureKind::RestartLimit,
             detail: format!("Restart limit reached after {max_restarts} automatic attempts"),
         });
-    }
-
-    /// Remove suppression after one confirmed terminal path chooses not to
-    /// restart the Process.
-    pub(super) fn clear_restart_suppression(&mut self) {
-        self.restart_suppressed = false;
     }
 
     /// Remove transient automatic-restart gates before a new explicit or
@@ -631,8 +701,6 @@ impl ProcessLifecycle {
     pub(super) fn clear_restart_state(&mut self) {
         self.awaiting_manual_restart = false;
         self.restart_backoff = None;
-        self.restart_suppressed = false;
-        self.unhealthy_restart_pending = false;
     }
 
     /// Record the bounded finished-Run summary for the Run that just ended
