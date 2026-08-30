@@ -272,6 +272,8 @@ The Logs view should retain hook kind and run metadata when possible.
 
 ### 14.1 Canonical format
 
+The [current configuration reference](../configuration.md) lists the YAML that the prototype accepts now. This section defines the north-star configuration contract.
+
 Use YAML with an explicit schema version:
 
 ```yaml

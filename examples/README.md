@@ -1,8 +1,12 @@
 # Example Projects
 
 These Projects show the behavior that the current macOS prototype supports.
-They use standard shell tools. The readiness example also uses `nc`, which is
-included with macOS.
+They omit fields when the default gives the intended behavior. See the
+[current configuration reference](../docs/configuration.md) for all fields and
+defaults.
+
+The Projects use standard shell tools. The readiness example also uses `nc`,
+which is included with macOS.
 
 The examples run POSIX command text through explicit command forms. They do not
 depend on your login shell. A `shell` expression uses the Project's configured

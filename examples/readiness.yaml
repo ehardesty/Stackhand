@@ -4,10 +4,6 @@ processes:
   # The TCP port opens after three seconds. Until then, the selected header
   # shows failed readiness attempts.
   tcp-listener:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     ready:
       tcp:
         host: 127.0.0.1
@@ -22,10 +18,6 @@ processes:
 
   # The helper uses /bin/sh and the macOS nc command to return HTTP 200.
   http-listener:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     ready:
       http:
         url: http://127.0.0.1:43124/health
@@ -38,10 +30,6 @@ processes:
 
   # This Process remains Waiting until both probes pass.
   ready-dependent:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     depends_on:
       tcp-listener: ready
       http-listener: ready

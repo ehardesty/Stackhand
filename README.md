@@ -6,6 +6,7 @@ The project is an idea under validation. All current milestones are prototype wo
 
 ## Documentation
 
+- [Current configuration reference](./docs/configuration.md): the YAML that the prototype accepts now.
 - [Product and technical specification](./docs/product-specification.md): the proposed north-star product behavior and architecture contract.
 - [Prototype implementation plan](./docs/implementation-plan.md): flexible milestones, spikes, tests, risks, and open questions.
 - [Domain language](./CONTEXT.md): the canonical terms used by the project.

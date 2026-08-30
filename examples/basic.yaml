@@ -3,10 +3,8 @@ version: 1
 processes:
   # A pipe Service starts automatically. Pipe output is read-only.
   clock:
-    kind: service
     terminal:
       mode: pipe
-      input: disabled
     shell: |
       while :; do
         printf "clock %s\n" "$(date +%H:%M:%S)"
@@ -15,7 +13,6 @@ processes:
 
   # Start this Process with `s`. Press `Esc` to send input to the shell.
   shell:
-    kind: service
     autostart: false
     terminal:
       mode: pty
@@ -26,9 +23,6 @@ processes:
   manual-task:
     kind: one-shot
     autostart: false
-    terminal:
-      mode: pipe
-      input: disabled
     environment:
       EXAMPLE_MESSAGE: hello from a One-shot
     shell: |
@@ -38,10 +32,5 @@ processes:
 
   # A disabled Process stays visible but cannot start.
   disabled-example:
-    kind: service
     enabled: false
-    autostart: false
-    terminal:
-      mode: pipe
-      input: disabled
     command: [/bin/sleep, "300"]

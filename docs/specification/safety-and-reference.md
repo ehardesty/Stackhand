@@ -292,6 +292,8 @@ Exceptions must be explicit and tested, such as Process history finalizing an ol
 
 ## 34. Illustrative Quadrant-like configuration
 
+This north-star example includes proposed settings that the current prototype does not accept. See the [current configuration reference](../configuration.md) and the checked [example Projects](../../examples/) for YAML that works now.
+
 This example uses the revised direct-command and shell-command distinction. It remains illustrative and does not require Quadrant to rewrite existing wrapper scripts immediately.
 
 ```yaml
@@ -335,7 +337,7 @@ processes:
       startup_timeout: 10m
 
   storage-init:
-    kind: oneshot
+    kind: one-shot
     shell: "source .venv/bin/activate && exec python scripts/azurite_init.py"
     cwd: app/functions-python
     autostart: true
@@ -343,7 +345,7 @@ processes:
       storage: ready
 
   cosmos-init:
-    kind: oneshot
+    kind: one-shot
     shell: "source app/functions-python/.venv/bin/activate && exec python scripts/local-dev/emulators/cosmos-init.py --skip-wait --timeout-seconds 600"
     autostart: true
     depends_on:

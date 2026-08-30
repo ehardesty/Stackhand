@@ -723,7 +723,7 @@ A concrete future use case may relax this through an explicit specification chan
 ```yaml
 processes:
   storage-init:
-    kind: oneshot
+    kind: one-shot
     command: [python, scripts/azurite_init.py]
     depends_on:
       storage: ready

@@ -4,18 +4,11 @@ processes:
   # A successful One-shot can release completed_successfully Dependencies.
   prepare:
     kind: one-shot
-    terminal:
-      mode: pipe
-      input: disabled
     shell: 'printf "prepare started\n"; sleep 2; printf "prepare complete\n"'
 
   # The Service starts before it becomes ready. This creates a visible window
   # between the started and ready Dependency conditions.
   database:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     ready:
       tcp:
         host: 127.0.0.1
@@ -30,10 +23,6 @@ processes:
 
   # A keyed Dependency names the Process and states its condition.
   started-dependent:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     depends_on:
       database: started
     shell: |
@@ -45,9 +34,6 @@ processes:
   # This One-shot waits for setup completion and Service readiness.
   migrate:
     kind: one-shot
-    terminal:
-      mode: pipe
-      input: disabled
     depends_on:
       prepare: completed_successfully
       database: ready
@@ -55,10 +41,6 @@ processes:
 
   # The final Service starts only after the migration succeeds.
   application:
-    kind: service
-    terminal:
-      mode: pipe
-      input: disabled
     depends_on:
       database: ready
       migrate: completed_successfully
