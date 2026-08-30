@@ -263,10 +263,10 @@ fn removed_readiness_spellings_name_the_replacements() {
 }
 
 #[test]
-fn all_readiness_parses_independent_children_and_one_parent_deadline() {
+fn all_readiness_inherits_parent_schedule_with_child_overrides() {
     let project = write_and_load(
         "readiness-all-ok",
-        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n          initial_delay: 250ms\n          interval: 2s\n          timeout: 3s\n          success_threshold: 2\n          failure_threshold: 3\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      startup_timeout: 1m\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    ready:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n          initial_delay: 4ms\n          interval: 5s\n          timeout: 6s\n          success_threshold: 3\n          failure_threshold: 4\n      initial_delay: 250ms\n      interval: 2s\n      timeout: 3s\n      success_threshold: 2\n      failure_threshold: 3\n      startup_timeout: 1m\n",
     )
     .expect("valid all readiness");
     let readiness = project.processes()[0]
@@ -294,6 +294,8 @@ fn all_readiness_parses_independent_children_and_one_parent_deadline() {
     assert_eq!(readiness.checks[1].initial_delay, Duration::from_millis(4));
     assert_eq!(readiness.checks[1].interval, Duration::from_secs(5));
     assert_eq!(readiness.checks[1].timeout, Duration::from_secs(6));
+    assert_eq!(readiness.checks[1].success_threshold, 3);
+    assert_eq!(readiness.checks[1].failure_threshold, 4);
 }
 
 #[test]
@@ -315,11 +317,6 @@ fn all_readiness_rejects_invalid_composite_forms_clearly() {
             "any",
             "      any:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n",
             "'any' readiness form is not supported",
-        ),
-        (
-            "parent scheduling",
-            "      all:\n        - tcp: {host: h, port: 1}\n        - tcp: {host: h, port: 2}\n      interval: 1s\n",
-            "on each child",
         ),
     ];
     for (label, block, expected) in cases {
@@ -560,7 +557,7 @@ fn readiness_on_a_one_shot_is_rejected() {
 fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
     let project = write_and_load(
         "liveness-all",
-        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    restart: {on_unhealthy: true}\n    liveness:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n        - exec: {command: [/usr/bin/true]}\n        - log: {contains: heartbeat}\n",
+        "version: 1\nprocesses:\n  api:\n    command: [/bin/sleep, \"1\"]\n    restart: {on_unhealthy: true}\n    liveness:\n      all:\n        - tcp: {host: localhost, port: 1}\n        - http: {url: \"http://example.test/health\"}\n        - exec: {command: [/usr/bin/true]}\n        - log: {contains: heartbeat}\n      interval: 3s\n",
     )
     .expect("valid liveness checks");
     let process = &project.processes()[0];
@@ -584,7 +581,7 @@ fn liveness_parses_all_probe_kinds_and_restart_recovery_setting() {
         ReadinessProbe::Log { .. }
     ));
     assert_eq!(liveness.checks[0].initial_delay, Duration::ZERO);
-    assert_eq!(liveness.checks[0].interval, Duration::from_secs(1));
+    assert_eq!(liveness.checks[0].interval, Duration::from_secs(3));
     assert_eq!(liveness.checks[0].timeout, Duration::from_secs(2));
 }
 

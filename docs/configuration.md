@@ -143,7 +143,7 @@ ready:
 
 `startup_timeout` is available only on `ready`. Readiness and liveness checks are available only for Services.
 
-Use `all` for two or more checks. Put scheduling fields on each child:
+Use `all` for two or more checks. Scheduling fields on `all` apply to every child by default. A scheduling field on a child overrides the parent value for that child:
 
 ```yaml
 liveness:
@@ -151,11 +151,14 @@ liveness:
     - tcp:
         host: 127.0.0.1
         port: 8080
-      interval: 2s
     - log:
         contains: heartbeat
       interval: 5s
+  interval: 2s
+  timeout: 500ms
 ```
+
+For each scheduling field, Stackhand uses the child value, then the parent value, and then the built-in default. `startup_timeout` remains a parent-only readiness setting.
 
 A TCP check requires a nonempty `host` and a `port` from 1 through 65535. An HTTP check accepts a plain `http://` URL. HTTPS is not supported. A log check requires a nonempty `contains` value.
 

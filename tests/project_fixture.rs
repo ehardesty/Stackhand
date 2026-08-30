@@ -274,12 +274,10 @@ processes:
         - tcp:
             host: 127.0.0.1
             port: {tcp_port}
-          interval: 20ms
-          timeout: 250ms
         - http:
             url: "http://127.0.0.1:{http_port}/all-ready"
-          interval: 20ms
-          timeout: 250ms
+      interval: 20ms
+      timeout: 250ms
     command: [/bin/sleep, "60"]
   ready-dependent:
     kind: service

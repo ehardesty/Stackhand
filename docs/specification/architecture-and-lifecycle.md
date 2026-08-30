@@ -625,8 +625,12 @@ ready:
     - tcp:
         host: 127.0.0.1
         port: 10002
+  interval: 2s
+  timeout: 1s
   startup_timeout: 10m
 ```
+
+Scheduling fields on `all` provide defaults for every child probe. A child field overrides the parent value for that child. Built-in defaults apply when neither level sets a field. `startup_timeout` applies only to the complete readiness check and remains on the parent.
 
 Each child probe maintains its own threshold state. The composite passes only while all children pass.
 

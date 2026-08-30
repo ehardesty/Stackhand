@@ -1,6 +1,6 @@
 //! Readiness configuration: one YAML `ready` block becomes one validated
 //! [`ReadinessConfig`] or a clear per-Process failure. The block carries
-//! exactly one leaf check or an `all` list with child scheduling fields.
+//! exactly one leaf check or an `all` list with shared scheduling defaults.
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,6 +17,15 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUCCESS_THRESHOLD: u32 = 1;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct CheckSchedule {
+    initial_delay: Duration,
+    interval: Duration,
+    timeout: Duration,
+    success_threshold: u32,
+    failure_threshold: u32,
+}
 
 #[derive(Clone, Copy)]
 struct CheckLabels {
@@ -36,8 +45,8 @@ const LIVENESS_LABELS: CheckLabels = CheckLabels {
     child_startup_timeout_detail: "startup_timeout is not supported for liveness",
 };
 
-/// One `ready` block: one leaf check or an `all` list with independent
-/// scheduling for every child.
+/// One `ready` block: one leaf check or an `all` list with parent scheduling
+/// defaults that each child can override.
 pub(super) fn build_readiness(
     process_name: &str,
     file: &ReadinessFile,
@@ -97,21 +106,6 @@ fn build_checks(
                 "define exactly one of 'tcp', 'http', 'exec', 'log', or 'all'",
             ));
         }
-        if file.initial_delay.is_some()
-            || file.interval.is_some()
-            || file.timeout.is_some()
-            || file.success_threshold.is_some()
-            || file.failure_threshold.is_some()
-        {
-            return Err(check_error(
-                process_name,
-                labels,
-                format!(
-                    "an 'all' {} check sets scheduling fields on each child, not on the parent",
-                    labels.noun
-                ),
-            ));
-        }
         if children.len() < 2 {
             return Err(check_error(
                 process_name,
@@ -119,15 +113,30 @@ fn build_checks(
                 "'all' must contain at least two child checks",
             ));
         }
+        let parent_schedule = build_schedule(process_name, file, None, labels)?;
         children
             .iter()
             .enumerate()
             .map(|(index, child)| {
-                build_leaf(process_name, child, Some(index + 1), base_dir, labels)
+                build_leaf(
+                    process_name,
+                    child,
+                    Some(index + 1),
+                    base_dir,
+                    labels,
+                    Some(parent_schedule),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        vec![build_leaf(process_name, file, None, base_dir, labels)?]
+        vec![build_leaf(
+            process_name,
+            file,
+            None,
+            base_dir,
+            labels,
+            None,
+        )?]
     };
 
     Ok(checks)
@@ -139,6 +148,7 @@ fn build_leaf(
     child_index: Option<usize>,
     base_dir: &Path,
     labels: CheckLabels,
+    parent_schedule: Option<CheckSchedule>,
 ) -> Result<ReadinessCheck, ConfigError> {
     let fail = |detail: String| Err(check_error_for(process_name, child_index, labels, detail));
     if file.all.is_some() {
@@ -186,48 +196,66 @@ fn build_leaf(
             return fail("define exactly one of 'tcp', 'http', 'exec', or 'log'".to_string());
         }
     };
-    let initial_delay = duration_or_default(
-        process_name,
-        "initial_delay",
-        file.initial_delay.as_deref(),
-        Duration::ZERO,
-        labels,
-    )?;
-    let interval = positive_duration(
-        process_name,
-        "interval",
-        file.interval.as_deref(),
-        DEFAULT_INTERVAL,
-        labels,
-    )?;
-    let timeout = positive_duration(
-        process_name,
-        "timeout",
-        file.timeout.as_deref(),
-        DEFAULT_TIMEOUT,
-        labels,
-    )?;
-    let success_threshold = configured_threshold(
-        process_name,
-        "success_threshold",
-        file.success_threshold,
-        DEFAULT_SUCCESS_THRESHOLD,
-        labels,
-    )?;
-    let failure_threshold = configured_threshold(
-        process_name,
-        "failure_threshold",
-        file.failure_threshold,
-        DEFAULT_FAILURE_THRESHOLD,
-        labels,
-    )?;
+    let schedule = build_schedule(process_name, file, parent_schedule, labels)?;
     Ok(ReadinessCheck {
         probe,
-        initial_delay,
-        interval,
-        timeout,
-        success_threshold,
-        failure_threshold,
+        initial_delay: schedule.initial_delay,
+        interval: schedule.interval,
+        timeout: schedule.timeout,
+        success_threshold: schedule.success_threshold,
+        failure_threshold: schedule.failure_threshold,
+    })
+}
+
+fn build_schedule(
+    process_name: &str,
+    file: &ReadinessFile,
+    parent: Option<CheckSchedule>,
+    labels: CheckLabels,
+) -> Result<CheckSchedule, ConfigError> {
+    let parent = parent.unwrap_or(CheckSchedule {
+        initial_delay: Duration::ZERO,
+        interval: DEFAULT_INTERVAL,
+        timeout: DEFAULT_TIMEOUT,
+        success_threshold: DEFAULT_SUCCESS_THRESHOLD,
+        failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+    });
+    Ok(CheckSchedule {
+        initial_delay: duration_or_default(
+            process_name,
+            "initial_delay",
+            file.initial_delay.as_deref(),
+            parent.initial_delay,
+            labels,
+        )?,
+        interval: positive_duration(
+            process_name,
+            "interval",
+            file.interval.as_deref(),
+            parent.interval,
+            labels,
+        )?,
+        timeout: positive_duration(
+            process_name,
+            "timeout",
+            file.timeout.as_deref(),
+            parent.timeout,
+            labels,
+        )?,
+        success_threshold: configured_threshold(
+            process_name,
+            "success_threshold",
+            file.success_threshold,
+            parent.success_threshold,
+            labels,
+        )?,
+        failure_threshold: configured_threshold(
+            process_name,
+            "failure_threshold",
+            file.failure_threshold,
+            parent.failure_threshold,
+            labels,
+        )?,
     })
 }
 
