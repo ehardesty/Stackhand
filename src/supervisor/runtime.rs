@@ -328,8 +328,8 @@ fn drain_retained_output(
 }
 
 /// Own one Run from spawn through confirmed cleanup. The same loop forwards
-/// low-volume live events, chooses stop versus natural completion, consumes
-/// the public Run completion events, and reports one finished-Run fact.
+/// low-volume live events, chooses stop versus natural completion, and
+/// reports one finished-Run fact from the returned outcome.
 /// Output remains a separate data plane during cancellation so bytes already
 /// produced by the child can still drain before `OwnedRun` cleanup completes;
 /// output never changes the Supervisor lifecycle snapshot.
@@ -354,9 +354,8 @@ fn own_run(
                     None => run.shutdown(),
                 },
             };
-            // `OwnedRun` emits Exited before its completion event. Consume
-            // that ordered public protocol before publishing the one seam
-            // fact derived from its returned outcome.
+            // Finalization joins the Run workers. Forward their remaining
+            // live diagnostics before publishing the returned outcome.
             forward_pending_events(key, &event_rx, &events);
             let finished = finished_run(key, &result, cause.intentional_stop());
             let cleanup_confirmed = finished.cleanup_confirmed;
@@ -402,13 +401,7 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
             run_id,
             root_pid,
         },
-        // The returned RunOutcome is the one completion authority. These
-        // ordered Run events are consumed here and do not create a second
-        // Supervisor completion protocol.
-        RunEventKind::Exited { .. } | RunEventKind::ShutdownComplete | RunEventKind::Failed(_) => {
-            return;
-        }
-        RunEventKind::OutputDropped { .. } => return,
+        RunEventKind::Abandoned(_) | RunEventKind::OutputDropped { .. } => return,
         RunEventKind::IoFailed(detail) => SeamEvent::OutputFailure {
             process_id,
             run_id,

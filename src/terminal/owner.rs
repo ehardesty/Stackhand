@@ -16,7 +16,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::command_gate::CommandReceiver;
-use super::history::{BoundedOutputHistory, OutputHistoryMetrics};
+use super::history::{OutputHistoryLedger, OutputHistoryMetrics};
 use super::session::OwnedCursorState;
 use super::state::{PendingInput, TerminalState};
 use crate::geometry::TerminalGeometry;
@@ -318,7 +318,7 @@ fn run_owner(
     })?;
     terminal.on_clipboard_write(deny_child_clipboard)?;
     let mut state = TerminalState::new(terminal, resizer, geometry)?;
-    let mut history = BoundedOutputHistory::new();
+    let mut history = OutputHistoryLedger::new();
     let mut pending_input: Option<PendingInput> = None;
     let mut pending_effect: Option<Vec<u8>> = None;
     let mut next_selection_tick = Instant::now() + SELECTION_AUTOSCROLL_INTERVAL;
@@ -348,7 +348,7 @@ fn run_owner(
             if let Some(observer) = &observer {
                 observer.observe(&data);
             }
-            let evicted = history.push(&data);
+            let evicted = history.push(data.len());
             *shared
                 .history
                 .lock()

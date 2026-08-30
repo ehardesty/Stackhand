@@ -296,12 +296,7 @@ impl Core {
         let Some(after) = after else {
             return;
         };
-        if before != Some(LivenessState::Failing) && after == LivenessState::Failing {
-            self.handle_liveness_failure(index);
-        } else if before == Some(LivenessState::Failing) && after == LivenessState::Passing {
-            self.recover_liveness(index);
-        }
-        self.evaluate();
+        self.apply_liveness_transition(index, before, after);
     }
 
     pub(super) fn complete_liveness_log(
@@ -325,6 +320,15 @@ impl Core {
         let Some(after) = after else {
             return;
         };
+        self.apply_liveness_transition(index, before, after);
+    }
+
+    fn apply_liveness_transition(
+        &mut self,
+        index: usize,
+        before: Option<LivenessState>,
+        after: LivenessState,
+    ) {
         if before != Some(LivenessState::Failing) && after == LivenessState::Failing {
             self.handle_liveness_failure(index);
         } else if before == Some(LivenessState::Failing) && after == LivenessState::Passing {

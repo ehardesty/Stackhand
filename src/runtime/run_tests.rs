@@ -101,16 +101,12 @@ mod pty_seam_tests {
             "root process did not reach natural exit"
         );
         // Cleanup after a natural root exit still finalizes the TerminalSession
-        // and joins every terminal worker thread. Exit is reported through the
-        // low-volume path before shutdown completion.
-        run.shutdown().expect("run joined after natural exit");
-
-        let exit_event = receiver.recv_timeout(WAIT).expect("exit event arrived");
-        assert_eq!(exit_event.run_id, RunId::new(42));
-        assert_eq!(exit_event.kind, RunEventKind::Exited { code: Some(0) });
-        let final_event = receiver.recv_timeout(WAIT).expect("final event arrived");
-        assert_eq!(final_event.run_id, RunId::new(42));
-        assert_eq!(final_event.kind, RunEventKind::ShutdownComplete);
+        // and joins every terminal worker thread. The returned outcome is the
+        // only normal completion protocol.
+        let outcome = run.shutdown().expect("run joined after natural exit");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.cleanup_confirmed);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -185,8 +181,7 @@ mod pipe_tests {
         let spawned = events.recv_timeout(WAIT).expect("spawn event");
         assert_eq!(spawned.run_id, RunId::new(77));
         assert!(matches!(spawned.kind, RunEventKind::Spawned { .. }));
-        let exited = events.recv_timeout(WAIT).expect("exit event");
-        assert_eq!(exited.kind, RunEventKind::Exited { code: Some(0) });
+        assert!(events.try_recv().is_err());
 
         // The root process was reaped by wait(); cleanup stays successful.
         run.shutdown().expect("run joined");
@@ -250,15 +245,10 @@ mod pipe_tests {
             "every output line must reach the high-volume path"
         );
 
-        // Only lifecycle events may exist on the low-volume sink.
+        // Only live lifecycle events may exist on the low-volume sink.
         loop {
             match events.try_recv() {
-                Ok(event) => assert!(matches!(
-                    event.kind,
-                    RunEventKind::Spawned { .. }
-                        | RunEventKind::Exited { .. }
-                        | RunEventKind::ShutdownComplete
-                )),
+                Ok(event) => assert!(matches!(event.kind, RunEventKind::Spawned { .. })),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -582,7 +572,7 @@ wait";
         assert!(
             diagnostics.iter().any(|event| matches!(
                 &event.kind,
-                RunEventKind::Failed(detail)
+                RunEventKind::Abandoned(detail)
                     if detail.contains("skipped Process Tree signaling")
             )),
             "drop latch diagnostic missing: {diagnostics:?}"

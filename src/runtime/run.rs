@@ -92,23 +92,15 @@ pub struct RunEvent {
 pub enum RunEventKind {
     /// The root process spawned. Carries the root PID when the platform
     /// reports one.
-    Spawned {
-        root_pid: Option<OsPid>,
-    },
-    /// All Run resources completed cleanup and joined.
-    ShutdownComplete,
-    Failed(String),
-    /// The root process exited on its own or was reaped during cleanup.
-    Exited {
-        code: Option<i32>,
-    },
+    Spawned { root_pid: Option<OsPid> },
+    /// Bounded cleanup diagnostics from an `OwnedRun` dropped without
+    /// `wait` or `shutdown`. Normal completion is returned as `RunOutcome`.
+    Abandoned(String),
     /// One owned I/O task failed. Carries no output bytes.
     IoFailed(String),
     /// Bounded backpressure: output bytes were dropped because the
     /// caller's queue was full. Metadata, not a failure.
-    OutputDropped {
-        bytes: usize,
-    },
+    OutputDropped { bytes: usize },
     /// One bounded aggregate Process Tree sample. At most one is emitted
     /// per configured interval.
     Metrics(RunMetrics),
@@ -579,11 +571,6 @@ impl OwnedRun {
             worker_join_failures,
             dropped_output_bytes,
         };
-        self.emit(RunEventKind::Exited { code: exit_code });
-        self.emit(match cleanup_confirmed {
-            true => RunEventKind::ShutdownComplete,
-            false => RunEventKind::Failed("Run cleanup did not fully confirm".to_string()),
-        });
         self.outcome = Some(outcome.clone());
         Ok(outcome)
     }
@@ -800,7 +787,7 @@ impl Drop for OwnedRun {
             );
         }
         for detail in diagnostics {
-            self.emit(RunEventKind::Failed(format!("Run dropped: {detail}")));
+            self.emit(RunEventKind::Abandoned(format!("Run dropped: {detail}")));
         }
     }
 }

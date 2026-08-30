@@ -377,20 +377,22 @@ impl PipeScroll {
     }
 
     fn apply_navigation(&mut self, output: &RetainedOutput, pane_rows: usize) {
-        let all = output.display_lines(usize::MAX);
-        if all.is_empty() {
+        let head = output
+            .display_position(None)
+            .expect("the retained head always has a display position");
+        let total = head.1;
+        if total == 0 {
             self.follow();
             return;
         }
-        let height = pane_rows.min(all.len());
-        let max_start = all.len() - height;
+        let height = pane_rows.min(total);
+        let max_start = total - height;
         let mut start = match self.position {
             Position::Following => max_start,
-            Position::Head => 0,
-            Position::Source(source) => all
-                .iter()
-                .position(|line| line.source == Some(source))
-                .unwrap_or(0),
+            Position::Head => head.0,
+            Position::Source(source) => output
+                .display_position(Some(source))
+                .map_or(head.0, |(position, _)| position),
         }
         .min(max_start);
         let mut last_direction = None;
@@ -405,43 +407,52 @@ impl PipeScroll {
                 last_direction = Some(movement.direction);
             }
         }
-        self.place(&all, height, start, max_start);
+        self.place(output, height, start, max_start);
         if last_direction.is_some() {
             self.extend_drag_selection();
         }
     }
 
     fn place_target(&mut self, output: &RetainedOutput, pane_rows: usize, source: (u64, usize)) {
-        let all = output.display_lines(usize::MAX);
-        if all.is_empty() {
+        let (_, total) = output
+            .display_position(None)
+            .expect("the retained head always has a display position");
+        if total == 0 {
             self.follow();
             return;
         }
-        let height = pane_rows.min(all.len());
-        let max_start = all.len() - height;
-        let Some(index) = all.iter().position(|line| line.source == Some(source)) else {
+        let Some((index, _)) = output.display_position(Some(source)) else {
             self.position = Position::Head;
             self.refresh(output, pane_rows);
             return;
         };
+        let height = pane_rows.min(total);
+        let max_start = total - height;
         let start = index.saturating_sub(height / 2).min(max_start);
-        self.place(&all, height, start, max_start);
+        self.place(output, height, start, max_start);
     }
 
-    fn place(&mut self, all: &[PipeLine], height: usize, start: usize, max_start: usize) {
+    fn place(&mut self, output: &RetainedOutput, height: usize, start: usize, max_start: usize) {
         if start == max_start && !self.held {
             self.position = Position::Following;
-        } else if start == 0 && all[0].source.is_none() {
+        } else if start == 0 && output.truncated {
             self.position = Position::Head;
         } else {
             self.position = Position::Source(
-                all[start]
-                    .source
+                output
+                    .display_source_at(start)
                     .expect("only the retained-head notice lacks a source"),
             );
         }
-        self.visible.clear();
-        self.visible.extend_from_slice(&all[start..start + height]);
+        self.visible = match self.position {
+            Position::Following => output.display_lines(height),
+            Position::Head => output
+                .display_window_from(None, height)
+                .expect("the retained head is available"),
+            Position::Source(source) => output
+                .display_window_from(Some(source), height)
+                .expect("the selected source is available"),
+        };
     }
 
     fn selection_point(
@@ -623,6 +634,15 @@ mod tests {
 
         assert_eq!(sources(scroll.window(&later, 20)), before);
         assert!(!scroll.following());
+    }
+
+    #[test]
+    fn an_empty_search_target_returns_to_the_live_tail() {
+        let mut scroll = PipeScroll::default();
+        scroll.show_source((1, 0));
+
+        assert!(scroll.window(&RetainedOutput::default(), 20).is_empty());
+        assert!(scroll.following());
     }
 
     #[test]
