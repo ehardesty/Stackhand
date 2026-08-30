@@ -542,19 +542,19 @@ fn scrollbar_thumb(scrollbar: LogsScrollbar, track_rows: usize) -> (usize, usize
     if track_rows == 0 {
         return (0, 0);
     }
-    // Match Ratatui's independent rounded endpoints so pointer hit testing
-    // always agrees with the rendered thumb.
+    // Ratatui does not expose rendered thumb geometry. Keep pointer hit
+    // testing equal to Ratatui 0.30's rounded length and clamped start.
     let max_position = scrollbar.content_length.saturating_sub(1);
     let position = scrollbar.position.min(max_position);
     let total_length = max_position.saturating_add(scrollbar.viewport_length);
-    let thumb_start = rounded_scale(position, track_rows, total_length).min(track_rows - 1);
-    let thumb_end = rounded_scale(
-        position.saturating_add(scrollbar.viewport_length),
-        track_rows,
-        total_length,
-    )
-    .min(track_rows);
-    (thumb_start, thumb_end.saturating_sub(thumb_start).max(1))
+    if total_length == 0 {
+        return (0, track_rows);
+    }
+    let thumb_length =
+        rounded_scale(scrollbar.viewport_length, track_rows, total_length).clamp(1, track_rows);
+    let thumb_start = rounded_scale(position, track_rows, total_length)
+        .min(track_rows.saturating_sub(thumb_length));
+    (thumb_start, thumb_length)
 }
 
 fn rounded_scale(value: usize, target: usize, source: usize) -> usize {
@@ -597,6 +597,9 @@ fn byte_at_column(text: &str, column: usize, include_character: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
+
     use crate::output::{RetainedChunk, RetainedOutput};
     use crate::runtime::OutputStream;
 
@@ -753,6 +756,42 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_hit_area_matches_ratatui_thumb_geometry() {
+        for track_rows in 1..=8 {
+            let area = Rect::new(0, 0, 1, track_rows as u16);
+            for content_length in 1..=10 {
+                for viewport_length in 1..=5 {
+                    for position in 0..content_length {
+                        let scrollbar = LogsScrollbar {
+                            position,
+                            content_length,
+                            viewport_length,
+                        };
+                        let mut buffer = Buffer::empty(area);
+                        let mut state = ScrollbarState::new(content_length)
+                            .position(position)
+                            .viewport_content_length(viewport_length);
+                        StatefulWidget::render(
+                            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                                .begin_symbol(None)
+                                .end_symbol(None),
+                            area,
+                            &mut buffer,
+                            &mut state,
+                        );
+                        let thumb_rows = (0..track_rows)
+                            .filter(|row| buffer[(0, *row as u16)].symbol() == "█")
+                            .collect::<Vec<_>>();
+                        let rendered = (thumb_rows.first().copied().unwrap_or(0), thumb_rows.len());
+
+                        assert_eq!(scrollbar_thumb(scrollbar, track_rows), rendered);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scrollbar_thumb_drag_maps_to_a_stable_logs_position() {
         let retained = output(0..40, 1);
         let mut scroll = PipeScroll::default();
@@ -776,11 +815,11 @@ mod tests {
             area,
             &retained,
         ));
-        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((11, 0)));
+        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((8, 0)));
         assert_eq!(
             scroll.scrollbar(),
             Some(LogsScrollbar {
-                position: 11,
+                position: 8,
                 content_length: 31,
                 viewport_length: 10,
             })

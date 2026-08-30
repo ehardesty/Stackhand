@@ -406,6 +406,7 @@ Search MAY be entered from Terminal view, but results SHOULD be presented in Log
 The user can:
 
 - start selected;
+- start a selected Waiting Process without requiring Dependencies for one Run;
 - stop selected;
 - restart selected service;
 - rerun selected oneshot;

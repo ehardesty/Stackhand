@@ -294,6 +294,21 @@ impl ProcessLifecycle {
         true
     }
 
+    /// Admit one explicit Dependency bypass only while this Process is waiting
+    /// to start. The next Run records the action and consumes it immediately.
+    pub(super) fn prepare_start_anyway(&mut self) -> bool {
+        if self.current_run.is_some()
+            || self.desired != DesiredState::Running
+            || self.lifecycle != Lifecycle::Waiting
+        {
+            return false;
+        }
+        self.clear_restart_state();
+        self.restart_budget.reset();
+        self.pending_trigger = RunTrigger::StartAnyway;
+        true
+    }
+
     /// Move the current Run into cleanup for an explicit replacement.
     pub(super) fn begin_replacement_cleanup(&mut self) -> Option<(ProcessId, RunId)> {
         let run_id = self.current_run.filter(|_| !self.cleanup_unconfirmed)?;

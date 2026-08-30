@@ -1,7 +1,7 @@
 //! Pure projection of Supervisor snapshots into compact user-visible rows and headers.
 
 use crate::supervisor::{Lifecycle, LivenessState, ProcessSnapshot, ProjectSnapshot};
-use crate::tui::ProcessRowView;
+use crate::tui::{LifecycleTone, ProcessRowView};
 
 pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
     let show_profiles = snapshot.processes.iter().any(|process| {
@@ -21,6 +21,7 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
         .map(|(index, process)| ProcessRowView {
             name: process.name.clone(),
             status: status_label(process),
+            lifecycle_tone: lifecycle_tone(process),
             profile: show_profiles.then(|| profile_label(process)),
             cpu: process.metrics.map(|metrics| {
                 metric_precision(format_cpu(metrics.cpu_percent), metrics.best_effort)
@@ -150,6 +151,38 @@ pub(super) fn status_label(process: &ProcessSnapshot) -> String {
             Some(backoff) => format!("Restarting ({})", short_reason(&backoff.reason)),
             None => "Restarting".to_string(),
         },
+    }
+}
+
+pub(super) fn lifecycle_tone(process: &ProcessSnapshot) -> LifecycleTone {
+    if !process.enabled && process.current_run.is_none() {
+        return LifecycleTone::Muted;
+    }
+    if process.lifecycle == Lifecycle::Done {
+        return LifecycleTone::Success;
+    }
+    if process.lifecycle == Lifecycle::Running
+        && process
+            .liveness
+            .as_ref()
+            .is_some_and(|liveness| liveness.state == LivenessState::Failing)
+    {
+        return LifecycleTone::Error;
+    }
+    if !matches!(
+        process.lifecycle,
+        Lifecycle::Stopping | Lifecycle::RestartBackoff
+    ) && process.failure.is_some()
+    {
+        return LifecycleTone::Error;
+    }
+    match process.lifecycle {
+        Lifecycle::Idle | Lifecycle::Stopped => LifecycleTone::Muted,
+        Lifecycle::Starting => LifecycleTone::Info,
+        Lifecycle::Running | Lifecycle::Done => LifecycleTone::Success,
+        Lifecycle::Waiting | Lifecycle::Stopping | Lifecycle::RestartBackoff => {
+            LifecycleTone::Warning
+        }
     }
 }
 

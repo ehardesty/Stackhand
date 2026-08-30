@@ -70,6 +70,7 @@ fn shutdown_closes_admission_and_repeated_requests_share_one_operation() {
     let intents_after_shutdown = h.runtime.intents().len();
 
     h.command(Command::Start("api".into()));
+    h.command(Command::StartAnyway("api".into()));
     h.command(Command::Restart("worker".into()));
     h.command(Command::Rerun("setup".into()));
     h.command(Command::Shutdown {

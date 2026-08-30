@@ -111,6 +111,7 @@
 
 - autostart schedules dependencies;
 - manual start schedules dependencies;
+- Start Anyway bypasses Dependencies for one Waiting Run only;
 - service becomes ready through TCP;
 - service becomes ready through HTTP;
 - service becomes ready through log match;
@@ -162,8 +163,10 @@ Use Ratatui `TestBackend` where useful for:
 - help/modal rendering;
 - metrics column collapse;
 - `p` global Process Profile cycling;
+- conditional `S: start anyway` control for a Waiting Process;
 - conditional `R: apply profile` control and affected-Process restart action;
 - conditional Profile column visibility;
+- semantic state colors through terminal palette roles;
 - narrow terminal behavior.
 
 Avoid brittle snapshots of dynamic terminal cell content when focused behavioral tests are clearer.

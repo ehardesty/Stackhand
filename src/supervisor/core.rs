@@ -99,6 +99,8 @@ pub enum RunTrigger {
     Autostart,
     /// The user started the selected Process.
     Manual,
+    /// The user started a Waiting Process without requiring its Dependencies.
+    StartAnyway,
     /// The user restarted the selected Service.
     Restart,
     /// The user reran the selected One-shot.
@@ -199,6 +201,7 @@ impl Core {
             && matches!(
                 command,
                 Command::Start(_)
+                    | Command::StartAnyway(_)
                     | Command::Restart(_)
                     | Command::Rerun(_)
                     | Command::StartAutostart
@@ -211,6 +214,11 @@ impl Core {
             Command::Start(name) => {
                 if let Some(index) = self.project.process_index(&name) {
                     self.start_at(index, RunTrigger::Manual);
+                }
+            }
+            Command::StartAnyway(name) => {
+                if let Some(index) = self.project.process_index(&name) {
+                    self.start_anyway_at(index);
                 }
             }
             Command::Stop(name) => {

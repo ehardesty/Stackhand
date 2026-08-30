@@ -69,7 +69,11 @@ FAILED
 RESTARTING
 ```
 
-The underlying state remains structured; labels are presentation only.
+The underlying state remains structured; labels are presentation only. The
+Process list uses semantic terminal-palette colors to make states easier to
+scan: muted for inactive states, information for startup, success for ready or
+done, warning for waiting or transitions, and error for failed or unhealthy.
+Text labels remain the primary signal, so meaning does not depend on color.
 
 ### 24.4 Selected-process header
 
@@ -111,6 +115,7 @@ When the process list is focused:
 ```text
 ↑/↓ or j/k     select process
 s              start selected
+S              start a Waiting Process without requiring Dependencies; shown only while Waiting
 x              stop selected
 r              restart/rerun selected
 p              cycle the global Process Profile for future Runs
@@ -289,6 +294,7 @@ The product supports:
 - cycle the global Process Profile for future Runs;
 - apply pending profile changes to affected active Processes;
 - start selected;
+- start a selected Waiting Process without requiring Dependencies;
 - stop selected;
 - restart selected service;
 - rerun selected oneshot;
@@ -298,6 +304,10 @@ The product supports:
 ### 27.1 Start Default and Start All
 
 Both actions recursively schedule required enabled Dependencies. Processes remain visibly blocked until gates are satisfied. Starting a Process sets it and each scheduled prerequisite to desired running. Disabled Dependencies remain disabled and block the request.
+
+Start Anyway is available only for a selected Waiting Process. It starts one
+Run without requiring its Dependencies. Existing Dependency work continues.
+Later Runs use the configured Dependency gates again.
 
 ### 27.2 Stop all
 

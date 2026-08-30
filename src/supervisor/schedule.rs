@@ -32,6 +32,15 @@ impl Core {
         self.evaluate();
     }
 
+    /// Start one Waiting Process now without checking its Dependencies. The
+    /// bypass applies to this Run only. Existing Dependency work continues.
+    pub(super) fn start_anyway_at(&mut self, index: usize) {
+        if !self.is_enabled(index) || !self.lifecycles[index].prepare_start_anyway() {
+            return;
+        }
+        self.begin_desired_run(index);
+    }
+
     /// Restart one Process: keep Desired State Running, stop the active
     /// Run without touching that desire, and let the scheduler start the
     /// next Run only after the bounded cleanup reports completion. While

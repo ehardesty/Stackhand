@@ -6,6 +6,9 @@ use std::time::Instant;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Start(String),
+    /// Start one Waiting Process without requiring its Dependencies. This
+    /// affects only the next Run and does not change the Project.
+    StartAnyway(String),
     Stop(String),
     Restart(String),
     /// Rerun one enabled One-shot; a no-op for every other Process.

@@ -9,6 +9,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::widgets::TableState;
 
 use super::view_model::profile_changes_pending;
 
@@ -16,7 +17,9 @@ use crate::console::{ConsoleInteraction, LifecycleCommand};
 use crate::log_view::OutputRepresentation;
 use crate::output::RetainedOutput;
 use crate::process_logs::{LogsInput, ProcessLogs};
-use crate::supervisor::{Command, ConsoleView, Consoles, ProcessSnapshot, ProjectSnapshot};
+use crate::supervisor::{
+    Command, ConsoleView, Consoles, Lifecycle, ProcessSnapshot, ProjectSnapshot,
+};
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
     ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, pane_inner, process_row_at,
@@ -58,15 +61,21 @@ pub(crate) struct ProjectUpdate {
 pub(crate) struct ProjectInteraction {
     console: ConsoleInteraction,
     selected: usize,
+    process_table: TableState,
     logs: Vec<ProcessLogs>,
     project_commands: Vec<Command>,
     profile_changes_pending: bool,
+    start_anyway_available: bool,
     truncation: Option<(usize, bool)>,
 }
 
 impl ProjectInteraction {
     pub(crate) fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub(super) fn process_table_state(&mut self) -> &mut TableState {
+        &mut self.process_table
     }
 
     pub(super) fn poll_requests(&mut self) -> bool {
@@ -90,6 +99,7 @@ impl ProjectInteraction {
             .console
             .apply_selection_moves(&mut self.selected, snapshot.processes.len());
         let process = &snapshot.processes[self.selected];
+        self.start_anyway_available = process.lifecycle == Lifecycle::Waiting;
         let mut commands = std::mem::take(&mut self.project_commands);
         commands.extend(
             self.console
@@ -194,6 +204,7 @@ impl ProjectInteraction {
         };
         let mut view = self.console.view();
         view.profile_changes_pending = self.profile_changes_pending;
+        view.start_anyway_available = self.start_anyway_available;
         let (lines, logs_status, logs_editing) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
@@ -245,6 +256,9 @@ impl ProjectInteraction {
                 KeyCode::Char('p') => Some(Command::SelectNextProcessProfile),
                 KeyCode::Char('R') if self.profile_changes_pending => {
                     Some(Command::RestartProfiledAutostart)
+                }
+                KeyCode::Char('S') if process.lifecycle == Lifecycle::Waiting => {
+                    Some(Command::StartAnyway(process.name.clone()))
                 }
                 _ => None,
             };
@@ -431,7 +445,7 @@ impl ProjectInteraction {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(index) =
-                        process_row_at(list, mouse.row, process_count, self.selected)
+                        process_row_at(list, mouse.row, process_count, self.process_table.offset())
                     {
                         self.selected = index;
                         self.console.clear_pane_warning();
@@ -654,6 +668,53 @@ mod tests {
         assert_eq!(
             interaction.update_project(&snapshot).commands,
             vec![Command::RestartProfiledAutostart]
+        );
+    }
+
+    #[test]
+    fn start_anyway_is_available_only_for_the_selected_waiting_process() {
+        let mut snapshot = ProjectSnapshot {
+            selected_profile: None,
+            available_profiles: Vec::new(),
+            processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('S')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Ignored
+        );
+
+        snapshot.processes[0].lifecycle = Lifecycle::Waiting;
+        snapshot.processes[0].blocked_reason = Some("db: ready".to_string());
+        interaction.update_project(&snapshot);
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('S')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.update_project(&snapshot).commands,
+            vec![Command::StartAnyway("api".to_string())]
         );
     }
 

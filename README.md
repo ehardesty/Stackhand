@@ -52,6 +52,9 @@ resolution rules without starting Processes.
 Stackhand starts enabled autostart Processes with the Process list focused. Use
 `j` or `k` to select a Process,
 `s` to start, `x` to stop, and `r` to restart a Service or rerun a One-shot.
+When the selected Process is waiting for a Dependency, press `S` to start it
+anyway. This skips Dependency checks for that Run only. Later Runs use the
+normal Dependency rules.
 Press `p` to cycle the global Process Profile. Profile selection has no
 immediate lifecycle effect, so active Processes continue. When active Runs
 need a profile change, Stackhand shows `R: apply profile`. Press `R` to stop

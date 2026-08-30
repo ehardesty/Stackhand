@@ -428,7 +428,9 @@ output pressure, resource measurements, and cleanup checks. Verify:
 - terminal scrollback compression;
 - keyboard selection state transitions;
 - future-Run Process Profile changes and affected-Process restarts;
-- conditional Profile column visibility; and
+- one-Run Start Anyway Dependency bypasses;
+- conditional Profile column visibility;
+- semantic state colors through terminal palette roles; and
 - copied text across wrapped lines and continued output.
 
 Milestone 4A is complete when the automated acceptance suite passes and no

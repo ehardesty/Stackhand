@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
 use super::interaction::{is_quit, mouse_changes_focus, mouse_starts_console_focus, should_quit};
 use super::view_model::{
-    format_age, format_cpu, format_rss, metric_precision, process_list_title, process_rows,
-    selected_header, status_label,
+    format_age, format_cpu, format_rss, lifecycle_tone, metric_precision, process_list_title,
+    process_rows, selected_header, status_label,
 };
 use super::*;
 use crate::tui::process_row_at;
@@ -123,6 +123,7 @@ fn tui_projection_keeps_lifecycle_reasons_visible() {
     process.current_run = None;
     process.blocked_reason = Some("all-ready: ready".to_string());
     assert_eq!(status_label(&process), "Waiting (all-ready: ready)");
+    assert_eq!(lifecycle_tone(&process), crate::tui::LifecycleTone::Warning);
     assert!(selected_header(&process, 5_000).contains("all-ready: ready"));
 
     process.lifecycle = crate::supervisor::Lifecycle::Running;
@@ -152,6 +153,7 @@ fn tui_projection_keeps_lifecycle_reasons_visible() {
         children: Vec::new(),
     });
     assert_eq!(status_label(&process), "Unhealthy");
+    assert_eq!(lifecycle_tone(&process), crate::tui::LifecycleTone::Error);
 
     process.lifecycle = crate::supervisor::Lifecycle::RestartBackoff;
     process.current_run = None;
@@ -162,6 +164,7 @@ fn tui_projection_keeps_lifecycle_reasons_visible() {
     });
     process.automatic_restart_budget.automatic_retries_used = 1;
     assert_eq!(status_label(&process), "Restarting (unhealthy)");
+    assert_eq!(lifecycle_tone(&process), crate::tui::LifecycleTone::Warning);
     let header = selected_header(&process, 5_000);
     assert!(header.contains("automatic retries 1/2"));
     assert!(header.contains("next restart at 7500ms"));
@@ -173,6 +176,7 @@ fn tui_projection_keeps_lifecycle_reasons_visible() {
         detail: "Restart limit exhausted".to_string(),
     });
     assert_eq!(status_label(&process), "Failed (Restart limit exhausted)");
+    assert_eq!(lifecycle_tone(&process), crate::tui::LifecycleTone::Error);
     assert!(selected_header(&process, 5_000).contains("Restart limit exhausted"));
 }
 
@@ -227,8 +231,8 @@ fn process_row_hit_testing_excludes_the_header_borders_and_empty_rows() {
 fn process_row_hit_testing_tracks_the_visible_table_offset() {
     let list = ratatui::layout::Rect::new(0, 0, 40, 6);
 
-    assert_eq!(process_row_at(list, 2, 8, 7), Some(5));
-    assert_eq!(process_row_at(list, 4, 8, 7), Some(7));
+    assert_eq!(process_row_at(list, 2, 8, 5), Some(5));
+    assert_eq!(process_row_at(list, 4, 8, 5), Some(7));
 }
 
 #[test]

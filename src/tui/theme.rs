@@ -7,14 +7,31 @@ pub(super) struct Theme {
     focus: Color,
     copy: Color,
     secondary: Color,
+    info: Color,
+    success: Color,
     warning: Color,
+    error: Color,
+}
+
+/// Semantic color roles for Process lifecycle labels. The text label remains
+/// the primary signal; color makes a dense list faster to scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleTone {
+    Muted,
+    Info,
+    Success,
+    Warning,
+    Error,
 }
 
 pub(super) const TERMINAL_THEME: Theme = Theme {
     focus: Color::Cyan,
     copy: Color::Yellow,
     secondary: Color::Gray,
+    info: Color::Cyan,
+    success: Color::Green,
     warning: Color::Yellow,
+    error: Color::Red,
 };
 
 impl Theme {
@@ -44,6 +61,17 @@ impl Theme {
         Style::default().add_modifier(Modifier::REVERSED)
     }
 
+    pub(super) fn lifecycle(&self, tone: LifecycleTone) -> Style {
+        let color = match tone {
+            LifecycleTone::Muted => self.secondary,
+            LifecycleTone::Info => self.info,
+            LifecycleTone::Success => self.success,
+            LifecycleTone::Warning => self.warning,
+            LifecycleTone::Error => self.error,
+        };
+        Style::default().fg(color)
+    }
+
     pub(super) fn footer(&self, warning: bool) -> Style {
         Style::default().fg(if warning {
             self.warning
@@ -68,5 +96,29 @@ mod tests {
         assert_eq!(TERMINAL_THEME.focus_border().fg, Some(Color::Cyan));
         assert_eq!(TERMINAL_THEME.copy_border().fg, Some(Color::Yellow));
         assert_eq!(TERMINAL_THEME.footer(true).fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn lifecycle_roles_use_terminal_palette_colors() {
+        assert_eq!(
+            TERMINAL_THEME.lifecycle(LifecycleTone::Muted).fg,
+            Some(Color::Gray)
+        );
+        assert_eq!(
+            TERMINAL_THEME.lifecycle(LifecycleTone::Info).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            TERMINAL_THEME.lifecycle(LifecycleTone::Success).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            TERMINAL_THEME.lifecycle(LifecycleTone::Warning).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            TERMINAL_THEME.lifecycle(LifecycleTone::Error).fg,
+            Some(Color::Red)
+        );
     }
 }

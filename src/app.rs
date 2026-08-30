@@ -214,6 +214,7 @@ fn run_event_loop(
             console_area = render_frame(
                 outer,
                 &rows,
+                interaction.process_table_state(),
                 frame.terminal.as_ref(),
                 frame.lines.as_deref(),
                 frame.view,
@@ -265,6 +266,7 @@ fn run_event_loop(
 fn render_frame(
     outer: &mut OuterTerminal,
     rows: &[ProcessRowView],
+    process_table_state: &mut ratatui::widgets::TableState,
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[crate::tui::PipeLine]>,
     view: crate::tui::ConsoleViewState,
@@ -278,6 +280,7 @@ fn render_frame(
             pane = Some(render_project(
                 frame,
                 rows,
+                process_table_state,
                 console_snapshot,
                 pipe_lines,
                 view,

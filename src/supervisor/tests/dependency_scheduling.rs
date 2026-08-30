@@ -1,4 +1,5 @@
 use super::*;
+use crate::supervisor::RunTrigger;
 
 fn start_intents(h: &Harness) -> Vec<(ProcessId, RunId)> {
     h.runtime
@@ -123,6 +124,48 @@ fn a_disabled_dependency_blocks_visibly_without_auto_enable() {
     // Disabled stays disabled: no desire, no Run.
     assert_eq!(h.process("db").desired, DesiredState::Stopped);
     assert_eq!(h.process("db").lifecycle, Lifecycle::Idle);
+    assert!(h.runtime.intents().is_empty());
+}
+
+#[test]
+fn start_anyway_bypasses_dependencies_for_one_waiting_run_only() {
+    let project = EffectiveProject::new(vec![
+        depending_on("api", &["db"]),
+        simple("db", ProcessKind::Service, Enabled::No, Autostart::No),
+    ])
+    .expect("unique names");
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Waiting);
+
+    h.command(Command::StartAnyway("api".into()));
+    assert_eq!(h.process("api").current_run, Some(1));
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Starting);
+    assert_eq!(h.process("db").desired, DesiredState::Stopped);
+
+    h.event(spawned("api", 1));
+    h.command(Command::Stop("api".into()));
+    assert_eq!(
+        h.process("api").recent_runs[0].trigger,
+        RunTrigger::StartAnyway
+    );
+
+    h.command(Command::Start("api".into()));
+    assert_eq!(h.process("api").current_run, None);
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Waiting);
+    assert_eq!(
+        h.process("api").blocked_reason.as_deref(),
+        Some("db: disabled")
+    );
+}
+
+#[test]
+fn start_anyway_is_ignored_unless_the_process_is_waiting() {
+    let mut h = Harness::new(EffectiveProject::new(vec![service("api")]).expect("unique names"));
+
+    h.command(Command::StartAnyway("api".into()));
+
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Idle);
     assert!(h.runtime.intents().is_empty());
 }
 

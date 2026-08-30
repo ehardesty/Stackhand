@@ -47,3 +47,7 @@ _Avoid_: Current profile
 **Dependency**:
 A startup relationship that prevents one Process from starting until another Process meets a specified condition. It does not couple their lifetimes after startup.
 _Avoid_: Parent, prerequisite process
+
+**Start Anyway**:
+A one-use action that starts a Waiting Process without requiring its Dependencies. It does not change the Project or later Runs.
+_Avoid_: Force start

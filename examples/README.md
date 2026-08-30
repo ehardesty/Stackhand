@@ -19,6 +19,7 @@ Stackhand starts enabled autostart Processes with the Process list focused:
 ```text
 j/k or Up/Down   select a Process
 s                start the selected Process
+S                start a Waiting Process now; skips Dependencies for one Run
 x                stop the selected Process
 r                restart a Service or rerun a One-shot
 p                cycle the global Process Profile for future Runs

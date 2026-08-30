@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
@@ -9,7 +9,7 @@ use ratatui::widgets::{
 
 use crate::terminal::OwnedTerminalSnapshot;
 
-use super::theme::TERMINAL_THEME;
+use super::theme::{LifecycleTone, TERMINAL_THEME};
 
 const FOOTER_HEIGHT: u16 = 1;
 
@@ -68,6 +68,7 @@ pub struct ConsoleViewState {
     pub logs_selection: bool,
     pub logs_scrollbar: Option<LogsScrollbar>,
     pub profile_changes_pending: bool,
+    pub start_anyway_available: bool,
 }
 
 impl Default for ConsoleViewState {
@@ -83,6 +84,7 @@ impl Default for ConsoleViewState {
             logs_selection: false,
             logs_scrollbar: None,
             profile_changes_pending: false,
+            start_anyway_available: false,
         }
     }
 }
@@ -92,6 +94,7 @@ impl Default for ConsoleViewState {
 pub struct ProcessRowView {
     pub name: String,
     pub status: String,
+    pub(crate) lifecycle_tone: LifecycleTone,
     /// Effective profile text when the Process list needs a Profile column.
     pub profile: Option<String>,
     /// Compact aggregate CPU percentage, when the current Run has one.
@@ -109,19 +112,12 @@ pub fn project_layout(area: Rect, process_rows: usize) -> (Rect, Rect, Rect) {
     let list_height = (process_rows as u16 + 3)
         .min((area.height / 3).max(4))
         .min(available_height);
-    let list = Rect::new(area.x, area.y, area.width, list_height);
-    let console_height = area
-        .height
-        .saturating_sub(list.height)
-        .saturating_sub(FOOTER_HEIGHT)
-        .max(1);
-    let console_outer = Rect::new(area.x, area.y + list.height, area.width, console_height);
-    let footer = Rect::new(
-        area.x,
-        area.bottom().saturating_sub(1),
-        area.width,
-        FOOTER_HEIGHT,
-    );
+    let [list, console_outer, footer] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Min(1),
+        Constraint::Length(FOOTER_HEIGHT),
+    ])
+    .areas(area);
     (list, console_outer, footer)
 }
 
@@ -236,6 +232,7 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
 pub fn render_project(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
+    process_table_state: &mut TableState,
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
     view: ConsoleViewState,
@@ -246,7 +243,14 @@ pub fn render_project(
     let (list, console_pane, footer) = project_layout(area, rows.len());
     let console_inner = pane_inner(console_pane);
 
-    render_process_table(frame, rows, list, view.mode, process_list_title);
+    render_process_table(
+        frame,
+        rows,
+        process_table_state,
+        list,
+        view.mode,
+        process_list_title,
+    );
     // The header names the selected Process and its live Run identity; it
     // is a projection of the immutable Supervisor snapshot, never stored
     // UI state.
@@ -307,6 +311,7 @@ const PROCESS_METRICS_MIN_WIDTH: u16 = 52;
 fn render_process_table(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
+    state: &mut TableState,
     pane: Rect,
     mode: ConsoleViewMode,
     title: &str,
@@ -317,7 +322,7 @@ fn render_process_table(
     let table_rows = rows.iter().map(|row| {
         let mut cells = vec![
             Cell::from(row.name.as_str()),
-            Cell::from(row.status.as_str()),
+            Cell::from(row.status.as_str()).style(TERMINAL_THEME.lifecycle(row.lifecycle_tone)),
         ];
         if show_profile {
             cells.push(Cell::from(row.profile.as_deref().unwrap_or("")));
@@ -363,11 +368,8 @@ fn render_process_table(
     if process_table_header_height(pane) == 1 {
         table = table.header(headings);
     }
-    let selected = rows.iter().position(|row| row.selected);
-    let mut state = TableState::default()
-        .with_offset(process_table_offset(pane, rows.len(), selected))
-        .with_selected(selected);
-    frame.render_stateful_widget(table, pane, &mut state);
+    state.select(rows.iter().position(|row| row.selected));
+    frame.render_stateful_widget(table, pane, state);
 }
 
 fn right_cell(text: &str) -> Cell<'_> {
@@ -378,35 +380,15 @@ fn process_table_header_height(pane: Rect) -> u16 {
     u16::from(pane_inner(pane).height > 1)
 }
 
-fn process_table_offset(pane: Rect, process_count: usize, selected: Option<usize>) -> usize {
-    let visible_rows = usize::from(
-        pane_inner(pane)
-            .height
-            .saturating_sub(process_table_header_height(pane)),
-    );
-    selected
-        .unwrap_or(0)
-        .saturating_add(1)
-        .saturating_sub(visible_rows)
-        .min(process_count.saturating_sub(visible_rows))
-}
-
-/// Return the Process row under one terminal cell. Header and scrolling
-/// rules stay with the table implementation, so mouse selection cannot
-/// drift from the rows that Ratatui renders.
-pub fn process_row_at(
-    pane: Rect,
-    row: u16,
-    process_count: usize,
-    selected: usize,
-) -> Option<usize> {
+/// Return the Process row under one terminal cell. The offset comes from the
+/// `TableState` that Ratatui updated during the last render.
+pub fn process_row_at(pane: Rect, row: u16, process_count: usize, offset: usize) -> Option<usize> {
     let inner = pane_inner(pane);
     let first_row = inner.y.saturating_add(process_table_header_height(pane));
     if row < first_row || row >= inner.bottom() {
         return None;
     }
-    let index = process_table_offset(pane, process_count, Some(selected))
-        .saturating_add(usize::from(row - first_row));
+    let index = offset.saturating_add(usize::from(row - first_row));
     (index < process_count).then_some(index)
 }
 
@@ -486,8 +468,13 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             } else {
                 ""
             };
+            let start_anyway = if view.start_anyway_available {
+                " · S: start anyway"
+            } else {
+                ""
+            };
             format!(
-                "j/k: select · p: profile{apply_profile} · s/x/r: lifecycle · l: view · /: search{match_control} · q: quit"
+                "j/k: select · p: profile{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · /: search{match_control} · q: quit"
             )
         }
         ConsoleViewMode::Console => match view.pane {
@@ -531,6 +518,7 @@ mod tests {
         ProcessRowView {
             name: name.to_string(),
             status: status.to_string(),
+            lifecycle_tone: LifecycleTone::Muted,
             profile: None,
             cpu: None,
             memory: None,
@@ -548,6 +536,7 @@ mod tests {
         ProcessRowView {
             name: name.to_string(),
             status: status.to_string(),
+            lifecycle_tone: LifecycleTone::Muted,
             profile: None,
             cpu: Some(cpu.to_string()),
             memory: Some(memory.to_string()),
@@ -564,11 +553,13 @@ mod tests {
     fn render_rows_at(rows: &[ProcessRowView], width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut process_table_state = TableState::default();
         terminal
             .draw(|frame| {
                 render_project(
                     frame,
                     rows,
+                    &mut process_table_state,
                     None,
                     None,
                     ConsoleViewState::default(),
@@ -615,6 +606,29 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_labels_use_semantic_terminal_palette_roles() {
+        let mut rows = [
+            row("web", "Ready", false),
+            row("worker", "Waiting", false),
+            row("api", "Failed", false),
+        ];
+        rows[0].lifecycle_tone = LifecycleTone::Success;
+        rows[1].lifecycle_tone = LifecycleTone::Warning;
+        rows[2].lifecycle_tone = LifecycleTone::Error;
+        let buffer = rendered(&rows);
+
+        for (row_index, label, color) in [
+            (2, "Ready", ratatui::style::Color::Green),
+            (3, "Waiting", ratatui::style::Color::Yellow),
+            (4, "Failed", ratatui::style::Color::Red),
+        ] {
+            let line = buffer_line(&buffer, row_index);
+            let column = line.find(label).expect("status label renders") as u16;
+            assert_eq!(buffer[(column, row_index)].fg, color);
+        }
+    }
+
+    #[test]
     fn secondary_chrome_uses_the_legible_terminal_palette_role() {
         let rows = [row("web", "Ready", true), row("db", "Stopped", false)];
         let buffer = rendered(&rows);
@@ -629,8 +643,9 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_selected_row_is_reversed() {
-        let rows = [row("web", "Ready", false), row("db", "Starting", true)];
+    fn exactly_the_selected_row_is_reversed_without_replacing_its_state_color() {
+        let mut rows = [row("web", "Ready", false), row("db", "Waiting", true)];
+        rows[1].lifecycle_tone = LifecycleTone::Warning;
         let buffer = rendered(&rows);
 
         // The table header occupies row 1; Process rows start on row 2.
@@ -638,6 +653,16 @@ mod tests {
         let db_reversed = buffer[(1, 3)].modifier.contains(Modifier::REVERSED);
         assert!(!web_reversed);
         assert!(db_reversed);
+
+        let selected = buffer_line(&buffer, 3);
+        let status_column = selected.find("Waiting").expect("status renders") as u16;
+        assert_eq!(buffer[(status_column, 3)].fg, ratatui::style::Color::Yellow);
+        assert!(
+            buffer[(status_column, 3)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(buffer[(1, 3)].fg, ratatui::style::Color::Reset);
     }
 
     #[test]
@@ -718,6 +743,49 @@ mod tests {
     }
 
     #[test]
+    fn process_table_keeps_ratatui_scroll_state_between_frames() {
+        let backend = ratatui::backend::TestBackend::new(60, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut rows = (0..12)
+            .map(|index| row(&format!("process-{index}"), "Ready", index == 7))
+            .collect::<Vec<_>>();
+        let mut state = TableState::default();
+        terminal
+            .draw(|frame| {
+                render_project(
+                    frame,
+                    &rows,
+                    &mut state,
+                    None,
+                    None,
+                    ConsoleViewState::default(),
+                    "Processes",
+                    "",
+                );
+            })
+            .unwrap();
+        assert_eq!(state.offset(), 5);
+
+        rows[7].selected = false;
+        rows[6].selected = true;
+        terminal
+            .draw(|frame| {
+                render_project(
+                    frame,
+                    &rows,
+                    &mut state,
+                    None,
+                    None,
+                    ConsoleViewState::default(),
+                    "Processes",
+                    "",
+                );
+            })
+            .unwrap();
+        assert_eq!(state.offset(), 5);
+    }
+
+    #[test]
     fn the_console_pane_stays_visible_on_small_screens() {
         let (_, console, footer) = project_layout(Rect::new(0, 0, 20, 6), 8);
 
@@ -752,11 +820,13 @@ mod tests {
             highlight: Some((25, 31)),
             selection: None,
         }];
+        let mut process_table_state = TableState::default();
         terminal
             .draw(|frame| {
                 render_project(
                     frame,
                     &[],
+                    &mut process_table_state,
                     None,
                     Some(&lines),
                     ConsoleViewState {
@@ -850,12 +920,14 @@ mod tests {
             mouse_tracking: false,
         };
         let mut console_inner = Rect::default();
+        let mut process_table_state = TableState::default();
 
         terminal
             .draw(|frame| {
                 console_inner = render_project(
                     frame,
                     &[],
+                    &mut process_table_state,
                     Some(&snapshot),
                     None,
                     ConsoleViewState {
@@ -890,6 +962,21 @@ mod tests {
     }
 
     #[test]
+    fn start_anyway_control_appears_only_for_a_waiting_selection() {
+        let ordinary = footer_text(ConsoleViewState::default(), false);
+        assert!(!ordinary.contains("S: start anyway"), "{ordinary}");
+
+        let waiting = footer_text(
+            ConsoleViewState {
+                start_anyway_available: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(waiting.contains("S: start anyway"), "{waiting}");
+    }
+
+    #[test]
     fn scrolling_keeps_process_list_focus_and_reports_live_state() {
         let text = footer_text(
             ConsoleViewState {
@@ -903,6 +990,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 profile_changes_pending: false,
+                start_anyway_available: false,
             },
             false,
         );
@@ -985,6 +1073,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 profile_changes_pending: false,
+                start_anyway_available: false,
             },
             false,
         );
@@ -1007,6 +1096,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 profile_changes_pending: false,
+                start_anyway_available: false,
             },
             false,
         );
@@ -1027,6 +1117,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 profile_changes_pending: false,
+                start_anyway_available: false,
             },
             true,
         );

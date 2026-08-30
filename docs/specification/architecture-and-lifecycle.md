@@ -362,6 +362,11 @@ When a user starts a process or an autostart process is scheduled:
 12. Satisfy waiting Dependencies on the first readiness success, then run `after_ready` independently and best-effort.
 13. Start liveness after first effective readiness.
 
+A user can apply Start Anyway to a Waiting Process. This action skips step 5
+for the next Run only. It does not change the Project, stop or cancel existing
+Dependency work, or affect later Runs. The action is unavailable when the
+Process is not Waiting.
+
 ### 9.2 Before-start failure
 
 A failed or timed-out `before_start` hook:
