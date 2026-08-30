@@ -81,6 +81,19 @@ fn one_direct_command_service_loads_with_defaults() {
     assert_eq!(web.restart.policy, RestartPolicy::Never);
     assert_eq!(web.restart.backoff, Duration::from_secs(2));
     assert_eq!(web.restart.max_restarts, 5);
+    assert_eq!(web.terminal_mode, TerminalMode::Pty);
+    assert_eq!(web.input_policy, InputPolicy::Disabled);
+}
+
+#[test]
+fn pipe_mode_remains_available_when_explicitly_selected() {
+    let project = write_and_load(
+        "explicit-pipe",
+        "version: 1\nprocesses:\n  web:\n    terminal: {mode: pipe, input: disabled}\n    command: [/bin/sleep, \"1\"]\n",
+    )
+    .expect("explicit pipe config is valid");
+    let web = &project.processes()[0];
+
     assert_eq!(web.terminal_mode, TerminalMode::Pipe);
     assert_eq!(web.input_policy, InputPolicy::Disabled);
 }

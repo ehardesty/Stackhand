@@ -621,7 +621,7 @@ Recommended schema:
 
 ```yaml
 terminal:
-  mode: pipe          # pipe | pty
+  mode: pty           # pty | pipe
   input: disabled     # disabled | focused
 ```
 
@@ -650,13 +650,17 @@ terminal:
 
 ### 17.2 Default behavior
 
-Recommended defaults:
+When `terminal` is omitted, every Process uses `pty` mode with input disabled. This default preserves terminal colors and progress output without sending user input to the Process.
 
-- `service`: `pipe` + input disabled;
-- `oneshot`: `pipe` + input disabled;
-- explicit interactive process: `pty` + focused input.
+Use explicit `pipe` mode when separate stdout and stderr streams or non-terminal command behavior are more important. Use explicit focused input for an interactive shell, editor, or terminal UI:
 
-A shorthand such as `tty: true` may be supported for migration or convenience, but the internal model must preserve the two independent decisions.
+```yaml
+terminal:
+  mode: pty
+  input: focused
+```
+
+Terminal transport and input access remain independent decisions.
 
 ### 17.3 Pipe mode
 

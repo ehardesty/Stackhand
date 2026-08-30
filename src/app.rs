@@ -153,7 +153,6 @@ fn run_event_loop(
         }
         let selected = interaction.selected();
         let selected_process = &snapshot.processes[selected];
-        let has_terminal = selected_process.terminal_mode == crate::model::TerminalMode::Pty;
         let output = outputs
             .for_process_id(selected_process.process_id)
             .expect("the Logs registry covers every configured Process");
@@ -187,12 +186,7 @@ fn run_event_loop(
             dirty = false;
             // Terminal snapshots and formatted Logs lines exist only for a
             // frame that will be drawn.
-            let frame = interaction.frame(
-                &pane,
-                retained,
-                console_area.height.max(1) as usize,
-                has_terminal,
-            );
+            let frame = interaction.frame(&pane, retained, console_area.height.max(1) as usize);
             let rows = process_rows(&snapshot, selected);
             let list_title = process_list_title(&snapshot);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);

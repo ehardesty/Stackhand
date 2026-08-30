@@ -46,7 +46,6 @@ pub enum ConsolePaneKind {
     #[default]
     Terminal,
     Pipe,
-    Empty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,9 +483,6 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             ConsolePaneKind::Pipe => format!(
                 "↑↓/j/k: scroll · PgUp/PgDn: page · /: search{match_control} · f: live · c/y: copy · Esc: Processes"
             ),
-            ConsolePaneKind::Empty => {
-                "no active Run · Ctrl-A: Process list · Ctrl-Q: quit".to_string()
-            }
         },
         ConsoleViewMode::Copy => {
             "h/j/k/l or arrows: move · v: select/unselect · c/y: copy · a: all · q/Esc: exit"
@@ -1192,16 +1188,6 @@ mod tests {
         );
         assert!(pipe_footer.contains("↑↓/j/k: scroll"), "{pipe_footer}");
         assert!(pipe_footer.contains("Esc: Processes"), "{pipe_footer}");
-
-        let empty_footer = footer_text(
-            ConsoleViewState {
-                mode: ConsoleViewMode::Console,
-                pane: ConsolePaneKind::Empty,
-                ..ConsoleViewState::default()
-            },
-            false,
-        );
-        assert!(empty_footer.contains("no active Run"), "{empty_footer}");
     }
 
     #[test]

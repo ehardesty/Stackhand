@@ -38,9 +38,7 @@ pub fn render<'alloc, 'cb>(
             if symbol.is_empty() {
                 symbol.push(' ');
             }
-            let mut cell_style = cell
-                .style()
-                .map(|value| to_ratatui_style(&value, &colors.palette))?;
+            let mut cell_style = cell.style().map(|value| to_ratatui_style(&value))?;
             cell_style = cell_style
                 .fg(cell.fg_color()?.map(rgb).unwrap_or(default_fg))
                 .bg(cell.bg_color()?.map(rgb).unwrap_or(default_bg));
@@ -91,22 +89,7 @@ fn rgb(color: style::RgbColor) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
-fn resolve(color: &style::StyleColor, palette: &[style::RgbColor; 256]) -> Option<Color> {
-    match color {
-        style::StyleColor::None => None,
-        style::StyleColor::Rgb(value) => Some(rgb(*value)),
-        style::StyleColor::Palette(index) => Some(rgb(palette[index.0 as usize])),
-    }
-}
-
-fn to_ratatui_style(value: &style::Style, palette: &[style::RgbColor; 256]) -> Style {
-    let mut result = Style::default();
-    if let Some(color) = resolve(&value.fg_color, palette) {
-        result = result.fg(color);
-    }
-    if let Some(color) = resolve(&value.bg_color, palette) {
-        result = result.bg(color);
-    }
+fn to_ratatui_style(value: &style::Style) -> Style {
     let mut modifiers = Modifier::empty();
     if value.bold {
         modifiers |= Modifier::BOLD;
@@ -132,7 +115,7 @@ fn to_ratatui_style(value: &style::Style, palette: &[style::RgbColor; 256]) -> S
     if value.underline != Underline::None {
         modifiers |= Modifier::UNDERLINED;
     }
-    result.add_modifier(modifiers)
+    Style::default().add_modifier(modifiers)
 }
 
 #[cfg(test)]

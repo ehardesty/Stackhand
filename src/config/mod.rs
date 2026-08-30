@@ -602,8 +602,8 @@ fn build_terminal_settings(
         }
     };
     let terminal_mode = match mode {
-        None | Some("pipe") => TerminalMode::Pipe,
-        Some("pty") => TerminalMode::Pty,
+        None | Some("pty") => TerminalMode::Pty,
+        Some("pipe") => TerminalMode::Pipe,
         Some(other) => {
             return Err(format!(
                 "invalid terminal mode '{other}' (use 'pipe' or 'pty')"

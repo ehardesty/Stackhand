@@ -229,9 +229,7 @@ impl ConsoleInteraction {
                 }
                 self.handle_key(key, session, page_rows)
             }
-            ConsolePaneKind::Pipe | ConsolePaneKind::Empty => {
-                self.handle_key_read_only(key, logs, page_rows)
-            }
+            ConsolePaneKind::Pipe => self.handle_key_read_only(key, logs, page_rows),
         }
     }
 

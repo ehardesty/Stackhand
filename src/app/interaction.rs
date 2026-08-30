@@ -30,7 +30,6 @@ use crate::tui::{
 pub(crate) enum SelectedPane<'a> {
     Terminal(ConsoleView),
     Logs(&'a RetainedOutput),
-    Empty,
 }
 
 /// One result from routing a terminal input event through application state.
@@ -137,12 +136,12 @@ impl ProjectInteraction {
             return SelectedPane::Logs(retained);
         }
         let Some(run_id) = process.current_run else {
-            return SelectedPane::Empty;
+            return SelectedPane::Logs(retained);
         };
         consoles
             .view_process(process.process_id, run_id)
             .map(SelectedPane::Terminal)
-            .unwrap_or(SelectedPane::Empty)
+            .unwrap_or(SelectedPane::Logs(retained))
     }
 
     /// Apply output-owner facts and project the selected pane into the shared
@@ -178,10 +177,6 @@ impl ProjectInteraction {
                 self.truncation = Some((self.selected, retained.truncated));
                 self.console.set_pane(ConsolePaneKind::Pipe);
             }
-            SelectedPane::Empty => {
-                self.truncation = None;
-                self.console.set_pane(ConsolePaneKind::Empty);
-            }
         }
         changed
     }
@@ -195,12 +190,14 @@ impl ProjectInteraction {
         pane: &SelectedPane<'_>,
         retained: &RetainedOutput,
         pane_rows: usize,
-        process_has_terminal: bool,
     ) -> InteractionFrame {
-        let representation = self.logs[self.selected].representation(process_has_terminal);
+        let representation = match pane {
+            SelectedPane::Terminal(_) => OutputRepresentation::Terminal,
+            SelectedPane::Logs(_) => OutputRepresentation::Logs,
+        };
         let terminal = match pane {
             SelectedPane::Terminal(view) => view.snapshot(),
-            SelectedPane::Logs(_) | SelectedPane::Empty => None,
+            SelectedPane::Logs(_) => None,
         };
         let mut view = self.console.view();
         view.profile_changes_pending = self.profile_changes_pending;
@@ -215,7 +212,7 @@ impl ProjectInteraction {
                 view.logs_scrollbar = frame.scrollbar;
                 (Some(frame.lines), frame.status, frame.editing)
             }
-            SelectedPane::Terminal(_) | SelectedPane::Empty => (None, None, false),
+            SelectedPane::Terminal(_) => (None, None, false),
         };
         InteractionFrame {
             terminal,
@@ -288,7 +285,7 @@ impl ProjectInteraction {
                     SelectedPane::Terminal(_) if !process.input_focused => {
                         self.console.warn(ConsoleWarning::InputDisabled);
                     }
-                    SelectedPane::Terminal(_) | SelectedPane::Logs(_) | SelectedPane::Empty => {
+                    SelectedPane::Terminal(_) | SelectedPane::Logs(_) => {
                         self.console.warn(ConsoleWarning::PasteRejected);
                     }
                 }
@@ -366,21 +363,14 @@ impl ProjectInteraction {
                     )
                 })
                 .unwrap_or(false),
-            SelectedPane::Logs(_) | SelectedPane::Empty => {
-                let kind = if matches!(pane, SelectedPane::Logs(_)) {
-                    ConsolePaneKind::Pipe
-                } else {
-                    ConsolePaneKind::Empty
-                };
-                self.console.route_pane_key(
-                    kind,
-                    process.input_focused,
-                    key,
-                    None,
-                    &mut self.logs[self.selected],
-                    pane_rows.max(1),
-                )
-            }
+            SelectedPane::Logs(_) => self.console.route_pane_key(
+                ConsolePaneKind::Pipe,
+                process.input_focused,
+                key,
+                None,
+                &mut self.logs[self.selected],
+                pane_rows.max(1),
+            ),
         };
         if changed {
             InputResult::Changed
@@ -436,9 +426,7 @@ impl ProjectInteraction {
                     SelectedPane::Terminal(view) => {
                         view.with(|session| self.console.focus_process_list(Some(session)));
                     }
-                    SelectedPane::Logs(_) | SelectedPane::Empty => {
-                        self.console.focus_process_list(None)
-                    }
+                    SelectedPane::Logs(_) => self.console.focus_process_list(None),
                 }
             }
             let previous = self.selected;
@@ -489,12 +477,6 @@ impl ProjectInteraction {
                     &mut self.logs[self.selected],
                     retained,
                 ) || mouse_changes_focus(mouse.kind)
-            }
-            SelectedPane::Empty => {
-                if mouse_starts_console_focus(mouse.kind, self.console.view().mode) {
-                    self.console.focus_console(None);
-                }
-                mouse_changes_focus(mouse.kind)
             }
         }
     }
@@ -719,6 +701,21 @@ mod tests {
     }
 
     #[test]
+    fn retained_logs_are_labeled_as_logs_when_a_terminal_is_not_available() {
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction {
+            logs: vec![ProcessLogs::default()],
+            ..Default::default()
+        };
+
+        let frame = interaction.frame(&pane, &retained, 20);
+
+        assert_eq!(frame.representation, OutputRepresentation::Logs);
+    }
+
+    #[test]
     fn logs_frame_reports_the_current_follow_state() {
         let output = crate::output::OutputViews::new(1);
         output.for_process(0).unwrap().append_at(
@@ -738,19 +735,9 @@ mod tests {
         };
 
         interaction.logs[0].scroll_page(20, -1);
-        assert!(
-            !interaction
-                .frame(&pane, &retained, 20, false)
-                .view
-                .following
-        );
+        assert!(!interaction.frame(&pane, &retained, 20).view.following);
 
         interaction.logs[0].scroll_page(20, 1);
-        assert!(
-            interaction
-                .frame(&pane, &retained, 20, false)
-                .view
-                .following
-        );
+        assert!(interaction.frame(&pane, &retained, 20).view.following);
     }
 }

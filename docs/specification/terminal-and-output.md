@@ -422,6 +422,8 @@ LOGS
 
 Entering search may switch to Logs view. Returning to Terminal view restores the prior terminal viewport and interaction mode.
 
+When a Process has no active Run terminal, show its retained Logs instead of an empty Terminal view. A later Run returns to the user's selected representation.
+
 Do not implement fragile raw-history-to-terminal-grid coordinate mapping solely to make search results appear in the Terminal view.
 
 ### 22.5 Pipe processes

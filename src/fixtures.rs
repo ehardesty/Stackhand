@@ -52,7 +52,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 
     let geometry = TerminalGeometry::DEFAULT;
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
-        "printf 'fixture-ready\\r\\n'; IFS= read -r line; printf 'fixture-echo:%s\\r\\n' \"$line\"; set -- $(stty size); printf 'fixture-size:%sx%s\\r\\n' \"$2\" \"$1\"",
+        "test -t 1 || exit 20; printf 'fixture-term:%s\\r\\nfixture-color:%s\\r\\nfixture-program:%s\\r\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\"; printf 'fixture-ready\\r\\n'; IFS= read -r line; printf 'fixture-echo:%s\\r\\n' \"$line\"; set -- $(stty size); printf 'fixture-size:%sx%s\\r\\n' \"$2\" \"$1\"",
     );
     let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
@@ -68,12 +68,22 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 
     let expected = format!("fixture-echo:{text}");
     let expected_size = "fixture-size:42x12";
+    let expected_environment = [
+        "fixture-term:xterm-256color",
+        "fixture-color:truecolor",
+        "fixture-program:stackhand",
+    ];
     let deadline = Instant::now() + FIXTURE_TIMEOUT;
     let mut output = String::new();
     while Instant::now() < deadline {
         if session.is_dirty() {
             output = session.snapshot().text();
-            if output.contains(&expected) && output.contains(expected_size) {
+            if output.contains(&expected)
+                && output.contains(expected_size)
+                && expected_environment
+                    .iter()
+                    .all(|expected| output.contains(expected))
+            {
                 break;
             }
         }
@@ -82,7 +92,12 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 
     run.shutdown()?;
 
-    if !output.contains(&expected) || !output.contains(expected_size) {
+    if !output.contains(&expected)
+        || !output.contains(expected_size)
+        || !expected_environment
+            .iter()
+            .all(|expected| output.contains(expected))
+    {
         bail!("fixture did not produce the expected output; terminal contained: {output:?}");
     }
     println!("{output}");
@@ -320,7 +335,8 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 pub fn run_fixture_rendering() -> Result<()> {
     let geometry = TerminalGeometry::new(16, 6).expect("fixture geometry is non-zero");
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
-        r#"stty -echo
+        r#"test -t 1 || exit 20
+stty -echo
 printf '\033[2J\033[H\033[31mR\033[38;5;202mP\033[38;2;1;2;3mT\033[0m\033[1mB\033[22m\033[2mD\033[22m\033[3mI\033[23m\033[4mU\033[24m\033[7mV\033[27m界é'
 printf '\033[3;5H\033[6 q'
 IFS= read -r _

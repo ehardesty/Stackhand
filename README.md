@@ -49,6 +49,8 @@ uses its base configuration. A same-directory `stackhand.local.yaml` is applied 
 to discovered Projects. `config validate` and `config show` use the same
 resolution rules without starting Processes.
 
+A Process uses a PTY with input disabled when `terminal` is omitted. This shows terminal colors and progress output without sending user input to the Process. Set `terminal.mode` to `pipe` when you need separate stdout and stderr streams or non-terminal command behavior. PTY output combines both streams.
+
 Stackhand starts enabled autostart Processes with the Process list focused. Use
 `j` or `k` to select a Process,
 `s` to start, `x` to stop, and `r` to restart a Service or rerun a One-shot.
@@ -70,8 +72,8 @@ outer terminal.
 For ready-to-run Projects and manual checks, see
 [Example Projects](./examples/README.md). For the macOS lifecycle validation record, see [Milestone 3 validation](./docs/implementation/milestone-3-validation.md).
 
-Press `l` from the Process list to switch a PTY Process between Terminal and
-Logs view. Press `/` to open Logs search, type a case-sensitive literal, and
+Press `l` from the Process list to switch an active PTY Process between Terminal and
+Logs view. When no PTY Run is active, Stackhand shows retained Logs until the next Run starts. Press `/` to open Logs search, type a case-sensitive literal, and
 press Enter. Use `n` and `N` for the next and previous retained match. Press
 `f` to return to the live tail. Logs show UTC timestamps, `out`, `err`, or
 combined `pty` stream labels, and Run boundaries. Invalid UTF-8 uses the
