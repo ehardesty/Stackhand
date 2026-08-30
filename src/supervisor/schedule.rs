@@ -58,19 +58,23 @@ impl Core {
     /// target keeps the command's trigger; a Dependency started on its
     /// behalf is recorded as started by the user's dependent.
     fn require_running(&mut self, index: usize, trigger: RunTrigger) {
-        if !self.is_enabled(index) {
+        let mut visited = vec![false; self.lifecycles.len()];
+        self.require_running_once(index, trigger, &mut visited);
+    }
+
+    fn require_running_once(&mut self, index: usize, trigger: RunTrigger, visited: &mut [bool]) {
+        if visited[index] || !self.is_enabled(index) {
             return;
         }
-        if !self.lifecycles[index].require_running(trigger) {
-            return;
-        }
+        visited[index] = true;
+        self.lifecycles[index].require_running(trigger);
         let dependency_indices = self
             .project
             .resolved_dependencies(index)
             .map(|(dependency_index, _)| dependency_index)
             .collect::<Vec<_>>();
         for dependency_index in dependency_indices {
-            self.require_running(dependency_index, RunTrigger::Dependency);
+            self.require_running_once(dependency_index, RunTrigger::Dependency, visited);
         }
     }
 
@@ -124,7 +128,8 @@ impl Core {
         let now_ms = self.now_ms();
         // Starting immediately invalidates an earlier successful One-shot
         // completion represented by Done.
-        let run_id = self.lifecycles[index].begin_run(now_ms, readiness, liveness);
+        let profile = self.project.process_profile(index).map(str::to_owned);
+        let run_id = self.lifecycles[index].begin_run(now_ms, readiness, liveness, profile);
         let intent = self.build_intent(index, run_id);
         self.seam.start(intent, &self.events);
     }
@@ -239,6 +244,9 @@ impl Core {
             .collect::<Vec<_>>();
         for index in expired.iter().copied() {
             self.lifecycles[index].release_restart_backoff();
+            // A profile selected during the previous Run can add Dependencies.
+            // An automatic retry must schedule the complete next-Run graph.
+            self.require_running(index, RunTrigger::AutomaticRestart);
         }
         if !expired.is_empty() {
             self.evaluate();

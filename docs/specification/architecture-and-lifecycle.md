@@ -47,7 +47,8 @@ The supervisor task owns authoritative mutable project state:
 - desired running/stopped intent;
 - lifecycle state;
 - dependency satisfaction;
-- current `RunId`;
+- current `RunId` and its applied Process Profile;
+- global Process Profile selection, per-Process overrides, and Next Profiles;
 - restart counters and timers;
 - readiness and liveness status;
 - last exit/failure diagnostics;
@@ -198,6 +199,8 @@ struct ProcessState {
     desired: DesiredState,
     lifecycle: LifecycleState,
     current_run: Option<RunId>,
+    current_run_profile: Option<ProfileName>,
+    next_profile: ProfileName,
     // readiness, health, metrics, diagnostics...
 }
 ```
@@ -213,6 +216,10 @@ Every process attempt receives a monotonically increasing per-process `RunId`:
 ```rust
 struct RunId(u64);
 ```
+
+Each Run retains the Process Profile and effective configuration applied when
+the Run was created. A later profile selection change has no immediate
+lifecycle effect and does not mutate that Run. Active Processes continue.
 
 The identifier changes for:
 
@@ -324,6 +331,7 @@ A process's own `before_start` failure makes that process `Failed`; it does not 
 The supervisor SHOULD retain a small bounded metadata history per process:
 
 - `RunId`;
+- applied Process Profile;
 - start/end timestamps;
 - exit status;
 - failure reason;
@@ -340,18 +348,19 @@ This metadata is separate from retained output and need not become a persistent 
 
 When a user starts a process or an autostart process is scheduled:
 
-1. Validate that the process is enabled.
-2. Set the process and each required enabled dependency to desired running.
-3. Detect already-failed or disabled dependencies and expose a blocked reason.
-4. Wait until all dependency conditions are satisfied.
-5. Allocate a new `RunId`.
-6. Run `before_start` hooks in configured order.
-7. Create a fresh terminal session for the Run.
-8. Spawn the command without losing early output.
-9. Begin readiness evaluation or mark the service effectively ready when no readiness probe exists.
-10. Run `after_start` hooks independently and best-effort.
-11. Satisfy waiting dependencies on the first readiness success, then run `after_ready` independently and best-effort.
-12. Start liveness after first effective readiness.
+1. Resolve and validate the Process's Next Profile and effective configuration.
+2. Validate that the effective Process is enabled.
+3. Set the Process and each required enabled Dependency to desired running.
+4. Detect already-failed or disabled Dependencies and expose a blocked reason.
+5. Wait until all Dependency conditions are satisfied.
+6. Allocate a new `RunId` and retain the applied profile.
+7. Run `before_start` hooks in configured order.
+8. Create a fresh terminal session for the Run.
+9. Spawn the command without losing early output.
+10. Begin readiness evaluation or mark the Service effectively ready when no readiness probe exists.
+11. Run `after_start` hooks independently and best-effort.
+12. Satisfy waiting Dependencies on the first readiness success, then run `after_ready` independently and best-effort.
+13. Start liveness after first effective readiness.
 
 ### 9.2 Before-start failure
 
@@ -435,18 +444,37 @@ Stopping a waiting Process does not stop Dependencies that were already schedule
 Manual restart:
 
 - cancels any pending automatic restart timer;
-- stops the active run intentionally;
+- stops the active Run intentionally;
 - resets the Automatic Restart Budget;
-- starts a new `RunId` after cleanup.
+- starts a new `RunId` with the Process's Next Profile after cleanup.
 
-### 9.12 Stale events
+An automatic restart also uses the Process's Next Profile. Neither restart
+reuses the prior Run's profile unless it is still the Next Profile.
+
+### 9.12 Apply profile
+
+Profile selection does not cause an immediate lifecycle action. The conditional
+`R: apply profile` action:
+
+- stops affected active Processes whose Next Profile disables them;
+- restarts affected active enabled autostart Processes;
+- starts newly enabled Dependencies required by restarted Processes;
+- does not start other inactive Processes that the Next Profile newly enables;
+  and
+- leaves affected active enabled Processes without autostart active.
+
+An affected Process has an active Run whose applied profile differs from its
+Next Profile. The user can manually start any other inactive Process that the Next Profile
+enables.
+
+### 9.13 Stale events
 
 Any late probe result, hook completion, timer, exit notification, metrics sample, or terminal callback from an older run MUST be discarded without changing current state.
 
 ---
-### 9.13 Readiness and liveness probes
+### 9.14 Readiness and liveness probes
 
-#### 9.13.1 Probe kinds
+#### 9.14.1 Probe kinds
 
 The core probe model supports:
 
@@ -458,7 +486,7 @@ The core probe model supports:
 
 Composite `any` is optional and is not required by this specification.
 
-#### 9.13.2 Common probe scheduling
+#### 9.14.2 Common probe scheduling
 
 A probe supports:
 
@@ -480,7 +508,7 @@ Rules:
 6. Probe diagnostics are bounded and retained separately from full process output.
 7. Threshold counters reset appropriately after the opposite result is observed.
 
-#### 9.13.3 Readiness example
+#### 9.14.3 Readiness example
 
 ```yaml
 ready:
@@ -496,7 +524,7 @@ ready:
 
 `startup_timeout` applies only to reaching readiness for the first time. It is distinct from the timeout of one HTTP/TCP/exec attempt.
 
-#### 9.13.4 HTTP probe semantics
+#### 9.14.4 HTTP probe semantics
 
 Defaults:
 
@@ -520,7 +548,7 @@ ready:
 
 Exact expected-status ranges MAY be added if straightforward, but `2xx` is the default.
 
-#### 9.13.5 TCP probe semantics
+#### 9.14.5 TCP probe semantics
 
 A TCP probe succeeds when a connection to the configured host and port is established within the timeout.
 
@@ -533,7 +561,7 @@ ready:
 
 The connection is closed immediately after success unless a future protocol-specific probe requires otherwise.
 
-#### 9.13.6 Exec probe semantics
+#### 9.14.6 Exec probe semantics
 
 Exec probes use the same direct-command or shell-command model as processes and hooks.
 
@@ -553,7 +581,7 @@ Rules:
 - timeout kills the probe process tree;
 - probe children are not included in the process's runtime metrics.
 
-#### 9.13.7 Log probe semantics
+#### 9.14.7 Log probe semantics
 
 A log readiness probe observes the current run's live output stream:
 
@@ -574,7 +602,7 @@ Rules:
 7. The matcher has a bounded rolling window based on pattern length, not an unbounded line buffer.
 8. Regex matching MAY be added later.
 
-#### 9.13.8 Composite readiness
+#### 9.14.8 Composite readiness
 
 `all` succeeds when every child probe is passing:
 
@@ -597,7 +625,7 @@ ready:
 
 Each child probe maintains its own threshold state. The composite passes only while all children pass.
 
-#### 9.13.9 Readiness diagnostics
+#### 9.14.9 Readiness diagnostics
 
 The latest useful diagnostic should be visible without opening internal debug logs:
 
@@ -609,7 +637,7 @@ Attempts: 12
 Elapsed: 24s / 10m
 ```
 
-#### 9.13.10 Liveness
+#### 9.14.10 Liveness
 
 Liveness uses the same probe kinds and scheduling rules.
 

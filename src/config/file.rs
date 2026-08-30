@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_yaml::Value;
 
 use super::readiness::ReadinessFile;
 
@@ -18,23 +19,7 @@ pub(super) struct ConfigFile {
     pub(super) env_files: Option<Vec<String>>,
     #[serde(default)]
     pub(super) processes: ProcessCollection,
-    // The typed parse keeps every profile subject to the top-level schema,
-    // including profiles that were not selected.
-    pub(super) profiles: Option<BTreeMap<String, ProfileFile>>,
     pub(super) settings: Option<SettingsFile>,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProfileFile {
-    #[serde(default)]
-    pub(super) enable: Vec<String>,
-    #[serde(default)]
-    pub(super) disable: Vec<String>,
-    #[serde(default)]
-    pub(super) overrides: serde_yaml::Value,
-    pub(super) settings: Option<serde_yaml::Value>,
 }
 
 #[derive(Default)]
@@ -168,6 +153,11 @@ pub(super) struct ShellFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ProcessFile {
+    /// A fixed Process Profile name, or the reserved `base` label.
+    pub(super) profile: Option<String>,
+    /// Named partial Process patches. Their field allow-list is validated
+    /// before the patches are merged and lowered.
+    pub(super) profiles: Option<BTreeMap<String, Value>>,
     pub(super) kind: Option<String>,
     pub(super) enabled: Option<bool>,
     pub(super) autostart: Option<bool>,

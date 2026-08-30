@@ -10,6 +10,8 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 
+use super::view_model::profile_changes_pending;
+
 use crate::console::{ConsoleInteraction, LifecycleCommand};
 use crate::log_view::OutputRepresentation;
 use crate::output::RetainedOutput;
@@ -57,6 +59,8 @@ pub(crate) struct ProjectInteraction {
     console: ConsoleInteraction,
     selected: usize,
     logs: Vec<ProcessLogs>,
+    project_commands: Vec<Command>,
+    profile_changes_pending: bool,
     truncation: Option<(usize, bool)>,
 }
 
@@ -76,6 +80,7 @@ impl ProjectInteraction {
     /// Reconcile queued user commands with the latest immutable Project
     /// snapshot. Selection and Process commands are applied in one place.
     pub(crate) fn update_project(&mut self, snapshot: &ProjectSnapshot) -> ProjectUpdate {
+        self.profile_changes_pending = profile_changes_pending(snapshot);
         self.selected = self
             .selected
             .min(snapshot.processes.len().saturating_sub(1));
@@ -85,19 +90,22 @@ impl ProjectInteraction {
             .console
             .apply_selection_moves(&mut self.selected, snapshot.processes.len());
         let process = &snapshot.processes[self.selected];
-        let commands = self
-            .console
-            .take_lifecycle_commands()
-            .into_iter()
-            .map(|request| match request {
-                LifecycleCommand::Start => Command::Start(process.name.clone()),
-                LifecycleCommand::Stop => Command::Stop(process.name.clone()),
-                LifecycleCommand::Restart if process.kind == crate::model::ProcessKind::OneShot => {
-                    Command::Rerun(process.name.clone())
-                }
-                LifecycleCommand::Restart => Command::Restart(process.name.clone()),
-            })
-            .collect();
+        let mut commands = std::mem::take(&mut self.project_commands);
+        commands.extend(
+            self.console
+                .take_lifecycle_commands()
+                .into_iter()
+                .map(|request| match request {
+                    LifecycleCommand::Start => Command::Start(process.name.clone()),
+                    LifecycleCommand::Stop => Command::Stop(process.name.clone()),
+                    LifecycleCommand::Restart
+                        if process.kind == crate::model::ProcessKind::OneShot =>
+                    {
+                        Command::Rerun(process.name.clone())
+                    }
+                    LifecycleCommand::Restart => Command::Restart(process.name.clone()),
+                }),
+        );
         ProjectUpdate { changed, commands }
     }
 
@@ -185,6 +193,7 @@ impl ProjectInteraction {
             SelectedPane::Logs(_) | SelectedPane::Empty => None,
         };
         let mut view = self.console.view();
+        view.profile_changes_pending = self.profile_changes_pending;
         let (lines, logs_status, logs_editing) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
@@ -224,6 +233,26 @@ impl ProjectInteraction {
             )
         {
             return InputResult::Quit;
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && self.console.view().mode == crate::tui::ConsoleViewMode::ProcessList
+            && !key.modifiers.intersects(
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            )
+        {
+            let command = match key.code {
+                KeyCode::Char('p') => Some(Command::SelectNextProcessProfile),
+                KeyCode::Char('R') if self.profile_changes_pending => {
+                    Some(Command::RestartProfiledAutostart)
+                }
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.project_commands.push(command);
+                self.console.clear_warning();
+                return InputResult::Changed;
+            }
         }
         match event {
             Event::Key(key) => self.route_key(key, pane, process, retained, console_area.height),
@@ -508,6 +537,8 @@ mod tests {
             lifecycle: Lifecycle::Running,
             terminal_mode: crate::model::TerminalMode::Pipe,
             current_run: Some(1),
+            current_profile: None,
+            next_profile: None,
             root_pid: None,
             run_started_at_ms: Some(0),
             failure: None,
@@ -532,6 +563,8 @@ mod tests {
     #[test]
     fn selection_and_lifecycle_commands_cross_one_state_seam() {
         let snapshot = ProjectSnapshot {
+            selected_profile: None,
+            available_profiles: Vec::new(),
             processes: vec![
                 process("api", crate::model::ProcessKind::Service, 0),
                 process("setup", crate::model::ProcessKind::OneShot, 1),
@@ -570,6 +603,58 @@ mod tests {
         );
         let update = interaction.update_project(&snapshot);
         assert_eq!(update.commands, vec![Command::Rerun("setup".to_string())]);
+    }
+
+    #[test]
+    fn profile_keys_queue_global_selection_and_pending_apply_commands() {
+        let mut snapshot = ProjectSnapshot {
+            selected_profile: Some("local".to_string()),
+            available_profiles: vec!["cloud-dev".to_string(), "local".to_string()],
+            processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('p')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.update_project(&snapshot).commands,
+            vec![Command::SelectNextProcessProfile]
+        );
+
+        snapshot.processes[0].current_run = Some(1);
+        snapshot.processes[0].current_profile = Some("local".to_string());
+        snapshot.processes[0].next_profile = Some("cloud-dev".to_string());
+        interaction.update_project(&snapshot);
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('R')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.update_project(&snapshot).commands,
+            vec![Command::RestartProfiledAutostart]
+        );
     }
 
     #[test]

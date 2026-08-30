@@ -2,6 +2,7 @@
 //! commands, typed seam events, observable runtime intent, and immutable
 //! snapshots — never internal state-machine fields.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use super::{
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, EffectiveProject, Enabled, InputPolicy,
     ProcessKind, ProcessSpec, ReadinessCheck, ReadinessConfig, ReadinessProbe, RestartConfig,
-    ShellConfig, TerminalMode,
+    RestartPolicy, ShellConfig, TerminalMode,
 };
 use crate::runtime::{ProcessId, RunId};
 use crate::supervisor::clock::Clock;
@@ -67,6 +68,76 @@ fn probed_service(name: &str) -> ProcessSpec {
         startup_timeout: None,
     });
     spec
+}
+
+fn profiled_project() -> EffectiveProject {
+    let base = service("api");
+    let mut cloud = base.clone();
+    cloud.command = CommandForm::Direct {
+        program: "echo".into(),
+        args: vec!["cloud".into()],
+    };
+    EffectiveProject::with_process_profiles(
+        vec![base],
+        vec![BTreeMap::from([("cloud".to_string(), cloud)])],
+        vec![None],
+        None,
+        vec!["cloud".to_string()],
+        ShellConfig::default(),
+    )
+    .expect("the profiled Project is valid")
+}
+
+fn profile_enablement_project() -> EffectiveProject {
+    let storage = service("storage");
+    let mut cloud_storage = storage.clone();
+    cloud_storage.enabled = Enabled::No;
+
+    let mut optional = service("optional");
+    optional.enabled = Enabled::No;
+    let mut cloud_optional = optional.clone();
+    cloud_optional.enabled = Enabled::Yes;
+
+    EffectiveProject::with_process_profiles(
+        vec![storage, optional],
+        vec![
+            BTreeMap::from([("cloud".to_string(), cloud_storage)]),
+            BTreeMap::from([("cloud".to_string(), cloud_optional)]),
+        ],
+        vec![None, None],
+        None,
+        vec!["cloud".to_string()],
+        ShellConfig::default(),
+    )
+    .expect("the profile enablement Project is valid")
+}
+
+fn profile_dependency_project() -> EffectiveProject {
+    let storage = service("storage");
+    let mut cloud_storage = storage.clone();
+    cloud_storage.enabled = Enabled::No;
+
+    let mut api = service("api");
+    api.restart.policy = RestartPolicy::OnFailure;
+    api.dependencies = vec![crate::model::DependencySpec {
+        name: "storage".to_string(),
+        condition: DependencyCondition::Started,
+    }];
+    let mut cloud_api = api.clone();
+    cloud_api.dependencies.clear();
+
+    EffectiveProject::with_process_profiles(
+        vec![api, storage],
+        vec![
+            BTreeMap::from([("cloud".to_string(), cloud_api)]),
+            BTreeMap::from([("cloud".to_string(), cloud_storage)]),
+        ],
+        vec![None, None],
+        Some("cloud".to_string()),
+        vec!["cloud".to_string()],
+        ShellConfig::default(),
+    )
+    .expect("each profile Dependency graph is valid")
 }
 
 fn configured_readiness_project(
@@ -335,6 +406,87 @@ fn duplicate_names_are_rejected() {
         error,
         crate::model::ProjectError::DuplicateName("api".into())
     );
+}
+
+#[test]
+fn profile_selection_is_deferred_until_bulk_restart() {
+    let mut h = Harness::new(profiled_project());
+    h.report_spawns();
+    h.command(Command::StartAutostart);
+    assert_eq!(h.process("api").current_profile, None);
+
+    let intent_count = h.runtime.intents().len();
+    h.command(Command::SelectNextProcessProfile);
+    let pending = h.process("api");
+    assert_eq!(pending.current_profile, None);
+    assert_eq!(pending.next_profile.as_deref(), Some("cloud"));
+    assert_eq!(h.runtime.intents().len(), intent_count);
+
+    h.command(Command::RestartProfiledAutostart);
+    let restarted = h.process("api");
+    assert_eq!(restarted.current_run, Some(2));
+    assert_eq!(restarted.current_profile.as_deref(), Some("cloud"));
+    assert_eq!(restarted.next_profile.as_deref(), Some("cloud"));
+}
+
+#[test]
+fn applying_a_profile_stops_newly_disabled_processes_without_starting_newly_enabled_processes() {
+    let mut h = Harness::new(profile_enablement_project());
+    h.report_spawns();
+    h.command(Command::StartAutostart);
+    assert_eq!(h.process("storage").lifecycle, Lifecycle::Running);
+    assert_eq!(h.process("optional").current_run, None);
+
+    h.command(Command::SelectNextProcessProfile);
+    assert!(!h.process("storage").enabled);
+    assert!(h.process("optional").enabled);
+    assert_eq!(h.process("storage").lifecycle, Lifecycle::Running);
+    assert_eq!(h.process("optional").current_run, None);
+
+    h.command(Command::RestartProfiledAutostart);
+    assert_eq!(h.process("storage").lifecycle, Lifecycle::Stopped);
+    assert_eq!(h.process("storage").current_run, None);
+    assert_eq!(h.process("optional").current_run, None);
+
+    h.command(Command::Start("optional".into()));
+    assert_eq!(
+        h.process("optional").current_profile.as_deref(),
+        Some("cloud")
+    );
+}
+
+#[test]
+fn applying_a_profile_starts_dependencies_required_by_affected_processes() {
+    let mut h = Harness::new(profile_dependency_project());
+    h.report_spawns();
+    h.command(Command::StartAutostart);
+    assert_eq!(h.process("storage").current_run, None);
+    assert_eq!(h.process("api").current_profile.as_deref(), Some("cloud"));
+
+    h.command(Command::SelectNextProcessProfile);
+    assert_eq!(h.process("api").next_profile, None);
+    h.command(Command::RestartProfiledAutostart);
+
+    assert_eq!(h.process("storage").current_run, Some(1));
+    assert_eq!(h.process("storage").lifecycle, Lifecycle::Running);
+    assert_eq!(h.process("api").current_profile, None);
+    assert_eq!(h.process("api").lifecycle, Lifecycle::Running);
+}
+
+#[test]
+fn an_automatic_restart_starts_dependencies_from_the_next_profile() {
+    let mut h = Harness::new(profile_dependency_project());
+    h.report_spawns();
+    h.command(Command::StartAutostart);
+    h.command(Command::SelectNextProcessProfile);
+
+    h.event(finished("api", 1, Some(7)));
+    h.advance_and_poll(Duration::from_secs(2));
+
+    assert_eq!(h.process("storage").current_run, Some(1));
+    assert_eq!(h.process("storage").lifecycle, Lifecycle::Running);
+    assert_eq!(h.process("api").current_run, Some(2));
+    assert_eq!(h.process("api").current_profile, None);
 }
 
 #[test]

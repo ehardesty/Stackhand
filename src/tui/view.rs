@@ -67,6 +67,7 @@ pub struct ConsoleViewState {
     pub search_active: bool,
     pub logs_selection: bool,
     pub logs_scrollbar: Option<LogsScrollbar>,
+    pub profile_changes_pending: bool,
 }
 
 impl Default for ConsoleViewState {
@@ -81,6 +82,7 @@ impl Default for ConsoleViewState {
             search_active: false,
             logs_selection: false,
             logs_scrollbar: None,
+            profile_changes_pending: false,
         }
     }
 }
@@ -90,6 +92,8 @@ impl Default for ConsoleViewState {
 pub struct ProcessRowView {
     pub name: String,
     pub status: String,
+    /// Effective profile text when the Process list needs a Profile column.
+    pub profile: Option<String>,
     /// Compact aggregate CPU percentage, when the current Run has one.
     pub cpu: Option<String>,
     /// Compact aggregate resident memory, when the current Run has one.
@@ -235,13 +239,14 @@ pub fn render_project(
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
     view: ConsoleViewState,
+    process_list_title: &str,
     selected_header: &str,
 ) -> Rect {
     let area = frame.area();
     let (list, console_pane, footer) = project_layout(area, rows.len());
     let console_inner = pane_inner(console_pane);
 
-    render_process_table(frame, rows, list, view.mode);
+    render_process_table(frame, rows, list, view.mode, process_list_title);
     // The header names the selected Process and its live Run identity; it
     // is a projection of the immutable Supervisor snapshot, never stored
     // UI state.
@@ -304,45 +309,43 @@ fn render_process_table(
     rows: &[ProcessRowView],
     pane: Rect,
     mode: ConsoleViewMode,
+    title: &str,
 ) {
     let inner = pane_inner(pane);
-    let show_metrics = inner.width >= PROCESS_METRICS_MIN_WIDTH;
+    let show_profile = rows.iter().any(|row| row.profile.is_some());
+    let show_metrics = inner.width >= PROCESS_METRICS_MIN_WIDTH + if show_profile { 24 } else { 0 };
     let table_rows = rows.iter().map(|row| {
-        if show_metrics {
-            Row::new([
-                Cell::from(row.name.as_str()),
-                Cell::from(row.status.as_str()),
-                right_cell(row.cpu.as_deref().unwrap_or("")),
-                right_cell(row.memory.as_deref().unwrap_or("")),
-            ])
-        } else {
-            Row::new([
-                Cell::from(row.name.as_str()),
-                Cell::from(row.status.as_str()),
-            ])
+        let mut cells = vec![
+            Cell::from(row.name.as_str()),
+            Cell::from(row.status.as_str()),
+        ];
+        if show_profile {
+            cells.push(Cell::from(row.profile.as_deref().unwrap_or("")));
         }
+        if show_metrics {
+            cells.push(right_cell(row.cpu.as_deref().unwrap_or("")));
+            cells.push(right_cell(row.memory.as_deref().unwrap_or("")));
+        }
+        Row::new(cells)
     });
-    let widths = if show_metrics {
-        vec![
-            Constraint::Percentage(28),
-            Constraint::Fill(1),
-            Constraint::Length(8),
-            Constraint::Length(8),
-        ]
-    } else {
-        vec![Constraint::Percentage(35), Constraint::Fill(1)]
-    };
-    let headings = if show_metrics {
-        Row::new([
-            Cell::from("Process"),
-            Cell::from("Status"),
-            right_cell("CPU"),
-            right_cell("Memory"),
-        ])
-    } else {
-        Row::new([Cell::from("Process"), Cell::from("Status")])
+    let mut widths = vec![Constraint::Percentage(28), Constraint::Fill(1)];
+    if show_profile {
+        widths.push(Constraint::Length(22));
     }
-    .style(TERMINAL_THEME.secondary_text().add_modifier(Modifier::BOLD));
+    if show_metrics {
+        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Length(8));
+    }
+    let mut heading_cells = vec![Cell::from("Process"), Cell::from("Status")];
+    if show_profile {
+        heading_cells.push(Cell::from("Profile"));
+    }
+    if show_metrics {
+        heading_cells.push(right_cell("CPU"));
+        heading_cells.push(right_cell("Memory"));
+    }
+    let headings =
+        Row::new(heading_cells).style(TERMINAL_THEME.secondary_text().add_modifier(Modifier::BOLD));
     let border_style = if mode == ConsoleViewMode::ProcessList {
         TERMINAL_THEME.focus_border()
     } else {
@@ -355,7 +358,7 @@ fn render_process_table(
             Block::new()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(" Processes "),
+                .title(format!(" {title} ")),
         );
     if process_table_header_height(pane) == 1 {
         table = table.header(headings);
@@ -477,9 +480,16 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
         ""
     };
     let controls = match view.mode {
-        ConsoleViewMode::ProcessList => format!(
-            "j/k: select · l: Terminal/Logs · /: search{match_control} · f: live · s/x/r: lifecycle · q: quit"
-        ),
+        ConsoleViewMode::ProcessList => {
+            let apply_profile = if view.profile_changes_pending {
+                " · R: apply profile"
+            } else {
+                ""
+            };
+            format!(
+                "j/k: select · p: profile{apply_profile} · s/x/r: lifecycle · l: view · /: search{match_control} · q: quit"
+            )
+        }
         ConsoleViewMode::Console => match view.pane {
             ConsolePaneKind::Terminal => {
                 "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit".to_string()
@@ -521,6 +531,7 @@ mod tests {
         ProcessRowView {
             name: name.to_string(),
             status: status.to_string(),
+            profile: None,
             cpu: None,
             memory: None,
             selected,
@@ -537,6 +548,7 @@ mod tests {
         ProcessRowView {
             name: name.to_string(),
             status: status.to_string(),
+            profile: None,
             cpu: Some(cpu.to_string()),
             memory: Some(memory.to_string()),
             selected,
@@ -554,7 +566,15 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_project(frame, rows, None, None, ConsoleViewState::default(), "");
+                render_project(
+                    frame,
+                    rows,
+                    None,
+                    None,
+                    ConsoleViewState::default(),
+                    "Processes",
+                    "",
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -634,6 +654,19 @@ mod tests {
         assert_eq!(header.find("Status"), first.find("Ready"));
         assert_eq!(text_end(&header, "CPU"), text_end(&first, "3.2%"));
         assert_eq!(text_end(&header, "Memory"), text_end(&first, "184M"));
+    }
+
+    #[test]
+    fn profile_column_renders_every_profile_when_present() {
+        let mut first = row("api", "Ready", true);
+        first.profile = Some("local → cloud-dev".to_string());
+        let mut second = row("worker", "Ready", false);
+        second.profile = Some("cloud-dev".to_string());
+
+        let text = buffer_text(&rendered(&[first, second]));
+        assert!(text.contains("Profile"), "{text:?}");
+        assert!(text.contains("local → cloud-dev"), "{text:?}");
+        assert!(text.contains("cloud-dev"), "{text:?}");
     }
 
     #[test]
@@ -730,6 +763,7 @@ mod tests {
                         pane: ConsolePaneKind::Pipe,
                         ..ConsoleViewState::default()
                     },
+                    "Processes",
                     "Logs · demo · search: /needle · 1/1",
                 );
             })
@@ -828,6 +862,7 @@ mod tests {
                         mode: ConsoleViewMode::Copy,
                         ..ConsoleViewState::default()
                     },
+                    "Processes",
                     "",
                 );
             })
@@ -837,6 +872,21 @@ mod tests {
             terminal.backend().cursor_position(),
             ratatui::layout::Position::new(console_inner.x + 2, console_inner.y + 1)
         );
+    }
+
+    #[test]
+    fn apply_profile_control_appears_only_for_pending_changes() {
+        let ordinary = footer_text(ConsoleViewState::default(), false);
+        assert!(!ordinary.contains("R: apply profile"), "{ordinary}");
+
+        let pending = footer_text(
+            ConsoleViewState {
+                profile_changes_pending: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(pending.contains("R: apply profile"), "{pending}");
     }
 
     #[test]
@@ -852,6 +902,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_changes_pending: false,
             },
             false,
         );
@@ -933,6 +984,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_changes_pending: false,
             },
             false,
         );
@@ -954,6 +1006,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_changes_pending: false,
             },
             false,
         );
@@ -973,6 +1026,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_changes_pending: false,
             },
             true,
         );

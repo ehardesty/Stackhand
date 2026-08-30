@@ -64,7 +64,7 @@ The lifecycle model should borrow the strongest concepts from **Process Compose*
 - aggregate process metrics;
 - clear blocked and failure diagnostics.
 
-The implementation remains intentionally focused. It MUST NOT become a Docker Compose replacement, Aspire replacement, SSH manager, cloud environment manager, general workflow engine, or machine-provisioning tool. Machine-specific behavior belongs in ordinary processes, bounded hooks, scripts, profiles, or a gitignored local override.
+The implementation remains intentionally focused. It MUST NOT become a Docker Compose replacement, Aspire replacement, SSH manager, cloud environment manager, general workflow engine, or machine-provisioning tool. Machine-specific behavior belongs in ordinary Processes, bounded hooks, scripts, Process Profiles, or a gitignored local override.
 
 The central architectural division is:
 
@@ -129,7 +129,8 @@ The project MUST NOT reimplement a terminal emulator or a general TUI framework.
 #### 2.1.5 Extensibility without core bloat
 
 - Bounded generic lifecycle hooks.
-- Named profiles.
+- Named Process Profiles for partial Process configuration.
+- One global Process Profile selection for future Runs.
 - Automatically discovered gitignored local overlay.
 - Ordinary supervised helper processes for long-running machine-specific work.
 - Scripts remain valid commands and extension points.
@@ -151,7 +152,7 @@ The project MUST NOT reimplement a terminal emulator or a general TUI framework.
 - Cross-platform public configuration and state concepts.
 - Understandable configuration for complex monorepos.
 - Manual/opt-in processes in addition to autostart processes.
-- Multiple development profiles such as `local`, `devcloud`, and `localProd` without duplicating entire definitions.
+- Multiple Process Profiles such as `local`, `devcloud`, and `localProd` without duplicating complete Process definitions.
 - Architecture that can support a future daemon/attach protocol without redesigning the supervisor core.
 - Reproducible packaging that does not require users of a packaged prototype to install Zig or compile Ghostty.
 
@@ -291,7 +292,7 @@ Broad shared mutable state behind `Arc<Mutex<...>>` SHOULD be avoided.
 
 ### 4.10 Prefer deterministic semantics over convenience magic
 
-Command execution, path resolution, environment precedence, profile order, merge behavior, dependency satisfaction, restart suppression, and shutdown escalation MUST be documented and testable.
+Command execution, path resolution, environment precedence, Process Profile selection, merge behavior, dependency satisfaction, restart suppression, and shutdown escalation MUST be documented and testable.
 
 ---
 
@@ -372,7 +373,7 @@ The default screen is a process list beside a large selected-process console:
  status/help footer
 ```
 
-The console SHOULD receive most of the horizontal space. Metrics and details MUST remain compact.
+The console SHOULD receive most of the horizontal space. Metrics and details MUST remain compact. The Process list MUST show a Profile column when a current Run differs from its Next Profile or when any Process Next Profile differs from the global Process Profile. A profile selection has no immediate lifecycle effect. Active Processes continue until the user applies the pending change or another lifecycle action creates a new Run.
 
 ### 6.2 Two output representations
 
@@ -412,6 +413,8 @@ The user can:
 - Start All;
 - stop all;
 - restart all running services;
+- cycle the global Process Profile for future Runs;
+- apply pending profile changes to affected active Processes;
 - zoom the console;
 - switch Terminal/Logs view;
 - inspect blocked and failure reasons;

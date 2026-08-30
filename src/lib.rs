@@ -27,12 +27,10 @@ mod tui;
 mod worker_handle;
 
 pub use app::{
-    run_discovered_project, run_discovered_project_with_profile,
-    run_discovered_project_with_profiles, run_project, run_project_with_profile,
-    run_project_with_profiles,
+    run_discovered_project, run_discovered_project_with_profile, run_project,
+    run_project_with_profile,
 };
 pub use config::{
-    EffectiveProjectView, ResolutionSources, show_project_with_profiles, validate_project,
-    validate_project_sources_with_profiles, validate_project_with_profile,
-    validate_project_with_profiles,
+    EffectiveProjectView, ResolutionSources, show_project, validate_project,
+    validate_project_sources, validate_project_with_profile,
 };

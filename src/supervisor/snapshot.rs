@@ -13,6 +13,10 @@ use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunS
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectSnapshot {
     pub processes: Vec<ProcessSnapshot>,
+    /// The global Process Profile selected for future Runs. `None` is base.
+    pub selected_profile: Option<String>,
+    /// Process Profile names available to the global selector.
+    pub available_profiles: Vec<String>,
     /// The one controlled Project shutdown, once requested.
     pub shutdown: Option<super::shutdown::ProjectShutdownSnapshot>,
     /// The Supervisor session's elapsed milliseconds when this snapshot
@@ -147,6 +151,10 @@ pub struct ProcessSnapshot {
     pub terminal_mode: crate::model::TerminalMode,
     /// The numeric identity of the current Run, when one exists.
     pub current_run: Option<u64>,
+    /// The Process Profile captured by the current Run. `None` is base.
+    pub current_profile: Option<String>,
+    /// The Process Profile that the next Run will use. `None` is base.
+    pub next_profile: Option<String>,
     /// The spawned root PID of the current Run, when observed.
     pub root_pid: Option<u32>,
     /// When the current Run began, in session milliseconds, when one

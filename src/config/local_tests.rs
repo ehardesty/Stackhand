@@ -19,7 +19,7 @@ fn write_base(directory: &Path, command: &str) -> PathBuf {
     fs::write(
         &path,
         format!(
-            "version: 1\nprocesses:\n  web:\n    command: [/bin/echo, {command}]\nprofiles:\n  profile:\n    overrides:\n      web:\n        command: [/bin/echo, profile]\n"
+            "version: 1\nprocesses:\n  web:\n    command: [/bin/echo, {command}]\n    profiles:\n      profile:\n        command: [/bin/echo, profile]\n"
         ),
     )
     .expect("base configuration writes");
@@ -35,7 +35,7 @@ fn discovered_resolution_uses_only_an_existing_same_directory_override() {
 
     let without_local = resolve(ResolutionRequest::Discover {
         start_dir: Some(nested.clone()),
-        profiles: Vec::new(),
+        profile: None,
     })
     .expect("discovery without a local override succeeds");
     assert_eq!(without_local.sources.base, base);
@@ -56,7 +56,7 @@ fn discovered_resolution_uses_only_an_existing_same_directory_override() {
     .expect("local override writes");
     let with_local = resolve(ResolutionRequest::Discover {
         start_dir: Some(nested),
-        profiles: vec!["profile".to_string()],
+        profile: None,
     })
     .expect("discovery with a local override succeeds");
     assert_eq!(with_local.sources.base, base);
@@ -82,9 +82,9 @@ fn explicit_resolution_never_loads_a_local_override() {
     )
     .expect("local override writes");
 
-    let resolution = resolve(ResolutionRequest::explicit_with_profiles(
+    let resolution = resolve(ResolutionRequest::explicit_with_profile(
         &base,
-        ["profile".to_string()],
+        Some("profile".to_string()),
     ))
     .expect("explicit resolution succeeds");
     assert_eq!(resolution.sources.local, None);
@@ -119,7 +119,7 @@ fn child_and_parent_local_files_are_not_searched() {
 
     let resolution = resolve(ResolutionRequest::Discover {
         start_dir: Some(child),
-        profiles: Vec::new(),
+        profile: None,
     })
     .expect("discovery succeeds");
     assert_eq!(resolution.sources.base, base);
@@ -141,7 +141,7 @@ fn local_override_has_profile_and_schema_version_guards() {
         (
             "profiles",
             "profiles: {}\n",
-            "local override cannot define profiles",
+            "top-level profiles are not supported",
         ),
         (
             "version",
@@ -164,7 +164,7 @@ fn local_override_has_profile_and_schema_version_guards() {
         fs::write(directory.join(LOCAL_FILE_NAME), local).expect("invalid local writes");
         let error = resolve(ResolutionRequest::Discover {
             start_dir: Some(directory.clone()),
-            profiles: Vec::new(),
+            profile: None,
         })
         .expect_err("invalid local override must fail");
         assert!(error.message.contains(expected), "{error}");
@@ -183,7 +183,7 @@ fn invalid_local_content_rejects_the_complete_project() {
     .expect("invalid local content writes");
     let error = resolve(ResolutionRequest::Discover {
         start_dir: Some(directory.clone()),
-        profiles: Vec::new(),
+        profile: None,
     })
     .expect_err("invalid local content must fail");
     assert!(error.message.contains("unknown field"), "{error}");
@@ -191,7 +191,7 @@ fn invalid_local_content_rejects_the_complete_project() {
 }
 
 #[test]
-fn local_null_values_have_the_same_merge_semantics_as_profile_values() {
+fn local_null_values_remove_base_environment_values() {
     let directory = unique_directory("null");
     let base = directory.join(BASE_FILE_NAME);
     fs::write(
@@ -203,12 +203,6 @@ processes:
     environment:
       KEEP: keep
       REMOVE: remove
-profiles:
-  profile:
-    overrides:
-      web:
-        environment:
-          PROFILE: profile
 ",
     )
     .expect("base configuration writes");
@@ -218,7 +212,6 @@ profiles:
   web:
     environment:
       REMOVE: null
-      PROFILE: null
       LOCAL: local
 ",
     )
@@ -226,7 +219,7 @@ profiles:
 
     let resolution = resolve(ResolutionRequest::Discover {
         start_dir: Some(directory.clone()),
-        profiles: vec!["profile".to_string()],
+        profile: None,
     })
     .expect("local null values merge successfully");
     assert_eq!(

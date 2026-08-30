@@ -169,6 +169,9 @@ pub(super) struct ProcessLifecycle {
     pub(super) desired: DesiredState,
     pub(super) lifecycle: Lifecycle,
     pub(super) current_run: Option<RunId>,
+    /// The Process Profile captured when the current Run was admitted.
+    /// `None` means the base Process definition.
+    pub(super) current_profile: Option<String>,
     pub(super) failure: Option<FailureSummary>,
     pub(super) metrics: Option<MetricsMetadata>,
     /// Why Desired State Running has not produced a Run yet, as a bounded
@@ -224,6 +227,7 @@ impl ProcessLifecycle {
             desired: DesiredState::Stopped,
             lifecycle: Lifecycle::Idle,
             current_run: None,
+            current_profile: None,
             failure: None,
             metrics: None,
             blocked: None,
@@ -321,10 +325,12 @@ impl ProcessLifecycle {
         now_ms: u64,
         readiness: Option<ReadinessTracking>,
         liveness: Option<LivenessTracking>,
+        profile: Option<String>,
     ) -> RunId {
         let run_id = RunId::new(self.next_run);
         self.next_run += 1;
         self.current_run = Some(run_id);
+        self.current_profile = profile;
         self.lifecycle = Lifecycle::Starting;
         self.failure = None;
         self.metrics = None;
@@ -651,6 +657,7 @@ impl ProcessLifecycle {
         debug_assert_eq!(self.current_run, Some(run_id));
         self.record_finished_run(now_ms, exit_code, intentional_stop);
         self.current_run = None;
+        self.current_profile = None;
         self.root_pid = None;
         self.metrics = None;
         self.readiness = None;
@@ -788,7 +795,7 @@ mod tests {
     fn confirmed_finish_releases_all_run_scoped_facts_together() {
         let mut lifecycle = lifecycle();
         lifecycle.require_running(RunTrigger::Manual);
-        let run_id = lifecycle.begin_run(10, None, None);
+        let run_id = lifecycle.begin_run(10, None, None, None);
         lifecycle.record_spawn(None, None, None, Instant::now(), 10);
         lifecycle.failure = Some(FailureSummary {
             kind: FailureKind::ProcessExit,

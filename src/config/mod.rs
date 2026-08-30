@@ -1,8 +1,8 @@
 //! Configuration: one YAML version 1 file becomes one validated
 //! [`EffectiveProject`] or a structured error before any Process starts.
 //!
-//! The resolver applies selected profiles to the canonical base file before
-//! lowering the result into the validated Project model.
+//! The resolver validates named Process Profiles and selects one global
+//! profile for future Runs before it lowers the Project model.
 
 mod diagnostics;
 mod env;
@@ -23,7 +23,7 @@ mod profile_tests;
 #[cfg(test)]
 mod schema_tests;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -35,11 +35,12 @@ use self::file::{
     CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
     TerminalFile,
 };
-use self::profile::{apply_local_override, apply_profiles};
+use self::profile::{apply_local_override, merge_yaml};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
-    InputPolicy, ProcessKind, ProcessSpec, RestartConfig, RestartPolicy, ShellConfig, TerminalMode,
+    InputPolicy, ProcessKind, ProcessSpec, ProjectError, RestartConfig, RestartPolicy, ShellConfig,
+    TerminalMode,
 };
 
 const MAX_EXIT_CODE: i32 = 255;
@@ -52,13 +53,13 @@ pub enum ResolutionRequest {
     /// Use exactly this Project path. No base-file discovery is performed.
     Explicit {
         path: PathBuf,
-        profiles: Vec<String>,
+        profile: Option<String>,
     },
     /// Search for the nearest base file. `None` starts at the current
     /// directory; `Some` is useful for deterministic callers and tests.
     Discover {
         start_dir: Option<PathBuf>,
-        profiles: Vec<String>,
+        profile: Option<String>,
     },
 }
 
@@ -66,24 +67,21 @@ impl ResolutionRequest {
     pub fn explicit(path: impl Into<PathBuf>) -> Self {
         Self::Explicit {
             path: path.into(),
-            profiles: Vec::new(),
+            profile: None,
         }
     }
 
-    pub fn explicit_with_profiles(
-        path: impl Into<PathBuf>,
-        profiles: impl IntoIterator<Item = String>,
-    ) -> Self {
+    pub fn explicit_with_profile(path: impl Into<PathBuf>, profile: Option<String>) -> Self {
         Self::Explicit {
             path: path.into(),
-            profiles: profiles.into_iter().collect(),
+            profile,
         }
     }
 
-    pub fn discover_with_profiles(profiles: impl IntoIterator<Item = String>) -> Self {
+    pub fn discover_with_profile(profile: Option<String>) -> Self {
         Self::Discover {
             start_dir: None,
-            profiles: profiles.into_iter().collect(),
+            profile,
         }
     }
 
@@ -91,7 +89,7 @@ impl ResolutionRequest {
     pub fn discover_from(path: impl Into<PathBuf>) -> Self {
         Self::Discover {
             start_dir: Some(path.into()),
-            profiles: Vec::new(),
+            profile: None,
         }
     }
 }
@@ -100,7 +98,7 @@ impl ResolutionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolutionSources {
     pub base: PathBuf,
-    pub profiles: Vec<String>,
+    pub profile: Option<String>,
     pub local: Option<PathBuf>,
 }
 
@@ -124,29 +122,26 @@ impl ProjectResolution {
 
 /// Resolve and validate one Project before any Process starts.
 pub fn resolve(request: ResolutionRequest) -> Result<ProjectResolution, ConfigError> {
-    let (base, profiles, local) = match request {
-        ResolutionRequest::Explicit { path, profiles } => (
+    let (base, profile, local) = match request {
+        ResolutionRequest::Explicit { path, profile } => (
             paths::absolute_normalized(&path)
                 .with_context(|| format!("could not resolve Project path {}", path.display()))
                 .map_err(config_error)?,
-            profiles,
+            profile,
             None,
         ),
-        ResolutionRequest::Discover {
-            start_dir,
-            profiles,
-        } => {
+        ResolutionRequest::Discover { start_dir, profile } => {
             let base = discover_base(start_dir.as_deref())?;
             let local = discover_local_override(&base);
-            (base, profiles, local)
+            (base, profile, local)
         }
     };
-    let project = load_file_with_local(&base, &profiles, local.as_deref())?;
+    let project = load_file_with_local(&base, profile.as_deref(), local.as_deref())?;
     Ok(ProjectResolution {
         project,
         sources: ResolutionSources {
             base,
-            profiles,
+            profile,
             local,
         },
     })
@@ -171,25 +166,15 @@ pub fn validate_project_with_profile(
     explicit_path: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<PathBuf, ConfigError> {
-    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    validate_project_with_profiles(explicit_path, &profiles)
+    validate_project_sources(explicit_path, profile).map(|sources| sources.base)
 }
 
-/// Resolve and validate a Project with profiles selected in CLI order.
-pub fn validate_project_with_profiles(
+/// Resolve and validate a Project, returning its selected sources.
+pub fn validate_project_sources(
     explicit_path: Option<&Path>,
-    profiles: &[String],
-) -> Result<PathBuf, ConfigError> {
-    validate_project_sources_with_profiles(explicit_path, profiles).map(|sources| sources.base)
-}
-
-/// Resolve and validate a Project, returning every selected source in
-/// precedence order.
-pub fn validate_project_sources_with_profiles(
-    explicit_path: Option<&Path>,
-    profiles: &[String],
+    profile: Option<&str>,
 ) -> Result<ResolutionSources, ConfigError> {
-    resolve(resolution_request(explicit_path, profiles)).map(|resolution| resolution.sources)
+    resolve(resolution_request(explicit_path, profile)).map(|resolution| resolution.sources)
 }
 
 /// The source summary and redacted normalized YAML for one resolved Project.
@@ -201,11 +186,11 @@ pub struct EffectiveProjectView {
 
 /// Resolve one Project and render the effective canonical configuration
 /// without starting the Supervisor or any Process.
-pub fn show_project_with_profiles(
+pub fn show_project(
     explicit_path: Option<&Path>,
-    profiles: &[String],
+    profile: Option<&str>,
 ) -> Result<EffectiveProjectView, ConfigError> {
-    let resolution = resolve(resolution_request(explicit_path, profiles))?;
+    let resolution = resolve(resolution_request(explicit_path, profile))?;
     let yaml = show::render(&resolution.project)?;
     Ok(EffectiveProjectView {
         sources: resolution.sources,
@@ -213,21 +198,21 @@ pub fn show_project_with_profiles(
     })
 }
 
-fn resolution_request(explicit_path: Option<&Path>, profiles: &[String]) -> ResolutionRequest {
+fn resolution_request(explicit_path: Option<&Path>, profile: Option<&str>) -> ResolutionRequest {
     explicit_path.map_or_else(
-        || ResolutionRequest::discover_with_profiles(profiles.iter().cloned()),
-        |path| ResolutionRequest::explicit_with_profiles(path, profiles.iter().cloned()),
+        || ResolutionRequest::discover_with_profile(profile.map(str::to_owned)),
+        |path| ResolutionRequest::explicit_with_profile(path, profile.map(str::to_owned)),
     )
 }
 
 #[cfg(test)]
-fn load_file(path: &Path, profiles: &[String]) -> Result<EffectiveProject, ConfigError> {
-    load_file_with_local(path, profiles, None)
+fn load_file(path: &Path, profile: Option<&str>) -> Result<EffectiveProject, ConfigError> {
+    load_file_with_local(path, profile, None)
 }
 
 fn load_file_with_local(
     path: &Path,
-    profiles: &[String],
+    profile: Option<&str>,
     local_path: Option<&Path>,
 ) -> Result<EffectiveProject, ConfigError> {
     let base_dir = path.parent().unwrap_or(Path::new("."));
@@ -251,35 +236,26 @@ fn load_file_with_local(
         ));
     }
     validate_shapes(&document, &base_source)?;
-    let base_only = profiles.is_empty() && local_path.is_none();
     let mut last_layer = base_source.clone();
-    let effective_text = if base_only {
-        text
-    } else {
-        apply_profiles(&mut document, profiles)?;
-        if let Some(profile) = profiles.last() {
-            last_layer = format!("profile '{profile}'");
+    let effective_text = if let Some(local_path) = local_path {
+        let local_source = format!("local override '{}'", local_path.display());
+        let local_text = std::fs::read_to_string(local_path)
+            .with_context(|| format!("could not read {local_source}"))
+            .map_err(config_error)?;
+        let local_document: Value = serde_yaml::from_str(&local_text).map_err(|error| {
+            config_error(anyhow::anyhow!(diagnostics::format_local_yaml_error(
+                local_path, &error
+            )))
+        })?;
+        if let Some(processes) = local_document
+            .as_mapping()
+            .and_then(|root| root.get(Value::String("processes".to_string())))
+        {
+            self::env::validate_process_overrides(processes, &local_source)?;
         }
-        if let Some(local_path) = local_path {
-            let local_source = format!("local override '{}'", local_path.display());
-            let local_text = std::fs::read_to_string(local_path)
-                .with_context(|| format!("could not read {local_source}"))
-                .map_err(config_error)?;
-            let local_document: Value = serde_yaml::from_str(&local_text).map_err(|error| {
-                config_error(anyhow::anyhow!(diagnostics::format_local_yaml_error(
-                    local_path, &error
-                )))
-            })?;
-            if let Some(processes) = local_document
-                .as_mapping()
-                .and_then(|root| root.get(Value::String("processes".to_string())))
-            {
-                self::env::validate_process_overrides(processes, &local_source)?;
-            }
-            apply_local_override(&mut document, &local_document)
-                .map_err(|error| diagnostics::with_source(error, &local_source))?;
-            last_layer = local_source;
-        }
+        apply_local_override(&mut document, &local_document)
+            .map_err(|error| diagnostics::with_source(error, &local_source))?;
+        last_layer = local_source;
         validate_shapes(&document, &last_layer)?;
         serde_yaml::to_string(&document).map_err(|error| {
             diagnostics::with_source(
@@ -289,9 +265,11 @@ fn load_file_with_local(
                 &last_layer,
             )
         })?
+    } else {
+        text
     };
     let file: ConfigFile = serde_yaml::from_str(&effective_text).map_err(|error| {
-        let message = if base_only {
+        let message = if local_path.is_none() {
             diagnostics::format_yaml_error(path, &error)
         } else {
             diagnostics::format_merged_yaml_error(path, &last_layer, &error)
@@ -306,49 +284,102 @@ fn load_file_with_local(
         "Project",
     )
     .map_err(|error| diagnostics::with_source(error, &last_layer))?;
-    let processes = file
+    let raw_processes = document
+        .as_mapping()
+        .and_then(|root| root.get(Value::String("processes".to_string())))
+        .and_then(Value::as_mapping)
+        .expect("typed Process parsing requires a Process mapping");
+    let profiled_processes = file
         .processes
         .entries
         .into_iter()
         .map(|entry| {
-            let ProcessEntry { key, process } = entry;
-            build_spec(&process, key, base_dir, &project_environment)
+            let raw = raw_processes
+                .get(Value::String(entry.key.clone()))
+                .cloned()
+                .expect("the raw Process mapping matches typed Process entries");
+            build_profiled_process(entry, raw, base_dir, &project_environment)
         })
         .collect::<Result<Vec<_>, ConfigError>>()
         .map_err(|error| diagnostics::with_source(error, &last_layer))?;
-    EffectiveProject::with_shell(processes, shell).map_err(|error| {
-        let detail = match error {
-            crate::model::ProjectError::DuplicateName(name) => {
-                format!("duplicate Process name '{name}'")
-            }
-            crate::model::ProjectError::UnknownDependency {
-                process,
-                dependency,
-            } => format!(
-                "Process '{process}': dependency '{dependency}' does not match any configured Process"
-            ),
-            crate::model::ProjectError::InvalidCondition {
-                process,
-                dependency,
-                condition,
-            } => format!(
-                "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'exited' and 'completed_successfully' are valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
-            ),
-            crate::model::ProjectError::ReadinessOnOneShot { process } => format!(
-                "Process '{process}': readiness is valid only on Services; a One-shot completes instead of becoming ready"
-            ),
-            crate::model::ProjectError::LivenessOnOneShot { process } => format!(
-                "Process '{process}': liveness is valid only on Services; a One-shot cannot have ongoing health checks"
-            ),
-            crate::model::ProjectError::InvalidRestartPolicy { process, policy } => format!(
-                "Process '{process}': restart.policy '{policy}' is valid only for Services"
-            ),
-            crate::model::ProjectError::DependencyCycle(path) => {
-                format!("dependency cycle: {}", path.join(" -> "))
-            }
-        };
+    let process_profile_names = profiled_processes
+        .iter()
+        .flat_map(|process| process.profiles.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(profile) = profile
+        && !process_profile_names.iter().any(|name| name == profile)
+    {
+        return Err(diagnostics::with_source(
+            ConfigError {
+                message: format!("unknown Process Profile '{profile}'"),
+            },
+            &last_layer,
+        ));
+    }
+    let selected_process_profile = profile.map(str::to_owned);
+    let processes = profiled_processes
+        .iter()
+        .map(|process| process.base.clone())
+        .collect();
+    let process_profiles = profiled_processes
+        .iter()
+        .map(|process| process.profiles.clone())
+        .collect();
+    let process_profile_overrides = profiled_processes
+        .into_iter()
+        .map(|process| process.profile_override)
+        .collect();
+    EffectiveProject::with_process_profiles(
+        processes,
+        process_profiles,
+        process_profile_overrides,
+        selected_process_profile,
+        process_profile_names,
+        shell,
+    )
+    .map_err(|error| {
+        let detail = format_project_error(error);
         diagnostics::with_source(config_error(anyhow::anyhow!(detail)), &last_layer)
     })
+}
+
+fn format_project_error(error: ProjectError) -> String {
+    match error {
+        ProjectError::DuplicateName(name) => format!("duplicate Process name '{name}'"),
+        ProjectError::UnknownDependency {
+            process,
+            dependency,
+        } => format!(
+            "Process '{process}': dependency '{dependency}' does not match any configured Process"
+        ),
+        ProjectError::InvalidCondition {
+            process,
+            dependency,
+            condition,
+        } => format!(
+            "Process '{process}': dependency '{dependency}' cannot use condition '{condition}': 'exited' and 'completed_successfully' are valid only when the dependency Process is a One-shot, and 'ready' only when it is a Service"
+        ),
+        ProjectError::ReadinessOnOneShot { process } => format!(
+            "Process '{process}': readiness is valid only on Services; a One-shot completes instead of becoming ready"
+        ),
+        ProjectError::LivenessOnOneShot { process } => format!(
+            "Process '{process}': liveness is valid only on Services; a One-shot cannot have ongoing health checks"
+        ),
+        ProjectError::InvalidRestartPolicy { process, policy } => {
+            format!("Process '{process}': restart.policy '{policy}' is valid only for Services")
+        }
+        ProjectError::DependencyCycle(path) => {
+            format!("dependency cycle: {}", path.join(" -> "))
+        }
+        ProjectError::InvalidProcessProfileGraph { profile, source } => {
+            format!(
+                "Process Profile '{profile}' produces an invalid Project: {}",
+                format_project_error(*source)
+            )
+        }
+    }
 }
 
 fn read_version(document: &Value) -> Result<u64, ConfigError> {
@@ -587,6 +618,134 @@ fn build_terminal_settings(
         ))?,
     };
     Ok((terminal_mode, input_policy))
+}
+
+struct ProfiledProcess {
+    base: ProcessSpec,
+    profiles: BTreeMap<String, ProcessSpec>,
+    profile_override: Option<String>,
+}
+
+fn build_profiled_process(
+    entry: ProcessEntry,
+    mut raw: Value,
+    base_dir: &Path,
+    project_environment: &BTreeMap<String, String>,
+) -> Result<ProfiledProcess, ConfigError> {
+    const PROFILE_FIELDS: &[&str] = &[
+        "command",
+        "shell",
+        "cwd",
+        "env_files",
+        "environment",
+        "enabled",
+        "depends_on",
+    ];
+
+    let ProcessEntry { key: name, process } = entry;
+    let profile_override = process.profile.clone();
+    let patches = process.profiles.clone().unwrap_or_default();
+    if raw.is_null() {
+        raw = Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let Some(base_mapping) = raw.as_mapping_mut() else {
+        return Err(ConfigError {
+            message: format!("Process '{name}' must define a mapping"),
+        });
+    };
+    base_mapping.remove(Value::String("profile".to_string()));
+    base_mapping.remove(Value::String("profiles".to_string()));
+
+    let base_file: ProcessFile =
+        serde_yaml::from_value(raw.clone()).map_err(|error| ConfigError {
+            message: format!("Process '{name}': invalid base definition: {error}"),
+        })?;
+    let base = build_spec(&base_file, name.clone(), base_dir, project_environment)?;
+    let mut profiles = BTreeMap::new();
+    for (profile_name, patch) in patches {
+        if profile_name == "base" {
+            return Err(ConfigError {
+                message: format!(
+                    "Process '{name}': Process Profile name 'base' is reserved for the base specification"
+                ),
+            });
+        }
+        let Some(mapping) = patch.as_mapping() else {
+            return Err(ConfigError {
+                message: format!(
+                    "Process '{name}' profile '{profile_name}' must be a partial mapping"
+                ),
+            });
+        };
+        for field in mapping.keys() {
+            let Some(field) = field.as_str() else {
+                return Err(ConfigError {
+                    message: format!(
+                        "Process '{name}' profile '{profile_name}' must use string field names"
+                    ),
+                });
+            };
+            if !PROFILE_FIELDS.contains(&field) {
+                return Err(ConfigError {
+                    message: format!(
+                        "Process '{name}' profile '{profile_name}' cannot change field '{field}'; Process Profiles can change only command, shell, cwd, env_files, environment, enabled, and depends_on"
+                    ),
+                });
+            }
+        }
+        let mut environment_check = serde_yaml::Mapping::new();
+        environment_check.insert(Value::String(name.clone()), patch.clone());
+        self::env::validate_process_overrides(
+            &Value::Mapping(environment_check),
+            &format!("Process '{name}' profile '{profile_name}'"),
+        )?;
+        let mut merged = raw.clone();
+        merge_process_profile(&mut merged, patch);
+        let profile_file: ProcessFile =
+            serde_yaml::from_value(merged).map_err(|error| ConfigError {
+                message: format!("Process '{name}' profile '{profile_name}': {error}"),
+            })?;
+        let spec = build_spec(&profile_file, name.clone(), base_dir, project_environment).map_err(
+            |error| ConfigError {
+                message: format!(
+                    "Process '{name}' profile '{profile_name}': {}",
+                    error.message
+                ),
+            },
+        )?;
+        profiles.insert(profile_name, spec);
+    }
+
+    if let Some(profile) = profile_override.as_deref()
+        && profile != "base"
+        && !profiles.contains_key(profile)
+    {
+        return Err(ConfigError {
+            message: format!(
+                "Process '{name}': profile override '{profile}' does not match a named Process Profile"
+            ),
+        });
+    }
+
+    Ok(ProfiledProcess {
+        base,
+        profiles,
+        profile_override,
+    })
+}
+
+/// Merge one Process Profile. Dependencies form one coherent startup contract,
+/// so a profile replaces the complete mapping instead of inheriting entries.
+fn merge_process_profile(base: &mut Value, patch: Value) {
+    let depends_on = Value::String("depends_on".to_string());
+    if patch
+        .as_mapping()
+        .is_some_and(|mapping| mapping.contains_key(&depends_on))
+        && let Some(base_mapping) = base.as_mapping_mut()
+    {
+        base_mapping.remove(&depends_on);
+    }
+    merge_yaml(base, patch);
 }
 
 fn build_spec(

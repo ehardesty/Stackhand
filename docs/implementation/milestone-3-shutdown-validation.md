@@ -80,23 +80,15 @@ The local Compose file passed:
 docker compose -f docker-compose.local.yml config
 ```
 
-`stackhand config validate` passed for the base Project, `local`, `devcloud`,
-and `localProd` profiles, and for these optional selections:
-
-- `local` + `worker-python`;
-- `devcloud` + `worker-python`;
-- `local` + `func-dotnet`;
-- `local` + `docs`;
-- `local` + `emulators-smoke`.
+`stackhand config validate` passed for the base Project. Other
+configuration-selection evidence from this run is omitted because it does not
+validate the current Process Profile model.
 
 ## Real default workflow
 
-The controller ran the default local Project with:
-
-```sh
-scripts/local-dev/emulators/forward-remote.sh dev-vm
-stackhand --profile local
-```
+The controller used the remote Docker port bridge and the then-current local
+Quadrant configuration. The obsolete configuration-selection command is
+omitted because it does not validate current Process Profile selection.
 
 An `expect` PTY sent `q` after both application endpoints passed their health
 checks. Observed results:
@@ -122,13 +114,9 @@ readiness procedure:
 A startup stop sent `q` after 5 seconds. Stackhand exited with status 0 in 7
 seconds, and the first cleanup poll reported zero running containers.
 
-The optional smoke workflow was also run with:
-
-```sh
-stackhand --profile local --profile emulators-smoke
-```
-
-For this check only, an ignored local override wrapped the existing
+The optional smoke workflow also passed. Its obsolete
+configuration-selection command is omitted. For this check only, an ignored
+local override wrapped the existing
 `scripts/local-dev/emulators/prepare.sh --smoke` command and wrote a marker
 only after that command succeeded. The API and web became ready, the marker
 was present, Stackhand accepted `q`, exited with status 0, and the first cleanup
@@ -174,7 +162,7 @@ coordination to Stackhand and keeping Quadrant work in Quadrant:
 | Visible One-shot ordering and completion | Azurite and Cosmos initialization scripts |
 | Project shutdown ladder and restart suppression | Service Bus, Azurite, and Cosmos smoke commands |
 | Pipe readers, probe work, and output ownership | Local environment values and app launch commands |
-| Ordered profiles and local overrides | The old `run.sh` and `prepare.sh` fallback scripts |
+| Local overrides | The old `run.sh` and `prepare.sh` fallback scripts |
 
 `stackhand-compose.sh` is the narrow Quadrant adapter at this seam. It starts
 only the Compose services named by its Process command. It keeps Compose in a

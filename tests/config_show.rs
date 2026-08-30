@@ -14,13 +14,13 @@ fn unique_directory(label: &str) -> PathBuf {
     directory
 }
 
-fn run_show(directory: &Path, path: Option<&Path>, profiles: &[&str]) -> std::process::Output {
+fn run_show(directory: &Path, path: Option<&Path>, profile: Option<&str>) -> std::process::Output {
     let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
     command.current_dir(directory).args(["config", "show"]);
     if let Some(path) = path {
         command.arg(path);
     }
-    for profile in profiles {
+    if let Some(profile) = profile {
         command.args(["--profile", profile]);
     }
     command.output().expect("config show runs")
@@ -71,20 +71,11 @@ processes:
     command: [/usr/bin/true]
     environment:
       BASE_SECRET: base-secret
-profiles:
-  first:
-    overrides:
-      web:
-        environment:
-          FIRST_SECRET: first-secret
-  second:
-    overrides:
-      web:
+    profiles:
+      second:
         environment:
           SECOND_SECRET: second-secret
-  unused:
-    overrides:
-      web:
+      unused:
         environment:
           UNUSED_SECRET: should-not-appear
 ",
@@ -104,30 +95,25 @@ profiles:
     let canonical_root = fs::canonicalize(&root).expect("root canonicalizes");
     let canonical_base = fs::canonicalize(&base).expect("base canonicalizes");
     let canonical_local = fs::canonicalize(&local).expect("local canonicalizes");
-    let output = run_show(&nested, None, &["first", "second"]);
+    let output = run_show(&nested, None, Some("second"));
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let base_position = stdout
         .find(&canonical_base.display().to_string())
         .expect("base is shown");
-    let first_position = stdout
-        .find("  profile: first")
-        .expect("first profile is shown");
-    let second_position = stdout
+    let profile_position = stdout
         .find("  profile: second")
-        .expect("second profile is shown");
+        .expect("selected profile is shown");
     let local_position = stdout
         .find(&canonical_local.display().to_string())
         .expect("local override is shown");
-    assert!(base_position < first_position);
-    assert!(first_position < second_position);
-    assert!(second_position < local_position);
+    assert!(base_position < local_position);
+    assert!(local_position < profile_position);
     assert!(!stdout.contains("unused"));
     for secret in [
         "project-file-secret",
         "process-file-secret",
         "base-secret",
-        "first-secret",
         "second-secret",
         "local-secret",
         "should-not-appear",
@@ -173,7 +159,6 @@ profiles:
         "PROJECT_FILE_SECRET",
         "PROCESS_FILE_SECRET",
         "BASE_SECRET",
-        "FIRST_SECRET",
         "SECOND_SECRET",
         "LOCAL_SECRET",
     ] {
@@ -197,7 +182,7 @@ fn config_show_accepts_explicit_paths_and_has_stable_output_without_starting_pro
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n  web:\n    shell: |\n      : > {}\nprofiles:\n  selected: {{}}\n",
+            "version: 1\nprocesses:\n  web:\n    shell: |\n      : > {}\n    profiles:\n      selected: {{}}\n",
             marker.display()
         ),
     )
@@ -211,8 +196,8 @@ fn config_show_accepts_explicit_paths_and_has_stable_output_without_starting_pro
     )
     .expect("local override writes");
 
-    let first = run_show(&current, Some(&config), &["selected"]);
-    let second = run_show(&current, Some(&config), &["selected"]);
+    let first = run_show(&current, Some(&config), Some("selected"));
+    let second = run_show(&current, Some(&config), Some("selected"));
     assert!(first.status.success(), "{first:?}");
     assert!(second.status.success(), "{second:?}");
     assert_eq!(first.stdout, second.stdout);
@@ -233,7 +218,7 @@ fn config_show_uses_the_same_resolution_failure_as_config_validate() {
     let config = root.join("project.yaml");
     fs::write(&config, "version: 2\nprocesses: {}\n").expect("invalid Project writes");
 
-    let show = run_show(&root, Some(&config), &[]);
+    let show = run_show(&root, Some(&config), None);
     let validate = run_validate(&root, &config);
     assert!(!show.status.success(), "{show:?}");
     assert!(!validate.status.success(), "{validate:?}");

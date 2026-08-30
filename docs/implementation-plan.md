@@ -1,8 +1,8 @@
 # Stackhand — Prototype Implementation Plan
 
-**Revision:** 4
+**Revision:** 5
 **Status:** Draft prototype plan
-**Last revised:** 2026-08-29
+**Last revised:** 2026-08-30
 **Companion north-star specification:** [`product-specification.md`](./product-specification.md)
 **Current platform sequence:** macOS real-world use first; Linux in a dedicated portability milestone; Windows after a dedicated runtime validation phase
 

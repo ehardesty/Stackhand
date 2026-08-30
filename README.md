@@ -17,13 +17,15 @@ The specification controls when it conflicts with the implementation plan. Proto
 ## Current prototype
 
 The current prototype discovers the nearest `stackhand.yaml` from the working
-directory, or accepts an explicit Project path. It layers ordered profiles and,
-for discovered Projects, a same-directory `stackhand.local.yaml` override. It
-starts and supervises Services and One-shots, applies Dependency, readiness,
-liveness, and restart rules, renders pipe or PTY output, accepts focused
-terminal input, reports basic metrics, and performs controlled Project
-shutdown. It is validation software, not a supported release. See the example
-Projects and the Milestone 3 validation record for the current behavior.
+directory, or accepts an explicit Project path. Each Process can define named
+Process Profiles for its launch command, working directory, environment files,
+environment, enabled state, and Dependencies. A same-directory `stackhand.local.yaml` can
+override discovered Projects. Stackhand starts and supervises Services and
+One-shots. It applies Dependency, readiness, liveness, and restart rules. It
+renders pipe or PTY output, accepts focused terminal input, reports basic
+metrics, and performs controlled
+Project shutdown. It is validation software, not a supported release. See the
+example Projects and the Milestone 3 validation record for current behavior.
 
 The next roadmap stage will make Stackhand usable with a complex real Project
 on macOS. Quadrant is the validation case. Stackhand will replace generic
@@ -41,14 +43,22 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run -- examples/basic.yaml
 ```
 
 Stackhand discovers the nearest `stackhand.yaml` when no path is given. Pass
-a Project path to disable discovery. Use repeated `--profile` options to select
-profiles in order. A same-directory `stackhand.local.yaml` is applied only to
-discovered Projects. `config validate` and `config show` use the same resolution
-rules without starting Processes.
+a Project path to disable discovery. Use one `--profile NAME` option to select
+the initial global Process Profile. A Process that does not define that name
+uses its base configuration. A same-directory `stackhand.local.yaml` is applied only
+to discovered Projects. `config validate` and `config show` use the same
+resolution rules without starting Processes.
 
 Stackhand starts enabled autostart Processes with the Process list focused. Use
 `j` or `k` to select a Process,
 `s` to start, `x` to stop, and `r` to restart a Service or rerun a One-shot.
+Press `p` to cycle the global Process Profile. Profile selection has no
+immediate lifecycle effect, so active Processes continue. When active Runs
+need a profile change, Stackhand shows `R: apply profile`. Press `R` to stop
+active Processes that the Next Profile disables. Stackhand also restarts
+affected active Processes that remain enabled and use autostart. It does not
+start an inactive Process that the Next Profile enables. Start that Process
+manually when you need it.
 Press `Ctrl-A` to focus the selected console and send keys to an input-enabled
 PTY. Press `Ctrl-A` again to return to the Process list. Press `q` from the
 Process list, or `Ctrl-Q` from anywhere, to stop the Project and restore the

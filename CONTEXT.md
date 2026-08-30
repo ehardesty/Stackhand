@@ -36,6 +36,14 @@ _Avoid_: Status, lifecycle state
 The maximum number of automatic retries allowed after an initial Run.
 _Avoid_: Consecutive failure count, retry count
 
+**Process Profile**:
+A named partial configuration patch that belongs to one Process. A Process Profile can change how the Process starts, what it depends on, or whether it is available.
+_Avoid_: Environment
+
+**Next Profile**:
+The selected Process Profile that controls future lifecycle actions and any next Run of a Process. A rare per-Process profile selection overrides the global Process Profile selection.
+_Avoid_: Current profile
+
 **Dependency**:
 A startup relationship that prevents one Process from starting until another Process meets a specified condition. It does not couple their lifetimes after startup.
 _Avoid_: Parent, prerequisite process

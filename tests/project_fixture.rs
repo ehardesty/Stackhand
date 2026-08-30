@@ -128,6 +128,10 @@ processes:
       FIXTURE_TOKEN: stackhand-env-ok
       FIXTURE_VALUE: inline-value
     command: [/bin/sh, "-c", {hello}]
+    profiles:
+      profile-final:
+        environment:
+          PROFILE_VALUE: second-profile
   shelled:
     kind: service
     terminal:
@@ -157,6 +161,9 @@ processes:
   optional:
     kind: one-shot
     enabled: false
+    profiles:
+      profile-final:
+        enabled: true
     terminal:
       mode: pipe
       input: disabled
@@ -380,19 +387,6 @@ processes:
     depends_on:
       initialization: completed_successfully
     command: [/bin/sleep, "60"]
-profiles:
-  profile-fixture:
-    overrides:
-      hello:
-        environment:
-          PROFILE_VALUE: first-profile
-  profile-final:
-    enable:
-      - optional
-    overrides:
-      hello:
-        environment:
-          PROFILE_VALUE: second-profile
 "#,
         started_dependent = yaml_quote(STARTED_DEPENDENT),
         started_source = yaml_quote(STARTED_SOURCE),
@@ -490,10 +484,10 @@ fn discovered_layered_project_runs_the_complete_project_path() {
     )
     .expect("local override writes");
 
-    let stdout = support::run_discovered_fixture_with_profiles(
+    let stdout = support::run_discovered_fixture_with_profile(
         "--fixture-project",
         &nested,
-        &["profile-fixture", "profile-final"],
+        Some("profile-final"),
         |line| states.apply_checkpoint(line),
     );
     for checkpoint in [
@@ -583,9 +577,9 @@ fn an_invalid_project_starts_nothing_and_fails_clearly() {
     );
 }
 
-/// An invalid profile layer must fail before the resolved Project reaches the Supervisor.
+/// An invalid Process Profile must fail before the Project reaches the Supervisor.
 #[test]
-fn an_invalid_layered_project_starts_nothing() {
+fn an_invalid_process_profile_starts_nothing() {
     let dir = unique_dir("invalid-layered");
     let marker = dir.join("started.marker");
     let command = yaml_quote(&format!(
@@ -601,10 +595,8 @@ processes:
       mode: pipe
       input: disabled
     command: [/bin/sh, "-c", {command}]
-profiles:
-  broken:
-    overrides:
-      marker:
+    profiles:
+      broken:
         terminal:
           mode: invalid
 "#

@@ -20,7 +20,7 @@ mod resize;
 mod view_model;
 
 use interaction::{InputResult, ProjectInteraction, SelectedPane};
-use view_model::{process_rows, selected_header};
+use view_model::{process_list_title, process_rows, selected_header};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
@@ -37,16 +37,9 @@ pub fn run_project(config_path: &Path) -> Result<()> {
 /// Load the explicit Project with one selected profile, then run it
 /// interactively.
 pub fn run_project_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
-    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    run_project_with_profiles(config_path, &profiles)
-}
-
-/// Load the explicit Project with profiles selected in CLI order, then run it
-/// interactively.
-pub fn run_project_with_profiles(config_path: &Path, profiles: &[String]) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::explicit_with_profiles(
+    run_resolved(crate::config::ResolutionRequest::explicit_with_profile(
         config_path,
-        profiles.iter().cloned(),
+        profile.map(str::to_owned),
     ))
 }
 
@@ -58,15 +51,8 @@ pub fn run_discovered_project() -> Result<()> {
 /// Discover the nearest base Project with one selected profile, then run it
 /// interactively.
 pub fn run_discovered_project_with_profile(profile: Option<&str>) -> Result<()> {
-    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    run_discovered_project_with_profiles(&profiles)
-}
-
-/// Discover the nearest base Project with profiles selected in CLI order,
-/// then run it interactively.
-pub fn run_discovered_project_with_profiles(profiles: &[String]) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::discover_with_profiles(
-        profiles.iter().cloned(),
+    run_resolved(crate::config::ResolutionRequest::discover_with_profile(
+        profile.map(str::to_owned),
     ))
 }
 
@@ -208,6 +194,7 @@ fn run_event_loop(
                 has_terminal,
             );
             let rows = process_rows(&snapshot, selected);
+            let list_title = process_list_title(&snapshot);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
             let view_label = match frame.representation {
                 crate::log_view::OutputRepresentation::Terminal => "Terminal",
@@ -230,6 +217,7 @@ fn run_event_loop(
                 frame.terminal.as_ref(),
                 frame.lines.as_deref(),
                 frame.view,
+                &list_title,
                 &header,
             )?;
             let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
@@ -280,6 +268,7 @@ fn render_frame(
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[crate::tui::PipeLine]>,
     view: crate::tui::ConsoleViewState,
+    process_list_title: &str,
     selected_header: &str,
 ) -> Result<ratatui::layout::Rect> {
     let mut pane = None;
@@ -292,6 +281,7 @@ fn render_frame(
                 console_snapshot,
                 pipe_lines,
                 view,
+                process_list_title,
                 selected_header,
             ));
         })

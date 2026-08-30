@@ -30,23 +30,28 @@ fn run_validate_with_profile(
     path: Option<&Path>,
     profile: Option<&str>,
 ) -> std::process::Output {
-    let profiles = profile.into_iter().collect::<Vec<_>>();
-    run_validate_with_profiles(directory, path, &profiles)
+    let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
+    command.current_dir(directory).args(["config", "validate"]);
+    if let Some(path) = path {
+        command.arg(path);
+    }
+    if let Some(profile) = profile {
+        command.args(["--profile", profile]);
+    }
+    command.output().expect("config validate runs")
 }
 
-fn run_validate_with_profiles(
+fn run_validate_with_arguments(
     directory: &Path,
     path: Option<&Path>,
-    profiles: &[&str],
+    arguments: &[&str],
 ) -> std::process::Output {
     let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
     command.current_dir(directory).args(["config", "validate"]);
     if let Some(path) = path {
         command.arg(path);
     }
-    for profile in profiles {
-        command.args(["--profile", profile]);
-    }
+    command.args(arguments);
     command.output().expect("config validate runs")
 }
 
@@ -216,7 +221,7 @@ fn config_validate_validates_the_selected_profile() {
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local:\n    overrides:\n      web:\n        command: [/usr/bin/true, 1]\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n    profiles:\n      local:\n        command: [/usr/bin/true, 1]\n",
     )
     .expect("profile config writes");
 
@@ -238,14 +243,14 @@ fn config_validate_rejects_an_unknown_profile_name() {
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local: {}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n    profiles:\n      local: {}\n",
     )
     .expect("profile config writes");
 
     let output = run_validate_with_profile(&root, Some(&config), Some("missing"));
     assert!(!output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unknown profile 'missing'"),
+        String::from_utf8_lossy(&output.stderr).contains("unknown Process Profile 'missing'"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -254,24 +259,41 @@ fn config_validate_rejects_an_unknown_profile_name() {
 }
 
 #[test]
-fn config_validate_does_not_select_a_profile_without_the_option() {
+fn config_validate_rejects_an_invalid_unselected_profile_graph() {
+    let root = unique_directory("profile-invalid-graph");
+    let config = root.join("project.yaml");
+    fs::write(
+        &config,
+        "version: 1\nprocesses:\n  api:\n    command: [/usr/bin/true]\n    profiles:\n      cloud:\n        depends_on: {worker: started}\n  worker:\n    command: [/usr/bin/true]\n    profiles:\n      cloud:\n        depends_on: {api: started}\n",
+    )
+    .expect("profile config writes");
+
+    let output = run_validate(&root, Some(&config));
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Process Profile 'cloud' produces an invalid Project")
+            && stderr.contains("api -> worker -> api"),
+        "{stderr}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn config_validate_accepts_an_unselected_valid_process_profile() {
     let root = unique_directory("profile-explicit");
     let config = root.join("project.yaml");
     fs::write(
         &config,
-        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  local:\n    overrides:\n      added: {}\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n    profiles:\n      local:\n        environment:\n          MODE: local\n",
     )
     .expect("profile config writes");
 
     let base = run_validate(&root, Some(&config));
     assert!(base.status.success(), "{base:?}");
     let selected = run_validate_with_profile(&root, Some(&config), Some("local"));
-    assert!(!selected.status.success(), "{selected:?}");
-    assert!(
-        String::from_utf8_lossy(&selected.stderr).contains("Process 'added'"),
-        "{}",
-        String::from_utf8_lossy(&selected.stderr)
-    );
+    assert!(selected.status.success(), "{selected:?}");
 
     fs::remove_dir_all(root).ok();
 }
@@ -303,7 +325,7 @@ fn config_validate_does_not_print_environment_values() {
 }
 
 #[test]
-fn config_validate_applies_repeated_profiles_in_cli_order() {
+fn config_validate_rejects_more_than_one_profile_option() {
     let root = unique_directory("profile-order");
     let config = root.join("project.yaml");
     fs::write(
@@ -312,28 +334,23 @@ fn config_validate_applies_repeated_profiles_in_cli_order() {
 processes:
   web:
     command: [/usr/bin/true]
-profiles:
-  first:
-    overrides:
-      web:
-        command: [/bin/echo, 1]
-  second:
-    overrides:
-      web:
-        command: [/usr/bin/true]
+    profiles:
+      first: {}
+      second: {}
 ",
     )
-    .expect("ordered profile config writes");
+    .expect("Process Profile config writes");
 
-    let forward = run_validate_with_profiles(&root, Some(&config), &["first", "second"]);
-    assert!(forward.status.success(), "{forward:?}");
-    let reverse = run_validate_with_profiles(&root, Some(&config), &["second", "first"]);
-    assert!(!reverse.status.success(), "{reverse:?}");
+    let output = run_validate_with_arguments(
+        &root,
+        Some(&config),
+        &["--profile", "first", "--profile", "second"],
+    );
+    assert!(!output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&reverse.stderr)
-            .contains("Process 'web': command argument 0 must be a string"),
+        String::from_utf8_lossy(&output.stderr).contains("--profile can be specified only once"),
         "{}",
-        String::from_utf8_lossy(&reverse.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
 
     fs::remove_dir_all(root).ok();

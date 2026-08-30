@@ -154,7 +154,10 @@ fn validate_values(value: &Value, process_name: &str, source: &str) -> Result<()
                     }
                 }
             }
-            for child in mapping.values() {
+            for (field, child) in mapping {
+                if field.as_str() == Some("profiles") {
+                    continue;
+                }
                 validate_values(child, process_name, source)?;
             }
         }

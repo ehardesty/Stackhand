@@ -271,6 +271,8 @@ enum SupervisorCommand {
     StartAllEnabled,
     StopAll,
     RestartRunningServices,
+    CycleGlobalProcessProfile,
+    ApplyProcessProfile,
     ShutdownProject,
 }
 ```
@@ -351,6 +353,11 @@ processes:
     kind: service
     command: [dotnet, run, --launch-profile, Local]
     cwd: app/api
+    profiles:
+      devcloud:
+        command: [dotnet, run, --launch-profile, DevCloud]
+        environment:
+          QUADRANT_ENVIRONMENT: dev
     autostart: true
     depends_on:
       servicebus: ready
@@ -433,6 +440,13 @@ The core differentiator is:
 ---
 
 ## 36. Change history
+
+### Revision 6 — 2026-08-30
+
+Defined the Process Profile model. Added `enabled` and complete Dependency
+patches, validation for every selectable graph, one initial global CLI
+selection, per-Process selection, future-Run behavior, the conditional apply
+action, and the conditional TUI Profile column.
 
 ### Revision 5 — 2026-08-28
 

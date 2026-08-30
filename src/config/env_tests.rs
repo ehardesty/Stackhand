@@ -96,21 +96,21 @@ fn invalid_inline_environment_diagnostics_exclude_the_value() {
 }
 
 #[test]
-fn profile_and_local_environment_errors_name_their_source_without_values() {
+fn process_profile_and_local_environment_errors_name_their_source_without_values() {
     let directory = unique_directory("layered-errors");
     let config = directory.join("stackhand.yaml");
     let profile_secret = "profile-secret-sentinel";
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n  child:\n    command: [/usr/bin/true]\nprofiles:\n  profile:\n    overrides:\n      child:\n        environment:\n          SECRET_VALUE: [{profile_secret}]\n"
+            "version: 1\nprocesses:\n  child:\n    command: [/usr/bin/true]\n    profiles:\n      profile:\n        environment:\n          SECRET_VALUE: [{profile_secret}]\n"
         ),
     )
     .expect("profile configuration writes");
 
-    let profile_error = resolve(ResolutionRequest::explicit_with_profiles(
+    let profile_error = resolve(ResolutionRequest::explicit_with_profile(
         &config,
-        vec!["profile".to_string()],
+        Some("profile".to_string()),
     ))
     .expect_err("invalid profile environment values fail");
     assert!(profile_error.message.contains("profile 'profile'"));
@@ -132,7 +132,7 @@ fn profile_and_local_environment_errors_name_their_source_without_values() {
 
     let local_error = resolve(ResolutionRequest::Discover {
         start_dir: Some(directory.clone()),
-        profiles: Vec::new(),
+        profile: None,
     })
     .expect_err("invalid local environment values fail");
     assert!(
@@ -238,10 +238,8 @@ env_files: [project.env]
 processes:
   child:
     command: [/usr/bin/true]
-profiles:
-  profile:
-    overrides:
-      child:
+    profiles:
+      profile:
         environment:
           FROM_FILE: null
 "#,
@@ -255,7 +253,7 @@ profiles:
 
     let resolution = resolve(ResolutionRequest::Discover {
         start_dir: Some(directory.clone()),
-        profiles: vec!["profile".to_string()],
+        profile: Some("profile".to_string()),
     })
     .expect("profile and local nulls are valid");
     assert!(resolution.project().processes()[0].env.is_empty());
@@ -374,10 +372,8 @@ processes:
       REMOVE_PARENT: null
       REMOVE_BASE: base
     command: [/bin/sh, -c, 'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$LAYERED" "$PROJECT_ONLY" "$PROCESS_ONLY" "$BASE_ONLY" "$PROFILE_ONLY" "$LOCAL_ONLY" "$PARENT_ONLY" "${REMOVE_PARENT-unset}" "${REMOVE_PROJECT-unset}" "${REMOVE_PROCESS-unset}" "${REMOVE_BASE-unset}" "${REMOVE_PROFILE-unset}"']
-profiles:
-  profile:
-    overrides:
-      child:
+    profiles:
+      profile:
         environment:
           LAYERED: profile
           REMOVE_PROJECT: null
@@ -391,18 +387,20 @@ profiles:
         directory.join("stackhand.local.yaml"),
         r#"processes:
   child:
-    environment:
-      LAYERED: local
-      REMOVE_PROCESS: null
-      REMOVE_PROFILE: null
-      LOCAL_ONLY: local
+    profiles:
+      profile:
+        environment:
+          LAYERED: local
+          REMOVE_PROCESS: null
+          REMOVE_PROFILE: null
+          LOCAL_ONLY: local
 "#,
     )
     .expect("local override writes");
 
     let resolution = resolve(ResolutionRequest::Discover {
         start_dir: Some(directory.clone()),
-        profiles: vec!["profile".to_string()],
+        profile: Some("profile".to_string()),
     })
     .expect("layered configuration resolves");
     let process = &resolution.project().processes()[0];

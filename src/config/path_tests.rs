@@ -65,7 +65,7 @@ fn relative_program_and_probe_paths_use_the_base_project_directory() {
 }
 
 #[test]
-fn profiles_and_local_overrides_keep_the_base_path_anchor() {
+fn process_profiles_and_local_overrides_keep_the_base_path_anchor() {
     let dir = unique_directory("layers");
     fs::create_dir_all(dir.join("bin")).expect("program directory creates");
     fs::create_dir_all(dir.join("profile-cwd")).expect("profile cwd creates");
@@ -75,18 +75,18 @@ fn profiles_and_local_overrides_keep_the_base_path_anchor() {
     let path = dir.join("stackhand.yaml");
     fs::write(
         &path,
-        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\nprofiles:\n  profile:\n    overrides:\n      web:\n        cwd: profile-cwd\n        command: [./bin/profile]\n",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n    profiles:\n      profile:\n        cwd: profile-cwd\n        command: [./bin/profile]\n",
     )
     .expect("profile configuration writes");
     fs::write(
         dir.join("stackhand.local.yaml"),
-        "processes:\n  web:\n    cwd: local-cwd\n    command: [./bin/local]\n",
+        "processes:\n  web:\n    profiles:\n      profile:\n        cwd: local-cwd\n        command: [./bin/local]\n",
     )
     .expect("local configuration writes");
 
     let resolution = resolve(ResolutionRequest::Discover {
         start_dir: Some(dir.join("nested")),
-        profiles: vec!["profile".to_string()],
+        profile: Some("profile".to_string()),
     })
     .expect("profile and local paths resolve");
     let process = &resolution.project().processes()[0];

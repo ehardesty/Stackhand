@@ -11,15 +11,21 @@
 - direct command versus shell command validation;
 - relative path resolution;
 - environment precedence and null unsetting;
-- profile order;
-- local overlay precedence;
+- Process Profile field limits;
+- reserved `base` name;
+- initial global Process Profile selection;
+- missing profile fallback to base;
+- rare per-Process `profile` override;
+- Process Profile environment and list replacement;
+- complete Process Profile Dependency replacement;
+- validation of every selectable Process Profile Dependency graph;
+- Process Profile `enabled` changes and its default value of `true`;
+- local override precedence;
 - map/scalar/list/null merge semantics;
 - enable/disable/autostart interaction;
 - enabled and autostart default values;
-- ordered profile enable/disable conflicts;
 - field-specific `null` behavior;
 - explicit and parent-directory configuration discovery;
-- dependency removal through overlay;
 - duration and byte-size parsing;
 - output budget validation.
 
@@ -39,6 +45,12 @@
 - manual stop versus restart policy;
 - one-shot `on_failure` and rejected one-shot `always` policy;
 - automatic restart budget usage and reset;
+- current Run keeps its applied profile after a selection change;
+- later start and manual or automatic restart use the Next Profile;
+- a profile selection change does not restart, stop, start, or change Desired State;
+- apply-profile stops active Processes that the Next Profile disables;
+- apply-profile restarts affected active enabled autostart Processes;
+- apply-profile starts newly enabled Dependencies but no unrelated inactive Processes;
 - startup timeout transition;
 - restart limits and counter reset;
 - liveness failure;
@@ -149,6 +161,9 @@ Use Ratatui `TestBackend` where useful for:
 - logs/search view;
 - help/modal rendering;
 - metrics column collapse;
+- `p` global Process Profile cycling;
+- conditional `R: apply profile` control and affected-Process restart action;
+- conditional Profile column visibility;
 - narrow terminal behavior.
 
 Avoid brittle snapshots of dynamic terminal cell content when focused behavioral tests are clearer.
@@ -256,7 +271,7 @@ Implementation work should follow these constraints unless concrete evidence jus
 13. **Do not silently drop interactive input.**
 14. **Do not blindly grant terminal OSC clipboard access.**
 15. **Do not build a daemon, API, web UI, or plugin system before the local TUI is excellent.**
-16. **Do not over-design profile inheritance or list merge operators.**
+16. **Do not add Process Profile inheritance, stacking, or patch fields without a demonstrated Project need.**
 17. **Move generic Process coordination into configuration when the existing model represents it cleanly. Keep domain-specific work in Project commands or scripts.**
 18. **Do not steal Ctrl-C from a focused interactive child.**
 19. **Do not treat process spawn as equivalent to readiness when a readiness probe exists.**

@@ -1,8 +1,8 @@
 # Stackhand — Product and Technical Specification
 
-**Revision:** 5
+**Revision:** 6
 **Status:** Proposed north-star product and architecture specification
-**Last revised:** 2026-08-28
+**Last revised:** 2026-08-30
 **Audience:** Maintainers, contributors, designers, and reviewers
 **Product name:** Stackhand
 **Primary implementation language:** Rust
@@ -16,7 +16,7 @@ This is the canonical north-star specification. It defines durable product behav
 
 1. [Product direction](./specification/product-direction.md): purpose, goals, non-goals, principles, the Quadrant reference case, and product experience.
 2. [Architecture and lifecycle](./specification/architecture-and-lifecycle.md): ownership, Process and Run models, lifecycle behavior, probes, and Dependencies.
-3. [Runtime and configuration](./specification/runtime-and-configuration.md): restarts, shutdown, hooks, configuration, profiles, commands, and process I/O.
+3. [Runtime and configuration](./specification/runtime-and-configuration.md): restarts, shutdown, hooks, configuration, Process Profiles, commands, and process I/O.
 4. [Terminal and output](./specification/terminal-and-output.md): `libghostty-vt`, host input, selection, clipboard, output history, Logs, and memory limits.
 5. [Interface and operations](./specification/interface-and-operations.md): TUI behavior, metrics, diagnostics, Project actions, validation, concurrency, and platforms.
 6. [Safety and reference](./specification/safety-and-reference.md): errors, trust boundaries, illustrative types, example configuration, success criteria, and change history.

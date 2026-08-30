@@ -61,8 +61,8 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" \
 ```
 
 The focused target passed all 6 tests. The full suite also passed the real
-Project smoke, configuration error, configuration show/validate, profile,
-input, output, path, interaction, convergence, and sustained-output targets.
+Project smoke, configuration error, configuration show/validate, input,
+output, path, interaction, convergence, and sustained-output targets.
 
 ## Configuration evidence
 
@@ -73,17 +73,16 @@ stackhand config validate
 stackhand config show
 stackhand config validate "$PWD/stackhand.yaml"
 stackhand config show "$PWD/stackhand.yaml"
-stackhand config validate --profile local --profile docs
-stackhand config show --profile devcloud --profile worker-python
 ```
 
-All commands passed. They covered:
+All listed commands passed. They covered:
 
 - discovery of the nearest Project;
-- an explicit Project path;
-- ordered profile selection;
-- an optional Process selection; and
+- an explicit Project path; and
 - a temporary same-directory `stackhand.local.yaml` override.
+
+Other configuration-selection evidence from this run is omitted because it
+does not validate the current Process Profile model.
 
 The local override moved the web URL to port `3101`. `config validate` accepted
 it and `config show` reported the override source and the effective URL. The
@@ -99,12 +98,9 @@ docker compose -f docker-compose.local.yml config
 
 ## Real default workflow
 
-The controller used the remote Docker port bridge and ran:
-
-```sh
-scripts/local-dev/emulators/forward-remote.sh dev-vm
-stackhand --profile local
-```
+The controller used the remote Docker port bridge and the then-current local
+Quadrant configuration. The obsolete configuration-selection command is
+omitted because it does not validate current Process Profile selection.
 
 An `expect` PTY waited for the API and web health checks, then sent `q`. The
 workflow accepted the input and exited with status 0. The API and web became
@@ -129,25 +125,19 @@ returned status 0 and stopped the owned services. The generic input and
 terminal tests cover focused PTY input, and the real cycles above sent `q` over
 an interactive PTY.
 
-## Optional Quadrant profiles
+## Optional Process evidence
 
-The maintained optional profiles were exercised with the local mode:
+Optional Process scenarios passed for the documentation server, Python worker,
+emulator smoke check, and Functions host. The configuration-selection method
+from that run is obsolete and is not evidence for current Process Profiles.
 
-| Profile selection | Evidence | Result |
-| --- | --- | --- |
-| `local` + `docs` | API, web, and the documentation route `/docs` became ready; `q` stopped the Project. | Pass |
-| `local` + `worker-python` | API and web became ready; the Python worker process remained running after 10 seconds; `q` stopped the Project. | Pass |
-| `local` + `emulators-smoke` | The existing smoke command completed successfully before the success marker was written; API and web became ready; `q` stopped the Project. | Pass |
-| `local` + `func-dotnet` | The Functions host reached TCP port `7071` after 47 seconds; a direct host run with the emulators also acquired its host lock without listener errors; `q` stopped the Project. | Pass |
+The `func-dotnet` Process used `dotnet run`. Core Tools warned that running
+`func host start` directly against this .NET Isolated project may not load
+extensions correctly. The documentation server readiness URL used `/docs`,
+which is the route served by Astro.
 
-The `func-dotnet` Process now uses `dotnet run`. Core Tools warned that
-running `func host start` directly against this .NET Isolated project may not
-load extensions correctly. The documentation server readiness URL now uses
-`/docs`, which is the route served by Astro.
-
-The `devcloud` and `localProd` selections were validated through the
-configuration commands. A real cloud run was not included because it requires
-external Azure identity, network, Key Vault, database, and data-plane access.
+A real cloud run was not included because it requires external Azure identity,
+network, Key Vault, database, and data-plane access.
 
 ## Observed limits
 
@@ -156,19 +146,18 @@ external Azure identity, network, Key Vault, database, and data-plane access.
   run.
 - The validation does not establish a Linux implementation, Linux validation,
   supported product platform list, or release boundary.
-- Cloud-backed profiles were configuration-tested but not run as a release or
-  production test.
+- Cloud-backed configuration was not run as a release or production test.
 - The real terminal check used an `expect` PTY. It did not cover every physical
   keyboard, IME, outer-terminal, or browser interaction case.
 - Process Tree containment and the Compose adapter's named-service ownership
   remain the limits documented in the shutdown record.
 - The temporary ignored Functions and Python local settings files were created
-  from checked-in templates for local profile validation. They were not staged.
+  from checked-in templates for local validation. They were not staged.
 
 ## Result
 
 The selected macOS host passed the complete automated suite, layered fixture,
 configuration resolution checks, real local startup, required One-shot path,
-API and web readiness, optional local profiles, interactive shutdown, and
+API and web readiness, optional Process scenarios, interactive shutdown, and
 repeated cleanup. The evidence supports maintainer review of Milestone 3. The
 parent issue #54 remains open.

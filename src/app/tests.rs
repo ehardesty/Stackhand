@@ -2,7 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
 use super::interaction::{is_quit, mouse_changes_focus, mouse_starts_console_focus, should_quit};
 use super::view_model::{
-    format_age, format_cpu, format_rss, metric_precision, selected_header, status_label,
+    format_age, format_cpu, format_rss, metric_precision, process_list_title, process_rows,
+    selected_header, status_label,
 };
 use super::*;
 use crate::tui::process_row_at;
@@ -39,6 +40,50 @@ fn metric_and_age_labels_use_compact_units() {
     assert_eq!(format_age(61_000), "1m1s");
 }
 
+#[test]
+fn profile_column_appears_for_pending_and_mixed_process_profiles() {
+    let mut first = projection_process();
+    first.current_profile = Some("local".to_string());
+    first.next_profile = Some("cloud-dev".to_string());
+    let mut second = projection_process();
+    second.name = "worker".to_string();
+    second.process_id = crate::supervisor::ProcessId::new(2);
+    second.current_profile = Some("cloud-dev".to_string());
+    second.next_profile = Some("cloud-dev".to_string());
+    let snapshot = crate::supervisor::ProjectSnapshot {
+        processes: vec![first, second],
+        selected_profile: Some("cloud-dev".to_string()),
+        available_profiles: vec!["cloud-dev".to_string(), "local".to_string()],
+        shutdown: None,
+        now_ms: 0,
+    };
+
+    let rows = process_rows(&snapshot, 0);
+    assert_eq!(rows[0].profile.as_deref(), Some("local → cloud-dev"));
+    assert_eq!(rows[1].profile.as_deref(), Some("cloud-dev"));
+    assert_eq!(
+        process_list_title(&snapshot),
+        "Processes · Profile: cloud-dev · 1 pending"
+    );
+}
+
+#[test]
+fn profile_column_hides_when_global_profile_describes_every_process() {
+    let mut process = projection_process();
+    process.current_profile = Some("local".to_string());
+    process.next_profile = Some("local".to_string());
+    let snapshot = crate::supervisor::ProjectSnapshot {
+        processes: vec![process],
+        selected_profile: Some("local".to_string()),
+        available_profiles: vec!["local".to_string()],
+        shutdown: None,
+        now_ms: 0,
+    };
+
+    assert_eq!(process_rows(&snapshot, 0)[0].profile, None);
+    assert_eq!(process_list_title(&snapshot), "Processes · Profile: local");
+}
+
 fn projection_process() -> crate::supervisor::ProcessSnapshot {
     crate::supervisor::ProcessSnapshot {
         process_id: crate::supervisor::ProcessId::new(1),
@@ -51,6 +96,8 @@ fn projection_process() -> crate::supervisor::ProcessSnapshot {
         lifecycle: crate::supervisor::Lifecycle::Running,
         terminal_mode: crate::model::TerminalMode::Pipe,
         current_run: Some(7),
+        current_profile: None,
+        next_profile: None,
         root_pid: Some(42),
         run_started_at_ms: Some(1_000),
         failure: None,

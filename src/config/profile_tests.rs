@@ -2,501 +2,269 @@ use std::fs;
 
 use super::*;
 
-fn write_and_load_with_profile(
+fn write_and_load(
     label: &str,
     yaml: &str,
     profile: Option<&str>,
-) -> Result<EffectiveProject, ConfigError> {
-    let profiles = profile.into_iter().collect::<Vec<_>>();
-    write_and_load_with_profiles(label, yaml, &profiles)
-}
-
-fn write_and_load_with_profiles(
-    label: &str,
-    yaml: &str,
-    profiles: &[&str],
 ) -> Result<EffectiveProject, ConfigError> {
     let dir = std::env::temp_dir().join(format!("stackhand-config-{label}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("config directory creates");
     let path = dir.join("stackhand.yaml");
     fs::write(&path, yaml).expect("config writes");
-    let selected = profiles
-        .iter()
-        .map(|profile| (*profile).to_owned())
-        .collect::<Vec<_>>();
-    let project = load_file(&path, &selected);
+    let project = load_file(&path, profile);
     let _ = fs::remove_dir_all(&dir);
     project
 }
 
 #[test]
-fn one_profile_replaces_fields_enables_processes_and_adds_processes() {
-    let project = write_and_load_with_profile(
-        "profile-merge",
+fn one_process_profile_is_selected_and_missing_names_fall_back_to_base() {
+    let mut project = write_and_load(
+        "process-profile-selection",
         "version: 1
 processes:
-  web:
-    enabled: false
-    autostart: false
+  api:
+    command: [/bin/echo, base-api]
+    profiles:
+      local:
+        command: [/bin/echo, local-api]
+      cloud:
+        command: [/bin/echo, cloud-api]
+  worker:
+    command: [/bin/echo, base-worker]
+    profiles:
+      local:
+        command: [/bin/echo, local-worker]
+",
+        Some("cloud"),
+    )
+    .expect("all Process Profiles are valid");
+
+    assert_eq!(project.process_profile_names(), ["cloud", "local"]);
+    assert_eq!(project.selected_process_profile(), Some("cloud"));
+    assert_eq!(project.process_profile(0), Some("cloud"));
+    assert_eq!(project.process_profile(1), None);
+    assert_eq!(direct_args(&project.processes()[0]), ["cloud-api"]);
+    assert_eq!(direct_args(&project.processes()[1]), ["base-worker"]);
+
+    assert!(project.select_process_profile(Some("local")));
+    assert_eq!(project.process_profile(0), Some("local"));
+    assert_eq!(project.process_profile(1), Some("local"));
+    assert_eq!(direct_args(&project.processes()[0]), ["local-api"]);
+    assert_eq!(direct_args(&project.processes()[1]), ["local-worker"]);
+
+    assert!(!project.select_process_profile(Some("missing")));
+    assert_eq!(project.selected_process_profile(), Some("local"));
+}
+
+#[test]
+fn a_process_profile_override_wins_and_base_is_reserved_for_the_base_spec() {
+    let mut project = write_and_load(
+        "process-profile-overrides",
+        "version: 1
+processes:
+  pinned:
+    profile: local
+    command: [/bin/echo, base-pinned]
+    profiles:
+      local:
+        command: [/bin/echo, local-pinned]
+      cloud:
+        command: [/bin/echo, cloud-pinned]
+  base-pinned:
+    profile: base
+    command: [/bin/echo, base-fixed]
+    profiles:
+      local:
+        command: [/bin/echo, local-fixed]
+",
+        Some("cloud"),
+    )
+    .expect("Process Profile overrides are valid");
+
+    assert_eq!(project.process_profile(0), Some("local"));
+    assert_eq!(project.process_profile(1), None);
+    assert_eq!(direct_args(&project.processes()[0]), ["local-pinned"]);
+    assert_eq!(direct_args(&project.processes()[1]), ["base-fixed"]);
+
+    assert!(project.select_process_profile(None));
+    assert_eq!(project.process_profile(0), Some("local"));
+    assert_eq!(project.process_profile(1), None);
+}
+
+#[test]
+fn enabled_defaults_to_true_and_a_process_profile_can_disable_a_process() {
+    let project = write_and_load(
+        "process-profile-enabled",
+        "version: 1
+processes:
+  api:
     command: [/usr/bin/true]
+    profiles:
+      cloud:
+        environment:
+          MODE: cloud
+  local-storage:
+    command: [/usr/bin/true]
+    profiles:
+      cloud:
+        enabled: false
+",
+        Some("cloud"),
+    )
+    .expect("enabled is an allowed Process Profile field");
+
+    assert_eq!(project.processes()[0].enabled, Enabled::Yes);
+    assert_eq!(project.processes()[1].enabled, Enabled::No);
+}
+
+#[test]
+fn a_process_profile_replaces_the_complete_dependency_mapping() {
+    let mut project = write_and_load(
+        "process-profile-dependencies",
+        "version: 1
+processes:
+  api:
+    depends_on:
+      local-db: ready
+    command: [/usr/bin/true]
+    profiles:
+      cloud:
+        depends_on:
+          cloud-login: completed_successfully
+  local-db:
+    kind: service
+    command: [/usr/bin/true]
+  cloud-login:
+    kind: one-shot
+    command: [/usr/bin/true]
+",
+        None,
+    )
+    .expect("every selectable Dependency graph is valid");
+
+    let base_dependencies = project
+        .resolved_dependencies(0)
+        .map(|(_, dependency)| dependency.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(base_dependencies, ["local-db"]);
+
+    assert!(project.select_process_profile(Some("cloud")));
+    let cloud_dependencies = project
+        .resolved_dependencies(0)
+        .map(|(_, dependency)| dependency.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(cloud_dependencies, ["cloud-login"]);
+}
+
+#[test]
+fn every_selectable_profile_dependency_graph_is_validated() {
+    let error = write_and_load(
+        "process-profile-dependency-cycle",
+        "version: 1
+processes:
+  api:
+    command: [/usr/bin/true]
+    profiles:
+      cloud:
+        depends_on: {worker: started}
   worker:
     command: [/usr/bin/true]
-profiles:
-  local:
-    enable: [web]
-    disable: [worker]
-    overrides:
-      web:
-        environment: {MODE: local}
-        command: [/bin/echo, profile]
-      added:
-        kind: one-shot
-        autostart: false
-        command: [/usr/bin/true]
+    profiles:
+      cloud:
+        depends_on: {api: started}
 ",
-        Some("local"),
+        None,
     )
-    .expect("the selected profile is valid");
+    .expect_err("an invalid unselected profile must fail before startup");
 
-    let names = project
-        .processes()
-        .iter()
-        .map(|process| process.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["web", "worker", "added"]);
-
-    let web = &project.processes()[0];
-    assert_eq!(web.enabled, Enabled::Yes);
-    assert_eq!(web.autostart, Autostart::No);
-    assert_eq!(project.processes()[1].enabled, Enabled::No);
-    assert_eq!(project.processes()[1].autostart, Autostart::Yes);
-    assert_eq!(web.env, [("MODE".to_string(), "local".to_string())]);
-    assert_eq!(
-        web.command,
-        CommandForm::Direct {
-            program: std::ffi::OsString::from("/bin/echo"),
-            args: vec![std::ffi::OsString::from("profile")],
-        }
-    );
-    assert_eq!(project.processes()[2].kind, ProcessKind::OneShot);
-    assert_eq!(project.processes()[2].autostart, Autostart::No);
-}
-
-#[test]
-fn a_profile_can_replace_project_shell_settings() {
-    let project = write_and_load_with_profile(
-        "profile-settings",
-        "version: 1
-processes:
-  web:
-    shell: printf profile-shell
-profiles:
-  local:
-    settings:
-      shell:
-        program: /bin/bash
-        args: [-lc]
-",
-        Some("local"),
-    )
-    .expect("profile settings are valid");
-    assert_eq!(
-        project.shell().program,
-        std::ffi::OsString::from("/bin/bash")
-    );
-    assert_eq!(project.shell().args, [std::ffi::OsString::from("-lc")]);
-}
-
-#[test]
-fn profile_selection_is_explicit_and_unknown_names_fail() {
-    let yaml = "version: 1
-processes:
-  web:
-    command: [/usr/bin/true]
-profiles:
-  local:
-    overrides:
-      added: {}
-";
-    let base = write_and_load_with_profile("profile-no-implicit-selection", yaml, None)
-        .expect("the base configuration does not select a profile");
-    assert_eq!(base.processes().len(), 1);
-
-    let error = write_and_load_with_profile("profile-unknown", yaml, Some("missing"))
-        .expect_err("an unknown profile must fail");
     assert!(
-        error.message.contains("unknown profile 'missing'"),
-        "{error}"
-    );
-
-    let error = write_and_load_with_profile("profile-invalid-added-process", yaml, Some("local"))
-        .expect_err("an incomplete profile Process must fail validation");
-    assert!(
-        error.message.contains("Process 'added'")
-            && error
-                .message
-                .contains("exactly one of 'command' or 'shell'"),
+        error
+            .message
+            .contains("Process Profile 'cloud' produces an invalid Project")
+            && error.message.contains("api -> worker -> api"),
         "{error}"
     );
 }
 
 #[test]
-fn profiles_cannot_define_profiles_or_change_the_schema_version() {
-    for (label, field) in [("nested", "profiles: {}"), ("version", "version: 2")] {
-        let error = write_and_load_with_profile(
-            &format!("profile-forbidden-{label}"),
-            &format!("version: 1\nprocesses: {{}}\nprofiles:\n  local:\n    {field}\n"),
-            Some("local"),
+fn process_profiles_reject_reserved_names_forbidden_fields_and_invalid_specs() {
+    for (label, profile, expected) in [
+        (
+            "base-name",
+            "base:\n        command: [/usr/bin/true]",
+            "reserved",
+        ),
+        (
+            "topology",
+            "local:\n        autostart: false",
+            "cannot change field 'autostart'",
+        ),
+        (
+            "invalid-command",
+            "local:\n        command: []",
+            "command must contain",
+        ),
+    ] {
+        let error = write_and_load(
+            &format!("process-profile-{label}"),
+            &format!(
+                "version: 1\nprocesses:\n  api:\n    command: [/usr/bin/true]\n    profiles:\n      {profile}\n"
+            ),
+            None,
         )
-        .expect_err("forbidden profile field must fail");
-        assert!(
-            error.message.contains("unknown field")
-                && error.message.contains(field.split(':').next().unwrap()),
-            "{label}: {error}"
-        );
+        .expect_err("every invalid Process Profile must fail before startup");
+        assert!(error.message.contains(expected), "{label}: {error}");
     }
 }
 
 #[test]
-fn ordered_profiles_deep_merge_maps_and_replace_scalars_and_lists() {
-    let yaml = "version: 1
-settings:
-  shell:
-    program: /bin/sh
-    args: [-c]
-processes:
-  web:
-    enabled: true
-    command: [/bin/echo, base]
-    environment:
-      BASE: base
-    success_exit_codes: [0, 1]
-profiles:
-  first:
-    disable: [web]
-    settings:
-      shell:
-        args: [-lc]
-    overrides:
-      web:
-        command: [/bin/echo, first]
-        environment:
-          FIRST: first
-        success_exit_codes: [2, 3]
-      first-added:
-        command: [/usr/bin/true]
-  second:
-    enable: [web]
-    settings:
-      shell:
-        program: /bin/bash
-    overrides:
-      web:
-        command: [/bin/echo, second]
-        environment:
-          SECOND: second
-        success_exit_codes: [7]
-      second-added:
-        command: [/usr/bin/true]
-";
-
-    let forward =
-        write_and_load_with_profiles("profile-ordered-forward", yaml, &["first", "second"])
-            .expect("profiles merge in CLI order");
-    let names = forward
-        .processes()
-        .iter()
-        .map(|process| process.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["web", "first-added", "second-added"]);
-    let web = &forward.processes()[0];
-    assert_eq!(web.enabled, Enabled::Yes);
-    assert_eq!(web.success_exit_codes, [7]);
-    assert_eq!(
-        web.command,
-        CommandForm::Direct {
-            program: std::ffi::OsString::from("/bin/echo"),
-            args: vec![std::ffi::OsString::from("second")],
-        }
-    );
-    assert_eq!(
-        web.env,
-        [
-            ("BASE".to_string(), "base".to_string()),
-            ("FIRST".to_string(), "first".to_string()),
-            ("SECOND".to_string(), "second".to_string()),
-        ]
-    );
-    assert_eq!(
-        forward.shell().program,
-        std::ffi::OsString::from("/bin/bash")
-    );
-    assert_eq!(forward.shell().args, [std::ffi::OsString::from("-lc")]);
-
-    let reverse =
-        write_and_load_with_profiles("profile-ordered-reverse", yaml, &["second", "first"])
-            .expect("the reverse profile order is also valid");
-    assert_eq!(reverse.processes()[0].enabled, Enabled::No);
-    assert_eq!(reverse.processes()[0].success_exit_codes, [2, 3]);
-    assert_eq!(
-        reverse.processes()[0].command,
-        CommandForm::Direct {
-            program: std::ffi::OsString::from("/bin/echo"),
-            args: vec![std::ffi::OsString::from("first")],
-        }
-    );
-}
-
-#[test]
-fn null_clears_optional_fields_and_named_map_entries() {
-    let project = write_and_load_with_profiles(
-        "profile-null-clears",
+fn top_level_profiles_are_rejected() {
+    let error = write_and_load(
+        "top-level-profile",
         "version: 1
 processes:
-  db:
-    kind: one-shot
+  api:
     command: [/usr/bin/true]
-  web:
-    command: [/usr/bin/true]
-    environment:
-      KEEP: keep
-      REMOVE: remove
-    depends_on:
-      db: started
-    terminal: {mode: pty, input: focused}
-    ready:
-      tcp: {host: 127.0.0.1, port: 5432}
-    liveness:
-      log: {contains: healthy}
-    restart: {policy: on_failure, backoff: 1s, max_restarts: 2}
 profiles:
-  clean:
-    overrides:
-      web:
-        environment:
-          REMOVE: null
-          ADD: add
-        depends_on:
-          db: null
-        terminal: null
-        ready: null
-        liveness: null
-        restart: null
+  cloud: {}
 ",
-        &["clean"],
+        None,
     )
-    .expect("null values clear optional configuration");
-    let web = &project.processes()[1];
-    assert_eq!(
-        web.env,
-        [
-            ("ADD".to_string(), "add".to_string()),
-            ("KEEP".to_string(), "keep".to_string()),
-        ]
-    );
-    assert!(web.dependencies.is_empty());
-    assert!(web.readiness.is_none());
-    assert!(web.liveness.is_none());
-    assert_eq!(web.restart, RestartConfig::default());
-    assert_eq!(web.terminal_mode, TerminalMode::Pipe);
-    assert_eq!(web.input_policy, InputPolicy::Disabled);
-}
+    .expect_err("top-level profiles are not part of the schema");
 
-#[test]
-fn base_environment_nulls_remove_inherited_environment_values() {
-    let project = write_and_load_with_profiles(
-        "base-null-environment",
-        "version: 1
-processes:
-  web:
-    command: [/usr/bin/true]
-    environment:
-      MISSING: null
-profiles:
-  clean:
-    overrides:
-      web:
-        environment:
-          MISSING: null
-",
-        &[],
-    )
-    .expect("base environment nulls are removal instructions");
-    assert!(project.processes()[0].env.is_empty());
-    assert_eq!(project.processes()[0].env_remove, ["MISSING"]);
-}
-
-#[test]
-fn null_cannot_define_a_profile_process_or_required_command() {
-    let complete_process = write_and_load_with_profiles(
-        "profile-null-process",
-        "version: 1
-processes:
-  web:
-    command: [/usr/bin/true]
-profiles:
-  bad:
-    overrides:
-      added: null
-",
-        &["bad"],
-    )
-    .expect_err("a null profile Process is not complete");
     assert!(
-        complete_process
-            .message
-            .contains("Process 'added' must define a complete Process"),
-        "{complete_process}"
-    );
-
-    let required_field = write_and_load_with_profiles(
-        "profile-null-command",
-        "version: 1
-processes:
-  web:
-    command: [/usr/bin/true]
-profiles:
-  bad:
-    overrides:
-      web:
-        command: null
-",
-        &["bad"],
-    )
-    .expect_err("a required command form cannot be cleared");
-    assert!(
-        required_field
-            .message
-            .contains("Process 'web': define exactly one of 'command' or 'shell'"),
-        "{required_field}"
+        error.message.contains("unknown field `profiles`"),
+        "{error}"
     );
 }
 
 #[test]
-fn dependencies_are_checked_after_profile_merge_and_enablement_does_not_remove_them() {
-    let repaired = write_and_load_with_profiles(
-        "profile-graph-repair",
+fn an_unknown_selected_process_profile_is_rejected() {
+    let error = write_and_load(
+        "unknown-process-profile",
         "version: 1
 processes:
-  web:
+  api:
     command: [/usr/bin/true]
-    depends_on: {cache: started}
-profiles:
-  repair:
-    overrides:
-      cache:
-        command: [/usr/bin/true]
+    profiles:
+      local: {}
 ",
-        &["repair"],
+        Some("missing"),
     )
-    .expect("a profile can add a missing dependency before graph validation");
-    assert_eq!(repaired.processes().len(), 2);
-    assert_eq!(repaired.processes()[0].dependencies[0].name, "cache");
+    .expect_err("the selected Process Profile must exist on at least one Process");
 
-    let base_error = write_and_load_with_profiles(
-        "profile-graph-base-error",
-        "version: 1
-processes:
-  web:
-    command: [/usr/bin/true]
-    depends_on: {cache: started}
-profiles:
-  repair:
-    overrides:
-      cache:
-        command: [/usr/bin/true]
-",
-        &[],
-    )
-    .expect_err("the unmerged graph must fail");
     assert!(
-        base_error.message.contains("dependency 'cache'"),
-        "{base_error}"
+        error.message.contains("unknown Process Profile 'missing'"),
+        "{error}"
     );
-
-    let disabled = write_and_load_with_profiles(
-        "profile-graph-disabled",
-        "version: 1
-processes:
-  cache:
-    command: [/usr/bin/true]
-  web:
-    command: [/usr/bin/true]
-    depends_on: {cache: started}
-profiles:
-  no-cache:
-    disable: [cache]
-",
-        &["no-cache"],
-    )
-    .expect("a disabled Process remains available to Dependencies");
-    assert_eq!(disabled.processes()[0].enabled, Enabled::No);
-    assert_eq!(disabled.processes()[1].dependencies[0].name, "cache");
 }
 
-#[test]
-fn profile_changes_can_repair_kind_checks_and_create_cycles() {
-    let repaired_kind = write_and_load_with_profiles(
-        "profile-kind-repair",
-        "version: 1
-processes:
-  setup:
-    command: [/usr/bin/true]
-    depends_on: {db: completed_successfully}
-  db:
-    command: [/usr/bin/true]
-profiles:
-  repair:
-    overrides:
-      db:
-        kind: one-shot
-",
-        &["repair"],
-    )
-    .expect("kind validation uses the merged Process definitions");
-    assert_eq!(repaired_kind.processes()[1].kind, ProcessKind::OneShot);
-
-    let cycle = write_and_load_with_profiles(
-        "profile-cycle",
-        "version: 1
-processes:
-  first:
-    command: [/usr/bin/true]
-  second:
-    command: [/usr/bin/true]
-profiles:
-  loop:
-    overrides:
-      first:
-        depends_on: {second: started}
-      second:
-        depends_on: {first: started}
-",
-        &["loop"],
-    )
-    .expect_err("cycle validation uses the merged Dependency graph");
-    assert!(cycle.message.contains("dependency cycle"), "{cycle}");
-
-    let broken = write_and_load_with_profiles(
-        "profile-graph-break",
-        "version: 1
-processes:
-  db:
-    command: [/usr/bin/true]
-  web:
-    command: [/usr/bin/true]
-    depends_on: {db: started}
-profiles:
-  break:
-    overrides:
-      web:
-        depends_on:
-          db: null
-          missing: started
-",
-        &["break"],
-    )
-    .expect_err("graph validation must run after null Dependency removal");
-    assert!(broken.message.contains("dependency 'missing'"), "{broken}");
+fn direct_args(process: &ProcessSpec) -> Vec<&str> {
+    let CommandForm::Direct { args, .. } = &process.command else {
+        panic!("the test Process uses a direct command");
+    };
+    args.iter()
+        .map(|arg| arg.to_str().expect("UTF-8 test arg"))
+        .collect()
 }

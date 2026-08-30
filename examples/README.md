@@ -21,6 +21,10 @@ j/k or Up/Down   select a Process
 s                start the selected Process
 x                stop the selected Process
 r                restart a Service or rerun a One-shot
+p                cycle the global Process Profile for future Runs
+R                apply pending profile changes when the footer shows this key
+                 (stops disabled active Processes and restarts affected active
+                 enabled autostart Processes; does not start inactive Processes)
 PageUp/PageDown  inspect retained output
 f                return to live output
 v                enter Copy mode for a PTY console
@@ -86,6 +90,6 @@ The example is intentionally noisy. Press `Ctrl-Q` when the check is complete.
 ## Current limits
 
 These examples are for the current macOS prototype. Windows is not supported.
-Linux interactive PTY behavior is not yet current validation evidence.
-Stackhand does not yet support hooks, profiles, overlays, or configuration
-discovery.
+Linux interactive PTY behavior is not yet current validation evidence. These
+examples do not yet show hooks, Process Profiles, local overrides, or
+configuration discovery.

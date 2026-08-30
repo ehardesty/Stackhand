@@ -69,24 +69,18 @@ pub fn run(config_path: &Path) -> Result<()> {
 
 /// Run the integrated fixture with one selected configuration profile.
 pub fn run_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
-    let profiles = profile.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    run_with_profiles(config_path, &profiles)
-}
-
-/// Run the integrated fixture with profiles selected in CLI order.
-pub fn run_with_profiles(config_path: &Path, profiles: &[String]) -> Result<()> {
-    let request = crate::config::ResolutionRequest::explicit_with_profiles(
+    let request = crate::config::ResolutionRequest::explicit_with_profile(
         config_path,
-        profiles.iter().cloned(),
+        profile.map(str::to_owned),
     );
-    run_request(request, !profiles.is_empty())
+    run_request(request, profile.is_some())
 }
 
 /// Discover the base Project from the current directory and run the fixture.
-pub fn run_discovered_with_profiles(profiles: &[String]) -> Result<()> {
+pub fn run_discovered_with_profile(profile: Option<&str>) -> Result<()> {
     let request =
-        crate::config::ResolutionRequest::discover_with_profiles(profiles.iter().cloned());
-    run_request(request, !profiles.is_empty())
+        crate::config::ResolutionRequest::discover_with_profile(profile.map(str::to_owned));
+    run_request(request, profile.is_some())
 }
 
 fn run_request(request: crate::config::ResolutionRequest, profile_selected: bool) -> Result<()> {

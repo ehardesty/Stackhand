@@ -4,6 +4,16 @@ use crate::supervisor::{Lifecycle, LivenessState, ProcessSnapshot, ProjectSnapsh
 use crate::tui::ProcessRowView;
 
 pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
+    let show_profiles = snapshot.processes.iter().any(|process| {
+        process
+            .current_profile
+            .as_deref()
+            .is_some_and(|current| Some(current) != process.next_profile.as_deref())
+            || process.current_run.is_some()
+                && process.current_profile.is_none()
+                && process.next_profile.is_some()
+            || process.next_profile.as_deref() != snapshot.selected_profile.as_deref()
+    });
     snapshot
         .processes
         .iter()
@@ -11,6 +21,7 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
         .map(|(index, process)| ProcessRowView {
             name: process.name.clone(),
             status: status_label(process),
+            profile: show_profiles.then(|| profile_label(process)),
             cpu: process.metrics.map(|metrics| {
                 metric_precision(format_cpu(metrics.cpu_percent), metrics.best_effort)
             }),
@@ -20,6 +31,44 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
             selected: index == selected,
         })
         .collect()
+}
+
+fn profile_label(process: &ProcessSnapshot) -> String {
+    let next = process.next_profile.as_deref().unwrap_or("base");
+    match process.current_run {
+        Some(_) if process.current_profile.as_deref().unwrap_or("base") != next => format!(
+            "{} → {next}",
+            process.current_profile.as_deref().unwrap_or("base")
+        ),
+        _ => next.to_string(),
+    }
+}
+
+pub(super) fn profile_changes_pending(snapshot: &ProjectSnapshot) -> bool {
+    snapshot.processes.iter().any(|process| {
+        process.current_run.is_some()
+            && process.current_profile.as_deref() != process.next_profile.as_deref()
+    })
+}
+
+pub(super) fn process_list_title(snapshot: &ProjectSnapshot) -> String {
+    if snapshot.available_profiles.is_empty() {
+        return "Processes".to_string();
+    }
+    let selected = snapshot.selected_profile.as_deref().unwrap_or("base");
+    let pending = snapshot
+        .processes
+        .iter()
+        .filter(|process| {
+            process.current_run.is_some()
+                && process.current_profile.as_deref() != process.next_profile.as_deref()
+        })
+        .count();
+    if pending == 0 {
+        format!("Processes · Profile: {selected}")
+    } else {
+        format!("Processes · Profile: {selected} · {pending} pending")
+    }
 }
 
 /// A compact CPU column: one decimal place at most, no more precision than
@@ -55,7 +104,7 @@ pub(super) fn format_rss(kib: u64) -> String {
 /// Project structured lifecycle state into the concise row label. The label
 /// is a projection; the snapshot remains the authority.
 pub(super) fn status_label(process: &ProcessSnapshot) -> String {
-    if !process.enabled {
+    if !process.enabled && process.current_run.is_none() {
         return "Disabled".to_string();
     }
     if process.lifecycle == Lifecycle::Done {

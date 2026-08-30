@@ -4,7 +4,7 @@
 //! [`EffectiveProject`]. The Supervisor consumes that validated Project and
 //! never sees YAML text or diagnostics.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -321,6 +321,11 @@ pub enum ProjectError {
     },
     /// The Dependency graph has a cycle; the path repeats its first name.
     DependencyCycle(Vec<String>),
+    /// One selectable Process Profile produces an invalid effective Project.
+    InvalidProcessProfileGraph {
+        profile: String,
+        source: Box<ProjectError>,
+    },
 }
 
 /// The launcher used for shell-expression commands in one Project.
@@ -345,10 +350,22 @@ impl Default for ShellConfig {
 /// is configuration order and stays stable for the session.
 #[derive(Clone, Default)]
 pub struct EffectiveProject {
+    /// The Process specifications selected for each next Run.
     processes: Vec<ProcessSpec>,
+    /// The stable base specifications. Process Profile selection never changes
+    /// Process identity or order.
+    base_processes: Vec<ProcessSpec>,
+    /// Fully resolved and validated named specifications for each Process.
+    process_profiles: Vec<BTreeMap<String, ProcessSpec>>,
+    /// A fixed Process selection. `base` is the reserved base override.
+    process_profile_overrides: Vec<Option<String>>,
+    selected_process_profile: Option<String>,
+    process_profile_names: Vec<String>,
     positions: HashMap<String, usize>,
     /// Each inner list follows its Process's configured Dependency order.
     dependency_indices: Vec<Vec<usize>>,
+    /// Validated Dependency graph for base and each global selection.
+    dependency_indices_by_profile: BTreeMap<Option<String>, Vec<Vec<usize>>>,
     shell: ShellConfig,
 }
 
@@ -430,15 +447,122 @@ impl EffectiveProject {
             return Err(ProjectError::DependencyCycle(path));
         }
         Ok(Self {
+            base_processes: processes.clone(),
+            process_profiles: vec![BTreeMap::new(); processes.len()],
+            process_profile_overrides: vec![None; processes.len()],
+            selected_process_profile: None,
+            process_profile_names: Vec::new(),
             processes,
             positions,
-            dependency_indices,
+            dependency_indices: dependency_indices.clone(),
+            dependency_indices_by_profile: BTreeMap::from([(None, dependency_indices)]),
             shell,
         })
     }
 
+    /// Attach every Process Profile, validate each selectable Dependency graph,
+    /// then select the initial global profile for future Runs.
+    pub(crate) fn with_process_profiles(
+        processes: Vec<ProcessSpec>,
+        process_profiles: Vec<BTreeMap<String, ProcessSpec>>,
+        process_profile_overrides: Vec<Option<String>>,
+        selected_process_profile: Option<String>,
+        process_profile_names: Vec<String>,
+        shell: ShellConfig,
+    ) -> Result<Self, ProjectError> {
+        debug_assert_eq!(processes.len(), process_profiles.len());
+        debug_assert_eq!(processes.len(), process_profile_overrides.len());
+        let mut project = Self::with_shell(processes, shell.clone())?;
+        project.process_profiles = process_profiles;
+        project.process_profile_overrides = process_profile_overrides;
+        project.process_profile_names = process_profile_names;
+        project.dependency_indices_by_profile.clear();
+
+        let selections = std::iter::once(None)
+            .chain(project.process_profile_names.iter().cloned().map(Some))
+            .collect::<Vec<_>>();
+        for selection in selections {
+            let processes = project.processes_for_selection(selection.as_deref());
+            let validated = Self::with_shell(processes, shell.clone()).map_err(|source| {
+                ProjectError::InvalidProcessProfileGraph {
+                    profile: selection.as_deref().unwrap_or("base").to_string(),
+                    source: Box::new(source),
+                }
+            })?;
+            project
+                .dependency_indices_by_profile
+                .insert(selection, validated.dependency_indices);
+        }
+
+        let selected = selected_process_profile.as_deref();
+        debug_assert!(selected.is_none_or(|name| {
+            project
+                .process_profile_names
+                .iter()
+                .any(|item| item == name)
+        }));
+        project.select_process_profile(selected);
+        Ok(project)
+    }
+
     pub fn processes(&self) -> &[ProcessSpec] {
         &self.processes
+    }
+
+    /// The global Process Profile selected for future Runs. `None` is base.
+    pub(crate) fn selected_process_profile(&self) -> Option<&str> {
+        self.selected_process_profile.as_deref()
+    }
+
+    /// Every named Process Profile in stable lexical order.
+    pub(crate) fn process_profile_names(&self) -> &[String] {
+        &self.process_profile_names
+    }
+
+    /// The effective Process Profile label for the next Run. A fixed
+    /// per-Process override wins over the global selection; `None` is base.
+    pub(crate) fn process_profile(&self, index: usize) -> Option<&str> {
+        self.process_profile_for_selection(index, self.selected_process_profile.as_deref())
+    }
+
+    fn process_profile_for_selection<'a>(
+        &'a self,
+        index: usize,
+        selection: Option<&'a str>,
+    ) -> Option<&'a str> {
+        match self.process_profile_overrides.get(index)?.as_deref() {
+            Some("base") => None,
+            Some(name) => Some(name),
+            None => selection.filter(|name| self.process_profiles[index].contains_key(*name)),
+        }
+    }
+
+    fn processes_for_selection(&self, selection: Option<&str>) -> Vec<ProcessSpec> {
+        (0..self.base_processes.len())
+            .map(|index| {
+                self.process_profile_for_selection(index, selection)
+                    .and_then(|name| self.process_profiles[index].get(name))
+                    .unwrap_or(&self.base_processes[index])
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Select one global Process Profile and replace the next-Run
+    /// specifications and validated Dependency graph. A missing name leaves
+    /// the current selection unchanged.
+    pub(crate) fn select_process_profile(&mut self, profile: Option<&str>) -> bool {
+        if profile.is_some_and(|name| !self.process_profile_names.iter().any(|item| item == name)) {
+            return false;
+        }
+        let key = profile.map(str::to_owned);
+        let Some(dependency_indices) = self.dependency_indices_by_profile.get(&key).cloned() else {
+            return false;
+        };
+        self.processes = self.processes_for_selection(profile);
+        self.dependency_indices = dependency_indices;
+        self.selected_process_profile = key;
+        true
     }
 
     /// Return the Project's shell launcher for shell-expression commands.

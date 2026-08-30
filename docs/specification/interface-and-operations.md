@@ -23,7 +23,10 @@ Keep the visual hierarchy close to mprocs:
  status/help footer
 ```
 
-The console should receive most of the screen width and height.
+The console should receive most of the screen width and height. The Process list
+MUST show a Profile column when a current Run's applied profile differs from its
+Next Profile, or when any Process's Next Profile differs from the global Process
+Profile. It SHOULD hide the column at other times.
 
 ### 24.2 Process row data
 
@@ -32,14 +35,18 @@ Minimum visible fields:
 - name;
 - primary status;
 - optional compact CPU;
-- optional compact memory.
+- optional compact memory;
+- conditional current and Next Profile.
+
+When the Profile column is visible, a running Process with different profiles
+shows `current → next`. Other rows show the Next Profile.
 
 Example:
 
 ```text
-api           READY      3.2%   184M
-worker        WAITING      -       -
-init-storage  DONE         -       -
+api           READY      local → devcloud   3.2%   184M
+worker        WAITING    devcloud               -       -
+init-storage  DONE       base                   -       -
 ```
 
 Metrics columns may be toggled when space is limited.
@@ -69,7 +76,7 @@ The underlying state remains structured; labels are presentation only.
 A compact header may show:
 
 ```text
-api · run 3 · PID 48122 · READY · 2m14s · 184 MiB · 3.2% CPU · restarts 1 · TERMINAL
+api · run 3 · local → devcloud · PID 48122 · READY · 2m14s · 184 MiB · 3.2% CPU · restarts 1 · TERMINAL
 ```
 
 For a blocked process:
@@ -106,6 +113,8 @@ When the process list is focused:
 s              start selected
 x              stop selected
 r              restart/rerun selected
+p              cycle the global Process Profile for future Runs
+R              apply a pending profile change; shown only while changes are pending
 z              zoom console
 /              search selected output
 l              toggle Terminal/Logs view
@@ -277,6 +286,8 @@ The product supports:
 - Start All: start every enabled Process;
 - stop all;
 - restart all currently running services;
+- cycle the global Process Profile for future Runs;
+- apply pending profile changes to affected active Processes;
 - start selected;
 - stop selected;
 - restart selected service;
@@ -294,7 +305,26 @@ Stop-all suppresses automatic restarts for the action and drives desired state t
 
 ### 27.3 Restart all
 
-Restart-all should operate on processes that are currently running or in startup/restart state. It should not unexpectedly start disabled or manually stopped optional processes.
+Restart-all should operate on Processes that are currently running or in
+startup/restart state. It should not unexpectedly start disabled or manually
+stopped optional Processes.
+
+`p` cycles the global Process Profile. This selection has no immediate
+lifecycle effect. It changes Next Profiles only. It MUST NOT change Desired
+State or modify, stop, restart, or start a Process. Active Processes continue.
+
+When at least one current Run differs from its Next Profile, the footer MUST
+show `R: apply profile`. It MUST hide this control when no profile change is
+pending. An affected Process has an active Run whose applied profile differs
+from its Next Profile.
+
+`R` MUST stop each affected active Process whose Next Profile disables it. It
+MUST restart each affected active Process that remains enabled and uses
+autostart. The restart MUST start each newly enabled Dependency required by the
+Process's Next Profile. It MUST NOT start other inactive Processes that the Next
+Profile newly enables. The user can start those Processes manually. An affected
+active Process that remains enabled but does not use autostart continues without
+a restart.
 
 ### 27.4 Quit
 
@@ -324,10 +354,12 @@ Validation occurs before any project process starts.
 ### 28.2 Graph validation
 
 - every referenced dependency exists;
-- no dependency cycles;
+- no dependency cycles in base or any selectable global Process Profile;
 - disabled dependencies remain representable and diagnosable;
 - conditions are valid for referenced processes;
-- profile/overlay result is graph-valid.
+- each Process Profile uses only allowed fields;
+- `base` is not defined as a Process Profile;
+- each per-Process `profile` override names `base` or a profile defined by that Process.
 
 ### 28.3 Path validation
 
@@ -361,7 +393,7 @@ Configuration errors should include:
 - YAML path;
 - line/column when available;
 - concise explanation;
-- relevant process/profile name.
+- relevant Process or Process Profile name.
 
 The TUI must not half-start a project with an invalid effective graph.
 

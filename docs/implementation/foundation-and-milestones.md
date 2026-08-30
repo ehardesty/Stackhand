@@ -351,7 +351,6 @@ Add:
 - base Project discovery from the current directory and its parents;
 - explicit Project paths that disable base-file discovery;
 - local override discovery;
-- named profiles applied in CLI order;
 - deterministic merge rules;
 - environment files and inline environment;
 - path-resolution rules;
@@ -368,7 +367,6 @@ that only coordinate Processes. The normal workflow should use:
 - One-shots for visible initialization and smoke checks;
 - restart rules and controlled Project shutdown;
 - environment files and inline environment values;
-- profiles for common development modes;
 - explicit shell configuration only when a command requires a shell.
 
 Keep Quadrant-specific work in Quadrant commands or scripts. Stackhand must not
@@ -378,7 +376,7 @@ tools as an ordinary command does not make it part of the Stackhand model.
 
 Prototype bounded lifecycle hooks only if the real Project shows a generic
 lifecycle need that a Service, One-shot, Dependency, probe, restart rule,
-profile, or local override cannot represent cleanly. If hooks are necessary,
+Process Profile, or local override cannot represent cleanly. If hooks are necessary,
 bound their runtime and output, and add visible Run markers.
 
 Milestone 3 is complete when:
@@ -414,6 +412,7 @@ Add or improve:
 - history truncation UX;
 - terminal scrollback compression tuning;
 - keyboard selection mode;
+- Process Profile controls and conditional Profile column;
 - terminal/log copy polish.
 
 Use deterministic fixtures, scripted input, terminal snapshots, synthetic
@@ -427,7 +426,9 @@ output pressure, resource measurements, and cleanup checks. Verify:
 - control responsiveness during output flood;
 - history truncation state and warnings;
 - terminal scrollback compression;
-- keyboard selection state transitions; and
+- keyboard selection state transitions;
+- future-Run Process Profile changes and affected-Process restarts;
+- conditional Profile column visibility; and
 - copied text across wrapped lines and continued output.
 
 Milestone 4A is complete when the automated acceptance suite passes and no
@@ -471,7 +472,7 @@ Confirm:
 - signal and shutdown behavior;
 - keyboard, mouse, paste, focus, and resize behavior;
 - readiness, liveness, restart, and Dependency behavior;
-- profile, local override, environment, and path behavior;
+- Process Profile selection, local override, environment, and path behavior;
 - direct-command behavior with non-POSIX login shells;
 - aggregate Process Tree metrics;
 - clean contributor builds and packaged artifacts; and

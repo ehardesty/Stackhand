@@ -279,7 +279,6 @@ version: 1
 
 env_files: []
 processes: {}
-profiles: {}
 settings: {}
 ```
 
@@ -294,12 +293,18 @@ The temporary list collections, nested command objects, `working_dir`, `env`,
 top-level `input`, and scalar terminal values are rejected. The validation
 message names the canonical replacement to use.
 
-A Project may define named profiles. Select profiles explicitly with one or
-more `--profile NAME` options on the normal run command, `config validate`, or
-`config show`. Profiles apply in the order of the options. No profile is
-selected by default. A profile may use `enable`, `disable`, `settings`, and
-name-keyed `overrides`; an override can replace Process fields or add a complete
-Process. The selected result is validated before any Process starts.
+Each Process may define named Process Profiles. A Process Profile is a partial
+configuration patch. It may contain only `command` or `shell`, `cwd`,
+`env_files`, `environment`, `enabled`, and `depends_on`. The name `base` is reserved and MUST
+NOT be defined. A Process may set `profile` as a rare override of the global
+selection. A Process's `enabled` value defaults to `true`. An omitted
+profile-specific value keeps the base value. Use `enabled: false` in a Process
+Profile rarely, when the Process must not be available under that profile.
+
+One `--profile NAME` option selects the initial global Process Profile when at
+least one Process defines `NAME`. Repeated `--profile` options are invalid.
+With no option, the global selection is `base`. A Process that does not define
+the selected name uses its base configuration.
 
 The final filename remains open. Examples in this document use:
 
@@ -320,12 +325,13 @@ Effective configuration is produced in this order:
 
 ```text
 base configuration
-  < selected profiles in CLI order
   < local override
   < explicit CLI overrides
 ```
 
-Validation and dependency graph compilation occur only after the full merge.
+The resolver builds the effective base Project and every selectable global
+Process Profile. It validates each complete Dependency graph before any Process
+starts. It then selects the requested Process Profile for future Runs.
 
 ### 14.4 Effective configuration diagnostics
 
@@ -336,24 +342,27 @@ Provide these non-interactive commands:
 <tool> config validate
 ```
 
-`config show` reports the base Project, selected profiles, and local override in
-precedence order. It then prints the normalized canonical YAML for the effective
-Project. The output includes resolved paths and effective defaults. Loaded
-environment files are represented by their effective keys, but every value uses
-a redaction marker. Removed environment keys are shown as YAML `null`.
-Profile definitions and environment-file paths are not copied into the
-effective YAML.
+`config show` reports the base Project and local override sources. It also
+reports the one selected global Process Profile. It then prints the normalized
+canonical YAML for the selected effective Project. Process Profile definitions
+are not copied into the effective YAML. The selected values are flattened into
+each Process.
+Loaded environment files are represented by their effective keys, but every
+value uses a redaction marker. Removed environment keys are shown as YAML
+`null`.
 
 `config validate` reports the same selected sources without printing the
 configuration. Both commands use the shared resolver and finish before any
-Process starts. Resolution failures use the same diagnostic path.
+Process starts. Resolution failures use the same diagnostic path. An invalid unselected Process
+Profile also fails validation, because the user can select it during the session.
 
-This is important because profile and local-overlay behavior otherwise becomes difficult to debug.
+This is important because Process Profiles and local overrides otherwise become
+difficult to debug.
 
 Configuration failures identify the contributing layer and effective field. YAML
-errors include the source path and line and column when available. Profile,
-local-override, environment-file, path, and Dependency graph errors identify
-the selected profile, source file, Process, or affected Processes. Diagnostics
+errors include the source path and line and column when available. Process
+Profile, local-override, environment-file, path, and Dependency graph errors
+identify the profile, source file, Process, or affected Processes. Diagnostics
 are concise and do not print complete files or environment values. Resolution
 finishes before the Supervisor starts, so an invalid layered Project starts no
 Process.
@@ -371,8 +380,9 @@ A local override is intended for gitignored machine-specific changes:
 The shared base config should not need to know the machine-specific domain concept.
 
 A local override is a partial YAML mapping. It may omit `version`; if present,
-`version` must be `1`. It cannot define `profiles`. It uses the same deep-map,
-scalar-replacement, list-replacement, and `null` clearing rules as profiles.
+`version` must be `1`. It may add or change Process Profiles inside a Process.
+It uses the same deep-map, scalar-replacement, list-replacement, and `null`
+clearing rules as the base configuration.
 
 ---
 
@@ -442,15 +452,16 @@ For one Process Run, environment changes are applied in this order:
 ```text
 parent process environment
   < Project env files, in listed order
-  < Process env files, in listed order
-  < base Process environment
-  < each selected profile's inline environment, in CLI order
-  < local override inline environment
+  < effective Process env files, in listed order
+  < effective Process environment
   < future CLI inline environment
 ```
 
-A later value replaces an earlier value for the same key. A YAML `null` value
-removes the key from the inherited environment and from every earlier layer.
+The Process Profile patch is resolved before this precedence is applied. Its
+`env_files` list replaces the base Process list in full. Its `environment` map
+deep-merges with the base Process map. A later value replaces an earlier value
+for the same key. A YAML `null` value removes the key from the inherited
+environment and from every earlier layer.
 It does not print the removed or replacement value in diagnostics.
 
 ```yaml
@@ -508,79 +519,95 @@ Interpolation is optional; relying on shell commands or explicit environment val
 
 ---
 
-## 16. Profiles and overlay merge semantics
+## 16. Process Profiles
 
-### 16.1 Profile purpose
+### 16.1 Purpose and fields
 
-Profiles represent named configuration overlays such as:
+A Process Profile is a named partial configuration patch for one Process. It
+may change only:
 
-- `local`;
-- `devcloud`;
-- `localProd`;
-- `docs`;
-- `minimal`.
+- `command` or `shell`;
+- `cwd`;
+- `env_files`;
+- `environment`;
+- `enabled`;
+- `depends_on`.
 
-They may enable/disable processes and override ordinary process fields. They are not a class inheritance system.
+A Process's base `enabled` value defaults to `true`. An omitted
+profile-specific value keeps the base value. Use profile-specific enablement
+rarely. Prefer an enabled Process that the user starts manually. A Process
+Profile MUST NOT change autostart, probes, hooks, restart policy, terminal
+policy, or Project settings. `command` and `shell` remain mutually exclusive
+after the patch is applied.
 
-### 16.2 Merge rules
+### 16.2 Selection
 
-The merge contract is normative:
+Stackhand keeps one global Process Profile selection. One `--profile NAME`
+option sets the initial global selection when at least one Process defines
+`NAME`. The CLI MUST reject repeated `--profile` options. The initial selection
+is `base` when the option is absent. `base` means that no Process Profile patch
+is applied. The name is reserved and MUST NOT appear in a Process's `profiles`
+mapping.
 
-- maps deep-merge;
+A Process may set `profile` as a rare override. Its Next Profile is that
+override when present. Otherwise, its Next Profile is the global selection. If
+the Process does not define that profile name, it falls back to `base`.
+
+### 16.3 Run behavior
+
+Stackhand resolves the Next Profile when it creates a Run. The Run retains the
+applied profile and its effective configuration. A global selection change or
+per-Process override change has no immediate lifecycle effect. It MUST NOT
+modify, stop, restart, or start a Process. Active Processes continue.
+
+A later start, manual rerun, manual restart, or automatic restart MUST use the
+Next Profile. Process Profile selection MUST NOT change Desired State.
+
+The conditional `R: apply profile` action stops active Processes whose
+effective Next Profile disables them. It restarts affected active Processes
+whose Next Profile keeps them enabled and whose `autostart` value is `true`.
+It MUST NOT start an unrelated inactive Process that a Process Profile newly
+enables. A restarted Process can start newly enabled Dependencies from its Next
+Profile. The user can start other newly enabled Processes manually.
+
+### 16.4 Patch rules
+
+The patch contract is normative:
+
+- maps deep-merge, except `depends_on`;
 - scalar values replace;
 - lists replace in full;
-- `environment.NAME: null` removes that variable from the child environment;
-- `depends_on.NAME: null` removes that Dependency from the effective graph;
-- `null` clears optional probes, hooks, and other optional objects;
-- required scalar values and complete Process definitions cannot be `null`;
+- `depends_on` replaces the complete Dependency mapping;
+- `environment.NAME: null` removes that variable;
+- base `enabled` defaults to `true`;
+- an omitted profile-specific `enabled` value keeps the base value;
 - no implicit list concatenation;
-- no implicit process cloning;
-- no implicit profile inheritance;
-- selected profiles apply in CLI order;
-- local override applies after profiles;
-- CLI overrides apply last.
-
-If profiles enable and disable the same Process, the last selected profile that mentions it wins. The local override and CLI overrides can replace that result in their normal precedence order. Enablement does not change `autostart`.
-
-If list append semantics are later required, add an explicit operation rather than changing ordinary list behavior.
-
-### 16.3 Profile example
+- no implicit Process Profile inheritance;
+- exactly one Process Profile patch applies to a Run.
 
 ```yaml
-profiles:
-  local:
-    enable:
-      - servicebus
-      - storage
-      - cosmos
-      - api
-      - web
-
-  devcloud:
-    disable:
-      - servicebus
-      - storage
-      - cosmos
-    overrides:
-      api:
+processes:
+  api:
+    kind: service
+    command: [dotnet, run, --launch-profile, Local]
+    cwd: app/api
+    profiles:
+      devcloud:
         command: [dotnet, run, --launch-profile, DevCloud]
-      worker-python:
+        depends_on: {}
         environment:
           QUADRANT_ENVIRONMENT: dev
+
+  worker-python:
+    kind: service
+    profile: devcloud
+    shell: "source .venv/bin/activate && exec python worker.py"
+    profiles:
+      devcloud:
+        environment:
+          QUADRANT_ENVIRONMENT: dev
+        enabled: false
 ```
-
-The exact surface syntax MAY evolve, but the semantics above SHOULD remain stable.
-
-### 16.4 Enable and disable behavior
-
-- A disabled process remains present in the effective graph with `enabled == false`; the UI projects this as `DISABLED`.
-- Dependencies do not auto-enable it.
-- A dependent is visibly blocked by the disabled process.
-- A local override/profile may enable it before validation/start.
-
-### 16.5 Process removal
-
-Complete deletion of a base process through an overlay is not required by this specification. Disabling is safer because dependency references remain diagnosable.
 
 ---
 

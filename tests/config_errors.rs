@@ -27,13 +27,13 @@ fn marker_process(marker: &Path) -> String {
     format!("  marker:\n    shell: {}\n", yaml_quote(&command))
 }
 
-fn run_project(directory: &Path, path: Option<&Path>, profiles: &[&str]) -> Output {
+fn run_project(directory: &Path, path: Option<&Path>, profile: Option<&str>) -> Output {
     let mut command = Command::cargo_bin("stackhand").expect("Stackhand binary builds");
     command.current_dir(directory);
     if let Some(path) = path {
         command.arg(path);
     }
-    for profile in profiles {
+    if let Some(profile) = profile {
         command.args(["--profile", profile]);
     }
     command.output().expect("Project command runs")
@@ -66,7 +66,7 @@ fn invalid_base_yaml_reports_path_and_location_without_starting_a_process() {
     )
     .expect("invalid base configuration writes");
 
-    let output = run_project(&root, Some(&config), &[]);
+    let output = run_project(&root, Some(&config), None);
     assert_failure_without_start(
         &output,
         &marker,
@@ -84,17 +84,21 @@ fn selected_profile_reports_the_profile_and_effective_process_without_starting()
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n{}profiles:\n  broken:\n    overrides:\n      marker:\n        terminal:\n          mode: invalid-mode\n",
+            "version: 1\nprocesses:\n{}    profiles:\n      broken:\n        terminal:\n          mode: invalid-mode\n",
             marker_process(&marker)
         ),
     )
     .expect("profile configuration writes");
 
-    let output = run_project(&root, Some(&config), &["broken"]);
+    let output = run_project(&root, Some(&config), Some("broken"));
     assert_failure_without_start(
         &output,
         &marker,
-        &["profile 'broken'", "Process 'marker'", "terminal mode"],
+        &[
+            "profile 'broken'",
+            "Process 'marker'",
+            "cannot change field 'terminal'",
+        ],
     );
 
     fs::remove_dir_all(root).ok();
@@ -115,7 +119,7 @@ fn invalid_local_yaml_reports_override_path_and_location_without_starting() {
     .expect("base configuration writes");
     fs::write(&local, "processes:\n  marker: [\n").expect("invalid local override writes");
 
-    let output = run_project(&nested, None, &[]);
+    let output = run_project(&nested, None, None);
     assert_failure_without_start(
         &output,
         &marker,
@@ -143,7 +147,7 @@ fn invalid_environment_file_reports_file_and_line_without_starting() {
     )
     .expect("environment configuration writes");
 
-    let output = run_project(&root, Some(&config), &[]);
+    let output = run_project(&root, Some(&config), None);
     let stderr = assert_failure_without_start(
         &output,
         &marker,
@@ -171,7 +175,7 @@ fn invalid_path_reports_process_and_configured_path_without_starting() {
     )
     .expect("path configuration writes");
 
-    let output = run_project(&root, Some(&config), &[]);
+    let output = run_project(&root, Some(&config), None);
     assert_failure_without_start(
         &output,
         &marker,
@@ -195,31 +199,31 @@ fn dependency_cycle_reports_affected_processes_without_starting() {
     )
     .expect("cycle configuration writes");
 
-    let output = run_project(&root, Some(&config), &[]);
+    let output = run_project(&root, Some(&config), None);
     assert_failure_without_start(&output, &marker, &["dependency cycle", "first", "second"]);
 
     fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn null_process_override_reports_the_layer_and_process_without_starting() {
+fn null_process_profile_reports_the_profile_and_process_without_starting() {
     let root = unique_directory("null-override");
     let marker = root.join("started.marker");
     let config = root.join("stackhand.yaml");
     fs::write(
         &config,
         format!(
-            "version: 1\nprocesses:\n{}profiles:\n  broken:\n    overrides:\n      marker: null\n",
+            "version: 1\nprocesses:\n{}    profiles:\n      broken:\n",
             marker_process(&marker)
         ),
     )
     .expect("null override configuration writes");
 
-    let output = run_project(&root, Some(&config), &["broken"]);
+    let output = run_project(&root, Some(&config), Some("broken"));
     assert_failure_without_start(
         &output,
         &marker,
-        &["profile 'broken'", "Process 'marker'", "complete Process"],
+        &["profile 'broken'", "Process 'marker'", "partial mapping"],
     );
 
     fs::remove_dir_all(root).ok();

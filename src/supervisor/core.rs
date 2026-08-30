@@ -202,6 +202,7 @@ impl Core {
                     | Command::Restart(_)
                     | Command::Rerun(_)
                     | Command::StartAutostart
+                    | Command::RestartProfiledAutostart
             )
         {
             return;
@@ -224,6 +225,8 @@ impl Core {
                     }
                 }
             }
+            Command::SelectNextProcessProfile => self.select_next_process_profile(),
+            Command::RestartProfiledAutostart => self.restart_profiled_autostart(),
             Command::StopAll => {
                 for index in 0..self.lifecycles.len() {
                     self.stop_at(index);
@@ -239,6 +242,44 @@ impl Core {
                 if let Some(index) = self.project.process_index(&name) {
                     self.rerun_at(index);
                 }
+            }
+        }
+    }
+
+    fn select_next_process_profile(&mut self) {
+        let names = self.project.process_profile_names();
+        if names.is_empty() {
+            return;
+        }
+        let next = match self.project.selected_process_profile() {
+            None => names.first().cloned(),
+            Some(selected) => names
+                .iter()
+                .position(|name| name == selected)
+                .and_then(|index| names.get(index + 1).cloned()),
+        };
+        self.project.select_process_profile(next.as_deref());
+    }
+
+    fn restart_profiled_autostart(&mut self) {
+        let affected = (0..self.lifecycles.len())
+            .filter(|&index| {
+                let lifecycle = &self.lifecycles[index];
+                lifecycle.current_run.is_some()
+                    && lifecycle.current_profile.as_deref() != self.project.process_profile(index)
+            })
+            .collect::<Vec<_>>();
+        for index in affected {
+            let spec = &self.project.processes()[index];
+            if matches!(spec.enabled, Enabled::No) {
+                self.stop_at(index);
+            } else if matches!(spec.autostart, Autostart::Yes) {
+                let trigger = if spec.kind == ProcessKind::OneShot {
+                    RunTrigger::Rerun
+                } else {
+                    RunTrigger::Restart
+                };
+                self.restart_at(index, trigger);
             }
         }
     }
@@ -370,6 +411,11 @@ impl Core {
                 lifecycle: entry.lifecycle,
                 terminal_mode: spec.terminal_mode,
                 current_run: entry.current_run.map(RunId::get),
+                current_profile: entry.current_profile.clone(),
+                next_profile: self
+                    .project
+                    .process_profile(entry.process_id.get() as usize)
+                    .map(str::to_owned),
                 root_pid: entry.root_pid,
                 run_started_at_ms: entry.run_started_at_ms,
                 failure: entry.failure.clone(),
@@ -402,6 +448,8 @@ impl Core {
             .collect();
         ProjectSnapshot {
             processes,
+            selected_profile: self.project.selected_process_profile().map(str::to_owned),
+            available_profiles: self.project.process_profile_names().to_vec(),
             now_ms,
             shutdown: self.shutdown_snapshot(),
         }

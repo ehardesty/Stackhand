@@ -77,7 +77,12 @@ pub fn run_fixture(
     config_path: &Path,
     on_checkpoint: impl FnMut(&str),
 ) -> String {
-    run_fixture_with_profiles(fixture_flag, config_path, &[], on_checkpoint)
+    run_fixture_command(
+        fixture_flag,
+        FixtureSource::Explicit(config_path),
+        None,
+        on_checkpoint,
+    )
 }
 
 #[allow(dead_code)]
@@ -87,35 +92,25 @@ pub fn run_fixture_with_profile(
     profile: Option<&str>,
     on_checkpoint: impl FnMut(&str),
 ) -> String {
-    let profiles = profile.into_iter().collect::<Vec<_>>();
-    run_fixture_with_profiles(fixture_flag, config_path, &profiles, on_checkpoint)
-}
-
-pub fn run_fixture_with_profiles(
-    fixture_flag: &str,
-    config_path: &Path,
-    profiles: &[&str],
-    on_checkpoint: impl FnMut(&str),
-) -> String {
     run_fixture_command(
         fixture_flag,
         FixtureSource::Explicit(config_path),
-        profiles,
+        profile,
         on_checkpoint,
     )
 }
 
 #[allow(dead_code)]
-pub fn run_discovered_fixture_with_profiles(
+pub fn run_discovered_fixture_with_profile(
     fixture_flag: &str,
     start_directory: &Path,
-    profiles: &[&str],
+    profile: Option<&str>,
     on_checkpoint: impl FnMut(&str),
 ) -> String {
     run_fixture_command(
         fixture_flag,
         FixtureSource::Discovered(start_directory),
-        profiles,
+        profile,
         on_checkpoint,
     )
 }
@@ -123,7 +118,7 @@ pub fn run_discovered_fixture_with_profiles(
 fn run_fixture_command(
     fixture_flag: &str,
     source: FixtureSource<'_>,
-    profiles: &[&str],
+    profile: Option<&str>,
     mut on_checkpoint: impl FnMut(&str),
 ) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stackhand"));
@@ -138,7 +133,7 @@ fn run_fixture_command(
             command.current_dir(start_directory);
         }
     }
-    for profile in profiles {
+    if let Some(profile) = profile {
         command.arg("--profile").arg(profile);
     }
     let mut child = command
