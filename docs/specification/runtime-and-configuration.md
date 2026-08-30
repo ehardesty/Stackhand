@@ -280,6 +280,7 @@ Use YAML with an explicit schema version:
 version: 1
 
 env_files: []
+profiles: {}
 processes: {}
 settings: {}
 ```
@@ -289,7 +290,8 @@ spellings into it. `processes` and `depends_on` are name-keyed mappings.
 Direct commands use a sequence, and shell commands use a sibling `shell`
 field. Use `cwd`, `env_files`, `environment`, and a terminal mapping with
 `mode` and optional `input`. Project-level `env_files` is a list at the root;
-Process-level `env_files` is a list inside that Process.
+Process-level `env_files` is a list inside that Process. A Project Profile may
+replace the Project-level list with `profiles.NAME.env_files`.
 
 The temporary list collections, nested command objects, `working_dir`, `env`,
 top-level `input`, and scalar terminal values are rejected. The validation
@@ -303,10 +305,12 @@ selection. A Process's `enabled` value defaults to `true`. An omitted
 profile-specific value keeps the base value. Use `enabled: false` in a Process
 Profile rarely, when the Process must not be available under that profile.
 
-One `--profile NAME` option selects the initial global Process Profile when at
-least one Process defines `NAME`. Repeated `--profile` options are invalid.
-With no option, the global selection is `base`. A Process that does not define
-the selected name uses its base configuration.
+One `--profile NAME` option selects the initial Project Profile when the name
+exists at the Project level or on at least one Process. Repeated `--profile`
+options are invalid. With no option, the selection is `base`. A selected
+Project Profile replaces Project `env_files` when it defines that field and
+activates matching Process Profiles. A Process without that name uses its base
+Process configuration.
 
 The final filename remains open. Examples in this document use:
 
@@ -331,9 +335,10 @@ base configuration
   < explicit CLI overrides
 ```
 
-The resolver builds the effective base Project and every selectable global
-Process Profile. It validates each complete Dependency graph before any Process
-starts. It then selects the requested Process Profile for future Runs.
+The resolver builds the effective base Project and every selectable Project
+Profile. It validates each complete Dependency graph and each environment file
+before any Process starts. It then selects the requested Project Profile for
+future Runs.
 
 ### 14.4 Effective configuration diagnostics
 
@@ -345,7 +350,7 @@ Provide these non-interactive commands:
 ```
 
 `config show` reports the base Project and local override sources. It also
-reports the one selected global Process Profile. It then prints the normalized
+reports the selected Project Profile. It then prints the normalized
 canonical YAML for the selected effective Project. Process Profile definitions
 are not copied into the effective YAML. The selected values are flattened into
 each Process.
@@ -459,8 +464,9 @@ parent process environment
   < future CLI inline environment
 ```
 
-The Process Profile patch is resolved before this precedence is applied. Its
-`env_files` list replaces the base Process list in full. Its `environment` map
+The Project Profile is resolved first. Its `env_files` list replaces the base
+Project list in full. The Process Profile is resolved next. Its `env_files`
+list replaces the base Process list in full. Its `environment` map
 deep-merges with the base Process map. A later value replaces an earlier value
 for the same key. A YAML `null` value removes the key from the inherited
 environment and from every earlier layer.
@@ -521,9 +527,14 @@ Interpolation is optional; relying on shell commands or explicit environment val
 
 ---
 
-## 16. Process Profiles
+## 16. Project and Process Profiles
 
 ### 16.1 Purpose and fields
+
+A Project Profile is a named Project-wide selection. It may define only
+`env_files`. An omitted list keeps the base Project list. An empty list loads
+no Project environment files. The name `base` is reserved and MUST NOT appear
+in the top-level `profiles` mapping.
 
 A Process Profile is a named partial configuration patch for one Process. It
 may change only:
@@ -544,16 +555,18 @@ after the patch is applied.
 
 ### 16.2 Selection
 
-Stackhand keeps one global Process Profile selection. One `--profile NAME`
-option sets the initial global selection when at least one Process defines
-`NAME`. The CLI MUST reject repeated `--profile` options. The initial selection
-is `base` when the option is absent. `base` means that no Process Profile patch
-is applied. The name is reserved and MUST NOT appear in a Process's `profiles`
-mapping.
+Stackhand keeps one Project Profile selection. One `--profile NAME` option
+sets the initial selection when the name exists at the Project level or on at
+least one Process. The CLI MUST reject repeated `--profile` options. The
+initial selection is `base` when the option is absent. `base` uses the base
+Project environment files and applies no same-named Process Profile. The name
+is reserved and MUST NOT appear in any `profiles` mapping.
 
 A Process may set `profile` as a rare override. Its Next Profile is that
-override when present. Otherwise, its Next Profile is the global selection. If
-the Process does not define that profile name, it falls back to `base`.
+override when present. Otherwise, a Process Profile that matches the selected
+Project Profile is its Next Profile. If the Process does not define that name,
+it uses its base Process configuration. A per-Process override does not change
+the environment files from the selected Project Profile.
 
 ### 16.3 Run behavior
 

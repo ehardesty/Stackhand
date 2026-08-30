@@ -95,7 +95,7 @@ The following should be treated as current project decisions:
 17. Shutdown is configured through semantic actions and escalation.
 18. Direct command arrays and shell strings have separate schema fields.
 19. Process Profile patches are limited to command or shell, cwd, env files, environment, enabled, and Dependencies. Maps deep-merge, lists replace, an environment `null` removes a value, and `depends_on` replaces the complete mapping.
-20. One global Process Profile controls future Runs, a rare per-Process override wins, and a missing profile falls back to base. Profile selection has no immediate lifecycle effect.
+20. One Project Profile controls future Runs, a rare per-Process override wins, and a missing Process Profile falls back to base. Profile selection has no immediate lifecycle effect.
 21. Per-process and project-wide output memory are bounded.
 22. Mouse ownership changes when a child enables tracking; an explicit override restores outer selection.
 23. OSC clipboard access is denied or consent-based by default.

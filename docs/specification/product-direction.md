@@ -130,7 +130,7 @@ The project MUST NOT reimplement a terminal emulator or a general TUI framework.
 
 - Bounded generic lifecycle hooks.
 - Named Process Profiles for partial Process configuration.
-- One global Process Profile selection for future Runs.
+- One Project Profile selection for future Runs.
 - Automatically discovered gitignored local overlay.
 - Ordinary supervised helper processes for long-running machine-specific work.
 - Scripts remain valid commands and extension points.
@@ -373,7 +373,7 @@ The default screen is a process list beside a large selected-process console:
  status/help footer
 ```
 
-The console SHOULD receive most of the horizontal space. Metrics and details MUST remain compact. The Process list MUST show a Profile column when a current Run differs from its Next Profile or when any Process Next Profile differs from the global Process Profile. A profile selection has no immediate lifecycle effect. Active Processes continue until the user applies the pending change or another lifecycle action creates a new Run.
+The console SHOULD receive most of the horizontal space. Metrics and details MUST remain compact. The Process list MUST show a Profile column when a current Run differs from its Next Profile or when any Process Next Profile differs from the selected Project Profile. A profile selection has no immediate lifecycle effect. Active Processes continue until the user applies the pending change or another lifecycle action creates a new Run.
 
 ### 6.2 Two output representations
 
@@ -414,7 +414,7 @@ The user can:
 - Start All;
 - stop all;
 - restart all running services;
-- cycle the global Process Profile for future Runs;
+- cycle the Project Profile for future Runs;
 - apply pending profile changes to affected active Processes;
 - zoom the console;
 - switch Terminal/Logs view;

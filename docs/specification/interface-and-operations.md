@@ -118,7 +118,7 @@ s              start selected
 S              start a Waiting Process without requiring Dependencies; shown only while Waiting
 x              stop selected
 r              restart/rerun selected
-p              cycle the global Process Profile for future Runs
+p              cycle the Project Profile for future Runs
 R              apply a pending profile change; shown only while changes are pending
 z              zoom console
 /              search selected output
@@ -291,7 +291,7 @@ The product supports:
 - Start All: start every enabled Process;
 - stop all;
 - restart all currently running services;
-- cycle the global Process Profile for future Runs;
+- cycle the Project Profile for future Runs;
 - apply pending profile changes to affected active Processes;
 - start selected;
 - start a selected Waiting Process without requiring Dependencies;
@@ -319,7 +319,7 @@ Restart-all should operate on Processes that are currently running or in
 startup/restart state. It should not unexpectedly start disabled or manually
 stopped optional Processes.
 
-`p` cycles the global Process Profile. This selection has no immediate
+`p` cycles the Project Profile. This selection has no immediate
 lifecycle effect. It changes Next Profiles only. It MUST NOT change Desired
 State or modify, stop, restart, or start a Process. Active Processes continue.
 
@@ -364,7 +364,7 @@ Validation occurs before any project process starts.
 ### 28.2 Graph validation
 
 - every referenced dependency exists;
-- no dependency cycles in base or any selectable global Process Profile;
+- no dependency cycles in base or any selectable Project Profile;
 - disabled dependencies remain representable and diagnosable;
 - conditions are valid for referenced processes;
 - each Process Profile uses only allowed fields;

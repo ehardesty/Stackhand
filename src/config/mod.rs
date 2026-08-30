@@ -278,18 +278,46 @@ fn load_file_with_local(
     })?;
     let shell = build_shell(file.settings.as_ref())
         .map_err(|error| diagnostics::with_source(error, &last_layer))?;
-    let project_environment = load_files(
-        base_dir,
-        file.env_files.as_deref().unwrap_or_default(),
-        "Project",
-    )
-    .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let raw_processes = document
         .as_mapping()
         .and_then(|root| root.get(Value::String("processes".to_string())))
         .and_then(Value::as_mapping)
         .expect("typed Process parsing requires a Process mapping");
-    let profiled_processes = file
+    let mut process_profile_names = file
+        .processes
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .process
+                .profiles
+                .as_ref()
+                .into_iter()
+                .flat_map(|profiles| profiles.keys().cloned())
+        })
+        .collect::<BTreeSet<_>>();
+    let project_profiles = file.profiles.unwrap_or_default();
+    if project_profiles.contains_key("base") {
+        return Err(diagnostics::with_source(
+            ConfigError {
+                message: "Project Profile name 'base' is reserved for the base Project".to_string(),
+            },
+            &last_layer,
+        ));
+    }
+    process_profile_names.extend(project_profiles.keys().cloned());
+    let process_profile_names = process_profile_names.into_iter().collect::<Vec<_>>();
+    if let Some(profile) = profile
+        && !process_profile_names.iter().any(|name| name == profile)
+    {
+        return Err(diagnostics::with_source(
+            ConfigError {
+                message: format!("unknown Project Profile '{profile}'"),
+            },
+            &last_layer,
+        ));
+    }
+    let process_documents = file
         .processes
         .entries
         .into_iter()
@@ -298,45 +326,77 @@ fn load_file_with_local(
                 .get(Value::String(entry.key.clone()))
                 .cloned()
                 .expect("the raw Process mapping matches typed Process entries");
-            build_profiled_process(entry, raw, base_dir, &project_environment)
+            (entry.key, raw)
         })
-        .collect::<Result<Vec<_>, ConfigError>>()
-        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
-    let process_profile_names = profiled_processes
-        .iter()
-        .flat_map(|process| process.profiles.keys().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
-    if let Some(profile) = profile
-        && !process_profile_names.iter().any(|name| name == profile)
-    {
-        return Err(diagnostics::with_source(
-            ConfigError {
-                message: format!("unknown Process Profile '{profile}'"),
-            },
-            &last_layer,
-        ));
+    let base_env_files = file.env_files.unwrap_or_default();
+    let resolve_profile = |selection: Option<&str>,
+                           project_environment: &BTreeMap<String, String>|
+     -> Result<(Vec<ProcessSpec>, Vec<Option<String>>), ConfigError> {
+        let mut processes = Vec::with_capacity(process_documents.len());
+        let mut labels = Vec::with_capacity(process_documents.len());
+        for (name, raw) in &process_documents {
+            let process = serde_yaml::from_value(raw.clone()).map_err(|error| ConfigError {
+                message: format!("Process '{name}': {error}"),
+            })?;
+            let profiled = build_profiled_process(
+                ProcessEntry {
+                    key: name.clone(),
+                    process,
+                },
+                raw.clone(),
+                base_dir,
+                project_environment,
+            )?;
+            let label = match profiled.profile_override.as_deref() {
+                Some("base") => None,
+                Some(name) => Some(name),
+                None => selection.filter(|name| profiled.profiles.contains_key(*name)),
+            };
+            processes.push(
+                label
+                    .and_then(|name| profiled.profiles.get(name))
+                    .unwrap_or(&profiled.base)
+                    .clone(),
+            );
+            let project_environment_changes = selection.is_some_and(|name| {
+                project_profiles
+                    .get(name)
+                    .is_some_and(|profile| profile.env_files.is_some())
+            });
+            labels.push(if project_environment_changes {
+                selection.map(str::to_owned)
+            } else {
+                label.map(str::to_owned)
+            });
+        }
+        Ok((processes, labels))
+    };
+    let base_environment = load_files(base_dir, &base_env_files, "Project")
+        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
+    let (base_processes, base_labels) = resolve_profile(None, &base_environment)
+        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
+    let mut processes_by_profile = BTreeMap::new();
+    let mut labels_by_profile = BTreeMap::new();
+    for name in &process_profile_names {
+        let env_files = project_profiles
+            .get(name)
+            .and_then(|profile| profile.env_files.as_ref())
+            .unwrap_or(&base_env_files);
+        let owner = format!("Project Profile '{name}'");
+        let environment = load_files(base_dir, env_files, &owner)
+            .map_err(|error| diagnostics::with_source(error, &last_layer))?;
+        let (processes, labels) = resolve_profile(Some(name), &environment)
+            .map_err(|error| diagnostics::with_source(error, &last_layer))?;
+        processes_by_profile.insert(name.clone(), processes);
+        labels_by_profile.insert(name.clone(), labels);
     }
-    let selected_process_profile = profile.map(str::to_owned);
-    let processes = profiled_processes
-        .iter()
-        .map(|process| process.base.clone())
-        .collect();
-    let process_profiles = profiled_processes
-        .iter()
-        .map(|process| process.profiles.clone())
-        .collect();
-    let process_profile_overrides = profiled_processes
-        .into_iter()
-        .map(|process| process.profile_override)
-        .collect();
-    EffectiveProject::with_process_profiles(
-        processes,
-        process_profiles,
-        process_profile_overrides,
-        selected_process_profile,
-        process_profile_names,
+    EffectiveProject::with_resolved_profiles(
+        base_processes,
+        base_labels,
+        processes_by_profile,
+        labels_by_profile,
+        profile.map(str::to_owned),
         shell,
     )
     .map_err(|error| {

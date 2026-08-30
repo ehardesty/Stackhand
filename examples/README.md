@@ -26,7 +26,7 @@ s                start the selected Process
 S                start a Waiting Process now; skips Dependencies for one Run
 x                stop the selected Process
 r                restart a Service or rerun a One-shot
-p                cycle the global Process Profile for future Runs
+p                cycle the Project Profile for future Runs
 R                apply pending profile changes when the footer shows this key
                  (stops disabled active Processes and restarts affected active
                  enabled autostart Processes; does not start inactive Processes)

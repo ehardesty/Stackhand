@@ -48,7 +48,7 @@ The supervisor task owns authoritative mutable project state:
 - lifecycle state;
 - dependency satisfaction;
 - current `RunId` and its applied Process Profile;
-- global Process Profile selection, per-Process overrides, and Next Profiles;
+- Project Profile selection, per-Process overrides, and Next Profiles;
 - restart counters and timers;
 - readiness and liveness status;
 - last exit/failure diagnostics;

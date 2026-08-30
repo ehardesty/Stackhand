@@ -36,12 +36,16 @@ _Avoid_: Status, lifecycle state
 The maximum number of automatic retries allowed after an initial Run.
 _Avoid_: Consecutive failure count, retry count
 
+**Project Profile**:
+A named Project-wide selection. It can replace Project environment files and activate matching Process Profiles.
+_Avoid_: Global Process Profile, Environment
+
 **Process Profile**:
 A named partial configuration patch that belongs to one Process. A Process Profile can change how the Process starts, what it depends on, or whether it is available.
 _Avoid_: Environment
 
 **Next Profile**:
-The selected Process Profile that controls future lifecycle actions and any next Run of a Process. A rare per-Process profile selection overrides the global Process Profile selection.
+The effective Process Profile for the next Run of a Process. The selected Project Profile activates a matching Process Profile. A rare per-Process selection overrides that match.
 _Avoid_: Current profile
 
 **Dependency**:

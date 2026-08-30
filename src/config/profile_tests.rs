@@ -219,28 +219,76 @@ fn process_profiles_reject_reserved_names_forbidden_fields_and_invalid_specs() {
 }
 
 #[test]
-fn top_level_profiles_are_rejected() {
-    let error = write_and_load(
-        "top-level-profile",
+fn a_project_profile_replaces_project_environment_files_and_applies_process_profiles() {
+    let dir = std::env::temp_dir().join("stackhand-config-project-profile-environment");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("config directory creates");
+    fs::write(dir.join("base.env"), "SOURCE=base\nREMOVE_ME=base\n")
+        .expect("base environment writes");
+    fs::write(dir.join("cloud.env"), "SOURCE=cloud\n").expect("profile environment writes");
+    fs::write(
+        dir.join("stackhand.yaml"),
         "version: 1
+env_files: [base.env]
+profiles:
+  cloud:
+    env_files: [cloud.env]
 processes:
   api:
+    command: [/bin/echo, base]
+    profiles:
+      cloud:
+        command: [/bin/echo, cloud]
+  pinned:
+    profile: base
     command: [/usr/bin/true]
-profiles:
-  cloud: {}
 ",
-        None,
     )
-    .expect_err("top-level profiles are not part of the schema");
+    .expect("config writes");
 
-    assert!(
-        error.message.contains("unknown field `profiles`"),
-        "{error}"
-    );
+    let project = load_file(&dir.join("stackhand.yaml"), Some("cloud"))
+        .expect("the Project Profile is valid");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(project.process_profile_names(), ["cloud"]);
+    assert_eq!(direct_args(&project.processes()[0]), ["cloud"]);
+    assert_eq!(project.process_profile(0), Some("cloud"));
+    assert_eq!(project.process_profile(1), Some("cloud"));
+    for process in project.processes() {
+        assert!(process.env.contains(&("SOURCE".into(), "cloud".into())));
+        assert!(!process.env.iter().any(|(name, _)| name == "REMOVE_ME"));
+    }
 }
 
 #[test]
-fn an_unknown_selected_process_profile_is_rejected() {
+fn a_project_profile_can_clear_project_environment_files() {
+    let dir = std::env::temp_dir().join("stackhand-config-project-profile-clear-environment");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("config directory creates");
+    fs::write(dir.join("base.env"), "REMOVE_ME=base\n").expect("environment writes");
+    fs::write(
+        dir.join("stackhand.yaml"),
+        "version: 1
+env_files: [base.env]
+profiles:
+  clean:
+    env_files: []
+processes:
+  api:
+    command: [/usr/bin/true]
+",
+    )
+    .expect("config writes");
+
+    let project = load_file(&dir.join("stackhand.yaml"), Some("clean"))
+        .expect("an empty Project Profile environment file list is valid");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(project.processes()[0].env.is_empty());
+}
+
+#[test]
+fn an_unknown_selected_project_profile_is_rejected() {
     let error = write_and_load(
         "unknown-process-profile",
         "version: 1
@@ -252,10 +300,10 @@ processes:
 ",
         Some("missing"),
     )
-    .expect_err("the selected Process Profile must exist on at least one Process");
+    .expect_err("the selected Project Profile must exist");
 
     assert!(
-        error.message.contains("unknown Process Profile 'missing'"),
+        error.message.contains("unknown Project Profile 'missing'"),
         "{error}"
     );
 }

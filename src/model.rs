@@ -352,13 +352,15 @@ impl Default for ShellConfig {
 pub struct EffectiveProject {
     /// The Process specifications selected for each next Run.
     processes: Vec<ProcessSpec>,
-    /// The stable base specifications. Process Profile selection never changes
-    /// Process identity or order.
+    /// The effective specifications for the base Project Profile.
+    /// Profile selection never changes Process identity or order.
     base_processes: Vec<ProcessSpec>,
-    /// Fully resolved and validated named specifications for each Process.
-    process_profiles: Vec<BTreeMap<String, ProcessSpec>>,
-    /// A fixed Process selection. `base` is the reserved base override.
-    process_profile_overrides: Vec<Option<String>>,
+    /// The effective specifications for each named Project Profile.
+    processes_by_profile: BTreeMap<String, Vec<ProcessSpec>>,
+    /// The effective Process Profile labels for the base Project Profile.
+    base_process_profile_labels: Vec<Option<String>>,
+    /// The effective Process Profile labels for each named Project Profile.
+    process_profile_labels_by_profile: BTreeMap<String, Vec<Option<String>>>,
     selected_process_profile: Option<String>,
     process_profile_names: Vec<String>,
     positions: HashMap<String, usize>,
@@ -448,8 +450,9 @@ impl EffectiveProject {
         }
         Ok(Self {
             base_processes: processes.clone(),
-            process_profiles: vec![BTreeMap::new(); processes.len()],
-            process_profile_overrides: vec![None; processes.len()],
+            processes_by_profile: BTreeMap::new(),
+            base_process_profile_labels: vec![None; processes.len()],
+            process_profile_labels_by_profile: BTreeMap::new(),
             selected_process_profile: None,
             process_profile_names: Vec::new(),
             processes,
@@ -461,7 +464,8 @@ impl EffectiveProject {
     }
 
     /// Attach every Process Profile, validate each selectable Dependency graph,
-    /// then select the initial global profile for future Runs.
+    /// then select the initial Project Profile for future Runs.
+    #[cfg(test)]
     pub(crate) fn with_process_profiles(
         processes: Vec<ProcessSpec>,
         process_profiles: Vec<BTreeMap<String, ProcessSpec>>,
@@ -472,26 +476,78 @@ impl EffectiveProject {
     ) -> Result<Self, ProjectError> {
         debug_assert_eq!(processes.len(), process_profiles.len());
         debug_assert_eq!(processes.len(), process_profile_overrides.len());
-        let mut project = Self::with_shell(processes, shell.clone())?;
-        project.process_profiles = process_profiles;
-        project.process_profile_overrides = process_profile_overrides;
-        project.process_profile_names = process_profile_names;
-        project.dependency_indices_by_profile.clear();
+        let resolve = |selection: Option<&str>| {
+            let mut resolved_processes = Vec::with_capacity(processes.len());
+            let mut labels = Vec::with_capacity(processes.len());
+            for index in 0..processes.len() {
+                let label = match process_profile_overrides[index].as_deref() {
+                    Some("base") => None,
+                    Some(name) => Some(name),
+                    None => selection.filter(|name| process_profiles[index].contains_key(*name)),
+                };
+                resolved_processes.push(
+                    label
+                        .and_then(|name| process_profiles[index].get(name))
+                        .unwrap_or(&processes[index])
+                        .clone(),
+                );
+                labels.push(label.map(str::to_owned));
+            }
+            (resolved_processes, labels)
+        };
+        let (base_processes, base_labels) = resolve(None);
+        let mut named_processes = BTreeMap::new();
+        let mut named_labels = BTreeMap::new();
+        for name in process_profile_names {
+            let (resolved_processes, labels) = resolve(Some(&name));
+            named_processes.insert(name.clone(), resolved_processes);
+            named_labels.insert(name, labels);
+        }
+        Self::with_resolved_profiles(
+            base_processes,
+            base_labels,
+            named_processes,
+            named_labels,
+            selected_process_profile,
+            shell,
+        )
+    }
 
-        let selections = std::iter::once(None)
-            .chain(project.process_profile_names.iter().cloned().map(Some))
-            .collect::<Vec<_>>();
-        for selection in selections {
-            let processes = project.processes_for_selection(selection.as_deref());
+    /// Build a Project from complete base and named profile selections.
+    pub(crate) fn with_resolved_profiles(
+        base_processes: Vec<ProcessSpec>,
+        base_process_profile_labels: Vec<Option<String>>,
+        processes_by_profile: BTreeMap<String, Vec<ProcessSpec>>,
+        process_profile_labels_by_profile: BTreeMap<String, Vec<Option<String>>>,
+        selected_process_profile: Option<String>,
+        shell: ShellConfig,
+    ) -> Result<Self, ProjectError> {
+        debug_assert_eq!(base_processes.len(), base_process_profile_labels.len());
+        let mut project = Self::with_shell(base_processes, shell.clone())?;
+        project.process_profile_names = processes_by_profile.keys().cloned().collect();
+        project.processes_by_profile = processes_by_profile;
+        project.base_process_profile_labels = base_process_profile_labels;
+        project.process_profile_labels_by_profile = process_profile_labels_by_profile;
+        project.dependency_indices_by_profile.clear();
+        project
+            .dependency_indices_by_profile
+            .insert(None, project.dependency_indices.clone());
+
+        for name in &project.process_profile_names {
+            let processes = project
+                .processes_by_profile
+                .get(name)
+                .expect("every profile name has effective Processes")
+                .clone();
             let validated = Self::with_shell(processes, shell.clone()).map_err(|source| {
                 ProjectError::InvalidProcessProfileGraph {
-                    profile: selection.as_deref().unwrap_or("base").to_string(),
+                    profile: name.clone(),
                     source: Box::new(source),
                 }
             })?;
             project
                 .dependency_indices_by_profile
-                .insert(selection, validated.dependency_indices);
+                .insert(Some(name.clone()), validated.dependency_indices);
         }
 
         let selected = selected_process_profile.as_deref();
@@ -509,12 +565,12 @@ impl EffectiveProject {
         &self.processes
     }
 
-    /// The global Process Profile selected for future Runs. `None` is base.
+    /// The Project Profile selected for future Runs. `None` is base.
     pub(crate) fn selected_process_profile(&self) -> Option<&str> {
         self.selected_process_profile.as_deref()
     }
 
-    /// Every named Process Profile in stable lexical order.
+    /// Every named Project Profile in stable lexical order.
     pub(crate) fn process_profile_names(&self) -> &[String] {
         &self.process_profile_names
     }
@@ -525,30 +581,22 @@ impl EffectiveProject {
         self.process_profile_for_selection(index, self.selected_process_profile.as_deref())
     }
 
-    fn process_profile_for_selection<'a>(
-        &'a self,
-        index: usize,
-        selection: Option<&'a str>,
-    ) -> Option<&'a str> {
-        match self.process_profile_overrides.get(index)?.as_deref() {
-            Some("base") => None,
-            Some(name) => Some(name),
-            None => selection.filter(|name| self.process_profiles[index].contains_key(*name)),
-        }
+    fn process_profile_for_selection(&self, index: usize, selection: Option<&str>) -> Option<&str> {
+        selection
+            .and_then(|name| self.process_profile_labels_by_profile.get(name))
+            .unwrap_or(&self.base_process_profile_labels)
+            .get(index)
+            .and_then(Option::as_deref)
     }
 
     fn processes_for_selection(&self, selection: Option<&str>) -> Vec<ProcessSpec> {
-        (0..self.base_processes.len())
-            .map(|index| {
-                self.process_profile_for_selection(index, selection)
-                    .and_then(|name| self.process_profiles[index].get(name))
-                    .unwrap_or(&self.base_processes[index])
-                    .clone()
-            })
-            .collect()
+        selection
+            .and_then(|name| self.processes_by_profile.get(name))
+            .unwrap_or(&self.base_processes)
+            .clone()
     }
 
-    /// Select one global Process Profile and replace the next-Run
+    /// Select one Project Profile and replace the next-Run
     /// specifications and validated Dependency graph. A missing name leaves
     /// the current selection unchanged.
     pub(crate) fn select_process_profile(&mut self, profile: Option<&str>) -> bool {

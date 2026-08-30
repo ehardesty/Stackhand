@@ -73,6 +73,30 @@ fn discovered_resolution_uses_only_an_existing_same_directory_override() {
 }
 
 #[test]
+fn local_override_can_define_project_profile_environment_files() {
+    let directory = unique_directory("project-profile");
+    let base = write_base(&directory, "base");
+    fs::write(directory.join("base.env"), "REMOVE_ME=base\n").expect("environment writes");
+    let mut base_text = fs::read_to_string(&base).expect("base reads");
+    base_text.insert_str("version: 1\n".len(), "env_files: [base.env]\n");
+    fs::write(&base, base_text).expect("base updates");
+    fs::write(
+        directory.join(LOCAL_FILE_NAME),
+        "profiles:\n  clean:\n    env_files: []\n",
+    )
+    .expect("local override writes");
+
+    let resolution = resolve(ResolutionRequest::Discover {
+        start_dir: Some(directory.clone()),
+        profile: Some("clean".to_string()),
+    })
+    .expect("the local Project Profile resolves");
+
+    assert!(resolution.project().processes()[0].env.is_empty());
+    fs::remove_dir_all(directory).ok();
+}
+
+#[test]
 fn explicit_resolution_never_loads_a_local_override() {
     let directory = unique_directory("explicit");
     let base = write_base(&directory, "base");
@@ -136,13 +160,8 @@ fn child_and_parent_local_files_are_not_searched() {
 }
 
 #[test]
-fn local_override_has_profile_and_schema_version_guards() {
+fn local_override_has_schema_version_and_process_guards() {
     for (label, local, expected) in [
-        (
-            "profiles",
-            "profiles: {}\n",
-            "top-level profiles are not supported",
-        ),
         (
             "version",
             "version: 2\n",

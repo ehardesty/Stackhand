@@ -17,9 +17,16 @@ use super::readiness::ReadinessFile;
 pub(super) struct ConfigFile {
     pub(super) version: u64,
     pub(super) env_files: Option<Vec<String>>,
+    pub(super) profiles: Option<BTreeMap<String, ProjectProfileFile>>,
     #[serde(default)]
     pub(super) processes: ProcessCollection,
     pub(super) settings: Option<SettingsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProjectProfileFile {
+    pub(super) env_files: Option<Vec<String>>,
 }
 
 #[derive(Default)]

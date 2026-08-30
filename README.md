@@ -18,8 +18,9 @@ The specification controls when it conflicts with the implementation plan. Proto
 ## Current prototype
 
 The current prototype discovers the nearest `stackhand.yaml` from the working
-directory, or accepts an explicit Project path. Each Process can define named
-Process Profiles for its launch command, working directory, environment files,
+directory, or accepts an explicit Project path. Project Profiles can select
+Project environment files and matching Process Profiles. Each Process Profile
+can change its launch command, working directory, environment files,
 environment, enabled state, and Dependencies. A same-directory `stackhand.local.yaml` can
 override discovered Projects. Stackhand starts and supervises Services and
 One-shots. It applies Dependency, readiness, liveness, and restart rules. It
@@ -45,8 +46,8 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run -- examples/basic.yaml
 
 Stackhand discovers the nearest `stackhand.yaml` when no path is given. Pass
 a Project path to disable discovery. Use one `--profile NAME` option to select
-the initial global Process Profile. A Process that does not define that name
-uses its base configuration. A same-directory `stackhand.local.yaml` is applied only
+the initial Project Profile. A Process that does not define that name uses its
+base Process configuration. A same-directory `stackhand.local.yaml` is applied only
 to discovered Projects. `config validate` and `config show` use the same
 resolution rules without starting Processes.
 
@@ -58,7 +59,7 @@ Stackhand starts enabled autostart Processes with the Process list focused. Use
 When the selected Process is waiting for a Dependency, press `S` to start it
 anyway. This skips Dependency checks for that Run only. Later Runs use the
 normal Dependency rules.
-Press `p` to cycle the global Process Profile. Profile selection has no
+Press `p` to cycle the Project Profile. Profile selection has no
 immediate lifecycle effect, so active Processes continue. When active Runs
 need a profile change, Stackhand shows `R: apply profile`. Press `R` to stop
 active Processes that the Next Profile disables. Stackhand also restarts

@@ -34,6 +34,12 @@ env_files:
   - .env
   - .env.local
 
+profiles:
+  cloud:
+    env_files: [.env.cloud]
+  clean:
+    env_files: []
+
 settings:
   shell:
     program: /bin/bash
@@ -43,6 +49,7 @@ processes: {}
 ```
 
 - `env_files` lists environment files in load order. Relative paths start from the directory that contains `stackhand.yaml`.
+- `profiles.NAME.env_files` replaces the Project `env_files` list when that Project Profile is selected. An empty list loads no Project environment files. If the field is absent, the profile uses the base list.
 - `settings.shell` selects the program that runs every `shell` expression. The default is `/bin/sh` with `[-c]`.
 - `processes` can be empty.
 
@@ -173,7 +180,9 @@ Set `restart.on_unhealthy` to `true` when a liveness failure must stop the curre
 
 Durations use a nonnegative whole number followed by `ms`, `s`, `m`, or `h`. Fields that require a positive duration do not accept zero.
 
-## Process Profiles
+## Profiles
+
+A Project Profile is a Project-wide selection. It can replace the Project environment files and activate same-named Process Profiles. One `--profile NAME` option selects the initial Project Profile. The name `base` is reserved.
 
 A Process Profile is a named partial patch inside one Process:
 
@@ -199,7 +208,7 @@ A Process Profile can change only:
 - `enabled`;
 - `depends_on`.
 
-One `--profile NAME` option selects the initial global Process Profile. A Process without that name keeps its base configuration. The name `base` is reserved.
+A Process without a matching Process Profile keeps its base Process configuration. It still uses the environment files from the selected Project Profile.
 
 A Process can use `profile` to select a fixed Process Profile:
 
@@ -213,7 +222,9 @@ processes:
         command: [worker, --cloud]
 ```
 
-A profile patch replaces `env_files` and the complete `depends_on` mapping. It merges `environment` by variable name. A `null` environment value removes that variable.
+A fixed Process Profile does not change the selected Project environment files.
+
+A Process Profile patch replaces Process `env_files` and the complete `depends_on` mapping. It merges `environment` by variable name. A `null` environment value removes that variable from all earlier layers, including the parent environment.
 
 ## Local override
 

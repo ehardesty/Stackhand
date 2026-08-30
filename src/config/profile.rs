@@ -10,12 +10,6 @@ pub(super) fn apply_local_override(document: &mut Value, local: &Value) -> Resul
             message: "local override must be a mapping".to_string(),
         });
     };
-    if root.contains_key(yaml_key("profiles")) {
-        return Err(ConfigError {
-            message: "top-level profiles are not supported; define profiles inside each Process"
-                .to_string(),
-        });
-    }
     if root.get(yaml_key("processes")).is_some_and(Value::is_null) {
         return Err(ConfigError {
             message: "local override processes cannot be null".to_string(),

@@ -13,7 +13,7 @@
 - environment precedence and null unsetting;
 - Process Profile field limits;
 - reserved `base` name;
-- initial global Process Profile selection;
+- initial Project Profile selection;
 - missing profile fallback to base;
 - rare per-Process `profile` override;
 - Process Profile environment and list replacement;
@@ -162,7 +162,7 @@ Use Ratatui `TestBackend` where useful for:
 - logs/search view;
 - help/modal rendering;
 - metrics column collapse;
-- `p` global Process Profile cycling;
+- `p` Project Profile cycling;
 - conditional `S: start anyway` control for a Waiting Process;
 - conditional `R: apply profile` control and affected-Process restart action;
 - conditional Profile column visibility;

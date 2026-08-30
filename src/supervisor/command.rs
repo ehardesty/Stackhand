@@ -14,7 +14,7 @@ pub enum Command {
     /// Rerun one enabled One-shot; a no-op for every other Process.
     Rerun(String),
     StartAutostart,
-    /// Select the next global Process Profile without changing current Runs.
+    /// Select the next Project Profile without changing current Runs.
     SelectNextProcessProfile,
     /// Apply pending profile changes to active Processes. Stop Processes that
     /// become disabled and restart affected enabled autostart Processes.
