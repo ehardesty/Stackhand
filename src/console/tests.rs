@@ -165,11 +165,9 @@ fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
     assert!(interaction.handle_key_read_only(key(KeyCode::PageUp), &mut logs, 20));
     assert!(!logs.following());
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
-    assert!(!interaction.view().following);
 
     assert!(interaction.handle_key_read_only(key(KeyCode::Char('f')), &mut logs, 20));
     assert!(logs.following());
-    assert!(interaction.view().following);
 
     assert!(interaction.handle_key_read_only(leader(), &mut logs, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::Console);
@@ -214,7 +212,6 @@ fn focused_logs_support_navigation_and_a_direct_escape() {
 
     assert!(interaction.handle_key_read_only(key(KeyCode::End), &mut logs, 20));
     assert!(logs.following());
-    assert!(interaction.view().following);
 
     assert!(interaction.handle_key_read_only(key(KeyCode::Esc), &mut logs, 20));
     assert_eq!(interaction.view().mode, ConsoleViewMode::ProcessList);
@@ -311,7 +308,6 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
         logs.handle_key(key(KeyCode::Char('c')), true, false, &retained, 3),
         LogsInput::Copy(text) if text.contains('\n')
     ));
-    assert!(!interaction.view().following);
 }
 
 #[test]

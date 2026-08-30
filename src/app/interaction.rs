@@ -159,8 +159,6 @@ impl ProjectInteraction {
                 }
                 self.truncation = Some((self.selected, retained.truncated));
                 self.console.set_pane(ConsolePaneKind::Pipe);
-                self.console
-                    .set_following(self.logs[self.selected].following());
             }
             SelectedPane::Empty => {
                 self.truncation = None;
@@ -190,7 +188,7 @@ impl ProjectInteraction {
         let (lines, logs_status, logs_editing) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
-                self.console.set_following(frame.following);
+                view.following = frame.following;
                 view.search_editing = frame.editing;
                 view.search_active = frame.search_active;
                 view.logs_selection = frame.has_selection;
@@ -232,8 +230,6 @@ impl ProjectInteraction {
             Event::Paste(data) if self.logs[self.selected].is_search_editing() => {
                 self.console.clear_warning();
                 if self.logs[self.selected].paste_search(&data, retained) {
-                    self.console
-                        .set_following(self.logs[self.selected].following());
                     InputResult::Changed
                 } else {
                     InputResult::Ignored
@@ -305,8 +301,6 @@ impl ProjectInteraction {
         ) {
             LogsInput::Changed => {
                 self.console.clear_warning();
-                self.console
-                    .set_following(self.logs[self.selected].following());
                 return InputResult::Changed;
             }
             LogsInput::Copy(text) => {
@@ -576,5 +570,41 @@ mod tests {
         );
         let update = interaction.update_project(&snapshot);
         assert_eq!(update.commands, vec![Command::Rerun("setup".to_string())]);
+    }
+
+    #[test]
+    fn logs_frame_reports_the_current_follow_state() {
+        let output = crate::output::OutputViews::new(1);
+        output.for_process(0).unwrap().append_at(
+            1,
+            crate::runtime::OutputStream::Stdout,
+            0,
+            (0..30)
+                .map(|line| format!("line-{line}\n"))
+                .collect::<String>()
+                .into_bytes(),
+        );
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction {
+            logs: vec![ProcessLogs::default()],
+            ..Default::default()
+        };
+
+        interaction.logs[0].scroll_page(20, -1);
+        assert!(
+            !interaction
+                .frame(&pane, &retained, 20, false)
+                .view
+                .following
+        );
+
+        interaction.logs[0].scroll_page(20, 1);
+        assert!(
+            interaction
+                .frame(&pane, &retained, 20, false)
+                .view
+                .following
+        );
     }
 }

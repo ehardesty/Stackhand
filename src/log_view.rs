@@ -201,12 +201,7 @@ impl LogView {
             }
             KeyCode::Enter => {
                 self.query = self.editor.take().unwrap_or_default();
-                self.generation = Some(output.generation);
-                self.search = output.search(&self.query);
-                self.current = (!self.search.matches.is_empty()).then_some(0);
-                self.current_match()
-                    .map(LogViewAction::ShowMatch)
-                    .unwrap_or(LogViewAction::Changed)
+                self.rebuild_current_query(output)
             }
             KeyCode::Backspace => {
                 self.editor.as_mut().expect("editor exists").pop();
@@ -228,19 +223,18 @@ impl LogView {
     }
 
     fn preview_search(&mut self, output: &RetainedOutput) -> LogViewAction {
-        let query = self.editor.as_deref().unwrap_or_default();
-        self.generation = Some(output.generation);
-        self.search = output.search(query);
-        self.current = (!self.search.matches.is_empty()).then_some(0);
-        self.current_match()
-            .map(LogViewAction::ShowMatch)
-            .unwrap_or(LogViewAction::Changed)
+        self.rebuild_current_query(output)
     }
 
     fn cancel_search_edit(&mut self, output: &RetainedOutput) -> LogViewAction {
         self.editor = None;
+        self.rebuild_current_query(output)
+    }
+
+    fn rebuild_current_query(&mut self, output: &RetainedOutput) -> LogViewAction {
+        let query = self.editor.as_deref().unwrap_or(&self.query);
         self.generation = Some(output.generation);
-        self.search = output.search(&self.query);
+        self.search = output.search(query);
         self.current = (!self.search.matches.is_empty()).then_some(0);
         self.current_match()
             .map(LogViewAction::ShowMatch)

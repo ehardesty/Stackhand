@@ -108,10 +108,6 @@ impl ConsoleInteraction {
         self.view.pane = pane;
     }
 
-    pub fn set_following(&mut self, following: bool) {
-        self.view.following = following;
-    }
-
     pub fn clear_pane_warning(&mut self) {
         Self::clear_pane_warnings(&mut self.view);
     }
@@ -350,7 +346,6 @@ impl ConsoleInteraction {
         if !logs.handle_mouse(mouse, area, repeats, output) {
             return false;
         }
-        self.view.following = logs.following();
         self.clear_warning();
         true
     }
@@ -467,14 +462,8 @@ impl ConsoleInteraction {
         self.clear_warning();
         match command {
             ProcessCommand::MoveSelection(direction) => self.selection_requests.push(direction),
-            ProcessCommand::ScrollPage(direction) => {
-                logs.scroll_page(page_rows, direction);
-                self.view.following = false;
-            }
-            ProcessCommand::Follow => {
-                logs.follow();
-                self.view.following = true;
-            }
+            ProcessCommand::ScrollPage(direction) => logs.scroll_page(page_rows, direction),
+            ProcessCommand::Follow => logs.follow(),
             ProcessCommand::Lifecycle(request) => self.lifecycle_requests.push(request),
             ProcessCommand::EnterCopy => {
                 self.view.warning = Some(ConsoleWarning::SelectionUnavailable);
@@ -490,10 +479,7 @@ impl ConsoleInteraction {
         page_rows: u16,
     ) -> bool {
         match logs.handle_navigation_key(key, page_rows) {
-            LogsNavigation::Changed => {
-                self.view.following = logs.following();
-                self.clear_warning();
-            }
+            LogsNavigation::Changed => self.clear_warning(),
             LogsNavigation::Exit => {
                 self.focus_process_list(None);
                 self.clear_warning();
