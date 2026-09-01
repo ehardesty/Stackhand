@@ -9,6 +9,7 @@ use ratatui::widgets::{
 
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
+use super::profile_menu::ProjectProfileMenu;
 use super::theme::{LifecycleTone, TERMINAL_THEME};
 
 const FOOTER_HEIGHT: u16 = 1;
@@ -79,6 +80,7 @@ pub struct ConsoleViewState {
     pub search_active: bool,
     pub logs_selection: bool,
     pub logs_scrollbar: Option<ConsoleScrollbar>,
+    pub profile_menu_open: bool,
     pub profile_changes_pending: bool,
     pub start_anyway_available: bool,
 }
@@ -95,6 +97,7 @@ impl Default for ConsoleViewState {
             search_active: false,
             logs_selection: false,
             logs_scrollbar: None,
+            profile_menu_open: false,
             profile_changes_pending: false,
             start_anyway_available: false,
         }
@@ -263,12 +266,13 @@ pub fn render_project(
     view: ConsoleViewState,
     process_list_title: &str,
     selected_header: &str,
+    profile_menu: &mut ProjectProfileMenu,
 ) -> Rect {
     let area = frame.area();
     let (list, console_pane, footer) = project_layout(area, rows.len());
     let console_inner = pane_inner(console_pane);
 
-    render_process_table(
+    let profile_trigger = render_process_table(
         frame,
         rows,
         process_table_state,
@@ -309,6 +313,9 @@ pub fn render_project(
             .style(TERMINAL_THEME.footer(view.warning.is_some())),
         footer,
     );
+    if let Some(trigger) = profile_trigger {
+        profile_menu.render(frame, trigger, area);
+    }
     // A pipe console has no terminal cursor. Console focus shows the child
     // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
     if matches!(view.mode, ConsoleViewMode::Console | ConsoleViewMode::Copy)
@@ -341,7 +348,7 @@ fn render_process_table(
     pane: Rect,
     mode: ConsoleViewMode,
     title: &str,
-) {
+) -> Option<Rect> {
     let inner = pane_inner(pane);
     let show_profile = rows.iter().any(|row| row.profile.is_some());
     let show_metrics = inner.width >= PROCESS_METRICS_MIN_WIDTH + if show_profile { 24 } else { 0 };
@@ -396,6 +403,32 @@ fn render_process_table(
     }
     state.select(rows.iter().position(|row| row.selected));
     frame.render_stateful_widget(table, pane, state);
+    profile_title_trigger(pane, title)
+}
+
+fn profile_title_trigger(pane: Rect, title: &str) -> Option<Rect> {
+    let profile_start = title.find("Profile: ")?;
+    let affordance_end = title[profile_start..].find(" ▾")? + profile_start + " ▾".len();
+    let title_area = Rect::new(
+        pane.x.saturating_add(1),
+        pane.y,
+        pane.width.saturating_sub(2),
+        1,
+    );
+    let trigger_x = title_area
+        .x
+        .saturating_add(1)
+        .saturating_add(Line::from(title[..profile_start].to_owned()).width() as u16);
+    let trigger_width = Line::from(title[profile_start..affordance_end].to_owned()).width() as u16;
+    let visible_width = title_area.right().saturating_sub(trigger_x);
+    (trigger_width > 0 && visible_width > 0).then(|| {
+        Rect::new(
+            trigger_x,
+            title_area.y,
+            trigger_width.min(visible_width),
+            title_area.height,
+        )
+    })
 }
 
 fn right_cell(text: &str) -> Cell<'_> {
@@ -489,19 +522,23 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
     };
     let controls = match view.mode {
         ConsoleViewMode::ProcessList => {
-            let apply_profile = if view.profile_changes_pending {
-                " · R: apply profile"
+            if view.profile_menu_open {
+                "↑/↓: select · Enter: choose · Esc: close".to_string()
             } else {
-                ""
-            };
-            let start_anyway = if view.start_anyway_available {
-                " · S: start anyway"
-            } else {
-                ""
-            };
-            format!(
-                "j/k: select · p: profile{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · /: search{match_control} · q: quit"
-            )
+                let apply_profile = if view.profile_changes_pending {
+                    " · R: apply profile"
+                } else {
+                    ""
+                };
+                let start_anyway = if view.start_anyway_available {
+                    " · S: start anyway"
+                } else {
+                    ""
+                };
+                format!(
+                    "j/k: select · p: profiles{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · /: search{match_control} · q: quit"
+                )
+            }
         }
         ConsoleViewMode::Console => match view.pane {
             ConsolePaneKind::Terminal => {
@@ -579,6 +616,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut process_table_state = TableState::default();
+        let mut profile_menu = ProjectProfileMenu::default();
         terminal
             .draw(|frame| {
                 render_project(
@@ -590,6 +628,7 @@ mod tests {
                     ConsoleViewState::default(),
                     "Processes",
                     "",
+                    &mut profile_menu,
                 );
             })
             .unwrap();
@@ -720,6 +759,48 @@ mod tests {
     }
 
     #[test]
+    fn profile_menu_overlay_keeps_title_affordance_visible() {
+        let backend = ratatui::backend::TestBackend::new(60, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let rows = [row("api", "Ready", true)];
+        let mut process_table_state = TableState::default();
+        let mut profile_menu = ProjectProfileMenu::default();
+        profile_menu.sync("base", ["dev"], None);
+        profile_menu.toggle();
+
+        terminal
+            .draw(|frame| {
+                render_project(
+                    frame,
+                    &rows,
+                    &mut process_table_state,
+                    None,
+                    None,
+                    ConsoleViewState {
+                        profile_menu_open: true,
+                        ..ConsoleViewState::default()
+                    },
+                    "Processes · Profile: base ▾",
+                    "",
+                    &mut profile_menu,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+        assert!(text.contains("Profile: base ▾"), "{text:?}");
+        assert!(
+            text.contains("dev"),
+            "dropdown should overlay the frame: {text:?}"
+        );
+        assert!(
+            buffer_text(buffer).contains("↑/↓: select"),
+            "open footer should show menu controls: {text:?}"
+        );
+    }
+
+    #[test]
     fn metric_cells_degrade_on_a_narrow_layout() {
         let rows = [
             row_with_metrics("web", "Ready", "3.2%", "184M", true),
@@ -775,6 +856,7 @@ mod tests {
             .map(|index| row(&format!("process-{index}"), "Ready", index == 7))
             .collect::<Vec<_>>();
         let mut state = TableState::default();
+        let mut profile_menu = ProjectProfileMenu::default();
         terminal
             .draw(|frame| {
                 render_project(
@@ -786,6 +868,7 @@ mod tests {
                     ConsoleViewState::default(),
                     "Processes",
                     "",
+                    &mut profile_menu,
                 );
             })
             .unwrap();
@@ -804,6 +887,7 @@ mod tests {
                     ConsoleViewState::default(),
                     "Processes",
                     "",
+                    &mut profile_menu,
                 );
             })
             .unwrap();
@@ -837,6 +921,7 @@ mod tests {
     fn logs_current_match_is_visibly_distinct() {
         let backend = ratatui::backend::TestBackend::new(40, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut profile_menu = ProjectProfileMenu::default();
         let lines = [PipeLine {
             text: "00:00:00.000 out: before needle after".to_string(),
             marker: false,
@@ -860,6 +945,7 @@ mod tests {
                     },
                     "Processes",
                     "Logs · demo · search: /needle · 1/1",
+                    &mut profile_menu,
                 );
             })
             .unwrap();
@@ -997,6 +1083,7 @@ mod tests {
         };
         let mut console_inner = Rect::default();
         let mut process_table_state = TableState::default();
+        let mut profile_menu = ProjectProfileMenu::default();
 
         terminal
             .draw(|frame| {
@@ -1012,6 +1099,7 @@ mod tests {
                     },
                     "Processes",
                     "",
+                    &mut profile_menu,
                 );
             })
             .unwrap();
@@ -1065,6 +1153,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1148,6 +1237,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1171,6 +1261,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1192,6 +1283,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },

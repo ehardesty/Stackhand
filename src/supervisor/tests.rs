@@ -430,6 +430,71 @@ fn profile_selection_is_deferred_until_bulk_restart() {
 }
 
 #[test]
+fn direct_project_profile_selection_updates_next_profiles_without_restarting_runs() {
+    let mut h = Harness::new(profile_enablement_project());
+    h.report_spawns();
+    h.command(Command::StartAutostart);
+    let runs_before = h
+        .snapshot()
+        .processes
+        .iter()
+        .map(|process| (process.name.clone(), process.current_run))
+        .collect::<Vec<_>>();
+    let intent_count = h.runtime.intents().len();
+
+    h.command(Command::SelectProjectProfile(Some("cloud".into())));
+    let cloud = h.snapshot();
+    assert_eq!(cloud.selected_profile.as_deref(), Some("cloud"));
+    assert_eq!(
+        cloud
+            .processes
+            .iter()
+            .map(|process| (process.name.as_str(), process.next_profile.as_deref()))
+            .collect::<Vec<_>>(),
+        [("storage", Some("cloud")), ("optional", Some("cloud"))]
+    );
+    assert_eq!(
+        cloud
+            .processes
+            .iter()
+            .map(|process| (process.name.clone(), process.current_run))
+            .collect::<Vec<_>>(),
+        runs_before
+    );
+    assert_eq!(h.runtime.intents().len(), intent_count);
+
+    h.command(Command::SelectProjectProfile(None));
+    let base = h.snapshot();
+    assert_eq!(base.selected_profile, None);
+    assert!(
+        base.processes
+            .iter()
+            .all(|process| process.next_profile.is_none())
+    );
+    assert_eq!(
+        base.processes
+            .iter()
+            .map(|process| (process.name.clone(), process.current_run))
+            .collect::<Vec<_>>(),
+        runs_before
+    );
+    assert_eq!(h.runtime.intents().len(), intent_count);
+}
+
+#[test]
+fn invalid_direct_project_profile_selection_is_a_no_op() {
+    let mut h = Harness::new(profile_enablement_project());
+    h.command(Command::SelectProjectProfile(Some("cloud".into())));
+    let before = h.snapshot();
+    let intent_count = h.runtime.intents().len();
+
+    h.command(Command::SelectProjectProfile(Some("missing".into())));
+
+    assert_eq!(h.snapshot(), before);
+    assert_eq!(h.runtime.intents().len(), intent_count);
+}
+
+#[test]
 fn applying_a_profile_stops_newly_disabled_processes_without_starting_newly_enabled_processes() {
     let mut h = Harness::new(profile_enablement_project());
     h.report_spawns();

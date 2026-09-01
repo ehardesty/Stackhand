@@ -22,8 +22,8 @@ use crate::supervisor::{
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
-    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, pane_inner, process_row_at,
-    project_layout,
+    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, ProjectProfileMenu,
+    ProjectProfileMenuAction, pane_inner, process_row_at, project_layout,
 };
 
 /// The selected Process's visible output owner.
@@ -63,6 +63,8 @@ pub(crate) struct ProjectInteraction {
     process_table: TableState,
     logs: Vec<ProcessLogs>,
     project_commands: Vec<Command>,
+    profile_menu: ProjectProfileMenu,
+    profile_menu_available: bool,
     profile_changes_pending: bool,
     start_anyway_available: bool,
     truncation: Option<(usize, bool)>,
@@ -73,8 +75,8 @@ impl ProjectInteraction {
         self.selected
     }
 
-    pub(super) fn process_table_state(&mut self) -> &mut TableState {
-        &mut self.process_table
+    pub(super) fn render_state(&mut self) -> (&mut TableState, &mut ProjectProfileMenu) {
+        (&mut self.process_table, &mut self.profile_menu)
     }
 
     pub(super) fn poll_requests(&mut self) -> bool {
@@ -88,6 +90,15 @@ impl ProjectInteraction {
     /// Reconcile queued user commands with the latest immutable Project
     /// snapshot. Selection and Process commands are applied in one place.
     pub(crate) fn update_project(&mut self, snapshot: &ProjectSnapshot) -> ProjectUpdate {
+        self.profile_menu.sync(
+            &snapshot.base_profile_name,
+            &snapshot.available_profiles,
+            snapshot.selected_profile.as_deref(),
+        );
+        self.profile_menu_available = !snapshot.available_profiles.is_empty();
+        if !self.profile_menu_available {
+            self.profile_menu.close();
+        }
         self.profile_changes_pending = profile_changes_pending(snapshot);
         self.selected = self
             .selected
@@ -203,6 +214,7 @@ impl ProjectInteraction {
             self.console.sync_terminal_following(snapshot.scrollbar);
         }
         let mut view = self.console.view();
+        view.profile_menu_open = self.profile_menu_available && self.profile_menu.is_open();
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
         let (lines, logs_status, logs_editing) = match pane {
@@ -247,13 +259,25 @@ impl ProjectInteraction {
         }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
+            && self.profile_menu_available
+            && self.profile_menu.is_open()
+        {
+            // An open menu owns keyboard input, including keys it does not use.
+            return self.route_profile_menu_key(key);
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
             && self.console.view().mode == crate::tui::ConsoleViewMode::ProcessList
             && !key.modifiers.intersects(
                 crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
             )
         {
+            if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+                && self.profile_menu_available
+            {
+                return self.route_profile_menu_key(key);
+            }
             let command = match key.code {
-                KeyCode::Char('p') => Some(Command::SelectNextProcessProfile),
                 KeyCode::Char('R') if self.profile_changes_pending => {
                     Some(Command::RestartProfiledAutostart)
                 }
@@ -323,6 +347,28 @@ impl ProjectInteraction {
                 }
             }
             Event::Resize(_, _) => InputResult::Ignored,
+        }
+    }
+
+    fn route_profile_menu_key(&mut self, key: KeyEvent) -> InputResult {
+        let action = self.profile_menu.handle_key(&key);
+        self.handle_profile_menu_action(action)
+    }
+
+    fn handle_profile_menu_action(&mut self, action: ProjectProfileMenuAction) -> InputResult {
+        match action {
+            ProjectProfileMenuAction::Ignored => InputResult::Ignored,
+            ProjectProfileMenuAction::Changed => {
+                self.console.clear_warning();
+                InputResult::Changed
+            }
+            ProjectProfileMenuAction::Selected(profile) => {
+                self.profile_menu.close();
+                self.project_commands
+                    .push(Command::SelectProjectProfile(profile));
+                self.console.clear_warning();
+                InputResult::Changed
+            }
         }
     }
 
@@ -398,6 +444,22 @@ impl ProjectInteraction {
         let console_inner = pane_inner(console_outer);
         let child_tracks_mouse = process.input_focused
             && matches!(pane, SelectedPane::Terminal(view) if view.mouse_tracking());
+
+        if self.profile_menu_available {
+            let action = self.profile_menu.handle_mouse(&mouse);
+            if action != ProjectProfileMenuAction::Ignored {
+                return matches!(
+                    self.handle_profile_menu_action(action),
+                    InputResult::Changed
+                );
+            }
+            if self.profile_menu.is_open()
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                self.profile_menu.close();
+                return true;
+            }
+        }
 
         let terminal_scrollbar_active = self.console.terminal_scrollbar_gesture_active();
         if terminal_scrollbar_active && !matches!(pane, SelectedPane::Terminal(_)) {
@@ -539,7 +601,8 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
     use crate::supervisor::{DesiredState, Lifecycle, ProcessId, RestartBudgetStatus};
@@ -577,6 +640,15 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn left_click(column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
     }
 
     #[test]
@@ -629,7 +701,7 @@ mod tests {
     fn profile_keys_queue_global_selection_and_pending_apply_commands() {
         let mut snapshot = ProjectSnapshot {
             base_profile_name: "base".to_string(),
-            selected_profile: Some("local".to_string()),
+            selected_profile: None,
             available_profiles: vec!["cloud-dev".to_string(), "local".to_string()],
             processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
             now_ms: 0,
@@ -652,9 +724,41 @@ mod tests {
             ),
             InputResult::Changed
         );
+        assert!(interaction.profile_menu.is_open());
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Down,
+        ] {
+            assert_eq!(
+                interaction.route_input(
+                    key(code),
+                    1,
+                    &pane,
+                    &snapshot.processes[0],
+                    &retained,
+                    Rect::new(0, 0, 80, 20),
+                ),
+                InputResult::Changed
+            );
+        }
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Enter),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert!(!interaction.profile_menu.is_open());
         assert_eq!(
             interaction.update_project(&snapshot).commands,
-            vec![Command::SelectNextProcessProfile]
+            vec![Command::SelectProjectProfile(Some("cloud-dev".to_string()))]
         );
 
         snapshot.processes[0].current_run = Some(1);
@@ -675,6 +779,192 @@ mod tests {
         assert_eq!(
             interaction.update_project(&snapshot).commands,
             vec![Command::RestartProfiledAutostart]
+        );
+    }
+
+    #[test]
+    fn escape_closes_profile_menu_without_queueing_a_command() {
+        let snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
+            selected_profile: None,
+            available_profiles: vec!["cloud-dev".to_string()],
+            processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('p')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('s')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Ignored
+        );
+        assert!(interaction.profile_menu.is_open());
+        assert!(interaction.update_project(&snapshot).commands.is_empty());
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Esc),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert!(!interaction.profile_menu.is_open());
+        assert!(interaction.update_project(&snapshot).commands.is_empty());
+    }
+
+    #[test]
+    fn profile_mouse_trigger_and_option_selection_are_routed_before_the_process_list() {
+        let snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
+            selected_profile: None,
+            available_profiles: vec!["cloud-dev".to_string()],
+            processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('p')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+
+        let rows = [crate::tui::ProcessRowView {
+            name: "api".to_string(),
+            status: "Ready".to_string(),
+            lifecycle_tone: crate::tui::LifecycleTone::Success,
+            profile: None,
+            cpu: None,
+            memory: None,
+            selected: true,
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>,
+                      interaction: &mut ProjectInteraction| {
+            let (table_state, profile_menu) = interaction.render_state();
+            terminal
+                .draw(|frame| {
+                    crate::tui::render_project(
+                        frame,
+                        &rows,
+                        table_state,
+                        None,
+                        None,
+                        ConsoleViewState {
+                            profile_menu_open: true,
+                            ..ConsoleViewState::default()
+                        },
+                        "Processes · Profile: base ▾",
+                        "",
+                        profile_menu,
+                    );
+                })
+                .unwrap();
+        };
+        // Store the wrapper geometry during a real frame render.
+        let (state, profile_menu) = interaction.render_state();
+        terminal
+            .draw(|frame| {
+                crate::tui::render_project(
+                    frame,
+                    &rows,
+                    state,
+                    None,
+                    None,
+                    ConsoleViewState {
+                        profile_menu_open: true,
+                        ..ConsoleViewState::default()
+                    },
+                    "Processes · Profile: base ▾",
+                    "",
+                    profile_menu,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            interaction.route_input(
+                left_click(15, 0),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert!(!interaction.profile_menu.is_open());
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('p')),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        render(&mut terminal, &mut interaction);
+        let option_row = (1..24)
+            .find(|row| {
+                (0..80)
+                    .map(|column| terminal.backend().buffer()[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("cloud-dev")
+            })
+            .expect("the named profile is rendered in the dropdown");
+        assert_eq!(
+            interaction.route_input(
+                left_click(15, option_row),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert!(!interaction.profile_menu.is_open());
+        assert_eq!(
+            interaction.update_project(&snapshot).commands,
+            vec![Command::SelectProjectProfile(Some("cloud-dev".to_string()))]
         );
     }
 

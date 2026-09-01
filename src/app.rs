@@ -7,7 +7,9 @@ use crate::supervisor::{
     Command, Consoles, ProjectShutdownSnapshot, ProjectSnapshot, SupervisorHandle,
 };
 use crate::terminal::OwnedTerminalSnapshot;
-use crate::tui::{OuterTerminal, ProcessRowView, pane_inner, project_layout, render_project};
+use crate::tui::{
+    OuterTerminal, ProcessRowView, ProjectProfileMenu, pane_inner, project_layout, render_project,
+};
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::Event;
 
@@ -205,15 +207,17 @@ fn run_event_loop(
             if shutting_down {
                 header.insert_str(0, "Project shutdown in progress · ");
             }
+            let (process_table_state, profile_menu) = interaction.render_state();
             console_area = render_frame(
                 outer,
                 &rows,
-                interaction.process_table_state(),
+                process_table_state,
                 frame.terminal.as_ref(),
                 frame.lines.as_deref(),
                 frame.view,
                 &list_title,
                 &header,
+                profile_menu,
             )?;
             let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
             outer.set_cursor_shape(cursor)?;
@@ -266,6 +270,7 @@ fn render_frame(
     view: crate::tui::ConsoleViewState,
     process_list_title: &str,
     selected_header: &str,
+    profile_menu: &mut ProjectProfileMenu,
 ) -> Result<ratatui::layout::Rect> {
     let mut pane = None;
     outer
@@ -280,6 +285,7 @@ fn render_frame(
                 view,
                 process_list_title,
                 selected_header,
+                profile_menu,
             ));
         })
         .map_err(|error| anyhow!("render failed: {error}"))?;

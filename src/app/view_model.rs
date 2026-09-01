@@ -81,9 +81,9 @@ pub(super) fn process_list_title(snapshot: &ProjectSnapshot) -> String {
         })
         .count();
     if pending == 0 {
-        format!("Processes · Profile: {selected}")
+        format!("Processes · Profile: {selected} ▾")
     } else {
-        format!("Processes · Profile: {selected} · {pending} pending")
+        format!("Processes · Profile: {selected} ▾ · {pending} pending")
     }
 }
 

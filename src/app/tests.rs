@@ -64,7 +64,7 @@ fn profile_column_appears_for_pending_and_mixed_process_profiles() {
     assert_eq!(rows[1].profile.as_deref(), Some("cloud-dev"));
     assert_eq!(
         process_list_title(&snapshot),
-        "Processes · Profile: cloud-dev · 1 pending"
+        "Processes · Profile: cloud-dev ▾ · 1 pending"
     );
 }
 
@@ -92,7 +92,7 @@ fn configured_base_profile_name_is_used_in_visible_profile_labels() {
     base_snapshot.processes[0].next_profile = None;
     assert_eq!(
         process_list_title(&base_snapshot),
-        "Processes · Profile: local"
+        "Processes · Profile: local ▾"
     );
 }
 
@@ -111,7 +111,10 @@ fn profile_column_hides_when_global_profile_describes_every_process() {
     };
 
     assert_eq!(process_rows(&snapshot, 0)[0].profile, None);
-    assert_eq!(process_list_title(&snapshot), "Processes · Profile: local");
+    assert_eq!(
+        process_list_title(&snapshot),
+        "Processes · Profile: local ▾"
+    );
 }
 
 fn projection_process() -> crate::supervisor::ProcessSnapshot {

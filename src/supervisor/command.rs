@@ -16,6 +16,9 @@ pub enum Command {
     StartAutostart,
     /// Select the next Project Profile without changing current Runs.
     SelectNextProcessProfile,
+    /// Select one exact Project Profile without changing current Runs. `None`
+    /// selects the base Project Profile.
+    SelectProjectProfile(Option<String>),
     /// Apply pending profile changes to active Processes. Stop Processes that
     /// become disabled and restart affected enabled autostart Processes.
     RestartProfiledAutostart,

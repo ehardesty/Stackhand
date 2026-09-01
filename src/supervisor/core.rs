@@ -234,6 +234,9 @@ impl Core {
                 }
             }
             Command::SelectNextProcessProfile => self.select_next_process_profile(),
+            Command::SelectProjectProfile(profile) => {
+                self.select_project_profile(profile.as_deref());
+            }
             Command::RestartProfiledAutostart => self.restart_profiled_autostart(),
             Command::StopAll => {
                 for index in 0..self.lifecycles.len() {
@@ -266,7 +269,13 @@ impl Core {
                 .position(|name| name == selected)
                 .and_then(|index| names.get(index + 1).cloned()),
         };
-        self.project.select_process_profile(next.as_deref());
+        self.select_project_profile(next.as_deref());
+    }
+
+    fn select_project_profile(&mut self, profile: Option<&str>) {
+        // Invalid names are ignored because the Supervisor has no error
+        // channel. The Project API keeps the current selection unchanged.
+        let _ = self.project.select_process_profile(profile);
     }
 
     fn restart_profiled_autostart(&mut self) {
