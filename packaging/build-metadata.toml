@@ -4,6 +4,11 @@
 schema_version = 1
 rust_version = "1.93.0"
 zig_version = "0.15.2"
+zig_download_base_url = "https://ziglang.org/download"
+zig_aarch64_macos_sha256 = "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b"
+zig_x86_64_macos_sha256 = "375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f"
+zig_aarch64_linux_sha256 = "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
+zig_x86_64_linux_sha256 = "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
 
 ghostty_repository = "https://github.com/ghostty-org/ghostty.git"
 ghostty_revision = "a887df42c56f6de86c0fe6da9c4eeca37931e083"

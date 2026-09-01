@@ -36,12 +36,29 @@ Quadrant-specific behavior to the core.
 
 ## Build and run the Project prototype
 
-The current Ghostty revision requires Rust 1.93 or newer and Zig 0.15.2. On macOS with Homebrew:
+Install Rust with [rustup](https://rustup.rs) first. The current Ghostty
+revision requires Rust 1.93 or newer and Zig 0.15.2. Rust is selected by
+`rust-toolchain.toml`. The Cargo wrapper downloads and caches the pinned Zig
+release in the user cache, so Homebrew is not required:
 
 ```sh
-brew install zig@0.15
-PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
-PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo run -- examples/basic.yaml
+./scripts/cargo.sh build --locked
+./scripts/cargo.sh run --locked -- examples/basic.yaml
+```
+
+The first build needs network access for the Rust dependencies, the pinned
+Ghostty source, and the Zig release. Use `./scripts/cargo.sh` for Cargo
+commands that compile Stackhand. The installed release binary is available at
+`target/release/stackhand` after `build --release`.
+
+On arm64 macOS, the wrapper uses an installed older macOS SDK when the current
+SDK is not readable by Zig 0.15.2. Install Xcode or the Command Line Tools.
+You can use another exact Zig binary with `STACKHAND_ZIG=/path/to/zig`.
+
+To install the binary in Cargo's user bin directory (`~/.cargo/bin`):
+
+```sh
+./scripts/cargo.sh install --path . --locked --force
 ```
 
 Stackhand discovers the nearest `stackhand.yaml` when no path is given. Pass
@@ -90,10 +107,10 @@ A double click selects a word. A triple click selects a logical line. Press
 `a` to select all retained terminal text, `c` or `y` to copy, or `Esc` to
 return to the Process list. Child clipboard reads and writes are denied.
 
-Run the automated checks with the pinned Zig version on `PATH`:
+Run the automated checks with the pinned toolchain:
 
 ```sh
-PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo test --all-targets
+./scripts/cargo.sh test --locked --all-targets
 ```
 
 ## Canonical sources
