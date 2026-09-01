@@ -69,7 +69,7 @@ processes:
       REMOVE_THIS_VALUE: null
     terminal:
       mode: pty
-      input: disabled
+      input: focused
     success_exit_codes: [0]
     restart:
       policy: never
@@ -80,6 +80,8 @@ processes:
 ```
 
 Each Process must set exactly one of `command` or `shell`. The other fields are optional.
+A PTY accepts keyboard input while its console has focus. Set
+`terminal.input: disabled` to make a PTY read-only.
 
 | Field | Accepted values | Default |
 | --- | --- | --- |
@@ -90,7 +92,7 @@ Each Process must set exactly one of `command` or `shell`. The other fields are 
 | `env_files` | List of paths | Empty |
 | `environment` | String values or `null` | Empty |
 | `terminal.mode` | `pty`, `pipe` | `pty` |
-| `terminal.input` | `disabled`, `focused` | `disabled` |
+| `terminal.input` | `disabled`, `focused` | `focused` for PTY; `disabled` for pipe |
 | `success_exit_codes` | Unique codes from 0 through 255 | `[0]` |
 | `restart.policy` | `never`, `on_failure`, `always` | `never` |
 | `restart.backoff` | Positive duration | `2s` |

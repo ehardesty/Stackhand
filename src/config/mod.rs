@@ -691,6 +691,7 @@ fn build_terminal_settings(
         }
     };
     let input_policy = match terminal_input {
+        None if terminal_mode == TerminalMode::Pty => InputPolicy::Focused,
         None | Some("disabled") => InputPolicy::Disabled,
         Some("focused") => InputPolicy::Focused,
         Some(other) => Err(format!(

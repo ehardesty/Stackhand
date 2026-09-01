@@ -126,9 +126,9 @@ processes:
 
 A Process is a `service` by default. Use `kind: one-shot` for a command that
 should finish. Set `terminal.mode` to `pipe` for separate output streams, or
-leave the default `pty` when the command needs terminal behavior. Input is
-disabled by default. Set `terminal.input: focused` when a PTY should accept
-keyboard input.
+leave the default `pty` when the command needs terminal behavior. A PTY accepts
+keyboard input while its console has focus. Set `terminal.input: disabled` when
+the Process must not receive keyboard input.
 
 Dependencies control startup only. They do not couple Process lifetimes after
 a Process starts.
@@ -227,10 +227,10 @@ A mouse drag selects Logs text. Press `c` or `y` to copy the selection.
 
 ### PTY input and Copy mode
 
-Press `Ctrl-A` to focus the selected console. Only a Process with
-`terminal.input: focused` accepts keyboard input from the terminal pane. This
-includes `Ctrl-C`, which is sent to the child command. Press `Ctrl-A` again to
-return to the Process list.
+Press `Ctrl-A` to focus the selected console. A PTY accepts keyboard input by
+default while its console has focus. This includes `Ctrl-C`, which is sent to
+the child command. Press `Ctrl-A` again to return to the Process list. A Process
+with `terminal.input: disabled` does not accept keyboard input.
 
 When PTY output is longer than the pane, Stackhand shows a scrollbar on the
 right. Click the track or drag the thumb to move through the retained terminal
