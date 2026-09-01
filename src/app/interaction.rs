@@ -67,6 +67,7 @@ pub(crate) struct ProjectInteraction {
     profile_menu_available: bool,
     profile_changes_pending: bool,
     start_anyway_available: bool,
+    terminal_available: bool,
     truncation: Option<(usize, bool)>,
 }
 
@@ -110,6 +111,8 @@ impl ProjectInteraction {
             .apply_selection_moves(&mut self.selected, snapshot.processes.len());
         let process = &snapshot.processes[self.selected];
         self.start_anyway_available = process.lifecycle == Lifecycle::Waiting;
+        self.terminal_available = process.terminal_mode == crate::model::TerminalMode::Pty
+            && process.current_run.is_some();
         let mut commands = std::mem::take(&mut self.project_commands);
         commands.extend(
             self.console
@@ -217,6 +220,7 @@ impl ProjectInteraction {
         view.profile_menu_open = self.profile_menu_available && self.profile_menu.is_open();
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
+        view.terminal_available = self.terminal_available;
         let (lines, logs_status, logs_editing) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
@@ -380,10 +384,12 @@ impl ProjectInteraction {
         retained: &RetainedOutput,
         pane_rows: u16,
     ) -> InputResult {
-        // Use the pane that is actually rendered. A PTY Process with no active
-        // Run falls back to retained Logs, so treating it as Terminal here
-        // would route Logs copy keys to the read-only navigation handler.
-        let has_terminal = matches!(pane, SelectedPane::Terminal(_));
+        // Logs commands follow the pane that is rendered. The view toggle is
+        // the exception: a PTY Process keeps its Terminal representation
+        // available while Logs is rendered.
+        let has_terminal = matches!(pane, SelectedPane::Terminal(_))
+            || (key.code == KeyCode::Char('l')
+                && process.terminal_mode == crate::model::TerminalMode::Pty);
         match self.logs[self.selected].handle_key(
             key,
             self.console.view().mode == crate::tui::ConsoleViewMode::ProcessList,
@@ -1029,6 +1035,50 @@ mod tests {
         let frame = interaction.frame(&pane, &retained, 20);
 
         assert_eq!(frame.representation, OutputRepresentation::Logs);
+    }
+
+    #[test]
+    fn logs_focus_can_return_to_the_pty_after_search() {
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let mut process = process("api", crate::model::ProcessKind::Service, 0);
+        process.terminal_mode = crate::model::TerminalMode::Pty;
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction {
+            logs: vec![ProcessLogs::default()],
+            ..Default::default()
+        };
+        interaction.logs[0].handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            true,
+            true,
+            &retained,
+            20,
+        );
+        interaction.logs[0].handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            true,
+            true,
+            &retained,
+            20,
+        );
+        interaction.console.focus_console(None);
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('l')),
+                1,
+                &pane,
+                &process,
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.logs[0].representation(true),
+            OutputRepresentation::Terminal
+        );
     }
 
     #[test]

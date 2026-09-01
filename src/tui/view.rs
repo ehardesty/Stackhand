@@ -80,6 +80,7 @@ pub struct ConsoleViewState {
     pub search_active: bool,
     pub logs_selection: bool,
     pub logs_scrollbar: Option<ConsoleScrollbar>,
+    pub terminal_available: bool,
     pub profile_menu_open: bool,
     pub profile_changes_pending: bool,
     pub start_anyway_available: bool,
@@ -97,6 +98,7 @@ impl Default for ConsoleViewState {
             search_active: false,
             logs_selection: false,
             logs_scrollbar: None,
+            terminal_available: false,
             profile_menu_open: false,
             profile_changes_pending: false,
             start_anyway_available: false,
@@ -544,9 +546,16 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             ConsolePaneKind::Terminal => {
                 "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit".to_string()
             }
-            ConsolePaneKind::Pipe => format!(
-                "↑↓/j/k: scroll · PgUp/PgDn: page · /: search{match_control} · f: live · c/y: copy · Esc: Processes"
-            ),
+            ConsolePaneKind::Pipe => {
+                let terminal_control = if view.terminal_available {
+                    " · l: terminal"
+                } else {
+                    ""
+                };
+                format!(
+                    "↑↓/j/k: scroll · PgUp/PgDn: page · /: search{match_control} · f: live · c/y: copy{terminal_control} · Esc: Processes"
+                )
+            }
         },
         ConsoleViewMode::Copy => {
             "h/j/k/l or arrows: move · v: select/unselect · c/y: copy · a: all · q/Esc: exit"
@@ -1153,6 +1162,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                terminal_available: false,
                 profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
@@ -1208,6 +1218,30 @@ mod tests {
     }
 
     #[test]
+    fn logs_footer_shows_how_to_return_to_an_available_terminal() {
+        let logs = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                mode: ConsoleViewMode::Console,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(!logs.contains("l: terminal"), "{logs}");
+
+        let pty_logs = footer_text(
+            ConsoleViewState {
+                pane: ConsolePaneKind::Pipe,
+                mode: ConsoleViewMode::Console,
+                terminal_available: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(pty_logs.contains("l: terminal"), "{pty_logs}");
+    }
+
+    #[test]
     fn logs_selection_footer_shows_copy_and_clear_actions() {
         let text = footer_text(
             ConsoleViewState {
@@ -1237,6 +1271,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                terminal_available: false,
                 profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
@@ -1261,6 +1296,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                terminal_available: false,
                 profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
@@ -1283,6 +1319,7 @@ mod tests {
                 search_active: false,
                 logs_selection: false,
                 logs_scrollbar: None,
+                terminal_available: false,
                 profile_menu_open: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,

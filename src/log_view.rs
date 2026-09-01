@@ -117,7 +117,7 @@ impl LogView {
             return LogViewAction::Ignored;
         }
         match key.code {
-            KeyCode::Char('l') if command_context && has_terminal => {
+            KeyCode::Char('l') if has_terminal => {
                 self.representation = match self.representation {
                     OutputRepresentation::Terminal => OutputRepresentation::Logs,
                     OutputRepresentation::Logs => OutputRepresentation::Terminal,
@@ -321,9 +321,9 @@ mod tests {
 
         assert_eq!(
             view.handle_key(key(KeyCode::Char('l')), false, true, &output),
-            LogViewAction::Ignored
+            LogViewAction::Changed
         );
-        assert_eq!(view.representation(true), OutputRepresentation::Logs);
+        assert_eq!(view.representation(true), OutputRepresentation::Terminal);
     }
 
     #[test]
