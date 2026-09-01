@@ -733,4 +733,19 @@ Do not invent a custom `TERM` value without shipping matching terminfo.
 
 The embedded terminal should respond conservatively to negotiated queries through `libghostty-vt` effects.
 
+### 17.7 Optional port discovery
+
+A Project can enable listening TCP port discovery:
+
+```yaml
+settings:
+  port_discovery: true
+```
+
+The default is `false`. Discovery observes the Process Tree for each active Run. It does not depend on a port declared in YAML or on parsing command output. It checks immediately, then every two seconds while no port is present, and every five seconds while one or more ports are present. The work runs outside the Supervisor loop and every result carries the Process and Run identity. A stale result cannot update a replacement Run.
+
+The runtime adapter owns platform inspection. macOS uses the owned process group and `lsof`. Linux matches socket file descriptors from Process Tree members with listening entries in `/proc/net/tcp` and `/proc/net/tcp6`. Windows support is deferred. Inspection is best effort because operating-system permissions and a descendant that leaves the owned Process Tree can make the result incomplete.
+
+Results contain only listening TCP ports. They are sorted, deduplicated, and limited to 32 ports per Process. The result includes an omitted count and a best-effort marker. The UI can therefore stay bounded and can show uncertainty without exposing platform details.
+
 ---

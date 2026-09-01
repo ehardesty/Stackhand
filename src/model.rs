@@ -346,6 +346,12 @@ impl Default for ShellConfig {
     }
 }
 
+/// Project-wide runtime settings resolved from configuration.
+pub(crate) struct ProjectSettings {
+    pub(crate) shell: ShellConfig,
+    pub(crate) port_discovery: bool,
+}
+
 /// The validated set of Processes for one Stackhand session. Process order
 /// is configuration order and stays stable for the session.
 #[derive(Clone, Default)]
@@ -371,6 +377,7 @@ pub struct EffectiveProject {
     /// Validated Dependency graph for base and each global selection.
     dependency_indices_by_profile: BTreeMap<Option<String>, Vec<Vec<usize>>>,
     shell: ShellConfig,
+    port_discovery: bool,
 }
 
 impl std::fmt::Debug for EffectiveProject {
@@ -463,6 +470,7 @@ impl EffectiveProject {
             dependency_indices: dependency_indices.clone(),
             dependency_indices_by_profile: BTreeMap::from([(None, dependency_indices)]),
             shell,
+            port_discovery: false,
         })
     }
 
@@ -513,7 +521,10 @@ impl EffectiveProject {
             named_labels,
             selected_process_profile,
             "base".to_string(),
-            shell,
+            ProjectSettings {
+                shell,
+                port_discovery: false,
+            },
         )
     }
 
@@ -525,11 +536,12 @@ impl EffectiveProject {
         process_profile_labels_by_profile: BTreeMap<String, Vec<Option<String>>>,
         selected_process_profile: Option<String>,
         base_profile_name: String,
-        shell: ShellConfig,
+        settings: ProjectSettings,
     ) -> Result<Self, ProjectError> {
         debug_assert_eq!(base_processes.len(), base_process_profile_labels.len());
-        let mut project = Self::with_shell(base_processes, shell.clone())?;
+        let mut project = Self::with_shell(base_processes, settings.shell.clone())?;
         project.base_profile_name = base_profile_name;
+        project.port_discovery = settings.port_discovery;
         project.process_profile_names = processes_by_profile.keys().cloned().collect();
         project.processes_by_profile = processes_by_profile;
         project.base_process_profile_labels = base_process_profile_labels;
@@ -545,12 +557,13 @@ impl EffectiveProject {
                 .get(name)
                 .expect("every profile name has effective Processes")
                 .clone();
-            let validated = Self::with_shell(processes, shell.clone()).map_err(|source| {
-                ProjectError::InvalidProcessProfileGraph {
-                    profile: name.clone(),
-                    source: Box::new(source),
-                }
-            })?;
+            let validated =
+                Self::with_shell(processes, settings.shell.clone()).map_err(|source| {
+                    ProjectError::InvalidProcessProfileGraph {
+                        profile: name.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
             project
                 .dependency_indices_by_profile
                 .insert(Some(name.clone()), validated.dependency_indices);
@@ -627,6 +640,17 @@ impl EffectiveProject {
     /// Return the Project's shell launcher for shell-expression commands.
     pub fn shell(&self) -> &ShellConfig {
         &self.shell
+    }
+
+    /// Whether this Project discovers listening TCP ports for active Runs.
+    pub fn port_discovery(&self) -> bool {
+        self.port_discovery
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_port_discovery(mut self) -> Self {
+        self.port_discovery = true;
+        self
     }
 
     /// Resolve a user-facing Process name to its stable session position.

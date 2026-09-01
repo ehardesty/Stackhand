@@ -135,6 +135,7 @@ fn projection_process() -> crate::supervisor::ProcessSnapshot {
         run_started_at_ms: Some(1_000),
         failure: None,
         metrics: None,
+        listening_ports: None,
         blocked_reason: None,
         readiness: None,
         liveness: None,

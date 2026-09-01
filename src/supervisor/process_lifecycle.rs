@@ -14,8 +14,8 @@ use crate::supervisor::readiness::ReadinessTracking;
 use crate::supervisor::snapshot::RestartBudgetStatus;
 
 use super::core::{
-    DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
-    RunExitDisposition, RunSummary, RunTrigger,
+    DesiredState, FailureKind, FailureSummary, Lifecycle, ListeningPortsMetadata, MetricsMetadata,
+    RECENT_RUNS, RunExitDisposition, RunSummary, RunTrigger,
 };
 
 /// Why the Supervisor is waiting before an automatic restart.
@@ -174,6 +174,8 @@ pub(super) struct ProcessLifecycle {
     pub(super) current_profile: Option<String>,
     pub(super) failure: Option<FailureSummary>,
     pub(super) metrics: Option<MetricsMetadata>,
+    /// `None` disables discovery; `Some` is the latest current-Run result.
+    pub(super) listening_ports: Option<ListeningPortsMetadata>,
     /// Why Desired State Running has not produced a Run yet, as a bounded
     /// "dependency: condition" reason.
     pub(super) blocked: Option<String>,
@@ -220,7 +222,7 @@ pub(super) struct ProcessLifecycle {
 }
 
 impl ProcessLifecycle {
-    pub(super) fn new(process_id: ProcessId) -> Self {
+    pub(super) fn new(process_id: ProcessId, port_discovery: bool) -> Self {
         Self {
             process_id,
             next_run: 1,
@@ -230,6 +232,7 @@ impl ProcessLifecycle {
             current_profile: None,
             failure: None,
             metrics: None,
+            listening_ports: port_discovery.then(ListeningPortsMetadata::default),
             blocked: None,
             readiness: None,
             liveness: None,
@@ -349,6 +352,7 @@ impl ProcessLifecycle {
         self.lifecycle = Lifecycle::Starting;
         self.failure = None;
         self.metrics = None;
+        self.clear_listening_ports();
         self.exited = false;
         self.cleanup_purpose = CleanupPurpose::Ordinary;
         self.clear_restart_state();
@@ -513,6 +517,18 @@ impl ProcessLifecycle {
         self.metrics = Some(metrics);
     }
 
+    pub(super) fn record_listening_ports(&mut self, ports: ListeningPortsMetadata) {
+        if self.listening_ports.is_some() {
+            self.listening_ports = Some(ports);
+        }
+    }
+
+    fn clear_listening_ports(&mut self) {
+        if self.listening_ports.is_some() {
+            self.listening_ports = Some(ListeningPortsMetadata::default());
+        }
+    }
+
     /// Retain an output-path failure without hiding a lifecycle failure.
     pub(super) fn record_output_failure(&mut self, detail: String) {
         if self.failure.is_none() {
@@ -597,6 +613,7 @@ impl ProcessLifecycle {
             };
         }
         self.metrics = None;
+        self.clear_listening_ports();
         self.readiness = None;
         self.liveness = None;
         self.spawned = false;
@@ -675,6 +692,7 @@ impl ProcessLifecycle {
         self.current_profile = None;
         self.root_pid = None;
         self.metrics = None;
+        self.clear_listening_ports();
         self.readiness = None;
         self.liveness = None;
         self.spawned = false;
@@ -779,7 +797,7 @@ mod tests {
     use super::*;
 
     fn lifecycle() -> ProcessLifecycle {
-        ProcessLifecycle::new(ProcessId::new(7))
+        ProcessLifecycle::new(ProcessId::new(7), false)
     }
 
     #[test]

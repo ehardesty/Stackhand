@@ -149,6 +149,7 @@ impl<'de> Deserialize<'de> for DependencyCollection {
 #[serde(deny_unknown_fields)]
 pub(super) struct SettingsFile {
     pub(super) shell: Option<ShellFile>,
+    pub(super) port_discovery: Option<bool>,
 }
 
 #[derive(Deserialize)]

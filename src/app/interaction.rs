@@ -11,7 +11,7 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
-use super::view_model::profile_changes_pending;
+use super::view_model::{port_list, profile_changes_pending, profiles_visible};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand};
 use crate::log_view::{OutputRepresentation, SearchDialogView};
@@ -22,8 +22,8 @@ use crate::supervisor::{
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
-    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, ProjectProfileMenu,
-    ProjectProfileMenuAction, pane_inner, process_row_at, project_layout,
+    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, PortListView, ProjectProfileMenu,
+    ProjectProfileMenuAction, pane_inner, process_port_at, process_row_at, project_layout,
 };
 
 /// The selected Process's visible output owner.
@@ -37,6 +37,7 @@ pub(crate) enum SelectedPane<'a> {
 pub(crate) enum InputResult {
     Ignored,
     Changed,
+    OpenPort(u16),
     Quit,
 }
 
@@ -68,6 +69,9 @@ pub(crate) struct ProjectInteraction {
     profile_changes_pending: bool,
     start_anyway_available: bool,
     terminal_available: bool,
+    ports_by_process: Vec<Option<PortListView>>,
+    profiles_visible: bool,
+    port_to_open: Option<u16>,
     truncation: Option<(usize, bool)>,
 }
 
@@ -101,6 +105,8 @@ impl ProjectInteraction {
             self.profile_menu.close();
         }
         self.profile_changes_pending = profile_changes_pending(snapshot);
+        self.profiles_visible = profiles_visible(snapshot);
+        self.ports_by_process = snapshot.processes.iter().map(port_list).collect();
         self.selected = self
             .selected
             .min(snapshot.processes.len().saturating_sub(1));
@@ -345,7 +351,10 @@ impl ProjectInteraction {
             }
             Event::Mouse(mouse) => {
                 if self.route_mouse(mouse, pane, process, repeats) {
-                    InputResult::Changed
+                    self.port_to_open
+                        .take()
+                        .map(InputResult::OpenPort)
+                        .unwrap_or(InputResult::Changed)
                 } else {
                     InputResult::Ignored
                 }
@@ -512,6 +521,25 @@ impl ProjectInteraction {
                 .unwrap_or(false);
         }
         if rect_contains(list, mouse.column, mouse.row) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(port) = process_port_at(
+                    list,
+                    mouse.column,
+                    mouse.row,
+                    &self.ports_by_process,
+                    self.profiles_visible,
+                    self.process_table.offset(),
+                )
+            {
+                if let Some(index) =
+                    process_row_at(list, mouse.row, process_count, self.process_table.offset())
+                {
+                    self.selected = index;
+                }
+                self.port_to_open = Some(port);
+                self.console.clear_pane_warning();
+                return true;
+            }
             if mouse_changes_focus(mouse.kind) {
                 match pane {
                     SelectedPane::Terminal(view) => {
@@ -611,7 +639,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::supervisor::{DesiredState, Lifecycle, ProcessId, RestartBudgetStatus};
+    use crate::supervisor::{
+        DesiredState, Lifecycle, ListeningPortsMetadata, ProcessId, RestartBudgetStatus,
+    };
 
     fn process(name: &str, kind: crate::model::ProcessKind, process_id: u32) -> ProcessSnapshot {
         ProcessSnapshot {
@@ -631,6 +661,7 @@ mod tests {
             run_started_at_ms: Some(0),
             failure: None,
             metrics: None,
+            listening_ports: None,
             blocked_reason: None,
             readiness: None,
             liveness: None,
@@ -701,6 +732,54 @@ mod tests {
         );
         let update = interaction.update_project(&snapshot);
         assert_eq!(update.commands, vec![Command::Rerun("setup".to_string())]);
+    }
+
+    #[test]
+    fn clicking_a_rendered_port_requests_its_local_url() {
+        let mut web = process("web", crate::model::ProcessKind::Service, 0);
+        web.listening_ports = Some(ListeningPortsMetadata {
+            ports: vec![5173, 8080],
+            omitted: 0,
+            best_effort: false,
+        });
+        let snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
+            selected_profile: None,
+            available_profiles: Vec::new(),
+            processes: vec![web],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+        let (list, _, _) = project_layout(Rect::new(0, 0, 80, 24), 1);
+        let port_column = (list.x..list.right())
+            .find(|column| {
+                process_port_at(
+                    list,
+                    *column,
+                    2,
+                    &interaction.ports_by_process,
+                    interaction.profiles_visible,
+                    interaction.process_table.offset(),
+                ) == Some(5173)
+            })
+            .expect("the port has a clickable cell");
+
+        assert_eq!(
+            interaction.route_input(
+                left_click(port_column, 2),
+                1,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::OpenPort(5173)
+        );
     }
 
     #[test]
@@ -878,6 +957,7 @@ mod tests {
             profile: None,
             cpu: None,
             memory: None,
+            ports: None,
             selected: true,
         }];
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

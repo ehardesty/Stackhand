@@ -253,10 +253,36 @@ fn run_event_loop(
                     dirty = true;
                 }
                 InputResult::Changed => dirty = true,
+                InputResult::OpenPort(port) => {
+                    if open_local_port(port).is_err() {
+                        interaction.warn(crate::tui::ConsoleWarning::LinkOpenFailed);
+                    }
+                    dirty = true;
+                }
                 InputResult::Ignored | InputResult::Quit => {}
             }
         }
     }
+}
+
+fn open_local_port(port: u16) -> std::io::Result<()> {
+    let url = format!("http://localhost:{port}/");
+    #[cfg(target_os = "macos")]
+    let mut child = std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .spawn()?;
+    #[cfg(target_os = "linux")]
+    let mut child = std::process::Command::new("xdg-open").arg(url).spawn()?;
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening browser links is not implemented on this platform",
+    ));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn render_frame(

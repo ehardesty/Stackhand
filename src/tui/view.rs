@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -38,6 +38,7 @@ pub enum ConsoleWarning {
     InputDisabled,
     LogsCommandOnly,
     SelectionUnavailable,
+    LinkOpenFailed,
 }
 
 /// Which console pane the selected Process currently renders. The footer
@@ -107,6 +108,14 @@ impl Default for ConsoleViewState {
     }
 }
 
+/// One bounded list of listening TCP ports for a Process row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortListView {
+    pub ports: Vec<u16>,
+    pub omitted: u16,
+    pub best_effort: bool,
+}
+
 /// One projected Process list row. Labels are projections of structured
 /// snapshot state, never stored authoritative strings.
 pub struct ProcessRowView {
@@ -119,6 +128,8 @@ pub struct ProcessRowView {
     pub cpu: Option<String>,
     /// Compact aggregate resident memory, when the current Run has one.
     pub memory: Option<String>,
+    /// `None` when Project port discovery is disabled.
+    pub ports: Option<PortListView>,
     pub selected: bool,
 }
 
@@ -373,6 +384,8 @@ static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
     });
 
 const PROCESS_METRICS_MIN_WIDTH: u16 = 52;
+const PROCESS_PORTS_MIN_WIDTH: u16 = 44;
+const PROCESS_PORTS_WIDTH: u16 = 18;
 
 fn render_process_table(
     frame: &mut Frame<'_>,
@@ -383,8 +396,7 @@ fn render_process_table(
     title: &str,
 ) -> Option<Rect> {
     let inner = pane_inner(pane);
-    let show_profile = rows.iter().any(|row| row.profile.is_some());
-    let show_metrics = inner.width >= PROCESS_METRICS_MIN_WIDTH + if show_profile { 24 } else { 0 };
+    let (show_profile, show_ports, show_metrics) = table_visibility(rows, inner.width);
     let table_rows = rows.iter().map(|row| {
         let mut cells = vec![
             Cell::from(row.name.as_str()),
@@ -393,23 +405,22 @@ fn render_process_table(
         if show_profile {
             cells.push(Cell::from(row.profile.as_deref().unwrap_or("")));
         }
+        if show_ports {
+            cells.push(port_cell(row.ports.as_ref()));
+        }
         if show_metrics {
             cells.push(right_cell(row.cpu.as_deref().unwrap_or("")));
             cells.push(right_cell(row.memory.as_deref().unwrap_or("")));
         }
         Row::new(cells)
     });
-    let mut widths = vec![Constraint::Percentage(28), Constraint::Fill(1)];
-    if show_profile {
-        widths.push(Constraint::Length(22));
-    }
-    if show_metrics {
-        widths.push(Constraint::Length(8));
-        widths.push(Constraint::Length(8));
-    }
+    let widths = table_widths(show_profile, show_ports, show_metrics);
     let mut heading_cells = vec![Cell::from("Process"), Cell::from("Status")];
     if show_profile {
         heading_cells.push(Cell::from("Profile"));
+    }
+    if show_ports {
+        heading_cells.push(Cell::from("Ports"));
     }
     if show_metrics {
         heading_cells.push(right_cell("CPU"));
@@ -464,8 +475,72 @@ fn profile_title_trigger(pane: Rect, title: &str) -> Option<Rect> {
     })
 }
 
+fn table_visibility(rows: &[ProcessRowView], width: u16) -> (bool, bool, bool) {
+    table_visibility_for(
+        rows.iter().any(|row| row.profile.is_some()),
+        rows.iter().any(|row| row.ports.is_some()),
+        width,
+    )
+}
+
+fn table_visibility_for(has_profile: bool, has_ports: bool, width: u16) -> (bool, bool, bool) {
+    let show_ports =
+        has_ports && width >= PROCESS_PORTS_MIN_WIDTH + if has_profile { 24 } else { 0 };
+    let show_metrics = width
+        >= PROCESS_METRICS_MIN_WIDTH
+            + if has_profile { 24 } else { 0 }
+            + if show_ports {
+                PROCESS_PORTS_WIDTH + 1
+            } else {
+                0
+            };
+    (has_profile, show_ports, show_metrics)
+}
+
+fn table_widths(show_profile: bool, show_ports: bool, show_metrics: bool) -> Vec<Constraint> {
+    let mut widths = vec![Constraint::Percentage(28), Constraint::Fill(1)];
+    if show_profile {
+        widths.push(Constraint::Length(22));
+    }
+    if show_ports {
+        widths.push(Constraint::Length(PROCESS_PORTS_WIDTH));
+    }
+    if show_metrics {
+        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Length(8));
+    }
+    widths
+}
+
 fn right_cell(text: &str) -> Cell<'_> {
     Cell::from(Line::from(text).right_aligned())
+}
+
+fn port_cell(ports: Option<&PortListView>) -> Cell<'static> {
+    let Some(ports) = ports else {
+        return Cell::from("");
+    };
+    if ports.ports.is_empty() {
+        let marker = if ports.best_effort { "~—" } else { "—" };
+        return Cell::from(Span::styled(marker, TERMINAL_THEME.secondary_text()));
+    }
+    let mut spans = Vec::new();
+    if ports.best_effort {
+        spans.push(Span::styled("~", TERMINAL_THEME.secondary_text()));
+    }
+    for (index, port) in ports.ports.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("; ", TERMINAL_THEME.secondary_text()));
+        }
+        spans.push(Span::styled(port.to_string(), TERMINAL_THEME.link()));
+    }
+    if ports.omitted > 0 {
+        spans.push(Span::styled(
+            format!("; +{}", ports.omitted),
+            TERMINAL_THEME.secondary_text(),
+        ));
+    }
+    Cell::from(Line::from(spans))
 }
 
 fn process_table_header_height(pane: Rect) -> u16 {
@@ -482,6 +557,50 @@ pub fn process_row_at(pane: Rect, row: u16, process_count: usize, offset: usize)
     }
     let index = offset.saturating_add(usize::from(row - first_row));
     (index < process_count).then_some(index)
+}
+
+/// Return the listening port under one Process-table cell. Rendering and hit
+/// testing use the same column visibility and width rules.
+pub fn process_port_at(
+    pane: Rect,
+    column: u16,
+    row: u16,
+    ports_by_process: &[Option<PortListView>],
+    has_profile: bool,
+    offset: usize,
+) -> Option<u16> {
+    let process_index = process_row_at(pane, row, ports_by_process.len(), offset)?;
+    let inner = pane_inner(pane);
+    let (show_profile, show_ports, show_metrics) = table_visibility_for(
+        has_profile,
+        ports_by_process.iter().any(Option::is_some),
+        inner.width,
+    );
+    if !show_ports {
+        return None;
+    }
+    let columns = Layout::horizontal(table_widths(show_profile, show_ports, show_metrics))
+        .flex(Flex::Start)
+        .spacing(1)
+        .split(inner);
+    let port_column = columns.get(2 + usize::from(show_profile))?;
+    if column < port_column.x || column >= port_column.right() {
+        return None;
+    }
+    let ports = ports_by_process.get(process_index)?.as_ref()?;
+    let local_column = column - port_column.x;
+    let mut cursor = u16::from(ports.best_effort);
+    for (index, port) in ports.ports.iter().enumerate() {
+        if index > 0 {
+            cursor = cursor.saturating_add(2);
+        }
+        let width = port.to_string().len() as u16;
+        if local_column >= cursor && local_column < cursor.saturating_add(width) {
+            return Some(*port);
+        }
+        cursor = cursor.saturating_add(width);
+    }
+    None
 }
 
 fn render_search_dialog(frame: &mut Frame<'_>, dialog: &SearchDialogView, area: Rect) {
@@ -568,6 +687,7 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
             ConsoleWarning::SelectionUnavailable => {
                 "WARNING: terminal selection is available only in Terminal view"
             }
+            ConsoleWarning::LinkOpenFailed => "WARNING: could not open the port in a browser",
         };
         return format!(
             "{} · {focus} · {warning}",
@@ -653,6 +773,7 @@ mod tests {
             profile: None,
             cpu: None,
             memory: None,
+            ports: None,
             selected,
         }
     }
@@ -671,6 +792,7 @@ mod tests {
             profile: None,
             cpu: Some(cpu.to_string()),
             memory: Some(memory.to_string()),
+            ports: None,
             selected,
         }
     }
@@ -812,6 +934,58 @@ mod tests {
         assert_eq!(header.find("Status"), first.find("Ready"));
         assert_eq!(text_end(&header, "CPU"), text_end(&first, "3.2%"));
         assert_eq!(text_end(&header, "Memory"), text_end(&first, "184M"));
+    }
+
+    #[test]
+    fn port_cells_render_as_links_and_hit_testing_returns_only_a_port() {
+        let mut process = row("web", "Ready", true);
+        process.ports = Some(PortListView {
+            ports: vec![5173, 8080],
+            omitted: 2,
+            best_effort: false,
+        });
+        let buffer = render_rows_at(&[process], 80, 18);
+        let header = buffer_line(&buffer, 1);
+        let process_line = buffer_line(&buffer, 2);
+        let first_column = (buffer.area.x..buffer.area.right())
+            .find(|column| {
+                let cell = &buffer[(*column, 2)];
+                cell.symbol() == "5" && cell.modifier.contains(Modifier::UNDERLINED)
+            })
+            .expect("first port renders");
+        let separator_column = first_column + 4;
+        let second_column = (buffer.area.x..buffer.area.right())
+            .find(|column| {
+                let cell = &buffer[(*column, 2)];
+                cell.symbol() == "8" && cell.modifier.contains(Modifier::UNDERLINED)
+            })
+            .expect("second port renders");
+        let (list, _, _) = project_layout(buffer.area, 1);
+        let ports = [Some(PortListView {
+            ports: vec![5173, 8080],
+            omitted: 2,
+            best_effort: false,
+        })];
+
+        assert!(header.contains("Ports"), "{header:?}");
+        assert!(process_line.contains("5173; 8080; +2"), "{process_line:?}");
+        assert!(
+            buffer[(first_column, 2)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert_eq!(
+            process_port_at(list, first_column, 2, &ports, false, 0),
+            Some(5173)
+        );
+        assert_eq!(
+            process_port_at(list, separator_column, 2, &ports, false, 0),
+            None
+        );
+        assert_eq!(
+            process_port_at(list, second_column, 2, &ports, false, 0),
+            Some(8080)
+        );
     }
 
     #[test]

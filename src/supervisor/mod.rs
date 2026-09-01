@@ -51,8 +51,8 @@ pub use checks::{CheckState, LivenessState, ReadinessState};
 pub use command::Command;
 pub use consoles::{ConsoleView, Consoles};
 pub use core::{
-    DesiredState, FailureKind, FailureSummary, Lifecycle, MetricsMetadata, RECENT_RUNS,
-    RunExitDisposition, RunSummary, RunTrigger,
+    DesiredState, FailureKind, FailureSummary, Lifecycle, ListeningPortsMetadata, MetricsMetadata,
+    RECENT_RUNS, RunExitDisposition, RunSummary, RunTrigger,
 };
 pub use shutdown::{ProcessShutdownFailure, ProjectShutdownSnapshot};
 pub use snapshot::{
@@ -84,7 +84,7 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, A
     // never observe a stale default size.
     let initial_geometry = crate::tui::project_console_geometry(project.processes().len());
     let outputs = Arc::new(OutputViews::new(project.processes().len()));
-    let seam = RealRunSeam::new(Arc::clone(&outputs));
+    let seam = RealRunSeam::new(Arc::clone(&outputs)).with_port_discovery(project.port_discovery());
     let consoles = seam.consoles();
     Ok((
         start_with(

@@ -8,7 +8,7 @@ use crate::model::{ProcessKind, RestartPolicy};
 use crate::runtime::RunId;
 use crate::supervisor::seam::{FinishedRun, SeamEvent};
 
-use super::core::{Core, FailureKind, MetricsMetadata};
+use super::core::{Core, FailureKind, ListeningPortsMetadata, MetricsMetadata};
 use super::process_lifecycle::RestartReason;
 
 #[derive(Clone, Copy)]
@@ -183,6 +183,13 @@ impl Core {
                     cpu_percent,
                     rss_kib,
                     best_effort,
+                });
+            }
+            SeamEvent::ListeningPorts { observation, .. } => {
+                self.lifecycles[index].record_listening_ports(ListeningPortsMetadata {
+                    ports: observation.ports,
+                    omitted: observation.omitted,
+                    best_effort: observation.best_effort,
                 });
             }
             SeamEvent::OutputFailure { detail, .. } => {

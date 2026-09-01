@@ -13,5 +13,6 @@ pub(crate) use view::render_project;
 pub(crate) use view::render_project_with_search;
 pub use view::{
     ConsolePaneKind, ConsoleScrollbar, ConsoleViewMode, ConsoleViewState, ConsoleWarning, PipeLine,
-    ProcessRowView, pane_inner, process_row_at, project_console_geometry, project_layout,
+    PortListView, ProcessRowView, pane_inner, process_port_at, process_row_at,
+    project_console_geometry, project_layout,
 };

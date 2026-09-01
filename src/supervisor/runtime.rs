@@ -39,6 +39,7 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) struct RealRunSeam {
     runs: RunRegistry,
     outputs: Arc<OutputViews>,
+    port_discovery: bool,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -48,9 +49,15 @@ impl RealRunSeam {
         Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
             outputs,
+            port_discovery: false,
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
+    }
+
+    pub(crate) fn with_port_discovery(mut self, enabled: bool) -> Self {
+        self.port_discovery = enabled;
+        self
     }
 
     #[cfg(test)]
@@ -129,6 +136,7 @@ impl RunSeam for RealRunSeam {
         let events = events.clone();
         let runs = Arc::clone(&self.runs);
         let outputs = Arc::clone(&self.outputs);
+        let port_discovery = self.port_discovery;
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             // Mark the Run before starting its readers. This gives every
@@ -162,7 +170,10 @@ impl RunSeam for RealRunSeam {
                 output_observer,
             };
             match RunRuntime.start(request) {
-                Ok(run) => {
+                Ok(mut run) => {
+                    if port_discovery {
+                        run.enable_port_discovery();
+                    }
                     #[cfg(test)]
                     if let Some(pause) = &record.test_hooks.after_spawn {
                         pause.pause_worker();
@@ -422,6 +433,17 @@ fn forward_event(key: RunKey, event: RunEvent, events: &SeamSender) {
             rss_kib: metrics.rss_kib,
             best_effort: metrics.best_effort,
         },
+        RunEventKind::ListeningPorts {
+            process_id: reported_process,
+            observation,
+        } => {
+            debug_assert_eq!(reported_process, process_id);
+            SeamEvent::ListeningPorts {
+                process_id,
+                run_id,
+                observation,
+            }
+        }
     };
     events.send(seam_event);
 }

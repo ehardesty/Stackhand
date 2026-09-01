@@ -4,6 +4,7 @@ mod log_matcher;
 mod metrics;
 mod outcome;
 mod pipe;
+mod port_discovery;
 mod process_tree;
 mod pty;
 mod terminal_handle;
@@ -44,6 +45,7 @@ pub use pipe::{
     OUTPUT_QUEUE_BYTES, OUTPUT_QUEUE_SLOTS, OutputStream, RunOutput, RunOutputReceiver,
     RunOutputSender, output_channel,
 };
+pub use port_discovery::DiscoveredPorts;
 #[allow(unused_imports)]
 pub use run::{
     InputRejected, OsPid, OwnedRun, ProcessId, RunEvent, RunEventKind, RunId, RunRuntime,

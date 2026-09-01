@@ -19,6 +19,7 @@ control of the whole Project in one terminal.
 - Checks Service readiness and liveness with TCP, HTTP, `exec`, or log checks.
 - Restarts failed Services when their restart policy allows it.
 - Shows PTY terminal output or separate pipe output.
+- Can find and link to listening TCP ports that development servers select at runtime.
 - Shows a scrollbar for retained PTY history when the output is longer than the pane.
 - Keeps bounded Logs that you can scroll, search, and copy.
 - Uses Project Profiles to select Project-wide configuration, such as `local`
@@ -132,6 +133,19 @@ the Process must not receive keyboard input.
 
 Dependencies control startup only. They do not couple Process lifetimes after
 a Process starts.
+
+To show listening TCP ports that development servers select at runtime, enable
+port discovery for the Project:
+
+```yaml
+settings:
+  port_discovery: true
+```
+
+This setting applies to all Processes in that `stackhand.yaml` Project. It is
+off by default. Click a port in the **Ports** column to open its
+`http://localhost:PORT/` address. See the configuration reference for polling
+and platform limits.
 
 See the [configuration reference](./docs/configuration.md) for all fields,
 defaults, Dependency conditions, readiness and liveness checks, restart

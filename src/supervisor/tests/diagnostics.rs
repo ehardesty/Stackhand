@@ -2,6 +2,7 @@
 //! snapshot's diagnostic projections and the structured failure kinds.
 
 use super::*;
+use crate::runtime::DiscoveredPorts;
 use crate::supervisor::{FailureKind, FailureSummary, RunTrigger};
 
 fn unconfirmed(process: &str, run: u64) -> SeamEvent {
@@ -72,6 +73,54 @@ fn stale_metrics_cannot_change_a_newer_run() {
         .expect("the current Run's sample lands");
     assert_eq!(sample.run_id, 2);
     assert_eq!(sample.cpu_percent, 7.5);
+}
+
+/// Port observations belong only to the current Run and clear when it ends.
+#[test]
+fn current_run_ports_update_and_stale_ports_cannot_change_a_new_run() {
+    let project = four_process_project().with_test_port_discovery();
+    let mut h = Harness::new(project);
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 1));
+    h.event(SeamEvent::ListeningPorts {
+        process_id: ProcessId::new(process_index("api")),
+        run_id: RunId::new(1),
+        observation: DiscoveredPorts {
+            ports: vec![5173, 8080],
+            omitted: 2,
+            best_effort: true,
+        },
+    });
+
+    let ports = h
+        .process("api")
+        .listening_ports
+        .expect("enabled discovery has a bounded observation");
+    assert_eq!(ports.ports, vec![5173, 8080]);
+    assert_eq!(ports.omitted, 2);
+    assert!(ports.best_effort);
+
+    h.event(finished("api", 1, Some(0)));
+    assert_eq!(
+        h.process("api").listening_ports,
+        Some(crate::supervisor::ListeningPortsMetadata::default()),
+        "a finished Run clears its ports"
+    );
+    h.command(Command::Start("api".into()));
+    h.event(spawned("api", 2));
+    h.event(SeamEvent::ListeningPorts {
+        process_id: ProcessId::new(process_index("api")),
+        run_id: RunId::new(1),
+        observation: DiscoveredPorts {
+            ports: vec![3000],
+            ..DiscoveredPorts::default()
+        },
+    });
+    assert_eq!(
+        h.process("api").listening_ports,
+        Some(crate::supervisor::ListeningPortsMetadata::default()),
+        "a stale observation cannot land on the replacement Run"
+    );
 }
 
 /// Active snapshots carry the observed PID, the Run start stamp, and the

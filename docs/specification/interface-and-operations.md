@@ -36,7 +36,16 @@ Minimum visible fields:
 - primary status;
 - optional compact CPU;
 - optional compact memory;
-- conditional current and Next Profile.
+- conditional current and Next Profile;
+- optional listening TCP ports when Project port discovery is enabled.
+
+When port discovery is enabled and the terminal has enough space, the Process
+list shows a **Ports** column before metrics. Ports use a semicolon-separated
+list. Each port is underlined and can be clicked to open
+`http://localhost:PORT/` in the default browser. The UI uses `~` when the
+observation is best effort and `+N` when more ports were omitted from the
+bounded list. Port links assume HTTP on localhost. Stackhand does not detect
+the application protocol.
 
 When the Profile column is visible, a running Process with different profiles
 shows `current → next`. Other rows show the Next Profile.
@@ -49,7 +58,9 @@ worker        WAITING    devcloud               -       -
 init-storage  DONE       base                   -       -
 ```
 
-Metrics columns may be toggled when space is limited.
+Metrics columns may be toggled when space is limited. The Ports column also
+hides when the terminal cannot show it without crowding the Process name and
+status.
 
 ### 24.3 Status projection
 

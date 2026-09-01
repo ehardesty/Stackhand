@@ -45,6 +45,7 @@ settings:
   shell:
     program: /bin/bash
     args: [-lc]
+  port_discovery: true
 
 processes: {}
 ```
@@ -52,6 +53,7 @@ processes: {}
 - `env_files` lists environment files in load order. Relative paths start from the directory that contains `stackhand.yaml`.
 - `profiles.NAME.env_files` replaces the Project `env_files` list when that Project Profile is selected. An empty list loads no Project environment files. If the field is absent, the profile uses the base list.
 - `settings.shell` selects the program that runs every `shell` expression. The default is `/bin/sh` with `[-c]`.
+- `settings.port_discovery` shows listening TCP ports for each Process. The default is `false`.
 - `processes` can be empty.
 
 ## Process fields
@@ -230,6 +232,37 @@ processes:
 A fixed Process Profile does not change the selected Project environment files.
 
 A Process Profile patch replaces Process `env_files` and the complete `depends_on` mapping. It merges `environment` by variable name. A `null` environment value removes that variable from all earlier layers, including the parent environment.
+
+## Port discovery
+
+Port discovery is optional and is off by default. Enable it in the Project's
+`stackhand.yaml` file:
+
+```yaml
+settings:
+  port_discovery: true
+```
+
+The setting applies to all Processes in the Project. You can also enable it in
+`stackhand.local.yaml` when port discovery is useful only on your computer.
+
+Stackhand shows a **Ports** column when the terminal has enough space. It finds
+listening TCP ports in each active Run's Process Tree. This works with tools
+that select a free port at startup, such as Vite. You do not have to declare
+the port in YAML.
+
+Stackhand checks a new Run immediately. It checks every two seconds until it
+finds a port. It then checks every five seconds. If all ports close, it returns
+to the two-second interval.
+
+Ports use a semicolon-separated list. Click a port to open
+`http://localhost:PORT/` in the default browser. Stackhand assumes that the
+port serves HTTP on localhost. It does not test the protocol or select HTTPS.
+
+Discovery is best effort on macOS and Linux. A `~` marker means Stackhand could
+not inspect all Process Tree members. A command that leaves the owned Process
+Tree can also hide its port. Stackhand shows at most 32 ports for one Process
+and uses `+N` for the remaining count. Windows port discovery is not available.
 
 ## Local override
 

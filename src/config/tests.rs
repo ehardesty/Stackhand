@@ -217,6 +217,23 @@ fn project_shell_defaults_to_sh_without_login_flags() {
 }
 
 #[test]
+fn port_discovery_is_project_wide_and_defaults_off() {
+    let disabled = write_and_load(
+        "port-discovery-default",
+        "version: 1\nprocesses:\n  web:\n    command: [/usr/bin/true]\n",
+    )
+    .expect("the default Project is valid");
+    assert!(!disabled.port_discovery());
+
+    let enabled = write_and_load(
+        "port-discovery-enabled",
+        "version: 1\nsettings:\n  port_discovery: true\nprocesses:\n  web:\n    command: [/usr/bin/true]\n",
+    )
+    .expect("the enabled Project is valid");
+    assert!(enabled.port_discovery());
+}
+
+#[test]
 fn project_shell_accepts_an_explicit_launcher_and_argument_list() {
     let project = write_and_load(
             "shell-explicit",

@@ -1,19 +1,10 @@
 //! Pure projection of Supervisor snapshots into compact user-visible rows and headers.
 
 use crate::supervisor::{Lifecycle, LivenessState, ProcessSnapshot, ProjectSnapshot};
-use crate::tui::{LifecycleTone, ProcessRowView};
+use crate::tui::{LifecycleTone, PortListView, ProcessRowView};
 
 pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
-    let show_profiles = snapshot.processes.iter().any(|process| {
-        process
-            .current_profile
-            .as_deref()
-            .is_some_and(|current| Some(current) != process.next_profile.as_deref())
-            || process.current_run.is_some()
-                && process.current_profile.is_none()
-                && process.next_profile.is_some()
-            || process.next_profile.as_deref() != snapshot.selected_profile.as_deref()
-    });
+    let show_profiles = profiles_visible(snapshot);
     snapshot
         .processes
         .iter()
@@ -30,9 +21,31 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
             memory: process
                 .metrics
                 .map(|metrics| metric_precision(format_rss(metrics.rss_kib), metrics.best_effort)),
+            ports: port_list(process),
             selected: index == selected,
         })
         .collect()
+}
+
+pub(super) fn profiles_visible(snapshot: &ProjectSnapshot) -> bool {
+    snapshot.processes.iter().any(|process| {
+        process
+            .current_profile
+            .as_deref()
+            .is_some_and(|current| Some(current) != process.next_profile.as_deref())
+            || process.current_run.is_some()
+                && process.current_profile.is_none()
+                && process.next_profile.is_some()
+            || process.next_profile.as_deref() != snapshot.selected_profile.as_deref()
+    })
+}
+
+pub(super) fn port_list(process: &ProcessSnapshot) -> Option<PortListView> {
+    process.listening_ports.as_ref().map(|ports| PortListView {
+        ports: ports.ports.clone(),
+        omitted: ports.omitted,
+        best_effort: ports.best_effort,
+    })
 }
 
 fn profile_label(process: &ProcessSnapshot, base_profile_name: &str) -> String {

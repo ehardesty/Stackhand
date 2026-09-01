@@ -39,8 +39,8 @@ use self::profile::{apply_local_override, merge_yaml};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
-    InputPolicy, ProcessKind, ProcessSpec, ProjectError, RestartConfig, RestartPolicy, ShellConfig,
-    TerminalMode,
+    InputPolicy, ProcessKind, ProcessSpec, ProjectError, ProjectSettings, RestartConfig,
+    RestartPolicy, ShellConfig, TerminalMode,
 };
 
 const MAX_EXIT_CODE: i32 = 255;
@@ -276,6 +276,11 @@ fn load_file_with_local(
         };
         config_error(anyhow::anyhow!(message))
     })?;
+    let port_discovery = file
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.port_discovery)
+        .unwrap_or(false);
     let shell = build_shell(file.settings.as_ref())
         .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let raw_processes = document
@@ -417,7 +422,10 @@ fn load_file_with_local(
         labels_by_profile,
         profile.map(str::to_owned),
         base_profile_name,
-        shell,
+        ProjectSettings {
+            shell,
+            port_discovery,
+        },
     )
     .map_err(|error| {
         let detail = format_project_error(error);

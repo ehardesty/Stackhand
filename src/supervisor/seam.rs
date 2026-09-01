@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::geometry::TerminalGeometry;
 use crate::model::{ReadinessProbe, ShellConfig};
-use crate::runtime::{OsPid, ProcessId, RunId};
+use crate::runtime::{DiscoveredPorts, OsPid, ProcessId, RunId};
 use crate::supervisor::FailureKind;
 
 /// Identity of one long-lived piece of work within a Run, such as a
@@ -116,6 +116,12 @@ pub enum SeamEvent {
         rss_kib: u64,
         best_effort: bool,
     },
+    /// A changed bounded set of listening TCP ports for the current Run.
+    ListeningPorts {
+        process_id: ProcessId,
+        run_id: RunId,
+        observation: DiscoveredPorts,
+    },
     /// One bounded readiness attempt finished for the current Run. `passing`
     /// is true only when the probe succeeded; a failure carries one bounded
     /// diagnostic.
@@ -155,6 +161,7 @@ impl SeamEvent {
             | Self::Failed { process_id, .. }
             | Self::OutputFailure { process_id, .. }
             | Self::Metrics { process_id, .. }
+            | Self::ListeningPorts { process_id, .. }
             | Self::Readiness { process_id, .. }
             | Self::Liveness { process_id, .. }
             | Self::LogMatched { process_id, .. } => *process_id,
@@ -168,6 +175,7 @@ impl SeamEvent {
             | Self::Failed { run_id, .. }
             | Self::OutputFailure { run_id, .. }
             | Self::Metrics { run_id, .. }
+            | Self::ListeningPorts { run_id, .. }
             | Self::Readiness { run_id, .. }
             | Self::Liveness { run_id, .. }
             | Self::LogMatched { run_id, .. } => *run_id,

@@ -5,7 +5,9 @@ use crate::model::{ProcessKind, ReadinessProbe};
 use super::checks::{LivenessState, ReadinessState};
 use crate::runtime::ProcessId;
 
-use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunSummary};
+use super::core::{
+    DesiredState, FailureSummary, Lifecycle, ListeningPortsMetadata, MetricsMetadata, RunSummary,
+};
 
 /// An immutable view of the whole Project at one moment. Rendering and
 /// callers can hold and inspect this freely; it cannot mutate lifecycle
@@ -165,6 +167,8 @@ pub struct ProcessSnapshot {
     pub run_started_at_ms: Option<u64>,
     pub failure: Option<FailureSummary>,
     pub metrics: Option<MetricsMetadata>,
+    /// `None` when Project port discovery is disabled.
+    pub listening_ports: Option<ListeningPortsMetadata>,
     /// Why this Process has not started although Desired State is Running:
     /// a bounded "dependency: condition" (or "dependency: disabled") reason.
     pub blocked_reason: Option<String>,

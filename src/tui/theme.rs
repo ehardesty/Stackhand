@@ -51,6 +51,12 @@ impl Theme {
         Style::default().fg(self.secondary)
     }
 
+    pub(super) fn link(&self) -> Style {
+        Style::default()
+            .fg(self.info)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
     pub(super) fn search_match(&self) -> Style {
         Style::default()
             .fg(self.copy)

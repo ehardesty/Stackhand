@@ -52,6 +52,11 @@ pub(super) fn render(project: &EffectiveProject) -> Result<String, ConfigError> 
         ),
     );
     insert(&mut settings, "shell", Value::Mapping(shell));
+    insert(
+        &mut settings,
+        "port_discovery",
+        Value::Bool(project.port_discovery()),
+    );
     insert(&mut root, "settings", Value::Mapping(settings));
 
     serde_yaml::to_string(&Value::Mapping(root)).map_err(|error| ConfigError {

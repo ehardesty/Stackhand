@@ -61,6 +61,14 @@ pub struct MetricsMetadata {
     pub best_effort: bool,
 }
 
+/// One bounded listening-port observation for the current Run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListeningPortsMetadata {
+    pub ports: Vec<u16>,
+    pub omitted: u16,
+    pub best_effort: bool,
+}
+
 /// The disposition of a finished Run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunExitDisposition {
@@ -168,11 +176,12 @@ impl Core {
         events: SeamSender,
         initial_geometry: TerminalGeometry,
     ) -> Self {
+        let port_discovery = project.port_discovery();
         let lifecycles = project
             .processes()
             .iter()
             .enumerate()
-            .map(|(index, _)| ProcessLifecycle::new(ProcessId::new(index as u32)))
+            .map(|(index, _)| ProcessLifecycle::new(ProcessId::new(index as u32), port_discovery))
             .collect();
         let epoch = clock.now();
         Self {
@@ -437,6 +446,7 @@ impl Core {
                 run_started_at_ms: entry.run_started_at_ms,
                 failure: entry.failure.clone(),
                 metrics: entry.metrics,
+                listening_ports: entry.listening_ports.clone(),
                 blocked_reason: entry.blocked.clone(),
                 readiness: entry.readiness.as_ref().map(|tracking| {
                     let config = spec

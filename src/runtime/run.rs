@@ -22,6 +22,7 @@ use crate::runtime::outcome::{
     ResizeRejected, RunExitDisposition, RunOutcome, ShutdownLadder, StageResult,
 };
 use crate::runtime::pipe::PipeRun;
+use crate::runtime::port_discovery::{DiscoveredPorts, PortObserver};
 use crate::runtime::process_tree::{SemanticSignal, SignalError, UnixProcessTree};
 use crate::terminal::{InputRejection as SessionInputRejection, TerminalSession};
 
@@ -94,6 +95,11 @@ pub enum RunEventKind {
     /// One bounded aggregate Process Tree sample. At most one is emitted
     /// per configured interval.
     Metrics(RunMetrics),
+    /// A changed set of listening TCP ports owned by this Run.
+    ListeningPorts {
+        process_id: ProcessId,
+        observation: DiscoveredPorts,
+    },
 }
 
 impl RunEvent {
@@ -206,6 +212,7 @@ impl RunRuntime {
             signals_stopped: AtomicBool::new(false),
             signal_failure: Mutex::new(None),
             metrics,
+            port_observer: None,
             retired_pty: None,
             events,
             outcome: None,
@@ -241,6 +248,8 @@ pub struct OwnedRun {
     signal_failure: Mutex<Option<String>>,
     /// Aggregate Process Tree sampler, present when sampling is enabled.
     metrics: Option<MetricsSampler>,
+    /// Optional listener discovery, started only for Projects that enable it.
+    port_observer: Option<PortObserver>,
     /// A finalized PTY session kept only so input/resize admission gates
     /// stay observable after completion.
     retired_pty: Option<TerminalSession>,
@@ -289,6 +298,24 @@ impl OwnedRun {
             RunInner::Pty { process, .. } => process.process_id().map(OsPid::new),
             RunInner::Pipe(pipe) => pipe.root_pid().map(OsPid::new),
         }
+    }
+
+    /// Start optional listening-port discovery for this Run. Repeated calls
+    /// are harmless and a Run without an observable root PID stays disabled.
+    pub(crate) fn enable_port_discovery(&mut self) {
+        if self.port_observer.is_some() || self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(root_pid) = self.root_pid() else {
+            return;
+        };
+        self.port_observer = Some(PortObserver::spawn(
+            root_pid.get(),
+            self.process_id,
+            self.run_id,
+            Arc::clone(&self.stopping),
+            self.events.clone(),
+        ));
     }
 
     /// A non-owning terminal view of this Run. Present only for PTY-mode
@@ -537,6 +564,13 @@ impl OwnedRun {
         if !sampler_joined {
             worker_join_failures.push("metrics sampler did not join".to_string());
         }
+        if self
+            .port_observer
+            .take()
+            .is_some_and(|observer| !observer.stop_and_join())
+        {
+            worker_join_failures.push("port-discovery observer did not join".to_string());
+        }
 
         if !intentional_stop {
             disposition = if exit_code == Some(0) {
@@ -698,6 +732,10 @@ impl Drop for OwnedRun {
         }
         self.stopping.store(true, Ordering::Release);
         let _ = self.metrics.take().map(|sampler| sampler.stop_and_join());
+        let _ = self
+            .port_observer
+            .take()
+            .map(|observer| observer.stop_and_join());
         let mut diagnostics = Vec::new();
         let mut containment_confirmed = false;
         let signals_stopped = self.signals_stopped.load(Ordering::Acquire);
