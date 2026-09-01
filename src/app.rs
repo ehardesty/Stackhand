@@ -8,7 +8,7 @@ use crate::supervisor::{
 };
 use crate::terminal::OwnedTerminalSnapshot;
 use crate::tui::{
-    OuterTerminal, ProcessRowView, ProjectProfileMenu, pane_inner, project_layout,
+    OuterTerminal, ProcessRowView, ProjectProfileMenu, VisibleActions, pane_inner, project_layout,
     render_project_with_search,
 };
 use anyhow::{Result, anyhow, bail};
@@ -204,7 +204,7 @@ fn run_event_loop(
             if shutting_down {
                 header.insert_str(0, "Project shutdown in progress · ");
             }
-            let (process_table_state, profile_menu) = interaction.render_state();
+            let (process_table_state, profile_menu, visible_actions) = interaction.render_state();
             console_area = render_frame(
                 outer,
                 &rows,
@@ -216,6 +216,7 @@ fn run_event_loop(
                 &list_title,
                 &header,
                 profile_menu,
+                visible_actions,
             )?;
             let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
             outer.set_cursor_shape(cursor)?;
@@ -285,6 +286,7 @@ fn open_local_port(port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     outer: &mut OuterTerminal,
     rows: &[ProcessRowView],
@@ -296,6 +298,7 @@ fn render_frame(
     process_list_title: &str,
     selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
+    visible_actions: &mut VisibleActions,
 ) -> Result<ratatui::layout::Rect> {
     let mut pane = None;
     outer
@@ -312,6 +315,7 @@ fn render_frame(
                 process_list_title,
                 selected_header,
                 profile_menu,
+                visible_actions,
             ));
         })
         .map_err(|error| anyhow!("render failed: {error}"))?;

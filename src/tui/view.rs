@@ -3,13 +3,14 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Table, TableState,
+    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
 };
 
 use crate::log_view::SearchDialogView;
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
+use super::footer::VisibleActions;
 use super::profile_menu::ProjectProfileMenu;
 use super::theme::{LifecycleTone, TERMINAL_THEME};
 
@@ -84,6 +85,7 @@ pub struct ConsoleViewState {
     pub logs_scrollbar: Option<ConsoleScrollbar>,
     pub terminal_available: bool,
     pub profile_menu_open: bool,
+    pub profiles_available: bool,
     pub profile_changes_pending: bool,
     pub start_anyway_available: bool,
 }
@@ -102,6 +104,7 @@ impl Default for ConsoleViewState {
             logs_scrollbar: None,
             terminal_available: false,
             profile_menu_open: false,
+            profiles_available: false,
             profile_changes_pending: false,
             start_anyway_available: false,
         }
@@ -272,6 +275,7 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn render_project(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
@@ -283,6 +287,7 @@ pub fn render_project(
     selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
 ) -> Rect {
+    let mut visible_actions = VisibleActions::default();
     render_project_with_search(
         frame,
         rows,
@@ -294,9 +299,11 @@ pub fn render_project(
         process_list_title,
         selected_header,
         profile_menu,
+        &mut visible_actions,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_project_with_search(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
@@ -308,6 +315,7 @@ pub(crate) fn render_project_with_search(
     process_list_title: &str,
     selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
+    visible_actions: &mut VisibleActions,
 ) -> Rect {
     let area = frame.area();
     let (list, console_pane, footer) = project_layout(area, rows.len());
@@ -349,16 +357,12 @@ pub(crate) fn render_project_with_search(
             console_inner,
         );
     }
-    frame.render_widget(
-        Paragraph::new(footer_text(view, mouse_tracking))
-            .style(TERMINAL_THEME.footer(view.warning.is_some())),
-        footer,
-    );
+    visible_actions.render_footer(frame, footer, area, view, mouse_tracking);
     if let Some(trigger) = profile_trigger {
         profile_menu.render(frame, trigger, area);
     }
     if let Some(dialog) = search_dialog {
-        render_search_dialog(frame, dialog, console_pane);
+        visible_actions.render_search_dialog(frame, dialog, console_pane);
     }
     // A pipe console has no terminal cursor. Console focus shows the child
     // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
@@ -603,36 +607,6 @@ pub fn process_port_at(
     None
 }
 
-fn render_search_dialog(frame: &mut Frame<'_>, dialog: &SearchDialogView, area: Rect) {
-    let width = area.width.saturating_sub(4).min(64);
-    let height = area.height.saturating_sub(2).min(7);
-    if width < 20 || height < 5 {
-        return;
-    }
-    let dialog_area = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, dialog_area);
-    let block = Block::bordered()
-        .border_style(TERMINAL_THEME.focus_border())
-        .title(" Search Logs ");
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-    let content = vec![
-        Line::styled("Search terms", TERMINAL_THEME.secondary_text()),
-        Line::from(format!("{}_", dialog.query)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(&dialog.result, TERMINAL_THEME.secondary_text()),
-            Span::raw("  ·  Enter: Search  ·  Esc: Cancel"),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(content), inner);
-}
-
 fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
     let source = snapshot.buffer.area();
     let width = source.width.min(console.width);
@@ -645,118 +619,9 @@ fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console
     }
 }
 
+#[cfg(test)]
 fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
-    if view.search_editing {
-        return "SEARCH · Enter: Search · Esc: Cancel".to_string();
-    }
-    let focus = match view.mode {
-        ConsoleViewMode::ProcessList => "FOCUS: PROCESSES",
-        ConsoleViewMode::Console => "FOCUS: CONSOLE",
-        ConsoleViewMode::Copy => "MODE: COPY",
-    };
-    if let Some(warning) = view.warning {
-        let warning = match warning {
-            ConsoleWarning::PasteRejected => {
-                "WARNING: paste rejected; focus an input-enabled console first"
-            }
-            ConsoleWarning::InputRejected => {
-                "WARNING: terminal input was rejected; Run is stopping or its queue is full"
-            }
-            ConsoleWarning::InputBackpressure => {
-                "WARNING: child input queue is saturated; delivery is bounded"
-            }
-            ConsoleWarning::OutputTruncated => {
-                "WARNING: oldest Process output was removed at the history bound"
-            }
-            ConsoleWarning::PasteDeliveryFailed => {
-                "WARNING: an admitted paste did not reach the child"
-            }
-            ConsoleWarning::ClipboardFailed => {
-                "WARNING: clipboard write failed; selection remains available"
-            }
-            ConsoleWarning::NothingSelected => {
-                "WARNING: no terminal text is selected · v: start selection"
-            }
-            ConsoleWarning::NoLogsToCopy => "WARNING: no Logs text is available to copy",
-            ConsoleWarning::InputDisabled => {
-                "WARNING: input is not enabled for this Process · Ctrl-A: Process list"
-            }
-            ConsoleWarning::LogsCommandOnly => {
-                "WARNING: Logs accepts commands, not Process input · Ctrl-F or /: search · Esc: Processes"
-            }
-            ConsoleWarning::SelectionUnavailable => {
-                "WARNING: terminal selection is available only in Terminal view"
-            }
-            ConsoleWarning::LinkOpenFailed => "WARNING: could not open the port in a browser",
-        };
-        return format!(
-            "{} · {focus} · {warning}",
-            mouse_owner_text(view, child_mouse_tracking)
-        );
-    }
-    if view.logs_selection {
-        return "MODE: SELECT LOGS · drag: adjust · c/y: copy · Esc: clear".to_string();
-    }
-    if view.search_active {
-        return "SEARCH · Ctrl-F or /: edit · Enter/F3: next · Shift+Enter/Shift+F3: previous"
-            .to_string();
-    }
-
-    let controls = match view.mode {
-        ConsoleViewMode::ProcessList => {
-            if view.profile_menu_open {
-                "↑/↓: select · Enter: choose · Esc: close".to_string()
-            } else {
-                let apply_profile = if view.profile_changes_pending {
-                    " · R: apply profile"
-                } else {
-                    ""
-                };
-                let start_anyway = if view.start_anyway_available {
-                    " · S: start anyway"
-                } else {
-                    ""
-                };
-                format!(
-                    "j/k: select · p: profiles{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · Ctrl-F or /: search · q: quit"
-                )
-            }
-        }
-        ConsoleViewMode::Console => match view.pane {
-            ConsolePaneKind::Terminal => {
-                "keys: child · Ctrl-A, then v: copy · Ctrl-Q: quit".to_string()
-            }
-            ConsolePaneKind::Pipe => {
-                let terminal_control = if view.terminal_available {
-                    " · l: terminal"
-                } else {
-                    ""
-                };
-                format!(
-                    "↑↓/j/k: scroll · PgUp/PgDn: page · Ctrl-F or /: search · f: live · c/y: copy{terminal_control} · Esc: Processes"
-                )
-            }
-        },
-        ConsoleViewMode::Copy => {
-            "h/j/k/l or arrows: move · v: select/unselect · c/y: copy · a: all · q/Esc: exit"
-                .to_string()
-        }
-    };
-    let tail = if view.following { "LIVE" } else { "PAUSED" };
-    format!(
-        "{} · {focus} · {controls} · {tail}",
-        mouse_owner_text(view, child_mouse_tracking)
-    )
-}
-
-fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'static str {
-    if view.stackhand_mouse_gesture {
-        "MOUSE: STACKHAND · selecting"
-    } else if view.mode == ConsoleViewMode::Console && child_mouse_tracking {
-        "MOUSE: CHILD · Shift+drag: copy"
-    } else {
-        "MOUSE: STACKHAND"
-    }
+    super::footer::footer_text(view, child_mouse_tracking)
 }
 
 #[cfg(test)]
@@ -1206,6 +1071,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut profile_menu = ProjectProfileMenu::default();
+        let mut visible_actions = VisibleActions::default();
         let mut process_table_state = TableState::default();
         let dialog = SearchDialogView {
             query: "timeout".to_string(),
@@ -1229,6 +1095,7 @@ mod tests {
                     "Processes",
                     "Logs · demo",
                     &mut profile_menu,
+                    &mut visible_actions,
                 );
             })
             .unwrap();
@@ -1439,6 +1306,7 @@ mod tests {
                 logs_scrollbar: None,
                 terminal_available: false,
                 profile_menu_open: false,
+                profiles_available: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1552,6 +1420,7 @@ mod tests {
                 logs_scrollbar: None,
                 terminal_available: false,
                 profile_menu_open: false,
+                profiles_available: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1577,6 +1446,7 @@ mod tests {
                 logs_scrollbar: None,
                 terminal_available: false,
                 profile_menu_open: false,
+                profiles_available: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },
@@ -1600,6 +1470,7 @@ mod tests {
                 logs_scrollbar: None,
                 terminal_available: false,
                 profile_menu_open: false,
+                profiles_available: false,
                 profile_changes_pending: false,
                 start_anyway_available: false,
             },

@@ -1,9 +1,11 @@
+mod footer;
 mod mouse;
 mod profile_menu;
 mod restore;
 mod theme;
 mod view;
 
+pub(crate) use footer::{VisibleAction, VisibleActionEvent, VisibleActions};
 pub use mouse::MouseRouter;
 pub(crate) use profile_menu::{ProjectProfileMenu, ProjectProfileMenuAction};
 pub use restore::OuterTerminal;

@@ -6,7 +6,7 @@
 //! output facts and performs the returned Supervisor commands.
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
@@ -23,7 +23,8 @@ use crate::supervisor::{
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
     ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, PortListView, ProjectProfileMenu,
-    ProjectProfileMenuAction, pane_inner, process_port_at, process_row_at, project_layout,
+    ProjectProfileMenuAction, VisibleAction, VisibleActionEvent, VisibleActions, pane_inner,
+    process_port_at, process_row_at, project_layout,
 };
 
 /// The selected Process's visible output owner.
@@ -65,13 +66,13 @@ pub(crate) struct ProjectInteraction {
     logs: Vec<ProcessLogs>,
     project_commands: Vec<Command>,
     profile_menu: ProjectProfileMenu,
+    visible_actions: VisibleActions,
     profile_menu_available: bool,
     profile_changes_pending: bool,
     start_anyway_available: bool,
     terminal_available: bool,
     ports_by_process: Vec<Option<PortListView>>,
     profiles_visible: bool,
-    port_to_open: Option<u16>,
     truncation: Option<(usize, bool)>,
 }
 
@@ -80,8 +81,18 @@ impl ProjectInteraction {
         self.selected
     }
 
-    pub(super) fn render_state(&mut self) -> (&mut TableState, &mut ProjectProfileMenu) {
-        (&mut self.process_table, &mut self.profile_menu)
+    pub(super) fn render_state(
+        &mut self,
+    ) -> (
+        &mut TableState,
+        &mut ProjectProfileMenu,
+        &mut VisibleActions,
+    ) {
+        (
+            &mut self.process_table,
+            &mut self.profile_menu,
+            &mut self.visible_actions,
+        )
     }
 
     pub(super) fn poll_requests(&mut self) -> bool {
@@ -224,6 +235,7 @@ impl ProjectInteraction {
         }
         let mut view = self.console.view();
         view.profile_menu_open = self.profile_menu_available && self.profile_menu.is_open();
+        view.profiles_available = self.profile_menu_available;
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
         view.terminal_available = self.terminal_available;
@@ -266,6 +278,13 @@ impl ProjectInteraction {
             )
         {
             return InputResult::Quit;
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && self.visible_actions.is_menu_open()
+        {
+            let action = self.visible_actions.handle_key(&key);
+            return self.handle_visible_action_event(action, pane, process, retained, console_area);
         }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
@@ -350,14 +369,7 @@ impl ProjectInteraction {
                 }
             }
             Event::Mouse(mouse) => {
-                if self.route_mouse(mouse, pane, process, repeats) {
-                    self.port_to_open
-                        .take()
-                        .map(InputResult::OpenPort)
-                        .unwrap_or(InputResult::Changed)
-                } else {
-                    InputResult::Ignored
-                }
+                self.route_mouse(mouse, pane, process, retained, repeats, console_area)
             }
             Event::Resize(_, _) => InputResult::Ignored,
         }
@@ -383,6 +395,82 @@ impl ProjectInteraction {
                 InputResult::Changed
             }
         }
+    }
+
+    fn handle_visible_action_event(
+        &mut self,
+        event: VisibleActionEvent,
+        pane: &SelectedPane<'_>,
+        process: &ProcessSnapshot,
+        retained: &RetainedOutput,
+        console_area: Rect,
+    ) -> InputResult {
+        match event {
+            VisibleActionEvent::Ignored => InputResult::Ignored,
+            VisibleActionEvent::Changed => InputResult::Changed,
+            VisibleActionEvent::Selected(action) => {
+                self.route_visible_action(action, pane, process, retained, console_area)
+            }
+        }
+    }
+
+    fn route_visible_action(
+        &mut self,
+        action: VisibleAction,
+        pane: &SelectedPane<'_>,
+        process: &ProcessSnapshot,
+        retained: &RetainedOutput,
+        console_area: Rect,
+    ) -> InputResult {
+        if action == VisibleAction::Quit {
+            return InputResult::Quit;
+        }
+        if action == VisibleAction::EnterCopy
+            && self.console.view().mode == crate::tui::ConsoleViewMode::Console
+        {
+            let focus_list = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+            self.route_input(
+                Event::Key(focus_list),
+                1,
+                pane,
+                process,
+                retained,
+                console_area,
+            );
+        }
+        let key = match action {
+            VisibleAction::ApplyProfile => KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+            VisibleAction::ChooseProfile
+            | VisibleAction::SearchNext
+            | VisibleAction::SearchSubmit => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            VisibleAction::ClearSelection
+            | VisibleAction::CloseProfileMenu
+            | VisibleAction::ExitCopy
+            | VisibleAction::SearchCancel => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            VisibleAction::Copy => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            VisibleAction::EnterCopy | VisibleAction::ToggleSelection => {
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)
+            }
+            VisibleAction::FocusProcesses => {
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
+            }
+            VisibleAction::Follow => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            VisibleAction::LifecycleStart => KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            VisibleAction::LifecycleStop => KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            VisibleAction::LifecycleRestart => {
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+            }
+            VisibleAction::OpenProfiles => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            VisibleAction::SearchEdit => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            VisibleAction::SearchPrevious => KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            VisibleAction::SelectAll => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            VisibleAction::StartAnyway => KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+            VisibleAction::ToggleView => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            VisibleAction::OpenLifecycleMenu | VisibleAction::Quit => {
+                return InputResult::Ignored;
+            }
+        };
+        self.route_input(Event::Key(key), 1, pane, process, retained, console_area)
     }
 
     fn route_key(
@@ -451,8 +539,10 @@ impl ProjectInteraction {
         mouse: MouseEvent,
         pane: &SelectedPane<'_>,
         process: &ProcessSnapshot,
+        retained: &RetainedOutput,
         repeats: usize,
-    ) -> bool {
+        console_area: Rect,
+    ) -> InputResult {
         let process_count = self.logs.len();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let (list, console_outer, _) = project_layout(Rect::new(0, 0, cols, rows), process_count);
@@ -460,20 +550,45 @@ impl ProjectInteraction {
         let child_tracks_mouse = process.input_focused
             && matches!(pane, SelectedPane::Terminal(view) if view.mouse_tracking());
 
+        if self.visible_actions.is_menu_open() {
+            let action = self.visible_actions.handle_mouse(&mouse);
+            if action != VisibleActionEvent::Ignored {
+                return self.handle_visible_action_event(
+                    action,
+                    pane,
+                    process,
+                    retained,
+                    console_area,
+                );
+            }
+        }
+
         if self.profile_menu_available {
             let action = self.profile_menu.handle_mouse(&mouse);
             if action != ProjectProfileMenuAction::Ignored {
-                return matches!(
-                    self.handle_profile_menu_action(action),
-                    InputResult::Changed
-                );
+                return self.handle_profile_menu_action(action);
             }
-            if self.profile_menu.is_open()
-                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            {
-                self.profile_menu.close();
-                return true;
+            if self.profile_menu.is_open() {
+                let action = self.visible_actions.handle_mouse(&mouse);
+                if action != VisibleActionEvent::Ignored {
+                    return self.handle_visible_action_event(
+                        action,
+                        pane,
+                        process,
+                        retained,
+                        console_area,
+                    );
+                }
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.profile_menu.close();
+                    return InputResult::Changed;
+                }
             }
+        }
+
+        let action = self.visible_actions.handle_mouse(&mouse);
+        if action != VisibleActionEvent::Ignored {
+            return self.handle_visible_action_event(action, pane, process, retained, console_area);
         }
 
         let terminal_scrollbar_active = self.console.terminal_scrollbar_gesture_active();
@@ -490,7 +605,7 @@ impl ProjectInteraction {
                 })
                 .unwrap_or(false)
         {
-            return true;
+            return InputResult::Changed;
         }
 
         if matches!(pane, SelectedPane::Logs(_))
@@ -498,19 +613,20 @@ impl ProjectInteraction {
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
             && let SelectedPane::Logs(retained) = pane
         {
-            return self.console.handle_read_only_mouse(
+            let changed = self.console.handle_read_only_mouse(
                 mouse,
                 console_inner,
                 repeats,
                 &mut self.logs[self.selected],
                 retained,
             );
+            return mouse_result(changed);
         }
         if self.console.mouse_gesture_active()
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
             && let SelectedPane::Terminal(view) = pane
         {
-            return view
+            let changed = view
                 .with(|session| {
                     (0..repeats).fold(false, |changed, _| {
                         self.console
@@ -519,6 +635,7 @@ impl ProjectInteraction {
                     })
                 })
                 .unwrap_or(false);
+            return mouse_result(changed);
         }
         if rect_contains(list, mouse.column, mouse.row) {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -536,9 +653,8 @@ impl ProjectInteraction {
                 {
                     self.selected = index;
                 }
-                self.port_to_open = Some(port);
                 self.console.clear_pane_warning();
-                return true;
+                return InputResult::OpenPort(port);
             }
             if mouse_changes_focus(mouse.kind) {
                 match pane {
@@ -567,12 +683,14 @@ impl ProjectInteraction {
                 }
                 _ => {}
             }
-            return previous != self.selected || matches!(mouse.kind, MouseEventKind::Down(_));
+            return mouse_result(
+                previous != self.selected || matches!(mouse.kind, MouseEventKind::Down(_)),
+            );
         }
         if !rect_contains(console_outer, mouse.column, mouse.row) {
-            return false;
+            return InputResult::Ignored;
         }
-        match pane {
+        let changed = match pane {
             SelectedPane::Terminal(view) => view
                 .with(|session| {
                     if mouse_starts_console_focus(mouse.kind, self.console.view().mode) {
@@ -597,7 +715,8 @@ impl ProjectInteraction {
                     retained,
                 ) || mouse_changes_focus(mouse.kind)
             }
-        }
+        };
+        mouse_result(changed)
     }
 }
 
@@ -631,6 +750,14 @@ pub(super) fn mouse_starts_console_focus(
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn mouse_result(changed: bool) -> InputResult {
+    if changed {
+        InputResult::Changed
+    } else {
+        InputResult::Ignored
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +859,38 @@ mod tests {
         );
         let update = interaction.update_project(&snapshot);
         assert_eq!(update.commands, vec![Command::Rerun("setup".to_string())]);
+    }
+
+    #[test]
+    fn visible_lifecycle_action_uses_the_existing_process_command_path() {
+        let snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
+            selected_profile: None,
+            available_profiles: Vec::new(),
+            processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
+            now_ms: 0,
+            shutdown: None,
+        };
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction::default();
+        interaction.update_project(&snapshot);
+
+        assert_eq!(
+            interaction.route_visible_action(
+                VisibleAction::LifecycleStop,
+                &pane,
+                &snapshot.processes[0],
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_eq!(
+            interaction.update_project(&snapshot).commands,
+            vec![Command::Stop("api".to_string())]
+        );
     }
 
     #[test]
@@ -963,7 +1122,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let render = |terminal: &mut Terminal<TestBackend>,
                       interaction: &mut ProjectInteraction| {
-            let (table_state, profile_menu) = interaction.render_state();
+            let (table_state, profile_menu, _) = interaction.render_state();
             terminal
                 .draw(|frame| {
                     crate::tui::render_project(
@@ -984,7 +1143,7 @@ mod tests {
                 .unwrap();
         };
         // Store the wrapper geometry during a real frame render.
-        let (state, profile_menu) = interaction.render_state();
+        let (state, profile_menu, _) = interaction.render_state();
         terminal
             .draw(|frame| {
                 crate::tui::render_project(

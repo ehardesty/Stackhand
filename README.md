@@ -195,6 +195,10 @@ Focus changes which keys Stackhand receives. Stackhand starts with the Process
 list focused. When an interactive PTY has focus, ordinary keys go to the
 selected command.
 
+Visible underlined actions can also be clicked. A click runs a single action
+directly. The lifecycle and Project Profile controls open a menu because they
+contain more than one choice.
+
 ### Process list
 
 Use these keys while the Process list has focus:
