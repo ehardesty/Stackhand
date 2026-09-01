@@ -18,6 +18,13 @@ const REDACTED_VALUE: &str = "<redacted>";
 pub(super) fn render(project: &EffectiveProject) -> Result<String, ConfigError> {
     let mut root = Mapping::new();
     insert(&mut root, "version", number(1));
+    if project.base_profile_name() != "base" {
+        insert(
+            &mut root,
+            "base_profile_name",
+            string(project.base_profile_name()),
+        );
+    }
 
     let mut processes = Mapping::new();
     for process in project.processes() {

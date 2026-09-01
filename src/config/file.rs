@@ -16,6 +16,7 @@ use super::readiness::ReadinessFile;
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigFile {
     pub(super) version: u64,
+    pub(super) base_profile_name: Option<String>,
     pub(super) env_files: Option<Vec<String>>,
     pub(super) profiles: Option<BTreeMap<String, ProjectProfileFile>>,
     #[serde(default)]

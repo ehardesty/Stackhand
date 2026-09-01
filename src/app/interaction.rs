@@ -582,6 +582,7 @@ mod tests {
     #[test]
     fn selection_and_lifecycle_commands_cross_one_state_seam() {
         let snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
             selected_profile: None,
             available_profiles: Vec::new(),
             processes: vec![
@@ -627,6 +628,7 @@ mod tests {
     #[test]
     fn profile_keys_queue_global_selection_and_pending_apply_commands() {
         let mut snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
             selected_profile: Some("local".to_string()),
             available_profiles: vec!["cloud-dev".to_string(), "local".to_string()],
             processes: vec![process("api", crate::model::ProcessKind::Service, 0)],
@@ -679,6 +681,7 @@ mod tests {
     #[test]
     fn start_anyway_is_available_only_for_the_selected_waiting_process() {
         let mut snapshot = ProjectSnapshot {
+            base_profile_name: "base".to_string(),
             selected_profile: None,
             available_profiles: Vec::new(),
             processes: vec![process("api", crate::model::ProcessKind::Service, 0)],

@@ -29,6 +29,7 @@ processes:
 
 ```yaml
 version: 1
+base_profile_name: local
 
 env_files:
   - .env
@@ -183,6 +184,8 @@ Durations use a nonnegative whole number followed by `ms`, `s`, `m`, or `h`. Fie
 ## Profiles
 
 A Project Profile is a Project-wide selection. It can replace the Project environment files and activate same-named Process Profiles. One `--profile NAME` option selects the initial Project Profile. The name `base` is reserved.
+
+`base_profile_name` changes the user-visible name of the base Project Profile. It does not create a named profile or change profile selection. If it is omitted, Stackhand displays `base`. The display name must not be empty or match a named Project Profile.
 
 A Process Profile is a named partial patch inside one Process:
 

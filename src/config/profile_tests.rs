@@ -18,6 +18,49 @@ fn write_and_load(
 }
 
 #[test]
+fn a_project_can_name_the_base_profile_for_display() {
+    let project = write_and_load(
+        "base-profile-name",
+        "version: 1
+base_profile_name: local
+processes:
+  api:
+    command: [/usr/bin/true]
+",
+        None,
+    )
+    .expect("the base profile display name is valid");
+
+    assert_eq!(project.base_profile_name(), "local");
+    assert_eq!(project.selected_process_profile(), None);
+}
+
+#[test]
+fn the_base_profile_display_name_cannot_conflict_with_a_named_profile() {
+    let error = write_and_load(
+        "conflicting-base-profile-name",
+        "version: 1
+base_profile_name: local
+profiles:
+  local: {}
+processes:
+  api:
+    command: [/usr/bin/true]
+",
+        None,
+    )
+    .expect_err("profile display names must be distinct");
+
+    assert!(
+        error
+            .message
+            .contains("base_profile_name 'local' conflicts with a named Project Profile"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn one_process_profile_is_selected_and_missing_names_fall_back_to_base() {
     let mut project = write_and_load(
         "process-profile-selection",

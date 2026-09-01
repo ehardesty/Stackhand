@@ -213,6 +213,35 @@ fn config_show_accepts_explicit_paths_and_has_stable_output_without_starting_pro
 }
 
 #[test]
+fn config_show_reports_a_configured_base_profile_name() {
+    let root = unique_directory("base-profile-name");
+    let config = root.join("stackhand.yaml");
+    fs::write(
+        &config,
+        "version: 1
+base_profile_name: local
+processes:
+  web:
+    command: [/usr/bin/true]
+",
+    )
+    .expect("Project writes");
+
+    let output = run_show(&root, Some(&config), None);
+    assert!(output.status.success(), "{output:?}");
+    let effective = effective_yaml(&output);
+    assert_eq!(
+        effective
+            .as_mapping()
+            .and_then(|root| root.get(Value::String("base_profile_name".to_string())))
+            .and_then(Value::as_str),
+        Some("local")
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn config_show_uses_the_same_resolution_failure_as_config_validate() {
     let root = unique_directory("failure");
     let config = root.join("project.yaml");

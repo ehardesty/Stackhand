@@ -22,7 +22,8 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
             name: process.name.clone(),
             status: status_label(process),
             lifecycle_tone: lifecycle_tone(process),
-            profile: show_profiles.then(|| profile_label(process)),
+            profile: show_profiles
+                .then(|| profile_label(process, snapshot.base_profile_name.as_str())),
             cpu: process.metrics.map(|metrics| {
                 metric_precision(format_cpu(metrics.cpu_percent), metrics.best_effort)
             }),
@@ -34,13 +35,24 @@ pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<P
         .collect()
 }
 
-fn profile_label(process: &ProcessSnapshot) -> String {
-    let next = process.next_profile.as_deref().unwrap_or("base");
+fn profile_label(process: &ProcessSnapshot, base_profile_name: &str) -> String {
+    let next = process.next_profile.as_deref().unwrap_or(base_profile_name);
     match process.current_run {
-        Some(_) if process.current_profile.as_deref().unwrap_or("base") != next => format!(
-            "{} → {next}",
-            process.current_profile.as_deref().unwrap_or("base")
-        ),
+        Some(_)
+            if process
+                .current_profile
+                .as_deref()
+                .unwrap_or(base_profile_name)
+                != next =>
+        {
+            format!(
+                "{} → {next}",
+                process
+                    .current_profile
+                    .as_deref()
+                    .unwrap_or(base_profile_name)
+            )
+        }
         _ => next.to_string(),
     }
 }
@@ -56,7 +68,10 @@ pub(super) fn process_list_title(snapshot: &ProjectSnapshot) -> String {
     if snapshot.available_profiles.is_empty() {
         return "Processes".to_string();
     }
-    let selected = snapshot.selected_profile.as_deref().unwrap_or("base");
+    let selected = snapshot
+        .selected_profile
+        .as_deref()
+        .unwrap_or(snapshot.base_profile_name.as_str());
     let pending = snapshot
         .processes
         .iter()

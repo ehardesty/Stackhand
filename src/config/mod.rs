@@ -296,6 +296,15 @@ fn load_file_with_local(
                 .flat_map(|profiles| profiles.keys().cloned())
         })
         .collect::<BTreeSet<_>>();
+    let base_profile_name = file.base_profile_name.unwrap_or_else(|| "base".to_string());
+    if base_profile_name.trim().is_empty() {
+        return Err(diagnostics::with_source(
+            ConfigError {
+                message: "base_profile_name must not be empty".to_string(),
+            },
+            &last_layer,
+        ));
+    }
     let project_profiles = file.profiles.unwrap_or_default();
     if project_profiles.contains_key("base") {
         return Err(diagnostics::with_source(
@@ -306,6 +315,16 @@ fn load_file_with_local(
         ));
     }
     process_profile_names.extend(project_profiles.keys().cloned());
+    if base_profile_name != "base" && process_profile_names.contains(&base_profile_name) {
+        return Err(diagnostics::with_source(
+            ConfigError {
+                message: format!(
+                    "base_profile_name '{base_profile_name}' conflicts with a named Project Profile"
+                ),
+            },
+            &last_layer,
+        ));
+    }
     let process_profile_names = process_profile_names.into_iter().collect::<Vec<_>>();
     if let Some(profile) = profile
         && !process_profile_names.iter().any(|name| name == profile)
@@ -397,6 +416,7 @@ fn load_file_with_local(
         processes_by_profile,
         labels_by_profile,
         profile.map(str::to_owned),
+        base_profile_name,
         shell,
     )
     .map_err(|error| {

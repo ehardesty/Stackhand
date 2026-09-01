@@ -52,6 +52,7 @@ fn profile_column_appears_for_pending_and_mixed_process_profiles() {
     second.next_profile = Some("cloud-dev".to_string());
     let snapshot = crate::supervisor::ProjectSnapshot {
         processes: vec![first, second],
+        base_profile_name: "base".to_string(),
         selected_profile: Some("cloud-dev".to_string()),
         available_profiles: vec!["cloud-dev".to_string(), "local".to_string()],
         shutdown: None,
@@ -68,12 +69,41 @@ fn profile_column_appears_for_pending_and_mixed_process_profiles() {
 }
 
 #[test]
+fn configured_base_profile_name_is_used_in_visible_profile_labels() {
+    let mut process = projection_process();
+    process.current_profile = None;
+    process.next_profile = Some("cloud-dev".to_string());
+    let snapshot = crate::supervisor::ProjectSnapshot {
+        processes: vec![process],
+        base_profile_name: "local".to_string(),
+        selected_profile: Some("cloud-dev".to_string()),
+        available_profiles: vec!["cloud-dev".to_string()],
+        shutdown: None,
+        now_ms: 0,
+    };
+
+    assert_eq!(
+        process_rows(&snapshot, 0)[0].profile.as_deref(),
+        Some("local → cloud-dev")
+    );
+
+    let mut base_snapshot = snapshot;
+    base_snapshot.selected_profile = None;
+    base_snapshot.processes[0].next_profile = None;
+    assert_eq!(
+        process_list_title(&base_snapshot),
+        "Processes · Profile: local"
+    );
+}
+
+#[test]
 fn profile_column_hides_when_global_profile_describes_every_process() {
     let mut process = projection_process();
     process.current_profile = Some("local".to_string());
     process.next_profile = Some("local".to_string());
     let snapshot = crate::supervisor::ProjectSnapshot {
         processes: vec![process],
+        base_profile_name: "base".to_string(),
         selected_profile: Some("local".to_string()),
         available_profiles: vec!["local".to_string()],
         shutdown: None,

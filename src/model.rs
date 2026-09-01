@@ -352,6 +352,8 @@ impl Default for ShellConfig {
 pub struct EffectiveProject {
     /// The Process specifications selected for each next Run.
     processes: Vec<ProcessSpec>,
+    /// The user-visible name of the base Project Profile.
+    base_profile_name: String,
     /// The effective specifications for the base Project Profile.
     /// Profile selection never changes Process identity or order.
     base_processes: Vec<ProcessSpec>,
@@ -449,6 +451,7 @@ impl EffectiveProject {
             return Err(ProjectError::DependencyCycle(path));
         }
         Ok(Self {
+            base_profile_name: "base".to_string(),
             base_processes: processes.clone(),
             processes_by_profile: BTreeMap::new(),
             base_process_profile_labels: vec![None; processes.len()],
@@ -509,6 +512,7 @@ impl EffectiveProject {
             named_processes,
             named_labels,
             selected_process_profile,
+            "base".to_string(),
             shell,
         )
     }
@@ -520,10 +524,12 @@ impl EffectiveProject {
         processes_by_profile: BTreeMap<String, Vec<ProcessSpec>>,
         process_profile_labels_by_profile: BTreeMap<String, Vec<Option<String>>>,
         selected_process_profile: Option<String>,
+        base_profile_name: String,
         shell: ShellConfig,
     ) -> Result<Self, ProjectError> {
         debug_assert_eq!(base_processes.len(), base_process_profile_labels.len());
         let mut project = Self::with_shell(base_processes, shell.clone())?;
+        project.base_profile_name = base_profile_name;
         project.process_profile_names = processes_by_profile.keys().cloned().collect();
         project.processes_by_profile = processes_by_profile;
         project.base_process_profile_labels = base_process_profile_labels;
@@ -563,6 +569,11 @@ impl EffectiveProject {
 
     pub fn processes(&self) -> &[ProcessSpec] {
         &self.processes
+    }
+
+    /// The user-visible name of the base Project Profile.
+    pub fn base_profile_name(&self) -> &str {
+        &self.base_profile_name
     }
 
     /// The Project Profile selected for future Runs. `None` is base.

@@ -250,7 +250,7 @@ fn config_validate_rejects_an_unknown_profile_name() {
     let output = run_validate_with_profile(&root, Some(&config), Some("missing"));
     assert!(!output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unknown Process Profile 'missing'"),
+        String::from_utf8_lossy(&output.stderr).contains("unknown Project Profile 'missing'"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

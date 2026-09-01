@@ -456,6 +456,7 @@ impl Core {
             .collect();
         ProjectSnapshot {
             processes,
+            base_profile_name: self.project.base_profile_name().to_string(),
             selected_profile: self.project.selected_process_profile().map(str::to_owned),
             available_profiles: self.project.process_profile_names().to_vec(),
             now_ms,

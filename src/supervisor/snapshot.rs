@@ -13,6 +13,8 @@ use super::core::{DesiredState, FailureSummary, Lifecycle, MetricsMetadata, RunS
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectSnapshot {
     pub processes: Vec<ProcessSnapshot>,
+    /// The user-visible name of the base Project Profile.
+    pub base_profile_name: String,
     /// The Project Profile selected for future Runs. `None` is base.
     pub selected_profile: Option<String>,
     /// Process Profile names available to the global selector.
