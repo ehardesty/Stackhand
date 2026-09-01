@@ -188,6 +188,15 @@ impl ConsoleInteraction {
         self.terminal_scrollbar_gesture.is_some()
     }
 
+    /// Reconcile the footer's live state with the terminal-owned viewport.
+    /// The owner applies scroll commands asynchronously, so input handlers
+    /// cannot know whether a move reached the retained tail yet.
+    pub fn sync_terminal_following(&mut self, scrollbar: OwnedTerminalScrollbar) {
+        if self.view.mode != ConsoleViewMode::Copy {
+            self.view.following = terminal_at_live_tail(scrollbar);
+        }
+    }
+
     pub fn cancel_terminal_scrollbar_gesture(&mut self) {
         self.terminal_scrollbar_gesture = None;
     }
@@ -691,6 +700,10 @@ fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEv
     !input_focused
         && view.mode == ConsoleViewMode::Console
         && !(key.kind == KeyEventKind::Press && is_focus_toggle(*key))
+}
+
+fn terminal_at_live_tail(scrollbar: OwnedTerminalScrollbar) -> bool {
+    scrollbar.offset.saturating_add(scrollbar.len) >= scrollbar.total
 }
 
 fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {

@@ -135,6 +135,25 @@ fn list_scrolling_keeps_list_focus_and_f_returns_to_live_tail() {
 }
 
 #[test]
+fn terminal_viewport_reaching_the_tail_resumes_live_tracking() {
+    let mut interaction = ConsoleInteraction::default();
+
+    interaction.sync_terminal_following(OwnedTerminalScrollbar {
+        total: 20,
+        offset: 10,
+        len: 4,
+    });
+    assert!(!interaction.view().following);
+
+    interaction.sync_terminal_following(OwnedTerminalScrollbar {
+        total: 20,
+        offset: 16,
+        len: 4,
+    });
+    assert!(interaction.view().following);
+}
+
+#[test]
 fn disabled_input_is_rejected_only_with_console_focus() {
     let plain = key(KeyCode::Char('x'));
     let repeat = KeyEvent {

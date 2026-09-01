@@ -199,6 +199,9 @@ impl ProjectInteraction {
             SelectedPane::Terminal(view) => view.snapshot(),
             SelectedPane::Logs(_) => None,
         };
+        if let Some(snapshot) = terminal.as_ref() {
+            self.console.sync_terminal_following(snapshot.scrollbar);
+        }
         let mut view = self.console.view();
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
