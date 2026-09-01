@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
+use crate::log_view::{LogView, LogViewAction, OutputRepresentation, SearchDialogView};
 use crate::output::RetainedOutput;
 use crate::pipe_scroll::PipeScroll;
 use crate::tui::{ConsoleScrollbar, PipeLine};
@@ -30,7 +30,7 @@ pub(crate) enum LogsNavigation {
 pub(crate) struct LogsFrame {
     pub(crate) lines: Vec<PipeLine>,
     pub(crate) status: Option<String>,
-    pub(crate) editing: bool,
+    pub(crate) search_dialog: Option<SearchDialogView>,
     pub(crate) search_active: bool,
     pub(crate) following: bool,
     pub(crate) has_selection: bool,
@@ -93,7 +93,7 @@ impl ProcessLogs {
         LogsFrame {
             lines,
             status: self.search.status(),
-            editing: self.search.is_editing(),
+            search_dialog: self.search.dialog(),
             search_active: self.search.has_search(),
             following: self.scroll.following(),
             has_selection: self.scroll.has_selection(),
@@ -259,7 +259,11 @@ mod tests {
         );
 
         let frame = logs.frame(&retained, 10);
-        assert!(frame.status.is_some_and(|status| status.contains("1/1")));
+        assert!(
+            frame
+                .status
+                .is_some_and(|status| status.contains("Match 1 of 1"))
+        );
         assert!(frame.lines.iter().any(|line| line.highlight.is_some()));
         assert!(!frame.following);
     }

@@ -14,7 +14,7 @@ use ratatui::widgets::TableState;
 use super::view_model::profile_changes_pending;
 
 use crate::console::{ConsoleInteraction, LifecycleCommand};
-use crate::log_view::OutputRepresentation;
+use crate::log_view::{OutputRepresentation, SearchDialogView};
 use crate::output::RetainedOutput;
 use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{
@@ -45,7 +45,7 @@ pub(super) struct InteractionFrame {
     pub(super) terminal: Option<OwnedTerminalSnapshot>,
     pub(super) lines: Option<Vec<PipeLine>>,
     pub(super) logs_status: Option<String>,
-    pub(super) logs_editing: bool,
+    pub(super) search_dialog: Option<SearchDialogView>,
     pub(super) representation: OutputRepresentation,
     pub(super) view: ConsoleViewState,
 }
@@ -221,23 +221,23 @@ impl ProjectInteraction {
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
         view.terminal_available = self.terminal_available;
-        let (lines, logs_status, logs_editing) = match pane {
+        let (lines, logs_status, search_dialog) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
                 view.following = frame.following;
-                view.search_editing = frame.editing;
+                view.search_editing = frame.search_dialog.is_some();
                 view.search_active = frame.search_active;
                 view.logs_selection = frame.has_selection;
                 view.logs_scrollbar = frame.scrollbar;
-                (Some(frame.lines), frame.status, frame.editing)
+                (Some(frame.lines), frame.status, frame.search_dialog)
             }
-            SelectedPane::Terminal(_) => (None, None, false),
+            SelectedPane::Terminal(_) => (None, None, None),
         };
         InteractionFrame {
             terminal,
             lines,
             logs_status,
-            logs_editing,
+            search_dialog,
             representation,
             view,
         }
@@ -1038,16 +1038,14 @@ mod tests {
     }
 
     #[test]
-    fn logs_focus_can_return_to_the_pty_after_search() {
+    fn cancel_search_returns_to_the_pty_that_opened_it() {
         let output = crate::output::OutputViews::new(1);
         let retained = output.for_process(0).unwrap().snapshot();
-        let mut process = process("api", crate::model::ProcessKind::Service, 0);
-        process.terminal_mode = crate::model::TerminalMode::Pty;
-        let pane = SelectedPane::Logs(&retained);
         let mut interaction = ProjectInteraction {
             logs: vec![ProcessLogs::default()],
             ..Default::default()
         };
+
         interaction.logs[0].handle_key(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             true,
@@ -1055,25 +1053,17 @@ mod tests {
             &retained,
             20,
         );
+        assert_eq!(
+            interaction.logs[0].representation(true),
+            OutputRepresentation::Logs
+        );
+
         interaction.logs[0].handle_key(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             true,
             true,
             &retained,
             20,
-        );
-        interaction.console.focus_console(None);
-
-        assert_eq!(
-            interaction.route_input(
-                key(KeyCode::Char('l')),
-                1,
-                &pane,
-                &process,
-                &retained,
-                Rect::new(0, 0, 80, 20),
-            ),
-            InputResult::Changed
         );
         assert_eq!(
             interaction.logs[0].representation(true),

@@ -8,7 +8,8 @@ use crate::supervisor::{
 };
 use crate::terminal::OwnedTerminalSnapshot;
 use crate::tui::{
-    OuterTerminal, ProcessRowView, ProjectProfileMenu, pane_inner, project_layout, render_project,
+    OuterTerminal, ProcessRowView, ProjectProfileMenu, pane_inner, project_layout,
+    render_project_with_search,
 };
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::Event;
@@ -198,11 +199,7 @@ fn run_event_loop(
             };
             header.insert_str(0, &format!("{view_label} · "));
             if let Some(status) = &frame.logs_status {
-                if frame.logs_editing {
-                    header.insert_str(0, &format!("{status} · "));
-                } else {
-                    header.push_str(&format!(" · {status}"));
-                }
+                header.push_str(&format!(" · {status}"));
             }
             if shutting_down {
                 header.insert_str(0, "Project shutdown in progress · ");
@@ -215,6 +212,7 @@ fn run_event_loop(
                 frame.terminal.as_ref(),
                 frame.lines.as_deref(),
                 frame.view,
+                frame.search_dialog.as_ref(),
                 &list_title,
                 &header,
                 profile_menu,
@@ -268,6 +266,7 @@ fn render_frame(
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[crate::tui::PipeLine]>,
     view: crate::tui::ConsoleViewState,
+    search_dialog: Option<&crate::log_view::SearchDialogView>,
     process_list_title: &str,
     selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
@@ -276,13 +275,14 @@ fn render_frame(
     outer
         .terminal_mut()
         .draw(|frame| {
-            pane = Some(render_project(
+            pane = Some(render_project_with_search(
                 frame,
                 rows,
                 process_table_state,
                 console_snapshot,
                 pipe_lines,
                 view,
+                search_dialog,
                 process_list_title,
                 selected_header,
                 profile_menu,

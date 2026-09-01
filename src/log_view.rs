@@ -10,6 +10,12 @@ use crate::output::{LogMatch, LogSearch, RetainedOutput};
 
 const SEARCH_QUERY_BYTES: usize = 256;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchDialogView {
+    pub(crate) query: String,
+    pub(crate) result: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputRepresentation {
     Terminal,
@@ -30,6 +36,7 @@ pub(crate) enum LogViewAction {
 pub(crate) struct LogView {
     representation: OutputRepresentation,
     editor: Option<String>,
+    search_origin: Option<OutputRepresentation>,
     query: String,
     search: LogSearch,
     current: Option<usize>,
@@ -41,6 +48,7 @@ impl Default for LogView {
         Self {
             representation: OutputRepresentation::Terminal,
             editor: None,
+            search_origin: None,
             query: String::new(),
             search: LogSearch::default(),
             current: None,
@@ -71,6 +79,13 @@ impl LogView {
         self.editor
             .as_ref()
             .map_or(!self.query.is_empty(), |editor| !editor.is_empty())
+    }
+
+    pub(crate) fn dialog(&self) -> Option<SearchDialogView> {
+        self.editor.as_ref().map(|query| SearchDialogView {
+            query: query.clone(),
+            result: self.match_result(),
+        })
     }
 
     /// Append a host paste to the active search field. Control characters do
@@ -109,6 +124,18 @@ impl LogView {
             return self.edit_search(key, output);
         }
         let logs_active = self.representation(has_terminal) == OutputRepresentation::Logs;
+        let opens_search = key.code == KeyCode::Char('/')
+            || (key.code == KeyCode::Char('f')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT));
+        if opens_search && (command_context || logs_active) {
+            self.search_origin = Some(self.representation(has_terminal));
+            self.representation = OutputRepresentation::Logs;
+            self.editor = Some(String::new());
+            self.search = LogSearch::default();
+            self.current = None;
+            return LogViewAction::Pause;
+        }
         if (!command_context && !logs_active)
             || key
                 .modifiers
@@ -124,23 +151,18 @@ impl LogView {
                 };
                 LogViewAction::Changed
             }
-            KeyCode::Char('/') => {
-                self.representation = OutputRepresentation::Logs;
-                self.editor = Some(String::new());
-                self.search = LogSearch::default();
-                self.current = None;
-                LogViewAction::Pause
-            }
-            KeyCode::Char('n')
-                if self.representation(has_terminal) == OutputRepresentation::Logs =>
-            {
-                self.move_match(1, output)
-            }
-            KeyCode::Char('N')
-                if self.representation(has_terminal) == OutputRepresentation::Logs =>
+            KeyCode::Enter | KeyCode::F(3)
+                if logs_active
+                    && self.has_search()
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.move_match(-1, output)
             }
+            KeyCode::Enter | KeyCode::F(3) if logs_active && self.has_search() => {
+                self.move_match(1, output)
+            }
+            KeyCode::Char('n') if logs_active => self.move_match(1, output),
+            KeyCode::Char('N') if logs_active => self.move_match(-1, output),
             KeyCode::Char('f')
                 if self.representation(has_terminal) == OutputRepresentation::Logs =>
             {
@@ -174,23 +196,27 @@ impl LogView {
     }
 
     pub(crate) fn status(&self) -> Option<String> {
-        let (query, cursor) = if let Some(editor) = &self.editor {
-            (editor.as_str(), "_")
-        } else if self.query.is_empty() {
+        if let Some(editor) = &self.editor {
+            return Some(format!("Search: {editor}_"));
+        }
+        if self.query.is_empty() {
             return None;
-        } else {
-            (self.query.as_str(), "")
-        };
+        }
+        Some(format!("Search: {} · {}", self.query, self.match_result()))
+    }
+
+    fn match_result(&self) -> String {
+        let query = self.editor.as_deref().unwrap_or(&self.query);
+        if query.is_empty() {
+            return "Type a word or phrase".to_string();
+        }
         let count = self.search.matches.len();
-        let position = self.current.map_or(0, |index| index + 1);
+        if count == 0 {
+            return "No matches".to_string();
+        }
+        let position = self.current.map_or(1, |index| index + 1);
         let suffix = if self.search.limited { "+" } else { "" };
-        Some(if query.is_empty() {
-            format!("search: /{cursor}")
-        } else if count == 0 {
-            format!("search: /{query}{cursor} · no matches")
-        } else {
-            format!("search: /{query}{cursor} · {position}/{count}{suffix}")
-        })
+        format!("Match {position} of {count}{suffix}")
     }
 
     fn edit_search(&mut self, key: KeyEvent, output: &RetainedOutput) -> LogViewAction {
@@ -201,6 +227,7 @@ impl LogView {
             }
             KeyCode::Enter => {
                 self.query = self.editor.take().unwrap_or_default();
+                self.search_origin = None;
                 self.rebuild_current_query(output)
             }
             KeyCode::Backspace => {
@@ -228,6 +255,9 @@ impl LogView {
 
     fn cancel_search_edit(&mut self, output: &RetainedOutput) -> LogViewAction {
         self.editor = None;
+        if let Some(origin) = self.search_origin.take() {
+            self.representation = origin;
+        }
         self.rebuild_current_query(output)
     }
 
@@ -280,7 +310,14 @@ mod tests {
             LogViewAction::Pause
         );
         assert!(view.is_editing());
-        assert_eq!(view.status().as_deref(), Some("search: /_"));
+        assert_eq!(
+            view.dialog(),
+            Some(SearchDialogView {
+                query: String::new(),
+                result: "Type a word or phrase".to_string(),
+            })
+        );
+        assert_eq!(view.status().as_deref(), Some("Search: _"));
 
         assert_eq!(
             view.handle_key(key(KeyCode::Esc), false, false, &output),
@@ -299,6 +336,23 @@ mod tests {
             LogViewAction::Changed
         );
         assert!(!view.is_editing());
+    }
+
+    #[test]
+    fn cancel_search_restores_the_terminal_view_that_opened_it() {
+        let output = OutputViews::new(1).for_process(0).unwrap().snapshot();
+        let mut view = LogView::default();
+
+        assert_eq!(
+            view.handle_key(key(KeyCode::Char('/')), true, true, &output),
+            LogViewAction::Pause
+        );
+        assert_eq!(view.representation(true), OutputRepresentation::Logs);
+
+        view.handle_key(key(KeyCode::Esc), true, true, &output);
+
+        assert!(!view.is_editing());
+        assert_eq!(view.representation(true), OutputRepresentation::Terminal);
     }
 
     #[test]
@@ -327,6 +381,24 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_f_opens_search_in_logs_but_stays_child_input_in_terminal() {
+        let output = OutputViews::new(1).for_process(0).unwrap().snapshot();
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let mut terminal = LogView::default();
+        assert_eq!(
+            terminal.handle_key(ctrl_f, false, true, &output),
+            LogViewAction::Ignored
+        );
+
+        let mut logs = LogView::default();
+        assert_eq!(
+            logs.handle_key(ctrl_f, true, false, &output),
+            LogViewAction::Pause
+        );
+        assert!(logs.is_editing());
+    }
+
+    #[test]
     fn search_paste_filters_controls_and_preserves_utf8_at_the_byte_limit() {
         let output = OutputViews::new(1).for_process(0).unwrap().snapshot();
         let mut view = LogView::default();
@@ -336,7 +408,10 @@ mod tests {
             view.paste_search("one\ntwo €", &output),
             LogViewAction::Changed
         ));
-        assert!(view.status().unwrap().contains("/onetwo €_"));
+        assert_eq!(
+            view.dialog().map(|dialog| dialog.query),
+            Some("onetwo €".to_string())
+        );
         assert!(matches!(
             view.paste_search(&"x".repeat(SEARCH_QUERY_BYTES), &output),
             LogViewAction::Changed
@@ -369,9 +444,16 @@ mod tests {
             LogViewAction::ShowMatch(_)
         ));
         assert_eq!(view.representation(true), OutputRepresentation::Logs);
-        assert_eq!(view.status().as_deref(), Some("search: /hit · 1/2"));
-        view.handle_key(key(KeyCode::Char('n')), true, true, &snapshot);
-        assert_eq!(view.status().as_deref(), Some("search: /hit · 2/2"));
+        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 1 of 2"));
+        view.handle_key(key(KeyCode::Enter), true, true, &snapshot);
+        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 2 of 2"));
+        view.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            true,
+            true,
+            &snapshot,
+        );
+        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 1 of 2"));
     }
 
     #[test]
@@ -394,6 +476,6 @@ mod tests {
         let later = output.snapshot();
         assert!(view.refresh(&later));
         assert!(view.current_match().is_none());
-        assert!(view.status().unwrap().contains("no matches"));
+        assert!(view.status().unwrap().contains("No matches"));
     }
 }

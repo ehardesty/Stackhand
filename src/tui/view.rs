@@ -1,12 +1,13 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState,
+    Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState,
 };
 
+use crate::log_view::SearchDialogView;
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
 use super::profile_menu::ProjectProfileMenu;
@@ -259,6 +260,7 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
     crate::geometry::TerminalGeometry::from_pane(pane_inner(pane))
 }
 
+#[cfg(test)]
 pub fn render_project(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
@@ -266,6 +268,32 @@ pub fn render_project(
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
     view: ConsoleViewState,
+    process_list_title: &str,
+    selected_header: &str,
+    profile_menu: &mut ProjectProfileMenu,
+) -> Rect {
+    render_project_with_search(
+        frame,
+        rows,
+        process_table_state,
+        console_snapshot,
+        pipe_lines,
+        view,
+        None,
+        process_list_title,
+        selected_header,
+        profile_menu,
+    )
+}
+
+pub(crate) fn render_project_with_search(
+    frame: &mut Frame<'_>,
+    rows: &[ProcessRowView],
+    process_table_state: &mut TableState,
+    console_snapshot: Option<&OwnedTerminalSnapshot>,
+    pipe_lines: Option<&[PipeLine]>,
+    view: ConsoleViewState,
+    search_dialog: Option<&SearchDialogView>,
     process_list_title: &str,
     selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
@@ -317,6 +345,9 @@ pub fn render_project(
     );
     if let Some(trigger) = profile_trigger {
         profile_menu.render(frame, trigger, area);
+    }
+    if let Some(dialog) = search_dialog {
+        render_search_dialog(frame, dialog, console_pane);
     }
     // A pipe console has no terminal cursor. Console focus shows the child
     // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
@@ -453,6 +484,36 @@ pub fn process_row_at(pane: Rect, row: u16, process_count: usize, offset: usize)
     (index < process_count).then_some(index)
 }
 
+fn render_search_dialog(frame: &mut Frame<'_>, dialog: &SearchDialogView, area: Rect) {
+    let width = area.width.saturating_sub(4).min(64);
+    let height = area.height.saturating_sub(2).min(7);
+    if width < 20 || height < 5 {
+        return;
+    }
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let block = Block::bordered()
+        .border_style(TERMINAL_THEME.focus_border())
+        .title(" Search Logs ");
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+    let content = vec![
+        Line::styled("Search terms", TERMINAL_THEME.secondary_text()),
+        Line::from(format!("{}_", dialog.query)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(&dialog.result, TERMINAL_THEME.secondary_text()),
+            Span::raw("  ·  Enter: Search  ·  Esc: Cancel"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
 fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
     let source = snapshot.buffer.area();
     let width = source.width.min(console.width);
@@ -467,7 +528,7 @@ fn blit_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console
 
 fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
     if view.search_editing {
-        return "MODE: SEARCH · type query · Enter: apply · Esc/Ctrl-C: cancel".to_string();
+        return "SEARCH · Enter: Search · Esc: Cancel".to_string();
     }
     let focus = match view.mode {
         ConsoleViewMode::ProcessList => "FOCUS: PROCESSES",
@@ -502,7 +563,7 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
                 "WARNING: input is not enabled for this Process · Ctrl-A: Process list"
             }
             ConsoleWarning::LogsCommandOnly => {
-                "WARNING: Logs accepts commands, not Process input · /: search · Esc: Processes"
+                "WARNING: Logs accepts commands, not Process input · Ctrl-F or /: search · Esc: Processes"
             }
             ConsoleWarning::SelectionUnavailable => {
                 "WARNING: terminal selection is available only in Terminal view"
@@ -516,12 +577,11 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
     if view.logs_selection {
         return "MODE: SELECT LOGS · drag: adjust · c/y: copy · Esc: clear".to_string();
     }
+    if view.search_active {
+        return "SEARCH · Ctrl-F or /: edit · Enter/F3: next · Shift+Enter/Shift+F3: previous"
+            .to_string();
+    }
 
-    let match_control = if view.search_active {
-        " · n/N: match"
-    } else {
-        ""
-    };
     let controls = match view.mode {
         ConsoleViewMode::ProcessList => {
             if view.profile_menu_open {
@@ -538,7 +598,7 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
                     ""
                 };
                 format!(
-                    "j/k: select · p: profiles{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · /: search{match_control} · q: quit"
+                    "j/k: select · p: profiles{apply_profile} · s/x/r: lifecycle{start_anyway} · l: view · Ctrl-F or /: search · q: quit"
                 )
             }
         }
@@ -553,7 +613,7 @@ fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
                     ""
                 };
                 format!(
-                    "↑↓/j/k: scroll · PgUp/PgDn: page · /: search{match_control} · f: live · c/y: copy{terminal_control} · Esc: Processes"
+                    "↑↓/j/k: scroll · PgUp/PgDn: page · Ctrl-F or /: search · f: live · c/y: copy{terminal_control} · Esc: Processes"
                 )
             }
         },
@@ -968,6 +1028,47 @@ mod tests {
     }
 
     #[test]
+    fn search_dialog_names_the_field_results_and_actions() {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut profile_menu = ProjectProfileMenu::default();
+        let mut process_table_state = TableState::default();
+        let dialog = SearchDialogView {
+            query: "timeout".to_string(),
+            result: "Match 2 of 4".to_string(),
+        };
+
+        terminal
+            .draw(|frame| {
+                render_project_with_search(
+                    frame,
+                    &[],
+                    &mut process_table_state,
+                    None,
+                    Some(&[]),
+                    ConsoleViewState {
+                        pane: ConsolePaneKind::Pipe,
+                        search_editing: true,
+                        ..ConsoleViewState::default()
+                    },
+                    Some(&dialog),
+                    "Processes",
+                    "Logs · demo",
+                    &mut profile_menu,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Search Logs"), "{text:?}");
+        assert!(text.contains("Search terms"), "{text:?}");
+        assert!(text.contains("timeout_"), "{text:?}");
+        assert!(text.contains("Match 2 of 4"), "{text:?}");
+        assert!(text.contains("Enter: Search"), "{text:?}");
+        assert!(text.contains("Esc: Cancel"), "{text:?}");
+    }
+
+    #[test]
     fn terminal_scrollbar_is_rendered_from_ghostty_rows() {
         let backend = ratatui::backend::TestBackend::new(10, 4);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1186,9 +1287,9 @@ mod tests {
             false,
         );
 
-        assert!(text.contains("MODE: SEARCH"), "{text}");
-        assert!(text.contains("Enter: apply"), "{text}");
-        assert!(text.contains("Esc/Ctrl-C: cancel"), "{text}");
+        assert!(text.contains("SEARCH"), "{text}");
+        assert!(text.contains("Enter: Search"), "{text}");
+        assert!(text.contains("Esc: Cancel"), "{text}");
         assert!(!text.contains("WARNING"), "{text}");
     }
 
@@ -1203,7 +1304,7 @@ mod tests {
             false,
         );
 
-        assert!(!text.contains("n/N: match"), "{text}");
+        assert!(!text.contains("F3: next"), "{text}");
 
         let active = footer_text(
             ConsoleViewState {
@@ -1214,7 +1315,11 @@ mod tests {
             },
             false,
         );
-        assert!(active.contains("n/N: match"), "{active}");
+        assert!(active.contains("Enter/F3: next"), "{active}");
+        assert!(
+            active.contains("Shift+Enter/Shift+F3: previous"),
+            "{active}"
+        );
     }
 
     #[test]
