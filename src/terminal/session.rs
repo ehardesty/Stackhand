@@ -21,7 +21,7 @@ use crate::runtime::{
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const INPUT_QUEUE_LIMIT_BYTES: usize = 256 * 1_024;
-pub const SCROLLBACK_TARGET_BYTES: usize = 64 * 1_024;
+pub const SCROLLBACK_TARGET_BYTES: usize = 128 * 1_024;
 const MAX_SAFE_SCROLL_DELTA: isize = 1_000_000;
 
 #[derive(Clone, Debug)]

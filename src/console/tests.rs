@@ -373,6 +373,74 @@ fn console_click_focuses_and_drag_enters_copy_mode() {
 }
 
 #[test]
+fn live_pty_mouse_selection_reaches_copy_request() {
+    let (session, mut peer) = session();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let handle = crate::runtime::handle_for_test(&session, &stopped);
+    let mut interaction = ConsoleInteraction::default();
+    interaction.focus_console(Some(&handle));
+    let area = Rect::new(0, 0, 20, 3);
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    use std::io::Write as _;
+    peer.write_all(b"alpha beta\r\n").unwrap();
+    let output_deadline = Instant::now() + Duration::from_secs(1);
+    while !session.snapshot().text().contains("alpha beta") {
+        assert!(
+            Instant::now() < output_deadline,
+            "PTY output did not reach the terminal owner"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    interaction.handle_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        area,
+        false,
+        &handle,
+    );
+    interaction.handle_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 5, 0),
+        area,
+        false,
+        &handle,
+    );
+    interaction.handle_mouse(
+        mouse(MouseEventKind::Up(MouseButton::Left), 5, 0),
+        area,
+        false,
+        &handle,
+    );
+    assert_eq!(interaction.view().mode, ConsoleViewMode::Copy);
+
+    assert!(interaction.handle_key(key(KeyCode::Char('c')), &handle, 20));
+    let request = interaction
+        .copy_requests
+        .pop()
+        .expect("Copy mode must enqueue a PTY copy request");
+    let copy_deadline = Instant::now() + Duration::from_secs(1);
+    let copied = loop {
+        if let Some(result) = request.poll() {
+            break result.unwrap();
+        }
+        assert!(
+            Instant::now() < copy_deadline,
+            "PTY copy request did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(copied.as_deref(), Some("alpha"));
+
+    drop(peer);
+    session.shutdown().unwrap();
+}
+
+#[test]
 fn a_wheel_burst_does_not_block_the_next_mouse_selection() {
     let (session, mut peer) = session();
     let stopped = std::sync::atomic::AtomicBool::new(false);

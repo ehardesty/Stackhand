@@ -56,7 +56,7 @@ the structural bounds remain executable in that case.
 | PTY output queue | 64 chunks |
 | PTY read buffer | 4 KiB |
 | diagnostic events | 64 events |
-| terminal scrollback target | 64 KiB |
+| terminal scrollback target | 128 KiB |
 | Process output history | 16 MiB / 4,096 real PTY chunks |
 | terminal effect collector | 256 KiB |
 

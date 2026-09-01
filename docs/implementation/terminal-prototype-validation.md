@@ -103,7 +103,7 @@ prior run.
 | Selection | Pass | Shell select-all and a tmux Shift drag used Stackhand selection. The tmux gesture did not add a child mouse action. |
 | Copy | Pass | The macOS clipboard contained logical shell text and the exact tmux selection. Automated tests cover Unicode, hard and soft wraps, output mutation, and reflow. |
 | Paste | Pass with current policy | Safe bracketed paste worked in zsh and Python. Newlines, a bracketed-paste terminator, and data above 64 KiB remain intentionally rejected before admission. |
-| Scrollback | Pass with known limits | PageUp stopped follow mode after 5,000 lines, and `f` returned to the live tail. The target is 64 KiB with Ghostty page rounding and no exact truncation signal. |
+| Scrollback | Pass with known limits | PageUp stopped follow mode after 5,000 lines, and `f` returned to the live tail. The target is 128 KiB with Ghostty page rounding and no exact truncation signal. |
 | Rapid resize | Pass | The outer PTY changed through 60x12, 120x40, 32x8, and 80x24. The child later reported the final pane as 21 rows by 78 columns. No zero geometry or panic occurred. Automated tests prove final-size coalescing and reflow. |
 | Alternate screens | Pass | Vim, fzf, and tmux opened full-screen terminal state and restored the shell state on exit. |
 | High output | Pass for the prototype | The manual 5,000-line producer completed. Automated sustained-output fixtures prove continued parsing, bounded history, redraw coalescing, input-effect order, blocked-writer fairness, and controlled shutdown. |

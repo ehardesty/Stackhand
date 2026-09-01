@@ -331,7 +331,10 @@ impl ProjectInteraction {
         retained: &RetainedOutput,
         pane_rows: u16,
     ) -> InputResult {
-        let has_terminal = process.terminal_mode == crate::model::TerminalMode::Pty;
+        // Use the pane that is actually rendered. A PTY Process with no active
+        // Run falls back to retained Logs, so treating it as Terminal here
+        // would route Logs copy keys to the read-only navigation handler.
+        let has_terminal = matches!(pane, SelectedPane::Terminal(_));
         match self.logs[self.selected].handle_key(
             key,
             self.console.view().mode == crate::tui::ConsoleViewMode::ProcessList,
@@ -713,6 +716,44 @@ mod tests {
         let frame = interaction.frame(&pane, &retained, 20);
 
         assert_eq!(frame.representation, OutputRepresentation::Logs);
+    }
+
+    #[test]
+    fn pty_logs_fallback_routes_copy_to_the_logs_handler() {
+        let output = crate::output::OutputViews::new(1);
+        output.for_process(0).unwrap().append_at(
+            1,
+            crate::runtime::OutputStream::Stdout,
+            0,
+            b"quadrant log\n".to_vec(),
+        );
+        let retained = output.for_process(0).unwrap().snapshot();
+        let mut process = process("api", crate::model::ProcessKind::Service, 0);
+        process.terminal_mode = crate::model::TerminalMode::Pty;
+        process.current_run = None;
+        let pane = SelectedPane::Logs(&retained);
+        let mut interaction = ProjectInteraction {
+            logs: vec![ProcessLogs::default()],
+            ..Default::default()
+        };
+        interaction.console.focus_console(None);
+
+        assert_eq!(
+            interaction.route_input(
+                key(KeyCode::Char('c')),
+                1,
+                &pane,
+                &process,
+                &retained,
+                Rect::new(0, 0, 80, 20),
+            ),
+            InputResult::Changed
+        );
+        assert_ne!(
+            interaction.console.view().warning,
+            Some(ConsoleWarning::LogsCommandOnly),
+            "copying visible PTY Logs must not be routed as child input"
+        );
     }
 
     #[test]
