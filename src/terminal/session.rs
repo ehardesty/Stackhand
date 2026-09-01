@@ -24,11 +24,32 @@ pub const INPUT_QUEUE_LIMIT_BYTES: usize = 256 * 1_024;
 pub const SCROLLBACK_TARGET_BYTES: usize = 128 * 1_024;
 const MAX_SAFE_SCROLL_DELTA: isize = 1_000_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedTerminalScrollbar {
+    /// Total rows in the active terminal screen and its retained scrollback.
+    pub total: usize,
+    /// First visible row in the total row space.
+    pub offset: usize,
+    /// Number of visible rows in the terminal viewport.
+    pub len: usize,
+}
+
+impl OwnedTerminalScrollbar {
+    pub const fn new(viewport_rows: u16) -> Self {
+        Self {
+            total: viewport_rows as usize,
+            offset: 0,
+            len: viewport_rows as usize,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OwnedTerminalSnapshot {
     pub buffer: Buffer,
     pub cursor: Option<OwnedCursorState>,
     pub mouse_tracking: bool,
+    pub scrollbar: OwnedTerminalScrollbar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +245,10 @@ impl TerminalSession {
             .try_send(TerminalCommand::Scroll(bounded_scroll_delta(delta)));
     }
 
+    pub fn scroll_to_row(&self, row: usize) {
+        let _ = self.commands.try_send(TerminalCommand::ScrollTo(row));
+    }
+
     pub fn follow_live(&self) {
         let _ = self
             .commands
@@ -277,7 +302,12 @@ impl TerminalSession {
             buffer: render.buffer,
             cursor: render.cursor,
             mouse_tracking: render.mouse_tracking,
+            scrollbar: render.scrollbar,
         }
+    }
+
+    pub fn scrollbar(&self) -> OwnedTerminalScrollbar {
+        self.owner.scrollbar()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -414,6 +444,7 @@ mod tests {
 
     use super::super::paste::PasteCompletion;
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn extreme_scroll_deltas_are_bounded_before_the_ghostty_call() {
@@ -520,6 +551,54 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_reports_and_moves_through_ghostty_rows() {
+        let (reader, mut peer) = UnixStream::pair().unwrap();
+        let io = PtyIo {
+            reader: Box::new(reader),
+            writer: Box::new(io::sink()),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let geometry = TerminalGeometry::new(20, 4).unwrap();
+        let session = TerminalSession::spawn(io, geometry, || {}).unwrap();
+        for index in 0..20 {
+            writeln!(peer, "line-{index}").unwrap();
+        }
+
+        let output_deadline = Instant::now() + Duration::from_secs(1);
+        let tail = loop {
+            let snapshot = session.snapshot();
+            if snapshot.scrollbar.total > snapshot.scrollbar.len {
+                break snapshot.scrollbar;
+            }
+            assert!(
+                Instant::now() < output_deadline,
+                "terminal scrollback did not become scrollable"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(tail.len, 4);
+        assert_eq!(tail.offset.saturating_add(tail.len), tail.total);
+
+        session.scroll_to_row(0);
+        let top_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let scrollbar = session.snapshot().scrollbar;
+            if scrollbar.offset == 0 {
+                assert_eq!(scrollbar.total, tail.total);
+                break;
+            }
+            assert!(
+                Instant::now() < top_deadline,
+                "absolute scrollbar movement did not reach the terminal head"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        drop(peer);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
     fn mouse_tracking_state_is_available_without_cloning_a_render_snapshot() {
         let (reader, mut peer) = UnixStream::pair().unwrap();
         let io = PtyIo {
@@ -535,6 +614,35 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "mouse tracking state was not published"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        drop(peer);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_is_encoded_as_child_input() {
+        let (reader, peer) = UnixStream::pair().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let io = PtyIo {
+            reader: Box::new(reader),
+            writer: Box::new(RecordingWriter {
+                bytes: Arc::clone(&captured),
+            }),
+            resizer: Box::new(|_, _| Ok(())),
+        };
+        let session = TerminalSession::spawn(io, TerminalGeometry::DEFAULT, || {}).unwrap();
+        session
+            .send_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !captured.lock().unwrap().contains(&0x03) {
+            assert!(
+                Instant::now() < deadline,
+                "Ctrl-C did not reach the PTY writer"
             );
             thread::sleep(Duration::from_millis(1));
         }

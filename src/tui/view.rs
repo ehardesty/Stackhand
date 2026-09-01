@@ -7,7 +7,7 @@ use ratatui::widgets::{
     TableState,
 };
 
-use crate::terminal::OwnedTerminalSnapshot;
+use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
 use super::theme::{LifecycleTone, TERMINAL_THEME};
 
@@ -49,10 +49,23 @@ pub enum ConsolePaneKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LogsScrollbar {
+pub struct ConsoleScrollbar {
     pub position: usize,
     pub content_length: usize,
     pub viewport_length: usize,
+}
+
+impl ConsoleScrollbar {
+    pub(crate) fn from_terminal(scrollbar: OwnedTerminalScrollbar) -> Option<Self> {
+        (scrollbar.total > scrollbar.len && scrollbar.len > 0).then(|| {
+            let max_position = scrollbar.total.saturating_sub(scrollbar.len);
+            Self {
+                position: scrollbar.offset.min(max_position),
+                content_length: max_position.saturating_add(1),
+                viewport_length: scrollbar.len,
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +78,7 @@ pub struct ConsoleViewState {
     pub search_editing: bool,
     pub search_active: bool,
     pub logs_selection: bool,
-    pub logs_scrollbar: Option<LogsScrollbar>,
+    pub logs_scrollbar: Option<ConsoleScrollbar>,
     pub profile_changes_pending: bool,
     pub start_anyway_available: bool,
 }
@@ -149,7 +162,7 @@ pub struct PipeLine {
 fn render_pipe_console(
     frame: &mut Frame<'_>,
     lines: &[PipeLine],
-    scrollbar: Option<LogsScrollbar>,
+    scrollbar: Option<ConsoleScrollbar>,
     pane: Rect,
 ) {
     if pane.height == 0 {
@@ -166,19 +179,32 @@ fn render_pipe_console(
     frame.render_widget(Paragraph::new(rows), text_pane);
 
     if let Some(scrollbar) = scrollbar.filter(|_| pane.width > 1) {
-        let mut state = ScrollbarState::new(scrollbar.content_length)
-            .position(scrollbar.position)
-            .viewport_content_length(scrollbar.viewport_length);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(TERMINAL_THEME.secondary_text())
-                .thumb_style(TERMINAL_THEME.focus_border()),
-            pane,
-            &mut state,
-        );
+        render_scrollbar(frame, scrollbar, pane);
     }
+}
+
+fn render_terminal_console(frame: &mut Frame<'_>, snapshot: &OwnedTerminalSnapshot, console: Rect) {
+    blit_console(frame, snapshot, console);
+    if console.width > 1
+        && let Some(scrollbar) = ConsoleScrollbar::from_terminal(snapshot.scrollbar)
+    {
+        render_scrollbar(frame, scrollbar, console);
+    }
+}
+
+fn render_scrollbar(frame: &mut Frame<'_>, scrollbar: ConsoleScrollbar, pane: Rect) {
+    let mut state = ScrollbarState::new(scrollbar.content_length)
+        .position(scrollbar.position)
+        .viewport_content_length(scrollbar.viewport_length);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_style(TERMINAL_THEME.secondary_text())
+            .thumb_style(TERMINAL_THEME.focus_border()),
+        pane,
+        &mut state,
+    );
 }
 
 fn styled_pipe_line(line: &PipeLine) -> ratatui::text::Line<'_> {
@@ -272,7 +298,7 @@ pub fn render_project(
     if let Some(lines) = pipe_lines {
         render_pipe_console(frame, lines, view.logs_scrollbar, console_inner);
     } else {
-        blit_console(
+        render_terminal_console(
             frame,
             console_snapshot.unwrap_or(&EMPTY_CONSOLE),
             console_inner,
@@ -303,6 +329,7 @@ static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
         buffer: ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1)),
         cursor: None,
         mouse_tracking: false,
+        scrollbar: OwnedTerminalScrollbar::new(1),
     });
 
 const PROCESS_METRICS_MIN_WIDTH: u16 = 52;
@@ -508,6 +535,8 @@ fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'sta
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+
     use super::*;
 
     fn row(name: &str, status: &str, selected: bool) -> ProcessRowView {
@@ -844,6 +873,56 @@ mod tests {
     }
 
     #[test]
+    fn terminal_scrollbar_is_rendered_from_ghostty_rows() {
+        let backend = ratatui::backend::TestBackend::new(10, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let snapshot = OwnedTerminalSnapshot {
+            buffer: Buffer::empty(Rect::new(0, 0, 10, 4)),
+            cursor: None,
+            mouse_tracking: false,
+            scrollbar: OwnedTerminalScrollbar {
+                total: 20,
+                offset: 10,
+                len: 4,
+            },
+        };
+
+        terminal
+            .draw(|frame| render_terminal_console(frame, &snapshot, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (0..4).all(|row| buffer[(9, row)].symbol() != " "),
+            "the PTY scrollbar track and thumb must remain visible"
+        );
+    }
+
+    #[test]
+    fn terminal_scrollbar_does_not_replace_the_only_output_column() {
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut source = Buffer::empty(Rect::new(0, 0, 1, 1));
+        source[(0, 0)].set_symbol("x");
+        let snapshot = OwnedTerminalSnapshot {
+            buffer: source,
+            cursor: None,
+            mouse_tracking: false,
+            scrollbar: OwnedTerminalScrollbar {
+                total: 20,
+                offset: 10,
+                len: 1,
+            },
+        };
+
+        terminal
+            .draw(|frame| render_terminal_console(frame, &snapshot, frame.area()))
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "x");
+    }
+
+    #[test]
     fn logs_scrollbar_uses_a_reserved_right_column() {
         let backend = ratatui::backend::TestBackend::new(10, 4);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -863,7 +942,7 @@ mod tests {
                 render_pipe_console(
                     frame,
                     &lines,
-                    Some(LogsScrollbar {
+                    Some(ConsoleScrollbar {
                         position: 4,
                         content_length: 5,
                         viewport_length: 4,
@@ -914,6 +993,7 @@ mod tests {
                 blinking: false,
             }),
             mouse_tracking: false,
+            scrollbar: OwnedTerminalScrollbar::new(12),
         };
         let mut console_inner = Rect::default();
         let mut process_table_state = TableState::default();

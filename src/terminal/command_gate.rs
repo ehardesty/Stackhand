@@ -26,6 +26,7 @@ pub enum TerminalCommand {
     },
     Resize(TerminalGeometry),
     Scroll(isize),
+    ScrollTo(usize),
     ScrollBatch(Arc<CoalescedScroll>),
     SelectionAll,
     SelectionClear,
@@ -46,7 +47,9 @@ impl TerminalCommand {
             Self::Raw(data) => data.len(),
             Self::Paste { data, .. } => data.len().saturating_add(12),
             Self::Resize(_) => 4,
-            Self::Scroll(_) | Self::ScrollBatch(_) => std::mem::size_of::<isize>(),
+            Self::Scroll(_) | Self::ScrollTo(_) | Self::ScrollBatch(_) => {
+                std::mem::size_of::<isize>()
+            }
             Self::SelectionAll
             | Self::SelectionClear
             | Self::SelectionKeyboardStart

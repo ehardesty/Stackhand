@@ -6,12 +6,17 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 
+use crate::pipe_scroll::{scale, scrollbar_thumb};
 use crate::process_logs::{LogsNavigation, ProcessLogs};
 use crate::runtime::TerminalHandle;
 use crate::terminal::{
-    CopyRequest, PasteCompletion, PasteRequest, SelectionDirection as CopyDirection,
+    CopyRequest, OwnedTerminalScrollbar, PasteCompletion, PasteRequest,
+    SelectionDirection as CopyDirection,
 };
-use crate::tui::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning, MouseRouter};
+use crate::tui::{
+    ConsolePaneKind, ConsoleScrollbar, ConsoleViewMode, ConsoleViewState, ConsoleWarning,
+    MouseRouter,
+};
 
 /// One requested move of the Process-list selection. The app event loop owns
 /// the selected Process, so navigation never mutates Supervisor truth.
@@ -49,6 +54,12 @@ enum ProcessCommand {
     EnterCopy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalScrollbarGesture {
+    Track,
+    Thumb { grab_row: usize },
+}
+
 fn process_command(code: KeyCode) -> Option<ProcessCommand> {
     match code {
         KeyCode::Up | KeyCode::Char('k') => Some(ProcessCommand::MoveSelection(SelectionMove::Up)),
@@ -74,6 +85,7 @@ pub(crate) struct ConsoleInteraction {
     selection_clock: Instant,
     last_stackhand_press: Option<(u16, u16, Duration)>,
     copy_return_mode: ConsoleViewMode,
+    terminal_scrollbar_gesture: Option<TerminalScrollbarGesture>,
 }
 
 impl Default for ConsoleInteraction {
@@ -88,6 +100,7 @@ impl Default for ConsoleInteraction {
             selection_clock: Instant::now(),
             last_stackhand_press: None,
             copy_return_mode: ConsoleViewMode::ProcessList,
+            terminal_scrollbar_gesture: None,
         }
     }
 }
@@ -140,6 +153,7 @@ impl ConsoleInteraction {
         }
         self.view.mode = ConsoleViewMode::ProcessList;
         self.view.stackhand_mouse_gesture = false;
+        self.terminal_scrollbar_gesture = None;
         self.last_stackhand_press = None;
     }
 
@@ -154,6 +168,7 @@ impl ConsoleInteraction {
         }
         self.view.mode = ConsoleViewMode::Console;
         self.view.stackhand_mouse_gesture = false;
+        self.terminal_scrollbar_gesture = None;
         if reset_mouse_clicks {
             self.last_stackhand_press = None;
         }
@@ -167,6 +182,14 @@ impl ConsoleInteraction {
 
     pub fn mouse_gesture_active(&self) -> bool {
         self.mouse.gesture_active()
+    }
+
+    pub fn terminal_scrollbar_gesture_active(&self) -> bool {
+        self.terminal_scrollbar_gesture.is_some()
+    }
+
+    pub fn cancel_terminal_scrollbar_gesture(&mut self) {
+        self.terminal_scrollbar_gesture = None;
     }
 
     pub fn take_selection_moves(&mut self) -> Vec<SelectionMove> {
@@ -346,6 +369,117 @@ impl ConsoleInteraction {
         }
         self.clear_warning();
         true
+    }
+
+    /// Own hit testing and drag mapping for the live PTY scrollbar. The
+    /// scrollbar uses Ghostty's absolute row space, so the terminal remains
+    /// the source of truth for retained history and viewport position.
+    pub fn handle_terminal_scrollbar_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        session: &TerminalHandle<'_>,
+    ) -> bool {
+        if self.terminal_scrollbar_gesture.is_some() {
+            match mouse.kind {
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.terminal_scrollbar_gesture = None;
+                    return true;
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let ghostty_scrollbar = session.scrollbar();
+                    let Some(scrollbar) = ConsoleScrollbar::from_terminal(ghostty_scrollbar) else {
+                        return true;
+                    };
+                    let row = usize::from(
+                        mouse
+                            .row
+                            .clamp(area.y, area.bottom().saturating_sub(1))
+                            .saturating_sub(area.y),
+                    );
+                    if let Some(TerminalScrollbarGesture::Thumb { grab_row }) =
+                        self.terminal_scrollbar_gesture
+                    {
+                        self.set_terminal_scrollbar_thumb(
+                            session,
+                            ghostty_scrollbar,
+                            scrollbar,
+                            usize::from(area.height),
+                            row.saturating_sub(grab_row),
+                        );
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let ghostty_scrollbar = session.scrollbar();
+        let Some(scrollbar) = ConsoleScrollbar::from_terminal(ghostty_scrollbar) else {
+            return false;
+        };
+        if area.width <= 1 || area.height == 0 {
+            return false;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || mouse.column != area.right().saturating_sub(1)
+            || mouse.row < area.y
+            || mouse.row >= area.bottom()
+        {
+            return false;
+        }
+
+        if self.view.mode == ConsoleViewMode::ProcessList {
+            self.focus_console(Some(session));
+        }
+
+        let track_rows = usize::from(area.height);
+        let row = usize::from(mouse.row - area.y);
+        let (thumb_start, thumb_len) = scrollbar_thumb(scrollbar, track_rows);
+        if row >= thumb_start && row < thumb_start.saturating_add(thumb_len) {
+            self.terminal_scrollbar_gesture = Some(TerminalScrollbarGesture::Thumb {
+                grab_row: row - thumb_start,
+            });
+            self.view.following = ghostty_scrollbar.offset
+                >= ghostty_scrollbar
+                    .total
+                    .saturating_sub(ghostty_scrollbar.len);
+        } else {
+            self.set_terminal_scrollbar_thumb(
+                session,
+                ghostty_scrollbar,
+                scrollbar,
+                track_rows,
+                row.saturating_sub(thumb_len / 2),
+            );
+            self.terminal_scrollbar_gesture = Some(TerminalScrollbarGesture::Track);
+        }
+        self.clear_warning();
+        true
+    }
+
+    fn set_terminal_scrollbar_thumb(
+        &mut self,
+        session: &TerminalHandle<'_>,
+        ghostty_scrollbar: OwnedTerminalScrollbar,
+        scrollbar: ConsoleScrollbar,
+        track_rows: usize,
+        thumb_start: usize,
+    ) {
+        let (_, thumb_len) = scrollbar_thumb(scrollbar, track_rows);
+        let max_thumb_start = track_rows.saturating_sub(thumb_len);
+        let max_position = scrollbar.content_length.saturating_sub(1);
+        let position = scale(
+            thumb_start.min(max_thumb_start),
+            max_position,
+            max_thumb_start,
+        );
+        let max_row = ghostty_scrollbar
+            .total
+            .saturating_sub(ghostty_scrollbar.len);
+        let row = position.min(max_row);
+        session.scroll_to_row(row);
+        self.view.following = row >= max_row;
     }
 
     pub fn handle_mouse(

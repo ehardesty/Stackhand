@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 use crate::output::RetainedOutput;
-use crate::tui::{LogsScrollbar, PipeLine};
+use crate::tui::{ConsoleScrollbar, PipeLine};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Position {
@@ -55,7 +55,7 @@ pub struct PipeScroll {
     visible: Vec<PipeLine>,
     held: bool,
     selection: Option<LogSelection>,
-    scrollbar: Option<LogsScrollbar>,
+    scrollbar: Option<ConsoleScrollbar>,
     scrollbar_gesture: Option<ScrollbarGesture>,
 }
 
@@ -185,7 +185,7 @@ impl PipeScroll {
             .is_some_and(|selection| selection.anchor != selection.cursor)
     }
 
-    pub fn scrollbar(&self) -> Option<LogsScrollbar> {
+    pub fn scrollbar(&self) -> Option<ConsoleScrollbar> {
         self.scrollbar
     }
 
@@ -305,7 +305,7 @@ impl PipeScroll {
         let first_source = self.visible.first().and_then(|line| line.source);
         let metrics = output.display_position(first_source);
         self.scrollbar = metrics.and_then(|(position, content_length)| {
-            (content_length > pane_rows).then_some(LogsScrollbar {
+            (content_length > pane_rows).then_some(ConsoleScrollbar {
                 position,
                 content_length: content_length
                     .saturating_sub(self.visible.len())
@@ -538,7 +538,7 @@ impl PipeScroll {
     }
 }
 
-fn scrollbar_thumb(scrollbar: LogsScrollbar, track_rows: usize) -> (usize, usize) {
+pub(crate) fn scrollbar_thumb(scrollbar: ConsoleScrollbar, track_rows: usize) -> (usize, usize) {
     if track_rows == 0 {
         return (0, 0);
     }
@@ -565,7 +565,7 @@ fn rounded_scale(value: usize, target: usize, source: usize) -> usize {
     ((numerator + source as u128 / 2) / source as u128) as usize
 }
 
-fn scale(value: usize, target: usize, source: usize) -> usize {
+pub(crate) fn scale(value: usize, target: usize, source: usize) -> usize {
     if source == 0 {
         return 0;
     }
@@ -743,7 +743,7 @@ mod tests {
 
         assert_eq!(
             scroll.scrollbar(),
-            Some(LogsScrollbar {
+            Some(ConsoleScrollbar {
                 position: 30,
                 content_length: 31,
                 viewport_length: 10,
@@ -762,7 +762,7 @@ mod tests {
             for content_length in 1..=10 {
                 for viewport_length in 1..=5 {
                     for position in 0..content_length {
-                        let scrollbar = LogsScrollbar {
+                        let scrollbar = ConsoleScrollbar {
                             position,
                             content_length,
                             viewport_length,
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(sources(scroll.window(&retained, 10))[0], Some((8, 0)));
         assert_eq!(
             scroll.scrollbar(),
-            Some(LogsScrollbar {
+            Some(ConsoleScrollbar {
                 position: 8,
                 content_length: 31,
                 viewport_length: 10,

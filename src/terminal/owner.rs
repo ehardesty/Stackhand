@@ -17,7 +17,7 @@ use ratatui::layout::Rect;
 
 use super::command_gate::CommandReceiver;
 use super::history::{OutputHistoryLedger, OutputHistoryMetrics};
-use super::session::OwnedCursorState;
+use super::session::{OwnedCursorState, OwnedTerminalScrollbar};
 use super::state::{PendingInput, TerminalState};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::{BoundedPtyWriter, PtyResizer, RunOutputObserver};
@@ -45,6 +45,7 @@ pub struct OwnedRender {
     pub buffer: Buffer,
     pub cursor: Option<OwnedCursorState>,
     pub mouse_tracking: bool,
+    pub scrollbar: OwnedTerminalScrollbar,
 }
 
 struct SharedOwner {
@@ -129,6 +130,7 @@ impl OwnerHandle {
                 buffer: Buffer::empty(Rect::new(0, 0, geometry.cols(), geometry.rows())),
                 cursor: None,
                 mouse_tracking: false,
+                scrollbar: OwnedTerminalScrollbar::new(geometry.rows()),
             }),
             dirty: AtomicBool::new(true),
             mouse_tracking: AtomicBool::new(false),
@@ -180,6 +182,14 @@ impl OwnerHandle {
 
     pub fn mouse_tracking(&self) -> bool {
         self.shared.mouse_tracking.load(Ordering::Acquire)
+    }
+
+    pub fn scrollbar(&self) -> OwnedTerminalScrollbar {
+        self.shared
+            .render
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scrollbar
     }
 
     pub fn is_alive(&self) -> bool {
@@ -487,7 +497,12 @@ fn render(state: &mut TerminalState, shared: &SharedOwner) {
         owned.buffer = Buffer::empty(area);
     }
     owned.buffer.reset();
-    owned.cursor = state.render(&mut owned.buffer).unwrap_or(None);
+    if let Ok((cursor, scrollbar)) = state.render(&mut owned.buffer) {
+        owned.cursor = cursor;
+        owned.scrollbar = scrollbar;
+    } else {
+        owned.cursor = None;
+    }
     owned.mouse_tracking = state.mouse_tracking();
     shared
         .mouse_tracking

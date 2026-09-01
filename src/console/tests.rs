@@ -8,6 +8,10 @@ use crate::runtime::PtyIo;
 use crate::terminal::TerminalSession;
 
 fn session() -> (TerminalSession, UnixStream) {
+    session_with_geometry(TerminalGeometry::DEFAULT)
+}
+
+fn session_with_geometry(geometry: TerminalGeometry) -> (TerminalSession, UnixStream) {
     let (reader, peer) = UnixStream::pair().unwrap();
     let session = TerminalSession::spawn(
         PtyIo {
@@ -15,7 +19,7 @@ fn session() -> (TerminalSession, UnixStream) {
             writer: Box::new(io::sink()),
             resizer: Box::new(|_, _| Ok(())),
         },
-        TerminalGeometry::DEFAULT,
+        geometry,
         || {},
     )
     .unwrap();
@@ -367,6 +371,93 @@ fn console_click_focuses_and_drag_enters_copy_mode() {
         ConsoleViewMode::Copy,
         "a third click keeps Copy mode for the logical-line selection"
     );
+
+    drop(peer);
+    session.shutdown().unwrap();
+}
+
+#[test]
+fn terminal_scrollbar_click_and_drag_move_the_ghostty_viewport() {
+    let (session, mut peer) = session_with_geometry(TerminalGeometry::new(20, 4).unwrap());
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let handle = crate::runtime::handle_for_test(&session, &stopped);
+    let mut interaction = ConsoleInteraction::default();
+    let area = Rect::new(0, 0, 20, 4);
+
+    use std::io::Write as _;
+    for line in 0..20 {
+        writeln!(peer, "line-{line}").unwrap();
+    }
+    let output_deadline = Instant::now() + Duration::from_secs(1);
+    while session.snapshot().scrollbar.total <= session.snapshot().scrollbar.len {
+        assert!(
+            Instant::now() < output_deadline,
+            "terminal scrollbar did not become visible"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: area.right().saturating_sub(1),
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(interaction.handle_terminal_scrollbar_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), area.y),
+        area,
+        &handle,
+    ));
+    assert_eq!(interaction.view().mode, ConsoleViewMode::Console);
+    assert!(!interaction.view().following);
+    assert!(interaction.terminal_scrollbar_gesture_active());
+
+    let head_deadline = Instant::now() + Duration::from_secs(1);
+    while session.snapshot().scrollbar.offset != 0 {
+        assert!(
+            Instant::now() < head_deadline,
+            "terminal scrollbar click did not reach the head"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(interaction.handle_terminal_scrollbar_mouse(
+        mouse(MouseEventKind::Up(MouseButton::Left), 0),
+        area,
+        &handle,
+    ));
+    assert!(!interaction.terminal_scrollbar_gesture_active());
+
+    assert!(interaction.handle_terminal_scrollbar_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), area.y),
+        area,
+        &handle,
+    ));
+    assert!(interaction.handle_terminal_scrollbar_mouse(
+        mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.bottom().saturating_sub(1)
+        ),
+        area,
+        &handle,
+    ));
+    let tail_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let scrollbar = session.snapshot().scrollbar;
+        if scrollbar.offset.saturating_add(scrollbar.len) == scrollbar.total {
+            break;
+        }
+        assert!(
+            Instant::now() < tail_deadline,
+            "terminal scrollbar drag did not reach the live tail"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(interaction.view().following);
+    assert!(interaction.handle_terminal_scrollbar_mouse(
+        mouse(MouseEventKind::Up(MouseButton::Left), 0),
+        area,
+        &handle,
+    ));
 
     drop(peer);
     session.shutdown().unwrap();

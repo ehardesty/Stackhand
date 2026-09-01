@@ -396,6 +396,23 @@ impl ProjectInteraction {
         let child_tracks_mouse = process.input_focused
             && matches!(pane, SelectedPane::Terminal(view) if view.mouse_tracking());
 
+        let terminal_scrollbar_active = self.console.terminal_scrollbar_gesture_active();
+        if terminal_scrollbar_active && !matches!(pane, SelectedPane::Terminal(_)) {
+            self.console.cancel_terminal_scrollbar_gesture();
+        }
+        if (terminal_scrollbar_active
+            || matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)))
+            && let SelectedPane::Terminal(view) = pane
+            && view
+                .with(|session| {
+                    self.console
+                        .handle_terminal_scrollbar_mouse(mouse, console_inner, session)
+                })
+                .unwrap_or(false)
+        {
+            return true;
+        }
+
         if matches!(pane, SelectedPane::Logs(_))
             && self.logs[self.selected].scrollbar_gesture_active()
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))

@@ -6,8 +6,8 @@ use crate::geometry::TerminalGeometry;
 use crate::runtime::outcome::ResizeRejected;
 use crate::terminal::{
     CopyRequest, InputRejection as SessionInputRejection, OutputHistoryMetrics,
-    OwnedTerminalSnapshot, PasteRejection, PasteRequest, SelectionDirection, TerminalEvent,
-    TerminalMouseEvent, TerminalSession,
+    OwnedTerminalScrollbar, OwnedTerminalSnapshot, PasteRejection, PasteRequest,
+    SelectionDirection, TerminalEvent, TerminalMouseEvent, TerminalSession,
 };
 
 use super::InputRejected;
@@ -102,6 +102,10 @@ impl TerminalHandle<'_> {
         self.session.scroll_lines(delta);
     }
 
+    pub fn scroll_to_row(&self, row: usize) {
+        self.session.scroll_to_row(row);
+    }
+
     pub fn follow_live(&self) {
         self.session.follow_live();
     }
@@ -135,6 +139,10 @@ impl TerminalHandle<'_> {
 
     pub fn snapshot(&self) -> OwnedTerminalSnapshot {
         self.session.snapshot()
+    }
+
+    pub fn scrollbar(&self) -> OwnedTerminalScrollbar {
+        self.session.scrollbar()
     }
 
     pub fn is_dirty(&self) -> bool {

@@ -19,6 +19,7 @@ control of the whole Project in one terminal.
 - Checks Service readiness and liveness with TCP, HTTP, `exec`, or log checks.
 - Restarts failed Services when their restart policy allows it.
 - Shows PTY terminal output or separate pipe output.
+- Shows a scrollbar for retained PTY history when the output is longer than the pane.
 - Keeps bounded Logs that you can scroll, search, and copy.
 - Uses Project Profiles to select Project-wide configuration, such as `local`
   and `cloud`.
@@ -227,8 +228,13 @@ A mouse drag selects Logs text. Press `c` or `y` to copy the selection.
 ### PTY input and Copy mode
 
 Press `Ctrl-A` to focus the selected console. Only a Process with
-`terminal.input: focused` accepts keyboard input from the terminal pane. Press
-`Ctrl-A` again to return to the Process list.
+`terminal.input: focused` accepts keyboard input from the terminal pane. This
+includes `Ctrl-C`, which is sent to the child command. Press `Ctrl-A` again to
+return to the Process list.
+
+When PTY output is longer than the pane, Stackhand shows a scrollbar on the
+right. Click the track or drag the thumb to move through the retained terminal
+history.
 
 Press `v` from the Process list, or drag in a PTY Terminal, to enter Copy mode.
 Use `h`/`j`/`k`/`l` or the arrow keys to move. Press `v` to toggle the selection

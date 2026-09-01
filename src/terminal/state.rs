@@ -14,7 +14,7 @@ use super::input;
 use super::mouse::MouseController;
 use super::render;
 use super::selection::SelectionController;
-use super::session::OwnedCursorState;
+use super::session::{OwnedCursorState, OwnedTerminalScrollbar};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::PtyResizer;
 
@@ -105,6 +105,10 @@ impl TerminalState {
                 self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
                 return Ok(None);
             }
+            TerminalCommand::ScrollTo(row) => {
+                self.terminal.scroll_viewport(ScrollViewport::Row(row));
+                return Ok(None);
+            }
             TerminalCommand::ScrollBatch(scroll) => {
                 self.terminal
                     .scroll_viewport(ScrollViewport::Delta(scroll.take()));
@@ -165,7 +169,10 @@ impl TerminalState {
         Rect::new(0, 0, self.geometry.cols(), self.geometry.rows())
     }
 
-    pub fn render(&mut self, buffer: &mut Buffer) -> Result<Option<OwnedCursorState>> {
+    pub fn render(
+        &mut self,
+        buffer: &mut Buffer,
+    ) -> Result<(Option<OwnedCursorState>, OwnedTerminalScrollbar)> {
         let area = self.area();
         let terminal_cursor =
             render::render(&self.terminal, &mut self.render, buffer, self.focused, area)?;
@@ -180,7 +187,15 @@ impl TerminalState {
                     blinking: false,
                 })
             });
-        Ok(copy_cursor.or(terminal_cursor))
+        let scrollbar = self.terminal.scrollbar()?;
+        Ok((
+            copy_cursor.or(terminal_cursor),
+            OwnedTerminalScrollbar {
+                total: usize::try_from(scrollbar.total)?,
+                offset: usize::try_from(scrollbar.offset)?,
+                len: usize::try_from(scrollbar.len)?,
+            },
+        ))
     }
 
     pub fn mouse_tracking(&self) -> bool {

@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use crate::log_view::{LogView, LogViewAction, OutputRepresentation};
 use crate::output::RetainedOutput;
 use crate::pipe_scroll::PipeScroll;
-use crate::tui::{LogsScrollbar, PipeLine};
+use crate::tui::{ConsoleScrollbar, PipeLine};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LogsInput {
@@ -34,7 +34,7 @@ pub(crate) struct LogsFrame {
     pub(crate) search_active: bool,
     pub(crate) following: bool,
     pub(crate) has_selection: bool,
-    pub(crate) scrollbar: Option<LogsScrollbar>,
+    pub(crate) scrollbar: Option<ConsoleScrollbar>,
 }
 
 #[derive(Clone, Debug, Default)]
