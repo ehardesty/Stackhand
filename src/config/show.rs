@@ -26,6 +26,25 @@ pub(super) fn render(project: &EffectiveProject) -> Result<String, ConfigError> 
         );
     }
 
+    let mut groups = Mapping::new();
+    for (index, process) in project.processes().iter().enumerate() {
+        let Some(group) = project.process_group(index) else {
+            continue;
+        };
+        let key = Value::String(group.to_string());
+        if !groups.contains_key(&key) {
+            groups.insert(key.clone(), Value::Sequence(Vec::new()));
+        }
+        groups
+            .get_mut(&key)
+            .and_then(Value::as_sequence_mut)
+            .expect("a Process Group is always a sequence")
+            .push(string(&process.name));
+    }
+    if !groups.is_empty() {
+        insert(&mut root, "groups", Value::Mapping(groups));
+    }
+
     let mut processes = Mapping::new();
     for process in project.processes() {
         insert(&mut processes, &process.name, process_value(process));

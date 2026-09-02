@@ -20,6 +20,8 @@ pub(super) struct ConfigFile {
     pub(super) env_files: Option<Vec<String>>,
     pub(super) profiles: Option<BTreeMap<String, ProjectProfileFile>>,
     #[serde(default)]
+    pub(super) groups: GroupCollection,
+    #[serde(default)]
     pub(super) processes: ProcessCollection,
     pub(super) settings: Option<SettingsFile>,
 }
@@ -30,14 +32,93 @@ pub(super) struct ProjectProfileFile {
     pub(super) env_files: Option<Vec<String>>,
 }
 
-#[derive(Default)]
-pub(super) struct ProcessCollection {
-    pub(super) entries: Vec<ProcessEntry>,
+/// Deserialize one name-keyed YAML mapping into `(name, value)` entries in
+/// YAML order, rejecting duplicate names. This is one schema-level concept:
+/// a mapping whose YAML order and duplicate-name rejection matter. Each
+/// collection owns its own error wording.
+fn ordered_mapping<'de, D, T>(
+    deserializer: D,
+    expecting: &'static str,
+    sequence_hint: &'static str,
+    duplicate_name: impl Fn(&str) -> String,
+) -> Result<Vec<(String, T)>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct OrderedMappingVisitor<'a, T, F> {
+        expecting: &'static str,
+        sequence_hint: &'static str,
+        duplicate_name: &'a F,
+        marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T, F> Visitor<'de> for OrderedMappingVisitor<'_, T, F>
+    where
+        T: Deserialize<'de>,
+        F: Fn(&str) -> String,
+    {
+        type Value = Vec<(String, T)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.expecting)
+        }
+
+        fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            Err(de::Error::custom(self.sequence_hint))
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            let mut names = HashSet::new();
+            while let Some(name) = map.next_key::<String>()? {
+                if !names.insert(name.clone()) {
+                    return Err(de::Error::custom((self.duplicate_name)(&name)));
+                }
+                let value = map.next_value::<T>()?;
+                entries.push((name, value));
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_any(OrderedMappingVisitor {
+        expecting,
+        sequence_hint,
+        duplicate_name: &duplicate_name,
+        marker: std::marker::PhantomData,
+    })
 }
 
-pub(super) struct ProcessEntry {
-    pub(super) key: String,
-    pub(super) process: ProcessFile,
+#[derive(Default)]
+pub(super) struct GroupCollection {
+    pub(super) entries: Vec<(String, Vec<String>)>,
+}
+
+impl<'de> Deserialize<'de> for GroupCollection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ordered_mapping(
+            deserializer,
+            "a name-keyed mapping of Process Groups",
+            "groups must be a name-keyed mapping; use 'groups: {Group name: [process-name]}'",
+            |name| format!("duplicate Process Group name '{name}'"),
+        )
+        .map(|entries| Self { entries })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct ProcessCollection {
+    pub(super) entries: Vec<(String, ProcessFile)>,
 }
 
 impl<'de> Deserialize<'de> for ProcessCollection {
@@ -45,56 +126,18 @@ impl<'de> Deserialize<'de> for ProcessCollection {
     where
         D: Deserializer<'de>,
     {
-        struct ProcessCollectionVisitor;
-
-        impl<'de> Visitor<'de> for ProcessCollectionVisitor {
-            type Value = ProcessCollection;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a name-keyed mapping of Processes")
-            }
-
-            fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                Err(de::Error::custom(
-                    "processes must be a name-keyed mapping; use 'processes: {name: {...}}'",
-                ))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                let mut names = HashSet::new();
-                while let Some(name) = map.next_key::<String>()? {
-                    if !names.insert(name.clone()) {
-                        return Err(de::Error::custom(format!(
-                            "duplicate Process name '{name}'"
-                        )));
-                    }
-                    entries.push(ProcessEntry {
-                        key: name,
-                        process: map.next_value::<ProcessFile>()?,
-                    });
-                }
-                Ok(ProcessCollection { entries })
-            }
-        }
-
-        deserializer.deserialize_any(ProcessCollectionVisitor)
+        ordered_mapping(
+            deserializer,
+            "a name-keyed mapping of Processes",
+            "processes must be a name-keyed mapping; use 'processes: {name: {...}}'",
+            |name| format!("duplicate Process name '{name}'"),
+        )
+        .map(|entries| Self { entries })
     }
 }
 
 pub(super) struct DependencyCollection {
-    pub(super) entries: Vec<DependencyEntry>,
-}
-
-pub(super) struct DependencyEntry {
-    pub(super) key: String,
-    pub(super) value: Option<serde_yaml::Value>,
+    pub(super) entries: Vec<(String, Option<serde_yaml::Value>)>,
 }
 
 impl<'de> Deserialize<'de> for DependencyCollection {
@@ -102,46 +145,13 @@ impl<'de> Deserialize<'de> for DependencyCollection {
     where
         D: Deserializer<'de>,
     {
-        struct DependencyCollectionVisitor;
-
-        impl<'de> Visitor<'de> for DependencyCollectionVisitor {
-            type Value = DependencyCollection;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a name-keyed mapping of Dependencies")
-            }
-
-            fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                Err(de::Error::custom(
-                    "depends_on must be a name-keyed mapping; use 'depends_on: {process-name: condition}'",
-                ))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut entries = Vec::new();
-                let mut names = HashSet::new();
-                while let Some(name) = map.next_key::<String>()? {
-                    if !names.insert(name.clone()) {
-                        return Err(de::Error::custom(format!(
-                            "duplicate Dependency name '{name}'"
-                        )));
-                    }
-                    entries.push(DependencyEntry {
-                        key: name,
-                        value: map.next_value::<Option<serde_yaml::Value>>()?,
-                    });
-                }
-                Ok(DependencyCollection { entries })
-            }
-        }
-
-        deserializer.deserialize_any(DependencyCollectionVisitor)
+        ordered_mapping(
+            deserializer,
+            "a name-keyed mapping of Dependencies",
+            "depends_on must be a name-keyed mapping; use 'depends_on: {process-name: condition}'",
+            |name| format!("duplicate Dependency name '{name}'"),
+        )
+        .map(|entries| Self { entries })
     }
 }
 

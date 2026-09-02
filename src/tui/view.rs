@@ -119,6 +119,17 @@ pub struct PortListView {
     pub best_effort: bool,
 }
 
+/// One visual Process list row in display order: a non-selectable Process
+/// Group heading or a selectable Process. Built once per snapshot; layout,
+/// rendering, and hit testing share this one sequence. `Process` carries the
+/// Process position into every per-Process view array, including the
+/// parallel `ProcessRowView` list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessListRow {
+    Heading(String),
+    Process(usize),
+}
+
 /// One projected Process list row. Labels are projections of structured
 /// snapshot state, never stored authoritative strings.
 pub struct ProcessRowView {
@@ -279,6 +290,7 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
 pub fn render_project(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
+    process_list: &[ProcessListRow],
     process_table_state: &mut TableState,
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
@@ -291,6 +303,7 @@ pub fn render_project(
     render_project_with_search(
         frame,
         rows,
+        process_list,
         process_table_state,
         console_snapshot,
         pipe_lines,
@@ -307,6 +320,7 @@ pub fn render_project(
 pub(crate) fn render_project_with_search(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
+    process_list: &[ProcessListRow],
     process_table_state: &mut TableState,
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[PipeLine]>,
@@ -318,12 +332,13 @@ pub(crate) fn render_project_with_search(
     visible_actions: &mut VisibleActions,
 ) -> Rect {
     let area = frame.area();
-    let (list, console_pane, footer) = project_layout(area, rows.len());
+    let (list, console_pane, footer) = project_layout(area, process_list.len());
     let console_inner = pane_inner(console_pane);
 
     let profile_trigger = render_process_table(
         frame,
         rows,
+        process_list,
         process_table_state,
         list,
         view.mode,
@@ -394,6 +409,7 @@ const PROCESS_PORTS_WIDTH: u16 = 18;
 fn render_process_table(
     frame: &mut Frame<'_>,
     rows: &[ProcessRowView],
+    process_list: &[ProcessListRow],
     state: &mut TableState,
     pane: Rect,
     mode: ConsoleViewMode,
@@ -401,24 +417,6 @@ fn render_process_table(
 ) -> Option<Rect> {
     let inner = pane_inner(pane);
     let (show_profile, show_ports, show_metrics) = table_visibility(rows, inner.width);
-    let table_rows = rows.iter().map(|row| {
-        let mut cells = vec![
-            Cell::from(row.name.as_str()),
-            Cell::from(row.status.as_str()).style(TERMINAL_THEME.lifecycle(row.lifecycle_tone)),
-        ];
-        if show_profile {
-            cells.push(Cell::from(row.profile.as_deref().unwrap_or("")));
-        }
-        if show_ports {
-            cells.push(port_cell(row.ports.as_ref()));
-        }
-        if show_metrics {
-            cells.push(right_cell(row.cpu.as_deref().unwrap_or("")));
-            cells.push(right_cell(row.memory.as_deref().unwrap_or("")));
-        }
-        Row::new(cells)
-    });
-    let widths = table_widths(show_profile, show_ports, show_metrics);
     let mut heading_cells = vec![Cell::from("Process"), Cell::from("Status")];
     if show_profile {
         heading_cells.push(Cell::from("Profile"));
@@ -430,6 +428,50 @@ fn render_process_table(
         heading_cells.push(right_cell("CPU"));
         heading_cells.push(right_cell("Memory"));
     }
+    // One column schema: the group headings and every Process row share the
+    // heading cell count.
+    let column_count = heading_cells.len();
+    let has_groups = process_list
+        .iter()
+        .any(|row| matches!(row, ProcessListRow::Heading(_)));
+    let mut table_rows = Vec::with_capacity(process_list.len());
+    for list_row in process_list {
+        match list_row {
+            ProcessListRow::Heading(group) => {
+                let mut cells = vec![Cell::from(group.as_str())];
+                cells.resize_with(column_count, || Cell::from(""));
+                table_rows.push(
+                    Row::new(cells)
+                        .style(TERMINAL_THEME.secondary_text().add_modifier(Modifier::BOLD)),
+                );
+            }
+            ProcessListRow::Process(index) => {
+                let row = &rows[*index];
+                let name = if has_groups {
+                    format!("  {}", row.name)
+                } else {
+                    row.name.clone()
+                };
+                let mut cells = vec![
+                    Cell::from(name),
+                    Cell::from(row.status.as_str())
+                        .style(TERMINAL_THEME.lifecycle(row.lifecycle_tone)),
+                ];
+                if show_profile {
+                    cells.push(Cell::from(row.profile.as_deref().unwrap_or("")));
+                }
+                if show_ports {
+                    cells.push(port_cell(row.ports.as_ref()));
+                }
+                if show_metrics {
+                    cells.push(right_cell(row.cpu.as_deref().unwrap_or("")));
+                    cells.push(right_cell(row.memory.as_deref().unwrap_or("")));
+                }
+                table_rows.push(Row::new(cells));
+            }
+        }
+    }
+    let widths = table_widths(show_profile, show_ports, show_metrics);
     let headings =
         Row::new(heading_cells).style(TERMINAL_THEME.secondary_text().add_modifier(Modifier::BOLD));
     let border_style = if mode == ConsoleViewMode::ProcessList {
@@ -449,7 +491,11 @@ fn render_process_table(
     if process_table_header_height(pane) == 1 {
         table = table.header(headings);
     }
-    state.select(rows.iter().position(|row| row.selected));
+    // The owned row sequence is the table row order: the selected Process's
+    // table position is its sequence position.
+    state.select(process_list.iter().position(|list_row| {
+        matches!(list_row, ProcessListRow::Process(index) if rows.get(*index).is_some_and(|row| row.selected))
+    }));
     frame.render_stateful_widget(table, pane, state);
     profile_title_trigger(pane, title)
 }
@@ -552,15 +598,23 @@ fn process_table_header_height(pane: Rect) -> u16 {
 }
 
 /// Return the Process row under one terminal cell. The offset comes from the
-/// `TableState` that Ratatui updated during the last render.
-pub fn process_row_at(pane: Rect, row: u16, process_count: usize, offset: usize) -> Option<usize> {
+/// `TableState` that Ratatui updated during the last render, and the visual
+/// row sequence is the table row order.
+pub fn process_row_at(
+    pane: Rect,
+    row: u16,
+    process_list: &[ProcessListRow],
+    offset: usize,
+) -> Option<usize> {
     let inner = pane_inner(pane);
     let first_row = inner.y.saturating_add(process_table_header_height(pane));
     if row < first_row || row >= inner.bottom() {
         return None;
     }
-    let index = offset.saturating_add(usize::from(row - first_row));
-    (index < process_count).then_some(index)
+    match process_list.get(offset.saturating_add(usize::from(row - first_row))) {
+        Some(ProcessListRow::Process(index)) => Some(*index),
+        _ => None,
+    }
 }
 
 /// Return the listening port under one Process-table cell. Rendering and hit
@@ -570,10 +624,11 @@ pub fn process_port_at(
     column: u16,
     row: u16,
     ports_by_process: &[Option<PortListView>],
+    process_list: &[ProcessListRow],
     has_profile: bool,
     offset: usize,
 ) -> Option<u16> {
-    let process_index = process_row_at(pane, row, ports_by_process.len(), offset)?;
+    let process_index = process_row_at(pane, row, process_list, offset)?;
     let inner = pane_inner(pane);
     let (show_profile, show_ports, show_metrics) = table_visibility_for(
         has_profile,
@@ -662,6 +717,12 @@ mod tests {
         }
     }
 
+    /// The visual sequence for tests without Process Groups: one Process row
+    /// per view row.
+    fn flat_list(count: usize) -> Vec<ProcessListRow> {
+        (0..count).map(ProcessListRow::Process).collect()
+    }
+
     /// Render one frame into a test buffer for assertions. Small but tall
     /// enough that three Process rows stay inside the capped list band.
     fn rendered(rows: &[ProcessRowView]) -> ratatui::buffer::Buffer {
@@ -669,6 +730,15 @@ mod tests {
     }
 
     fn render_rows_at(rows: &[ProcessRowView], width: u16, height: u16) -> ratatui::buffer::Buffer {
+        render_list_at(rows, &flat_list(rows.len()), width, height)
+    }
+
+    fn render_list_at(
+        rows: &[ProcessRowView],
+        process_list: &[ProcessListRow],
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut process_table_state = TableState::default();
@@ -678,6 +748,7 @@ mod tests {
                 render_project(
                     frame,
                     rows,
+                    process_list,
                     &mut process_table_state,
                     None,
                     None,
@@ -723,6 +794,25 @@ mod tests {
                 row.status
             );
         }
+    }
+
+    #[test]
+    fn process_groups_render_as_non_selected_headings_with_indented_members() {
+        let rows = [row("database", "Ready", false), row("api", "Ready", true)];
+        let process_list = [
+            ProcessListRow::Heading("Infrastructure".to_string()),
+            ProcessListRow::Process(0),
+            ProcessListRow::Heading("Application".to_string()),
+            ProcessListRow::Process(1),
+        ];
+
+        let buffer = render_list_at(&rows, &process_list, 60, 30);
+        assert!(buffer_line(&buffer, 2).contains("Infrastructure"));
+        assert!(buffer_line(&buffer, 3).contains("  database"));
+        assert!(buffer_line(&buffer, 4).contains("Application"));
+        assert!(buffer_line(&buffer, 5).contains("  api"));
+        assert!(!buffer[(1, 4)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(1, 5)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -840,15 +930,39 @@ mod tests {
                 .contains(Modifier::UNDERLINED)
         );
         assert_eq!(
-            process_port_at(list, first_column, 2, &ports, false, 0),
+            process_port_at(
+                list,
+                first_column,
+                2,
+                &ports,
+                &[ProcessListRow::Process(0)],
+                false,
+                0
+            ),
             Some(5173)
         );
         assert_eq!(
-            process_port_at(list, separator_column, 2, &ports, false, 0),
+            process_port_at(
+                list,
+                separator_column,
+                2,
+                &ports,
+                &[ProcessListRow::Process(0)],
+                false,
+                0
+            ),
             None
         );
         assert_eq!(
-            process_port_at(list, second_column, 2, &ports, false, 0),
+            process_port_at(
+                list,
+                second_column,
+                2,
+                &ports,
+                &[ProcessListRow::Process(0)],
+                false,
+                0
+            ),
             Some(8080)
         );
     }
@@ -881,6 +995,7 @@ mod tests {
                 render_project(
                     frame,
                     &rows,
+                    &flat_list(rows.len()),
                     &mut process_table_state,
                     None,
                     None,
@@ -970,6 +1085,7 @@ mod tests {
                 render_project(
                     frame,
                     &rows,
+                    &flat_list(rows.len()),
                     &mut state,
                     None,
                     None,
@@ -989,6 +1105,7 @@ mod tests {
                 render_project(
                     frame,
                     &rows,
+                    &flat_list(rows.len()),
                     &mut state,
                     None,
                     None,
@@ -1044,6 +1161,7 @@ mod tests {
                 render_project(
                     frame,
                     &[],
+                    &[],
                     &mut process_table_state,
                     None,
                     Some(&lines),
@@ -1082,6 +1200,7 @@ mod tests {
             .draw(|frame| {
                 render_project_with_search(
                     frame,
+                    &[],
                     &[],
                     &mut process_table_state,
                     None,
@@ -1240,6 +1359,7 @@ mod tests {
             .draw(|frame| {
                 console_inner = render_project(
                     frame,
+                    &[],
                     &[],
                     &mut process_table_state,
                     Some(&snapshot),

@@ -281,12 +281,18 @@ version: 1
 
 env_files: []
 profiles: {}
+groups: {}
 processes: {}
 settings: {}
 ```
 
 Version 1 accepts this canonical shape only. It does not translate older
-spellings into it. `processes` and `depends_on` are name-keyed mappings.
+spellings into it. `groups`, `processes`, and `depends_on` are name-keyed
+mappings. Each `groups` value is an ordered list of Process names. A Process
+can belong to at most one Process Group. Group and member order define the
+Process list order, followed by unlisted Processes in the visual **Other**
+group. Process Groups are presentation only and do not change lifecycle or
+Dependency behavior. `Other` is a reserved Process Group name.
 Direct commands use a sequence, and shell commands use a sibling `shell`
 field. Use `cwd`, `env_files`, `environment`, and a terminal mapping with
 `mode` and optional `input`. Project-level `env_files` is a list at the root;

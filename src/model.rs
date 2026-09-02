@@ -9,6 +9,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// The reserved Process Group name for Processes without a named group.
+/// Configuration cannot declare it and the display synthesizes it.
+pub(crate) const OTHER_PROCESS_GROUP: &str = "Other";
+
 /// How a Process expects to run. A Process is exactly one of these kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessKind {
@@ -346,10 +350,11 @@ impl Default for ShellConfig {
     }
 }
 
-/// Project-wide runtime settings resolved from configuration.
+/// Project-wide values resolved from configuration.
 pub(crate) struct ProjectSettings {
     pub(crate) shell: ShellConfig,
     pub(crate) port_discovery: bool,
+    pub(crate) process_groups: Vec<Option<String>>,
 }
 
 /// The validated set of Processes for one Stackhand session. Process order
@@ -376,6 +381,9 @@ pub struct EffectiveProject {
     dependency_indices: Vec<Vec<usize>>,
     /// Validated Dependency graph for base and each global selection.
     dependency_indices_by_profile: BTreeMap<Option<String>, Vec<Vec<usize>>>,
+    /// Visual Process Group name by stable Process position. `None` is the
+    /// implicit Other group when at least one named group exists.
+    process_groups: Vec<Option<String>>,
     shell: ShellConfig,
     port_discovery: bool,
 }
@@ -465,6 +473,7 @@ impl EffectiveProject {
             process_profile_labels_by_profile: BTreeMap::new(),
             selected_process_profile: None,
             process_profile_names: Vec::new(),
+            process_groups: vec![None; processes.len()],
             processes,
             positions,
             dependency_indices: dependency_indices.clone(),
@@ -524,6 +533,7 @@ impl EffectiveProject {
             ProjectSettings {
                 shell,
                 port_discovery: false,
+                process_groups: vec![None; processes.len()],
             },
         )
     }
@@ -539,8 +549,10 @@ impl EffectiveProject {
         settings: ProjectSettings,
     ) -> Result<Self, ProjectError> {
         debug_assert_eq!(base_processes.len(), base_process_profile_labels.len());
+        debug_assert_eq!(base_processes.len(), settings.process_groups.len());
         let mut project = Self::with_shell(base_processes, settings.shell.clone())?;
         project.base_profile_name = base_profile_name;
+        project.process_groups = settings.process_groups;
         project.port_discovery = settings.port_discovery;
         project.process_profile_names = processes_by_profile.keys().cloned().collect();
         project.processes_by_profile = processes_by_profile;
@@ -582,6 +594,31 @@ impl EffectiveProject {
 
     pub fn processes(&self) -> &[ProcessSpec] {
         &self.processes
+    }
+
+    /// The number of visual rows in the Process list at Project startup.
+    pub(crate) fn process_list_row_count(&self) -> usize {
+        let heading_count = self
+            .process_groups
+            .iter()
+            .any(Option::is_some)
+            .then(|| {
+                self.process_groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, group)| {
+                        *index == 0 || Some(*group) != self.process_groups.get(index - 1)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        self.processes.len().saturating_add(heading_count)
+    }
+
+    /// The visual Process Group for one stable Process position. `None`
+    /// belongs to Other when this Project has at least one named group.
+    pub(crate) fn process_group(&self, index: usize) -> Option<&str> {
+        self.process_groups.get(index).and_then(Option::as_deref)
     }
 
     /// The user-visible name of the base Project Profile.
@@ -765,6 +802,25 @@ mod tests {
             })
             .collect();
         spec
+    }
+
+    #[test]
+    fn startup_process_list_row_count_includes_group_headings() {
+        let mut project = EffectiveProject::new(vec![
+            bare("database"),
+            bare("cache"),
+            bare("api"),
+            bare("worker"),
+        ])
+        .expect("the Project is valid");
+        project.process_groups = vec![
+            Some("Infrastructure".to_string()),
+            Some("Infrastructure".to_string()),
+            Some("Application".to_string()),
+            None,
+        ];
+
+        assert_eq!(project.process_list_row_count(), 7);
     }
 
     #[test]

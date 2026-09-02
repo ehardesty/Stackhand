@@ -242,6 +242,41 @@ processes:
 }
 
 #[test]
+fn config_show_includes_named_groups_but_not_the_implicit_other_group() {
+    let root = unique_directory("groups");
+    let config = root.join("stackhand.yaml");
+    fs::write(
+        &config,
+        "version: 1
+groups:
+  Infrastructure: [database]
+processes:
+  web: {command: [/usr/bin/true]}
+  database: {command: [/usr/bin/true]}
+",
+    )
+    .expect("Project writes");
+
+    let output = run_show(&root, Some(&config), None);
+    assert!(output.status.success(), "{output:?}");
+    let effective = effective_yaml(&output);
+    let groups = effective
+        .as_mapping()
+        .and_then(|root| root.get(Value::String("groups".to_string())))
+        .and_then(Value::as_mapping)
+        .expect("effective YAML includes groups");
+    assert_eq!(
+        groups.get(Value::String("Infrastructure".to_string())),
+        Some(&Value::Sequence(vec![Value::String(
+            "database".to_string()
+        )]))
+    );
+    assert!(!groups.contains_key(Value::String("Other".to_string())));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn config_show_uses_the_same_resolution_failure_as_config_validate() {
     let root = unique_directory("failure");
     let config = root.join("project.yaml");

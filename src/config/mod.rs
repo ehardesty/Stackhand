@@ -32,15 +32,15 @@ use anyhow::Context;
 
 use self::env::{build_process_environment, load_files, validate_shapes};
 use self::file::{
-    CommandFile, ConfigFile, DependencyEntry, ProcessEntry, ProcessFile, RestartFile, SettingsFile,
-    TerminalFile,
+    CommandFile, ConfigFile, GroupCollection, ProcessCollection, ProcessFile, RestartFile,
+    SettingsFile, TerminalFile,
 };
 use self::profile::{apply_local_override, merge_yaml};
 
 use crate::model::{
     Autostart, CommandForm, DependencyCondition, DependencySpec, EffectiveProject, Enabled,
-    InputPolicy, ProcessKind, ProcessSpec, ProjectError, ProjectSettings, RestartConfig,
-    RestartPolicy, ShellConfig, TerminalMode,
+    InputPolicy, OTHER_PROCESS_GROUP, ProcessKind, ProcessSpec, ProjectError, ProjectSettings,
+    RestartConfig, RestartPolicy, ShellConfig, TerminalMode,
 };
 
 const MAX_EXIT_CODE: i32 = 255;
@@ -288,13 +288,14 @@ fn load_file_with_local(
         .and_then(|root| root.get(Value::String("processes".to_string())))
         .and_then(Value::as_mapping)
         .expect("typed Process parsing requires a Process mapping");
+    let (process_order, process_groups) = resolve_process_groups(&file.groups, &file.processes)
+        .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let mut process_profile_names = file
         .processes
         .entries
         .iter()
-        .flat_map(|entry| {
-            entry
-                .process
+        .flat_map(|(_, process)| {
+            process
                 .profiles
                 .as_ref()
                 .into_iter()
@@ -341,16 +342,14 @@ fn load_file_with_local(
             &last_layer,
         ));
     }
-    let process_documents = file
-        .processes
-        .entries
+    let process_documents = process_order
         .into_iter()
-        .map(|entry| {
+        .map(|name| {
             let raw = raw_processes
-                .get(Value::String(entry.key.clone()))
+                .get(Value::String(name.clone()))
                 .cloned()
                 .expect("the raw Process mapping matches typed Process entries");
-            (entry.key, raw)
+            (name, raw)
         })
         .collect::<Vec<_>>();
     let base_env_files = file.env_files.unwrap_or_default();
@@ -364,10 +363,8 @@ fn load_file_with_local(
                 message: format!("Process '{name}': {error}"),
             })?;
             let profiled = build_profiled_process(
-                ProcessEntry {
-                    key: name.clone(),
-                    process,
-                },
+                name.clone(),
+                process,
                 raw.clone(),
                 base_dir,
                 project_environment,
@@ -425,12 +422,69 @@ fn load_file_with_local(
         ProjectSettings {
             shell,
             port_discovery,
+            process_groups,
         },
     )
     .map_err(|error| {
         let detail = format_project_error(error);
         diagnostics::with_source(config_error(anyhow::anyhow!(detail)), &last_layer)
     })
+}
+
+fn resolve_process_groups(
+    groups: &GroupCollection,
+    processes: &ProcessCollection,
+) -> Result<(Vec<String>, Vec<Option<String>>), ConfigError> {
+    let configured = processes
+        .entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    let mut assigned = HashSet::new();
+    let mut order = Vec::with_capacity(processes.entries.len());
+    let mut memberships = Vec::with_capacity(processes.entries.len());
+
+    for (group, members) in &groups.entries {
+        if group.trim().is_empty() {
+            return Err(ConfigError {
+                message: "Process Group name must not be empty".to_string(),
+            });
+        }
+        if group.trim() == OTHER_PROCESS_GROUP {
+            return Err(ConfigError {
+                message: format!(
+                    "Process Group name '{OTHER_PROCESS_GROUP}' is reserved for ungrouped Processes"
+                ),
+            });
+        }
+        if members.is_empty() {
+            return Err(ConfigError {
+                message: format!("Process Group '{group}' must contain at least one Process",),
+            });
+        }
+        for name in members {
+            if !configured.contains(name.as_str()) {
+                return Err(ConfigError {
+                    message: format!("Process Group '{group}': Process '{name}' is not configured",),
+                });
+            }
+            if !assigned.insert(name.as_str()) {
+                return Err(ConfigError {
+                    message: format!("Process '{name}' appears in more than one Process Group"),
+                });
+            }
+            order.push(name.clone());
+            memberships.push(Some(group.clone()));
+        }
+    }
+
+    for (name, _) in &processes.entries {
+        if assigned.insert(name.as_str()) {
+            order.push(name.clone());
+            memberships.push(None);
+        }
+    }
+    Ok((order, memberships))
 }
 
 fn format_project_error(error: ProjectError) -> String {
@@ -716,7 +770,8 @@ struct ProfiledProcess {
 }
 
 fn build_profiled_process(
-    entry: ProcessEntry,
+    name: String,
+    process: ProcessFile,
     mut raw: Value,
     base_dir: &Path,
     project_environment: &BTreeMap<String, String>,
@@ -731,7 +786,6 @@ fn build_profiled_process(
         "depends_on",
     ];
 
-    let ProcessEntry { key: name, process } = entry;
     let profile_override = process.profile.clone();
     let patches = process.profiles.clone().unwrap_or_default();
     if raw.is_null() {
@@ -874,11 +928,13 @@ fn build_spec(
     };
     let dependencies = match &process.depends_on {
         None => Vec::new(),
-        Some(entries) => entries
+        Some(dependencies) => dependencies
             .entries
             .iter()
             .enumerate()
-            .map(|(index, entry)| build_dependency(&name, index, entry))
+            .map(|(index, (dependency, condition))| {
+                build_dependency(&name, index, dependency, condition)
+            })
             .collect::<Result<Vec<_>, ConfigError>>()?,
     };
     let readiness = match &process.ready {
@@ -919,10 +975,10 @@ fn build_spec(
 fn build_dependency(
     process_name: &str,
     index: usize,
-    entry: &DependencyEntry,
+    dependency: &str,
+    condition: &Option<Value>,
 ) -> Result<DependencySpec, ConfigError> {
-    let condition = entry
-        .value
+    let condition = condition
         .as_ref()
         .and_then(serde_yaml::Value::as_str)
         .ok_or_else(|| {
@@ -931,7 +987,7 @@ fn build_dependency(
             index,
             format!(
                 "condition for Dependency '{}' must be a string; use 'dependency-name: condition'",
-                entry.key
+                dependency
             ),
         )
     })?;
@@ -954,7 +1010,7 @@ fn build_dependency(
         }
     };
     Ok(DependencySpec {
-        name: entry.key.clone(),
+        name: dependency.to_string(),
         condition,
     })
 }

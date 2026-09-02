@@ -1,7 +1,30 @@
 //! Pure projection of Supervisor snapshots into compact user-visible rows and headers.
 
+use crate::model::OTHER_PROCESS_GROUP;
 use crate::supervisor::{Lifecycle, LivenessState, ProcessSnapshot, ProjectSnapshot};
-use crate::tui::{LifecycleTone, PortListView, ProcessRowView};
+use crate::tui::{LifecycleTone, PortListView, ProcessListRow, ProcessRowView};
+
+/// The one owner of the Process list's visual row sequence: where the
+/// non-selectable Process Group headings sit between the Process rows.
+/// Built once per snapshot; layout, rendering, and hit testing share it.
+pub(super) fn process_list_rows(snapshot: &ProjectSnapshot) -> Vec<ProcessListRow> {
+    let has_groups = snapshot.has_process_groups();
+    let mut rows = Vec::with_capacity(snapshot.processes.len());
+    for (index, process) in snapshot.processes.iter().enumerate() {
+        // A heading opens each contiguous group run; ungrouped Processes in
+        // a grouped Project open the synthetic Other section.
+        if has_groups && (index == 0 || process.group != snapshot.processes[index - 1].group) {
+            rows.push(ProcessListRow::Heading(
+                process
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| OTHER_PROCESS_GROUP.to_string()),
+            ));
+        }
+        rows.push(ProcessListRow::Process(index));
+    }
+    rows
+}
 
 pub(super) fn process_rows(snapshot: &ProjectSnapshot, selected: usize) -> Vec<ProcessRowView> {
     let show_profiles = profiles_visible(snapshot);

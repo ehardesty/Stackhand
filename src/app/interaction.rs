@@ -11,7 +11,7 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
-use super::view_model::{port_list, profile_changes_pending, profiles_visible};
+use super::view_model::{port_list, process_list_rows, profile_changes_pending, profiles_visible};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand};
 use crate::log_view::{OutputRepresentation, SearchDialogView};
@@ -22,9 +22,9 @@ use crate::supervisor::{
 };
 use crate::terminal::{OwnedTerminalSnapshot, TerminalEvent};
 use crate::tui::{
-    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, PortListView, ProjectProfileMenu,
-    ProjectProfileMenuAction, VisibleAction, VisibleActionEvent, VisibleActions, pane_inner,
-    process_port_at, process_row_at, project_layout,
+    ConsolePaneKind, ConsoleViewState, ConsoleWarning, PipeLine, PortListView, ProcessListRow,
+    ProjectProfileMenu, ProjectProfileMenuAction, VisibleAction, VisibleActionEvent,
+    VisibleActions, pane_inner, process_port_at, process_row_at, project_layout,
 };
 
 /// The selected Process's visible output owner.
@@ -72,6 +72,7 @@ pub(crate) struct ProjectInteraction {
     start_anyway_available: bool,
     terminal_available: bool,
     ports_by_process: Vec<Option<PortListView>>,
+    process_list: Vec<ProcessListRow>,
     profiles_visible: bool,
     truncation: Option<(usize, bool)>,
 }
@@ -79,6 +80,15 @@ pub(crate) struct ProjectInteraction {
 impl ProjectInteraction {
     pub(crate) fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// The owned visual Process list row sequence for the latest snapshot.
+    pub(super) fn process_list(&self) -> &[ProcessListRow] {
+        &self.process_list
+    }
+
+    pub(super) fn process_list_row_count(&self) -> usize {
+        self.process_list.len()
     }
 
     pub(super) fn render_state(
@@ -118,6 +128,7 @@ impl ProjectInteraction {
         self.profile_changes_pending = profile_changes_pending(snapshot);
         self.profiles_visible = profiles_visible(snapshot);
         self.ports_by_process = snapshot.processes.iter().map(port_list).collect();
+        self.process_list = process_list_rows(snapshot);
         self.selected = self
             .selected
             .min(snapshot.processes.len().saturating_sub(1));
@@ -545,7 +556,8 @@ impl ProjectInteraction {
     ) -> InputResult {
         let process_count = self.logs.len();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (list, console_outer, _) = project_layout(Rect::new(0, 0, cols, rows), process_count);
+        let (list, console_outer, _) =
+            project_layout(Rect::new(0, 0, cols, rows), self.process_list_row_count());
         let console_inner = pane_inner(console_outer);
         let child_tracks_mouse = process.input_focused
             && matches!(pane, SelectedPane::Terminal(view) if view.mouse_tracking());
@@ -644,13 +656,17 @@ impl ProjectInteraction {
                     mouse.column,
                     mouse.row,
                     &self.ports_by_process,
+                    &self.process_list,
                     self.profiles_visible,
                     self.process_table.offset(),
                 )
             {
-                if let Some(index) =
-                    process_row_at(list, mouse.row, process_count, self.process_table.offset())
-                {
+                if let Some(index) = process_row_at(
+                    list,
+                    mouse.row,
+                    &self.process_list,
+                    self.process_table.offset(),
+                ) {
                     self.selected = index;
                 }
                 self.console.clear_pane_warning();
@@ -667,9 +683,12 @@ impl ProjectInteraction {
             let previous = self.selected;
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) =
-                        process_row_at(list, mouse.row, process_count, self.process_table.offset())
-                    {
+                    if let Some(index) = process_row_at(
+                        list,
+                        mouse.row,
+                        &self.process_list,
+                        self.process_table.offset(),
+                    ) {
                         self.selected = index;
                         self.console.clear_pane_warning();
                     }
@@ -774,6 +793,7 @@ mod tests {
         ProcessSnapshot {
             process_id: ProcessId::new(process_id),
             name: name.to_string(),
+            group: None,
             kind,
             enabled: true,
             autostart: true,
@@ -922,6 +942,7 @@ mod tests {
                     *column,
                     2,
                     &interaction.ports_by_process,
+                    &interaction.process_list,
                     interaction.profiles_visible,
                     interaction.process_table.offset(),
                 ) == Some(5173)
@@ -1119,6 +1140,7 @@ mod tests {
             ports: None,
             selected: true,
         }];
+        let process_list = [crate::tui::ProcessListRow::Process(0)];
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let render = |terminal: &mut Terminal<TestBackend>,
                       interaction: &mut ProjectInteraction| {
@@ -1128,6 +1150,7 @@ mod tests {
                     crate::tui::render_project(
                         frame,
                         &rows,
+                        &process_list,
                         table_state,
                         None,
                         None,
@@ -1149,6 +1172,7 @@ mod tests {
                 crate::tui::render_project(
                     frame,
                     &rows,
+                    &process_list,
                     state,
                     None,
                     None,

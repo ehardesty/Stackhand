@@ -23,10 +23,16 @@ Keep the visual hierarchy close to mprocs:
  status/help footer
 ```
 
-The console should receive most of the screen width and height. The Process list
-MUST show a Profile column when a current Run's applied profile differs from its
-Next Profile, or when any Process's Next Profile differs from the global Process
-Profile. It SHOULD hide the column at other times.
+The console should receive most of the screen width and height. When the Project
+defines Process Groups, the Process list MUST render each group as a muted,
+non-selectable heading and indent its member rows. Unlisted Processes appear
+under **Other**. Group headings do not change keyboard selection, mouse
+selection, or Process actions. Without configured groups, the list remains
+flat.
+
+The Process list MUST show a Profile column when a current Run's applied profile
+differs from its Next Profile, or when any Process's Next Profile differs from
+the global Process Profile. It SHOULD hide the column at other times.
 
 ### 24.2 Process row data
 

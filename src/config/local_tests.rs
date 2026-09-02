@@ -250,3 +250,47 @@ processes:
     );
     fs::remove_dir_all(directory).ok();
 }
+
+#[test]
+fn local_override_merges_groups_and_replaces_each_member_list() {
+    let directory = unique_directory("groups");
+    fs::write(
+        directory.join(BASE_FILE_NAME),
+        "version: 1
+groups:
+  Infrastructure: [database, cache]
+  Application: [web]
+processes:
+  database: {command: [/usr/bin/true]}
+  cache: {command: [/usr/bin/true]}
+  web: {command: [/usr/bin/true]}
+",
+    )
+    .expect("base configuration writes");
+    fs::write(
+        directory.join(LOCAL_FILE_NAME),
+        "groups:
+  Infrastructure: [cache]
+  Application: null
+",
+    )
+    .expect("local override writes");
+
+    let resolution = resolve(ResolutionRequest::Discover {
+        start_dir: Some(directory.clone()),
+        profile: None,
+    })
+    .expect("local Process Group changes merge");
+    let project = resolution.project();
+    let names = project
+        .processes()
+        .iter()
+        .map(|process| process.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["cache", "database", "web"]);
+    assert_eq!(project.process_group(0), Some("Infrastructure"));
+    assert_eq!(project.process_group(1), None);
+    assert_eq!(project.process_group(2), None);
+
+    fs::remove_dir_all(directory).ok();
+}

@@ -426,9 +426,11 @@ impl Core {
             .processes()
             .iter()
             .zip(&self.lifecycles)
-            .map(|(spec, entry)| ProcessSnapshot {
+            .enumerate()
+            .map(|(index, (spec, entry))| ProcessSnapshot {
                 process_id: entry.process_id,
                 name: spec.name.clone(),
+                group: self.project.process_group(index).map(str::to_owned),
                 kind: spec.kind,
                 enabled: matches!(spec.enabled, Enabled::Yes),
                 autostart: matches!(spec.autostart, Autostart::Yes),

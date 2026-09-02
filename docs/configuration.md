@@ -41,6 +41,10 @@ profiles:
   clean:
     env_files: []
 
+groups:
+  Infrastructure: [database, cache]
+  Application: [api, worker, web]
+
 settings:
   shell:
     program: /bin/bash
@@ -55,6 +59,28 @@ processes: {}
 - `settings.shell` selects the program that runs every `shell` expression. The default is `/bin/sh` with `[-c]`.
 - `settings.port_discovery` shows listening TCP ports for each Process. The default is `false`.
 - `processes` can be empty.
+
+## Process Groups
+
+Process Groups divide the Process list into visual sections:
+
+```yaml
+groups:
+  Infrastructure: [database, cache]
+  Application: [api, worker, web]
+```
+
+Group and member order follow the YAML order. Each member must name a configured
+Process, and a Process can belong to only one group. A group must contain at
+least one Process. The name `Other` is reserved. When at least one group is
+configured, Stackhand places every unlisted Process under **Other**.
+
+Process Groups do not change startup, shutdown, Dependencies, Desired State, or
+Project Profiles. A Project without `groups` keeps the flat Process list.
+
+A local override merges `groups` by group name. A member list in the local file
+replaces that group's list. Set a group to `null` to remove it, or set `groups`
+to `null` to remove all Process Groups.
 
 ## Process fields
 

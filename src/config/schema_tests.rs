@@ -58,6 +58,12 @@ fn removed_yaml_forms_name_their_canonical_replacements() {
             "use 'depends_on: {process-name: condition}'",
         ),
         (
+            "group-list",
+            "version: 1\ngroups: [web]\nprocesses:\n  web:\n    command: [/bin/true]\n",
+            "groups must be a name-keyed mapping",
+            "use 'groups: {Group name: [process-name]}'",
+        ),
+        (
             "command-map",
             "version: 1\nprocesses:\n  web:\n    command: {program: /bin/true}\n",
             "command must be a sequence",

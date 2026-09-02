@@ -8,8 +8,8 @@ use crate::supervisor::{
 };
 use crate::terminal::OwnedTerminalSnapshot;
 use crate::tui::{
-    OuterTerminal, ProcessRowView, ProjectProfileMenu, VisibleActions, pane_inner, project_layout,
-    render_project_with_search,
+    OuterTerminal, ProcessListRow, ProcessRowView, ProjectProfileMenu, VisibleActions, pane_inner,
+    project_layout, render_project_with_search,
 };
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::Event;
@@ -191,6 +191,9 @@ fn run_event_loop(
             // frame that will be drawn.
             let frame = interaction.frame(&pane, retained, console_area.height.max(1) as usize);
             let rows = process_rows(&snapshot, selected);
+            // The sequence is selection-independent; the frame borrows a copy
+            // while the table state is mutably borrowed.
+            let process_list = interaction.process_list().to_vec();
             let list_title = process_list_title(&snapshot);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
             let view_label = match frame.representation {
@@ -208,6 +211,7 @@ fn run_event_loop(
             console_area = render_frame(
                 outer,
                 &rows,
+                &process_list,
                 process_table_state,
                 frame.terminal.as_ref(),
                 frame.lines.as_deref(),
@@ -231,7 +235,7 @@ fn run_event_loop(
             if let Event::Resize(cols, rows) = input_event {
                 // The child sees exactly the rendered console pane.
                 let area = ratatui::layout::Rect::new(0, 0, cols, rows);
-                let (_, pane, _) = project_layout(area, snapshot.processes.len());
+                let (_, pane, _) = project_layout(area, interaction.process_list_row_count());
                 pending_resize.update(
                     TerminalGeometry::from_pane(pane_inner(pane)),
                     Instant::now(),
@@ -290,6 +294,7 @@ fn open_local_port(port: u16) -> std::io::Result<()> {
 fn render_frame(
     outer: &mut OuterTerminal,
     rows: &[ProcessRowView],
+    process_list: &[ProcessListRow],
     process_table_state: &mut ratatui::widgets::TableState,
     console_snapshot: Option<&OwnedTerminalSnapshot>,
     pipe_lines: Option<&[crate::tui::PipeLine]>,
@@ -307,6 +312,7 @@ fn render_frame(
             pane = Some(render_project_with_search(
                 frame,
                 rows,
+                process_list,
                 process_table_state,
                 console_snapshot,
                 pipe_lines,

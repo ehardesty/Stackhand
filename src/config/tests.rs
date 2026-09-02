@@ -820,3 +820,72 @@ fn invalid_kinds_terminal_modes_and_input_policies_are_rejected() {
         );
     }
 }
+
+#[test]
+fn process_groups_define_visual_order_and_leave_unlisted_processes_for_other() {
+    let project = write_and_load(
+        "groups",
+        "version: 1
+groups:
+  Infrastructure: [database, cache]
+  Application: [api]
+processes:
+  api: {command: [/usr/bin/true]}
+  database: {command: [/usr/bin/true]}
+  worker: {command: [/usr/bin/true]}
+  cache: {command: [/usr/bin/true]}
+",
+    )
+    .expect("valid Process Groups load");
+
+    let names = project
+        .processes()
+        .iter()
+        .map(|process| process.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["database", "cache", "api", "worker"]);
+    let groups = (0..project.processes().len())
+        .map(|index| project.process_group(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        groups,
+        [
+            Some("Infrastructure"),
+            Some("Infrastructure"),
+            Some("Application"),
+            None,
+        ]
+    );
+}
+
+#[test]
+fn invalid_process_group_membership_is_rejected() {
+    for (label, groups, expected) in [
+        ("unknown", "Infrastructure: [missing]", "is not configured"),
+        (
+            "duplicate",
+            "Infrastructure: [web]\n  Application: [web]",
+            "more than one Process Group",
+        ),
+        (
+            "empty",
+            "Infrastructure: []",
+            "must contain at least one Process",
+        ),
+        ("other", "Other: [web]", "reserved for ungrouped Processes"),
+        (
+            "padded-other",
+            "' Other ': [web]",
+            "reserved for ungrouped Processes",
+        ),
+    ] {
+        let error = write_and_load(
+            &format!("group-{label}"),
+            &format!(
+                "version: 1\ngroups:\n  {groups}\nprocesses:\n  web: {{command: [/usr/bin/true]}}\n"
+            ),
+        )
+        .expect_err("invalid Process Group membership must fail");
+        assert!(error.message.contains(expected), "{label}: {error}");
+    }
+}

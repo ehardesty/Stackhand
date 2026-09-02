@@ -2,11 +2,11 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
 use super::interaction::{is_quit, mouse_changes_focus, mouse_starts_console_focus, should_quit};
 use super::view_model::{
-    format_age, format_cpu, format_rss, lifecycle_tone, metric_precision, process_list_title,
-    process_rows, selected_header, status_label,
+    format_age, format_cpu, format_rss, lifecycle_tone, metric_precision, process_list_rows,
+    process_list_title, process_rows, selected_header, status_label,
 };
 use super::*;
-use crate::tui::process_row_at;
+use crate::tui::{ProcessListRow, process_row_at};
 
 #[test]
 fn shutdown_result_keeps_failures_and_remaining_pids() {
@@ -117,10 +117,44 @@ fn profile_column_hides_when_global_profile_describes_every_process() {
     );
 }
 
+#[test]
+fn process_list_rows_place_named_and_other_group_headings() {
+    let mut database = projection_process();
+    database.name = "database".to_string();
+    database.group = Some("Infrastructure".to_string());
+    let mut api = projection_process();
+    api.name = "api".to_string();
+    api.group = Some("Application".to_string());
+    let mut worker = projection_process();
+    worker.name = "worker".to_string();
+    let snapshot = crate::supervisor::ProjectSnapshot {
+        processes: vec![database, api, worker],
+        base_profile_name: "base".to_string(),
+        selected_profile: None,
+        available_profiles: Vec::new(),
+        shutdown: None,
+        now_ms: 0,
+    };
+
+    let rows = process_list_rows(&snapshot);
+    assert_eq!(
+        rows,
+        vec![
+            ProcessListRow::Heading("Infrastructure".to_string()),
+            ProcessListRow::Process(0),
+            ProcessListRow::Heading("Application".to_string()),
+            ProcessListRow::Process(1),
+            ProcessListRow::Heading("Other".to_string()),
+            ProcessListRow::Process(2),
+        ]
+    );
+}
+
 fn projection_process() -> crate::supervisor::ProcessSnapshot {
     crate::supervisor::ProcessSnapshot {
         process_id: crate::supervisor::ProcessId::new(1),
         name: "api".to_string(),
+        group: None,
         kind: crate::model::ProcessKind::Service,
         enabled: true,
         autostart: true,
@@ -254,19 +288,42 @@ fn only_a_mouse_press_changes_keyboard_focus() {
 fn process_row_hit_testing_excludes_the_header_borders_and_empty_rows() {
     let list = ratatui::layout::Rect::new(0, 0, 40, 6);
 
-    assert_eq!(process_row_at(list, 0, 3, 0), None);
-    assert_eq!(process_row_at(list, 1, 3, 0), None);
-    assert_eq!(process_row_at(list, 2, 3, 0), Some(0));
-    assert_eq!(process_row_at(list, 4, 3, 0), Some(2));
-    assert_eq!(process_row_at(list, 5, 3, 0), None);
+    let flat = [
+        ProcessListRow::Process(0),
+        ProcessListRow::Process(1),
+        ProcessListRow::Process(2),
+    ];
+    assert_eq!(process_row_at(list, 0, &flat, 0), None);
+    assert_eq!(process_row_at(list, 1, &flat, 0), None);
+    assert_eq!(process_row_at(list, 2, &flat, 0), Some(0));
+    assert_eq!(process_row_at(list, 4, &flat, 0), Some(2));
+    assert_eq!(process_row_at(list, 5, &flat, 0), None);
+}
+
+#[test]
+fn process_row_hit_testing_skips_process_group_headings() {
+    let list = ratatui::layout::Rect::new(0, 0, 40, 8);
+    let grouped = [
+        ProcessListRow::Heading("Infrastructure".to_string()),
+        ProcessListRow::Process(0),
+        ProcessListRow::Process(1),
+        ProcessListRow::Heading("Application".to_string()),
+        ProcessListRow::Process(2),
+    ];
+    assert_eq!(process_row_at(list, 2, &grouped, 0), None);
+    assert_eq!(process_row_at(list, 3, &grouped, 0), Some(0));
+    assert_eq!(process_row_at(list, 4, &grouped, 0), Some(1));
+    assert_eq!(process_row_at(list, 5, &grouped, 0), None);
+    assert_eq!(process_row_at(list, 6, &grouped, 0), Some(2));
 }
 
 #[test]
 fn process_row_hit_testing_tracks_the_visible_table_offset() {
     let list = ratatui::layout::Rect::new(0, 0, 40, 6);
 
-    assert_eq!(process_row_at(list, 2, 8, 5), Some(5));
-    assert_eq!(process_row_at(list, 4, 8, 5), Some(7));
+    let flat = (0..8).map(ProcessListRow::Process).collect::<Vec<_>>();
+    assert_eq!(process_row_at(list, 2, &flat, 5), Some(5));
+    assert_eq!(process_row_at(list, 4, &flat, 5), Some(7));
 }
 
 #[test]

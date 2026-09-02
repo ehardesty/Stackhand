@@ -82,7 +82,7 @@ enum Inbox {
 pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, Arc<OutputViews>)> {
     // Size each first PTY like the pane that will render it, so children
     // never observe a stale default size.
-    let initial_geometry = crate::tui::project_console_geometry(project.processes().len());
+    let initial_geometry = crate::tui::project_console_geometry(project.process_list_row_count());
     let outputs = Arc::new(OutputViews::new(project.processes().len()));
     let seam = RealRunSeam::new(Arc::clone(&outputs)).with_port_discovery(project.port_discovery());
     let consoles = seam.consoles();

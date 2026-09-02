@@ -32,6 +32,13 @@ impl ProjectSnapshot {
     pub fn named(&self, name: &str) -> Option<&ProcessSnapshot> {
         self.processes.iter().find(|process| process.name == name)
     }
+
+    /// Whether this Project displays named Process Groups at all. When it
+    /// does, every Process without a named group belongs to the synthetic
+    /// Other group.
+    pub fn has_process_groups(&self) -> bool {
+        self.processes.iter().any(|process| process.group.is_some())
+    }
 }
 
 /// The check kinds in the readiness and liveness snapshots.
@@ -143,6 +150,9 @@ pub struct ProcessSnapshot {
     /// Callers use this value instead of reconstructing it from Project order.
     pub process_id: ProcessId,
     pub name: String,
+    /// The configured visual Process Group. `None` belongs to Other when
+    /// another Process has a named group.
+    pub group: Option<String>,
     pub kind: ProcessKind,
     pub enabled: bool,
     pub autostart: bool,

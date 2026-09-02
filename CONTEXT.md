@@ -24,6 +24,10 @@ _Avoid_: Instance, execution instance
 The root operating-system process and the owned descendant processes for one Run.
 _Avoid_: Process, child list
 
+**Process Group**:
+A named visual section that organizes Processes in a Project display. It does not change lifecycle or Dependency behavior. Always qualify the operating-system concept as an OS Process Group.
+_Avoid_: Process Set, category
+
 **Project**:
 The effective set of Processes and dependencies loaded from configuration for one Stackhand session.
 _Avoid_: Workspace, environment
