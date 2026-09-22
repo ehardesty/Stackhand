@@ -28,7 +28,7 @@ mod tui;
 mod worker_handle;
 
 pub use app::{
-    run_discovered_project, run_discovered_project_with_profile, run_project,
+    run_discovered_project, run_discovered_project_with_profile, run_project, run_project_session,
     run_project_with_profile,
 };
 pub use config::{

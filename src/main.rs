@@ -5,10 +5,11 @@ use anyhow::{Context, Result, anyhow, bail};
 
 fn main() -> Result<()> {
     match parse_mode(std::env::args_os().skip(1))? {
-        Mode::Project { path, profile } => match path {
-            Some(path) => stackhand::run_project_with_profile(&path, profile.as_deref()),
-            None => stackhand::run_discovered_project_with_profile(profile.as_deref()),
-        },
+        Mode::Project {
+            path,
+            profile,
+            no_autostart,
+        } => stackhand::run_project_session(path.as_deref(), profile.as_deref(), !no_autostart),
         Mode::ConfigValidate { path, profile } => {
             let sources = stackhand::validate_project_sources(path.as_deref(), profile.as_deref())
                 .map_err(|error| anyhow!("configuration error: {error}"))?;
@@ -40,10 +41,12 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Debug)]
 enum Mode {
     Project {
         path: Option<PathBuf>,
         profile: Option<String>,
+        no_autostart: bool,
     },
     ConfigValidate {
         path: Option<PathBuf>,
@@ -72,24 +75,25 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
         return Ok(Mode::Project {
             path: None,
             profile: None,
+            no_autostart: false,
         });
     };
 
     if first == "config" {
         let command = args.next().context("config requires a subcommand")?;
         if command == "validate" {
-            let (path, profile) = parse_path_and_profile(args.collect(), "config validate")?;
+            let (path, profile, _) = parse_path_and_profile(args.collect(), "config validate")?;
             return Ok(Mode::ConfigValidate { path, profile });
         }
         if command == "show" {
-            let (path, profile) = parse_path_and_profile(args.collect(), "config show")?;
+            let (path, profile, _) = parse_path_and_profile(args.collect(), "config show")?;
             return Ok(Mode::ConfigShow { path, profile });
         }
         bail!("unknown config command: {}", command.to_string_lossy());
     }
 
     if first == "--fixture-project" {
-        let (path, profile) = parse_path_and_profile(args.collect(), "--fixture-project")?;
+        let (path, profile, _) = parse_path_and_profile(args.collect(), "--fixture-project")?;
         return Ok(Mode::FixtureProject { path, profile });
     }
 
@@ -141,8 +145,12 @@ fn parse_mode(mut args: impl Iterator<Item = OsString>) -> Result<Mode> {
 
     let mut project_arguments = vec![first];
     project_arguments.extend(args);
-    let (path, profile) = parse_path_and_profile(project_arguments, "Project")?;
-    Ok(Mode::Project { path, profile })
+    let (path, profile, no_autostart) = parse_path_and_profile(project_arguments, "Project")?;
+    Ok(Mode::Project {
+        path,
+        profile,
+        no_autostart,
+    })
 }
 
 fn zero_argument_mode(
@@ -159,11 +167,16 @@ fn zero_argument_mode(
 fn parse_path_and_profile(
     arguments: Vec<OsString>,
     context: &str,
-) -> Result<(Option<PathBuf>, Option<String>)> {
+) -> Result<(Option<PathBuf>, Option<String>, bool)> {
     let mut path = None;
     let mut profile = None;
+    let mut no_autostart = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
+        if argument == "--no-autostart" && context == "Project" {
+            no_autostart = true;
+            continue;
+        }
         if argument == "--profile" {
             let value = arguments
                 .next()
@@ -186,7 +199,7 @@ fn parse_path_and_profile(
         }
         path = Some(PathBuf::from(argument));
     }
-    Ok((path, profile))
+    Ok((path, profile, no_autostart))
 }
 
 fn set_profile(selected: &mut Option<String>, profile: String) -> Result<()> {
@@ -214,4 +227,63 @@ fn profile_name(value: OsString) -> Result<String> {
         bail!("--profile requires a profile name");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_flag_composes_with_paths_and_both_profile_forms() {
+        for arguments in [
+            vec!["--no-autostart", "--profile", "local", "project.yaml"],
+            vec!["project.yaml", "--profile=local", "--no-autostart"],
+        ] {
+            let mode = parse_mode(arguments.into_iter().map(OsString::from)).unwrap();
+            assert!(
+                matches!(mode, Mode::Project { path: Some(path), profile: Some(profile), no_autostart: true }
+                if path == PathBuf::from("project.yaml") && profile == "local")
+            );
+        }
+        let mode = parse_mode([OsString::from("--no-autostart")].into_iter()).unwrap();
+        assert!(matches!(
+            mode,
+            Mode::Project {
+                path: None,
+                profile: None,
+                no_autostart: true
+            }
+        ));
+    }
+
+    #[test]
+    fn ordinary_launches_keep_autostart() {
+        for arguments in [vec![], vec!["project.yaml"], vec!["--profile", "local"]] {
+            let mode = parse_mode(arguments.into_iter().map(OsString::from)).unwrap();
+            assert!(matches!(
+                mode,
+                Mode::Project {
+                    no_autostart: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_flag_is_rejected_for_config_commands() {
+        for subcommand in ["show", "validate"] {
+            let error = parse_mode(
+                ["config", subcommand, "--no-autostart"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unknown argument: --no-autostart")
+            );
+        }
+    }
 }

@@ -172,6 +172,16 @@ Select a Project Profile for the first Run:
 stackhand --profile local path/to/stackhand.yaml
 ```
 
+Open the TUI with all Processes stopped:
+
+```sh
+stackhand --no-autostart
+stackhand --no-autostart --profile local path/to/stackhand.yaml
+```
+
+`--no-autostart` skips startup for this session only. Configured `autostart`
+values and manual start actions (including Dependencies) still work normally.
+
 When Stackhand discovers a Project, it also loads `stackhand.local.yaml` from
 the same directory if that file exists. An explicit Project path does not load
 the local override.

@@ -40,10 +40,7 @@ pub fn run_project(config_path: &Path) -> Result<()> {
 /// Load the explicit Project with one selected profile, then run it
 /// interactively.
 pub fn run_project_with_profile(config_path: &Path, profile: Option<&str>) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::explicit_with_profile(
-        config_path,
-        profile.map(str::to_owned),
-    ))
+    run_project_session(Some(config_path), profile, true)
 }
 
 /// Discover the nearest base Project, then run it interactively.
@@ -54,17 +51,30 @@ pub fn run_discovered_project() -> Result<()> {
 /// Discover the nearest base Project with one selected profile, then run it
 /// interactively.
 pub fn run_discovered_project_with_profile(profile: Option<&str>) -> Result<()> {
-    run_resolved(crate::config::ResolutionRequest::discover_with_profile(
-        profile.map(str::to_owned),
-    ))
+    run_project_session(None, profile, true)
 }
 
-fn run_resolved(request: crate::config::ResolutionRequest) -> Result<()> {
+/// Run an explicit or discovered Project, optionally leaving all Processes stopped
+/// on entry. This does not change configured autostart or later start actions.
+pub fn run_project_session(
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+    autostart: bool,
+) -> Result<()> {
+    let request = match config_path {
+        Some(path) => crate::config::ResolutionRequest::explicit_with_profile(
+            path,
+            profile.map(str::to_owned),
+        ),
+        None => crate::config::ResolutionRequest::discover_with_profile(profile.map(str::to_owned)),
+    };
     // Invalid configuration starts no Processes and never enters the TUI.
     let resolution =
         crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
-    supervisor.command(Command::StartAutostart);
+    if autostart {
+        supervisor.command(Command::StartAutostart);
+    }
 
     // The TUI remains active while shutdown progresses. This scope restores
     // the outer terminal before the already-observed result reaches the CLI.
