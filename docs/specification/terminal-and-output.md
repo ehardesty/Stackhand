@@ -392,6 +392,8 @@ The Logs view is a bounded line-oriented projection:
 - invalid UTF-8 replacement policy;
 - deterministic observation order.
 
+Terminal control sequences (including colors and hyperlink metadata) are removed before retention and search. Filtering spans reader chunks and stays isolated per stream and Run. CRLF and bare carriage returns become line breaks.
+
 It does not claim that each line corresponds to one terminal row. Carriage returns, cursor movement, alternate screens, and overwritten progress output may produce a different representation from Terminal view.
 
 ### 22.3 Search behavior

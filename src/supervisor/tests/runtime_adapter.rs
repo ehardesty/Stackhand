@@ -645,7 +645,7 @@ fn real_pipe_log_match_is_not_limited_by_retained_history() {
         "sh",
         &[
             "-c",
-            "dd if=/dev/zero bs=1048576 count=2 2>/dev/null; printf 'retained-history-log-marker'; sleep 30",
+            "dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\000' x; printf 'retained-history-log-marker'; sleep 30",
         ],
     );
     start.log_matchers = vec![LogMatcherIntent {

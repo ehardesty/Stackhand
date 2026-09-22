@@ -23,6 +23,7 @@ mod stress;
 pub mod supervisor;
 mod sync_fixture;
 mod terminal;
+mod terminal_control;
 mod tui;
 mod worker_handle;
 

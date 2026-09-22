@@ -2,8 +2,9 @@
 //!
 //! One deep module owns normalized Logs output for every Process. Callers append
 //! observed bytes and take immutable snapshots. The implementation hides lossy
-//! UTF-8 conversion, long-line splitting, per-Process limits, the hard Project
-//! limit, oldest-first eviction, timestamps, stream labels, and literal search.
+//! UTF-8 conversion, terminal-control filtering, long-line splitting, per-Process
+//! limits, the hard Project limit, oldest-first eviction, timestamps, stream
+//! labels, and literal search.
 //! Output bytes do not enter the Supervisor control queue.
 
 use std::collections::VecDeque;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime::{OutputStream, ProcessId};
+use crate::terminal_control::ControlParser;
 
 /// Maximum retained Logs bytes for one Process.
 pub const RETAINED_BYTES: usize = 1024 * 1024;
@@ -214,6 +216,7 @@ pub struct ProcessOutput {
 struct ProcessHistory {
     chunks: VecDeque<RetainedChunk>,
     pending: [Option<PendingLine>; 3],
+    parsers: [Option<(u64, ControlParser)>; 3],
     bytes: usize,
     dropped_chunks: u64,
     dropped_bytes: u64,
@@ -262,7 +265,19 @@ impl ProcessOutput {
         {
             project.flush_pending(self.process, stream_index, false);
         }
+        let parser = &mut project.processes[self.process].parsers[stream_index];
+        if parser.as_ref().is_none_or(|(id, _)| *id != run_id) {
+            *parser = Some((run_id, ControlParser::default()));
+        }
         for byte in data {
+            let Some(byte) = project.processes[self.process].parsers[stream_index]
+                .as_mut()
+                .expect("the stream parser exists")
+                .1
+                .consume(byte)
+            else {
+                continue;
+            };
             if project.processes[self.process].pending[stream_index].is_none() {
                 let sequence = project.next_sequence;
                 project.next_sequence = project.next_sequence.wrapping_add(1);
@@ -310,6 +325,7 @@ impl ProcessOutput {
         for stream_index in 0..3 {
             project.flush_pending(self.process, stream_index, false);
         }
+        project.processes[self.process].parsers = std::array::from_fn(|_| None);
         let sequence = project.next_sequence;
         project.next_sequence = project.next_sequence.wrapping_add(1);
         project.processes[self.process].latest_run = Some(run_id);
@@ -597,6 +613,7 @@ impl OutputViews {
                 .map(|_| ProcessHistory {
                     chunks: VecDeque::new(),
                     pending: std::array::from_fn(|_| None),
+                    parsers: std::array::from_fn(|_| None),
                     bytes: 0,
                     dropped_chunks: 0,
                     dropped_bytes: 0,
@@ -632,132 +649,4 @@ impl OutputViews {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn output() -> Arc<ProcessOutput> {
-        OutputViews::new(1).for_process(0).unwrap()
-    }
-
-    #[test]
-    fn logs_format_fixed_timestamps_streams_runs_and_invalid_utf8() {
-        let output = output();
-        output.mark_run_at(1, 3_723_004);
-        output.append_at(1, OutputStream::Stdout, 3_723_005, b"ok\n".to_vec());
-        output.append_at(1, OutputStream::Stderr, 3_723_006, vec![b'x', 0xff, b'\n']);
-        let text: Vec<_> = output
-            .snapshot()
-            .display_lines(10)
-            .into_iter()
-            .map(|line| line.text)
-            .collect();
-        assert_eq!(
-            text,
-            [
-                "01:02:03.004 ── Run 1 started ──",
-                "01:02:03.005 out: ok",
-                "01:02:03.006 err: x�",
-            ]
-        );
-    }
-
-    #[test]
-    fn long_lines_are_split_visibly_and_later_output_survives() {
-        let output = output();
-        let mut data = vec![b'a'; LOGICAL_LINE_BYTES + 1];
-        data.extend_from_slice(b"\nafter\n");
-        output.append_at(1, OutputStream::Combined, 0, data);
-        let lines = output.snapshot().display_lines(10);
-        assert!(lines[0].text.contains("[line continued at 16 KiB]"));
-        assert!(lines.last().unwrap().text.ends_with("pty: after"));
-    }
-
-    #[test]
-    fn normalization_spans_reader_chunks_without_breaking_utf8_or_line_bounds() {
-        let output = output();
-        let euro = "€".as_bytes();
-        output.append_at(1, OutputStream::Combined, 0, euro[..1].to_vec());
-        output.append_at(1, OutputStream::Combined, 1, euro[1..].to_vec());
-        for _ in 0..LOGICAL_LINE_BYTES {
-            output.append_at(1, OutputStream::Combined, 2, vec![b'x']);
-        }
-        output.append_at(1, OutputStream::Combined, 3, b"\nafter\n".to_vec());
-
-        let lines = output.snapshot().display_lines(10);
-        assert!(lines.iter().any(|line| line.text.contains('€')));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.text.contains("[line continued at 16 KiB]"))
-        );
-        assert!(lines.last().unwrap().text.ends_with("pty: after"));
-    }
-
-    #[test]
-    fn unchanged_logs_do_not_clone_another_snapshot() {
-        let output = output();
-        let first = output
-            .snapshot_if_changed(None)
-            .expect("the first snapshot is returned");
-
-        assert!(output.snapshot_if_changed(Some(first.generation)).is_none());
-
-        output.append_at(1, OutputStream::Stdout, 0, b"later\n".to_vec());
-        let changed = output
-            .snapshot_if_changed(Some(first.generation))
-            .expect("new output returns a new snapshot");
-        assert_ne!(changed.generation, first.generation);
-    }
-
-    #[test]
-    fn literal_search_is_case_sensitive_and_bounded_to_retained_text() {
-        let output = output();
-        output.append_at(
-            1,
-            OutputStream::Stdout,
-            0,
-            b"needle Needle needle\n".to_vec(),
-        );
-        let search = output.snapshot().search("needle");
-        assert_eq!(search.matches.len(), 2);
-        assert!(!search.limited);
-        assert!(output.snapshot().search("NEEDLE").matches.is_empty());
-    }
-
-    #[test]
-    fn per_process_bound_evicts_oldest_and_shows_the_history_marker() {
-        let output = output();
-        output.append_at(1, OutputStream::Stdout, 0, vec![b'a'; RETAINED_BYTES]);
-        output.append_at(1, OutputStream::Stdout, 1, b"new\n".to_vec());
-        let snapshot = output.snapshot();
-        assert!(snapshot.truncated);
-        assert!(
-            snapshot
-                .chunks
-                .iter()
-                .any(|chunk| matches!(chunk, RetainedChunk::Data { text, .. } if text == "new\n"))
-        );
-        assert!(
-            snapshot.display_lines(100)[0]
-                .text
-                .contains("history limit")
-        );
-    }
-
-    #[test]
-    fn project_bound_evicts_the_oldest_process_even_when_another_is_selected() {
-        let views = OutputViews::new(9);
-        for process in 0..9 {
-            views.for_process(process).unwrap().append_at(
-                1,
-                OutputStream::Stdout,
-                process as u64,
-                vec![b'a' + process as u8; RETAINED_BYTES],
-            );
-        }
-        let oldest = views.for_process(0).unwrap().snapshot();
-        let newest = views.for_process(8).unwrap().snapshot();
-        assert!(oldest.truncated);
-        assert!(!newest.chunks.is_empty());
-    }
-}
+mod tests;
