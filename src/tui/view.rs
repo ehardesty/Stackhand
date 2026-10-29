@@ -84,6 +84,8 @@ pub struct ConsoleViewState {
     pub logs_selection: bool,
     pub logs_scrollbar: Option<ConsoleScrollbar>,
     pub terminal_available: bool,
+    /// The selected Process accepts child input in Terminal view.
+    pub input_enabled: bool,
     pub profile_menu_open: bool,
     pub profiles_available: bool,
     pub profile_changes_pending: bool,
@@ -103,6 +105,7 @@ impl Default for ConsoleViewState {
             logs_selection: false,
             logs_scrollbar: None,
             terminal_available: false,
+            input_enabled: false,
             profile_menu_open: false,
             profiles_available: false,
             profile_changes_pending: false,
@@ -849,7 +852,13 @@ mod tests {
             buffer[(console.x, console.y)].fg,
             ratatui::style::Color::Gray
         );
-        assert_eq!(buffer[(footer.x, footer.y)].fg, ratatui::style::Color::Gray);
+        // The mode badge uses the focus role; footer chrome after it stays gray.
+        let badge_width = " PROCESSES ".len() as u16;
+        assert_eq!(buffer[(footer.x, footer.y)].fg, ratatui::style::Color::Cyan);
+        assert_eq!(
+            buffer[(footer.x + badge_width, footer.y)].fg,
+            ratatui::style::Color::Gray
+        );
     }
 
     #[test]
@@ -1425,6 +1434,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
+                input_enabled: false,
                 profile_menu_open: false,
                 profiles_available: false,
                 profile_changes_pending: false,
@@ -1433,8 +1443,8 @@ mod tests {
             false,
         );
 
-        assert!(text.contains("FOCUS: PROCESSES"), "{text}");
-        assert!(text.contains("PAUSED"), "{text}");
+        assert!(text.starts_with("PROCESSES"), "{text}");
+        assert!(text.ends_with("PAUSED"), "{text}");
         assert!(text.contains("j/k: select"), "{text}");
     }
 
@@ -1449,9 +1459,9 @@ mod tests {
             false,
         );
 
-        assert!(text.contains("SEARCH"), "{text}");
-        assert!(text.contains("Enter: Search"), "{text}");
-        assert!(text.contains("Esc: Cancel"), "{text}");
+        assert!(text.starts_with("FIND"), "{text}");
+        assert!(text.contains("Enter: search"), "{text}");
+        assert!(text.contains("Esc: cancel"), "{text}");
         assert!(!text.contains("WARNING"), "{text}");
     }
 
@@ -1466,7 +1476,7 @@ mod tests {
             false,
         );
 
-        assert!(!text.contains("F3: next"), "{text}");
+        assert!(!text.contains("n: next"), "{text}");
 
         let active = footer_text(
             ConsoleViewState {
@@ -1477,11 +1487,8 @@ mod tests {
             },
             false,
         );
-        assert!(active.contains("Enter/F3: next"), "{active}");
-        assert!(
-            active.contains("Shift+Enter/Shift+F3: previous"),
-            "{active}"
-        );
+        assert!(active.contains("n: next"), "{active}");
+        assert!(active.contains("N: previous"), "{active}");
     }
 
     #[test]
@@ -1494,7 +1501,7 @@ mod tests {
             },
             false,
         );
-        assert!(!logs.contains("l: terminal"), "{logs}");
+        assert!(!logs.contains("l: Terminal"), "{logs}");
 
         let pty_logs = footer_text(
             ConsoleViewState {
@@ -1505,7 +1512,7 @@ mod tests {
             },
             false,
         );
-        assert!(pty_logs.contains("l: terminal"), "{pty_logs}");
+        assert!(pty_logs.contains("l: Terminal"), "{pty_logs}");
     }
 
     #[test]
@@ -1520,7 +1527,7 @@ mod tests {
             false,
         );
 
-        assert!(text.contains("MODE: SELECT LOGS"), "{text}");
+        assert!(text.starts_with("SELECT"), "{text}");
         assert!(text.contains("c/y: copy"), "{text}");
         assert!(text.contains("Esc: clear"), "{text}");
     }
@@ -1539,6 +1546,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
+                input_enabled: false,
                 profile_menu_open: false,
                 profiles_available: false,
                 profile_changes_pending: false,
@@ -1565,6 +1573,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
+                input_enabled: false,
                 profile_menu_open: false,
                 profiles_available: false,
                 profile_changes_pending: false,
@@ -1589,6 +1598,7 @@ mod tests {
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
+                input_enabled: false,
                 profile_menu_open: false,
                 profiles_available: false,
                 profile_changes_pending: false,
@@ -1599,7 +1609,8 @@ mod tests {
 
         assert!(text.contains("clipboard write failed"));
         assert!(text.contains("selection remains available"));
-        assert!(text.contains("MOUSE: STACKHAND"));
+        assert!(text.starts_with("COPY"), "{text}");
+        assert!(!text.contains("MOUSE:"), "{text}");
     }
 
     #[test]
@@ -1626,7 +1637,10 @@ mod tests {
             true,
         );
 
-        assert!(text.starts_with("MOUSE: STACKHAND · selecting"));
+        assert!(
+            text.starts_with("PROCESSES MOUSE: STACKHAND · selecting"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1638,15 +1652,30 @@ mod tests {
             },
             false,
         );
+        assert!(console_footer.starts_with("TERMINAL"), "{console_footer}");
         assert!(
-            console_footer.contains("FOCUS: CONSOLE"),
+            console_footer.contains("Ctrl-A: Processes"),
             "{console_footer}"
         );
         assert!(
-            console_footer.contains("Ctrl-A, then v: copy"),
+            console_footer.contains("Ctrl-A l: Logs"),
             "{console_footer}"
         );
-        assert!(console_footer.contains("LIVE"), "{console_footer}");
+        assert!(
+            console_footer.contains("Ctrl-A v: copy"),
+            "{console_footer}"
+        );
+        assert!(console_footer.ends_with("LIVE"), "{console_footer}");
+
+        let input_footer = footer_text(
+            ConsoleViewState {
+                mode: ConsoleViewMode::Console,
+                input_enabled: true,
+                ..ConsoleViewState::default()
+            },
+            false,
+        );
+        assert!(input_footer.starts_with("INPUT"), "{input_footer}");
 
         let list_footer = footer_text(
             ConsoleViewState {
@@ -1655,7 +1684,8 @@ mod tests {
             },
             false,
         );
-        assert!(list_footer.contains("FOCUS: PROCESSES"), "{list_footer}");
+        assert!(list_footer.starts_with("PROCESSES"), "{list_footer}");
+        assert!(list_footer.contains("Tab: console"), "{list_footer}");
 
         let pipe_footer = footer_text(
             ConsoleViewState {
@@ -1665,7 +1695,11 @@ mod tests {
             },
             false,
         );
-        assert!(pipe_footer.contains("↑↓/j/k: scroll"), "{pipe_footer}");
+        assert!(pipe_footer.starts_with("LOGS"), "{pipe_footer}");
+        assert!(
+            pipe_footer.contains("j/k PgUp/PgDn: scroll"),
+            "{pipe_footer}"
+        );
         assert!(pipe_footer.contains("Esc: Processes"), "{pipe_footer}");
     }
 

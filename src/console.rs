@@ -255,6 +255,16 @@ impl ConsoleInteraction {
         match pane {
             ConsolePaneKind::Terminal => {
                 let session = session.expect("a terminal pane owns a live session");
+                // A read-only Terminal console has no child to own Tab, so
+                // Tab returns to the Process list as it does from Logs.
+                if !input_focused
+                    && self.view.mode == ConsoleViewMode::Console
+                    && key.kind == KeyEventKind::Press
+                    && is_console_focus_key(key)
+                {
+                    self.focus_process_list(Some(session));
+                    return true;
+                }
                 if child_input_rejected(self.view(), input_focused, &key) {
                     self.warn(ConsoleWarning::InputDisabled);
                     return true;
@@ -296,6 +306,10 @@ impl ConsoleInteraction {
 
         match self.view.mode {
             ConsoleViewMode::Console => self.record_input_result(session.send_key(key)),
+            ConsoleViewMode::ProcessList if is_console_focus_key(key) => {
+                self.focus_console(Some(session));
+                true
+            }
             ConsoleViewMode::ProcessList => {
                 let Some(command) = process_command(key.code) else {
                     return false;
@@ -315,11 +329,11 @@ impl ConsoleInteraction {
         if key.kind != KeyEventKind::Press {
             return false;
         }
-        if is_focus_toggle(key) {
-            self.view.mode = match self.view.mode {
-                ConsoleViewMode::ProcessList => ConsoleViewMode::Console,
-                ConsoleViewMode::Console | ConsoleViewMode::Copy => ConsoleViewMode::ProcessList,
-            };
+        if is_focus_toggle(key) || is_console_focus_key(key) {
+            match self.view.mode {
+                ConsoleViewMode::ProcessList => self.focus_console(None),
+                ConsoleViewMode::Console | ConsoleViewMode::Copy => self.focus_process_list(None),
+            }
             return true;
         }
         match self.view.mode {
@@ -694,6 +708,13 @@ impl ConsoleInteraction {
 
 pub(crate) fn is_focus_toggle(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Tab moves focus between the Process list and a read-only console. It
+/// never leaves an input-enabled Terminal console because the child owns Tab
+/// there.
+fn is_console_focus_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Tab && key.modifiers.is_empty()
 }
 
 fn child_input_rejected(view: ConsoleViewState, input_focused: bool, key: &KeyEvent) -> bool {

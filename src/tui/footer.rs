@@ -13,7 +13,7 @@ use ratatui_interact::{
 
 use crate::log_view::SearchDialogView;
 
-use super::theme::TERMINAL_THEME;
+use super::theme::{ModeTone, TERMINAL_THEME};
 use super::view::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning};
 
 /// One action named in the visible footer or Search Logs dialog.
@@ -26,6 +26,7 @@ pub(crate) enum VisibleAction {
     Copy,
     EnterCopy,
     ExitCopy,
+    FocusConsole,
     FocusProcesses,
     Follow,
     LifecycleStart,
@@ -58,6 +59,7 @@ struct ActionRegion {
     action: VisibleAction,
 }
 
+#[derive(Clone)]
 struct Segment {
     text: String,
     action: Option<VisibleAction>,
@@ -195,7 +197,7 @@ impl VisibleActions {
         self.modal_area = None;
         let line = self.action_line(
             area,
-            footer_segments(view, child_mouse_tracking),
+            footer_segments(view, child_mouse_tracking, area.width),
             TERMINAL_THEME.footer(view.warning.is_some()),
         );
         frame.render_widget(Paragraph::new(line), area);
@@ -313,233 +315,396 @@ impl VisibleActions {
     }
 }
 
+/// One footer hint. Lower priorities survive longer when the footer is
+/// narrower than its content, so essential exits stay visible on small
+/// terminals.
+struct Hint {
+    segment: Segment,
+    priority: Priority,
+}
+
+/// How long a hint survives as the footer narrows. Essential hints are
+/// clipped rather than hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Priority {
+    Essential,
+    Useful,
+    Extra,
+}
+
+use Priority::{Essential, Extra, Useful};
+
+impl Hint {
+    fn action(text: impl Into<String>, action: VisibleAction, priority: Priority) -> Self {
+        Self {
+            segment: Segment::action(text, action),
+            priority,
+        }
+    }
+
+    fn text(text: impl Into<String>, priority: Priority) -> Self {
+        Self {
+            segment: Segment::text(text),
+            priority,
+        }
+    }
+}
+
+/// The footer's projection of keyboard ownership: one mode badge, ranked
+/// hints, and an optional right-aligned follow state.
+struct FooterContent {
+    badge: &'static str,
+    tone: ModeTone,
+    hints: Vec<Hint>,
+    trailing: Option<&'static str>,
+}
+
+const SEPARATOR: &str = " · ";
+const TRAILING_GAP: usize = 2;
+
+impl FooterContent {
+    /// Drop the least important hints until the content fits. Equal
+    /// priorities drop from the end, so the visible order never changes.
+    /// The follow state goes last; essential hints are clipped, not hidden.
+    fn fit(mut self, width: u16) -> Self {
+        while self.width() > usize::from(width) {
+            let Some(drop) = self
+                .hints
+                .iter()
+                .enumerate()
+                .filter(|(_, hint)| hint.priority > Essential)
+                .max_by_key(|(index, hint)| (hint.priority, *index))
+                .map(|(index, _)| index)
+            else {
+                self.trailing = None;
+                break;
+            };
+            self.hints.remove(drop);
+        }
+        self
+    }
+
+    fn width(&self) -> usize {
+        segments_width(&self.leading_segments())
+            + self
+                .trailing
+                .map_or(0, |trailing| TRAILING_GAP + text_width(trailing))
+    }
+
+    /// The badge and hints, in rendered order.
+    fn leading_segments(&self) -> Vec<Segment> {
+        let mut segments = vec![
+            Segment::styled(format!(" {} ", self.badge), TERMINAL_THEME.badge(self.tone)),
+            Segment::text(" "),
+        ];
+        for (index, hint) in self.hints.iter().enumerate() {
+            if index > 0 {
+                segments.push(Segment::text(SEPARATOR));
+            }
+            segments.push(hint.segment.clone());
+        }
+        segments
+    }
+
+    fn into_segments(self, width: u16) -> Vec<Segment> {
+        let mut segments = self.leading_segments();
+        if let Some(trailing) = self.trailing {
+            let gap = usize::from(width)
+                .saturating_sub(segments_width(&segments) + text_width(trailing))
+                .max(TRAILING_GAP);
+            segments.push(Segment::text(" ".repeat(gap)));
+            segments.push(Segment::text(trailing));
+        }
+        segments
+    }
+}
+
+fn segments_width(segments: &[Segment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| text_width(&segment.text))
+        .sum()
+}
+
+fn text_width(text: &str) -> usize {
+    Line::from(text.to_owned()).width()
+}
+
 #[cfg(test)]
 pub(super) fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
-    footer_segments(view, child_mouse_tracking)
+    footer_content(view, child_mouse_tracking)
+        .into_segments(0)
         .into_iter()
         .map(|segment| segment.text)
-        .collect()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn footer_segments(view: ConsoleViewState, child_mouse_tracking: bool) -> Vec<Segment> {
-    if view.search_editing {
-        return vec![
-            Segment::text("SEARCH · "),
-            Segment::action("Enter: Search", VisibleAction::SearchSubmit),
-            Segment::text(" · "),
-            Segment::action("Esc: Cancel", VisibleAction::SearchCancel),
-        ];
-    }
+fn footer_segments(view: ConsoleViewState, child_mouse_tracking: bool, width: u16) -> Vec<Segment> {
+    footer_content(view, child_mouse_tracking)
+        .fit(width)
+        .into_segments(width)
+}
 
-    let focus = match view.mode {
-        ConsoleViewMode::ProcessList => "FOCUS: PROCESSES",
-        ConsoleViewMode::Console => "FOCUS: CONSOLE",
-        ConsoleViewMode::Copy => "MODE: COPY",
+fn footer_content(view: ConsoleViewState, child_mouse_tracking: bool) -> FooterContent {
+    let (badge, tone) = mode_badge(view);
+    let mut content = FooterContent {
+        badge,
+        tone,
+        hints: Vec::new(),
+        trailing: None,
     };
-    let mut segments = vec![
-        Segment::text(mouse_owner_text(view, child_mouse_tracking)),
-        Segment::text(" · "),
-        Segment::text(focus),
-        Segment::text(" · "),
-    ];
+    if view.search_editing {
+        content.hints = vec![
+            Hint::action("Enter: search", VisibleAction::SearchSubmit, Essential),
+            Hint::action("Esc: cancel", VisibleAction::SearchCancel, Essential),
+        ];
+        return content;
+    }
+    if let Some(owner) = mouse_owner_text(view, child_mouse_tracking) {
+        content.hints.push(Hint::text(owner, Essential));
+    }
     if let Some(warning) = view.warning {
-        append_warning(&mut segments, warning);
-        return segments;
+        append_warning(&mut content.hints, warning);
+        return content;
     }
     if view.logs_selection {
-        return vec![
-            Segment::text("MODE: SELECT LOGS · drag: adjust · "),
-            Segment::action("c/y: copy", VisibleAction::Copy),
-            Segment::text(" · "),
-            Segment::action("Esc: clear", VisibleAction::ClearSelection),
-        ];
+        content.hints.extend([
+            Hint::text("drag: adjust", Extra),
+            Hint::action("c/y: copy", VisibleAction::Copy, Essential),
+            Hint::action("Esc: clear", VisibleAction::ClearSelection, Essential),
+        ]);
+        return content;
     }
-    if view.search_active {
-        return vec![
-            Segment::text("SEARCH · "),
-            Segment::action("Ctrl-F or /: edit", VisibleAction::SearchEdit),
-            Segment::text(" · "),
-            Segment::action("Enter/F3: next", VisibleAction::SearchNext),
-            Segment::text(" · "),
-            Segment::action(
-                "Shift+Enter/Shift+F3: previous",
-                VisibleAction::SearchPrevious,
-            ),
-        ];
-    }
-
+    let hints = &mut content.hints;
     match view.mode {
-        ConsoleViewMode::ProcessList => append_process_list_controls(&mut segments, view),
+        ConsoleViewMode::ProcessList => append_process_list_controls(hints, view),
         ConsoleViewMode::Console if view.pane == ConsolePaneKind::Terminal => {
-            segments.push(Segment::text("keys: child · "));
-            segments.push(Segment::action(
-                "Ctrl-A, then v: copy",
+            hints.push(Hint::action(
+                "Ctrl-A: Processes",
+                VisibleAction::FocusProcesses,
+                Essential,
+            ));
+            hints.push(Hint::action(
+                "Ctrl-A l: Logs",
+                VisibleAction::ToggleView,
+                Essential,
+            ));
+            hints.push(Hint::action(
+                "Ctrl-A v: copy",
                 VisibleAction::EnterCopy,
+                Useful,
             ));
-            segments.push(Segment::text(" · "));
-            segments.push(Segment::action("Ctrl-Q: quit", VisibleAction::Quit));
+            hints.push(Hint::action("Ctrl-Q: quit", VisibleAction::Quit, Extra));
         }
-        ConsoleViewMode::Console => append_logs_controls(&mut segments, view),
+        ConsoleViewMode::Console => append_logs_controls(hints, view),
         ConsoleViewMode::Copy => {
-            segments.push(Segment::text("h/j/k/l or arrows: move · "));
-            segments.push(Segment::action(
-                "v: select/unselect",
+            hints.push(Hint::text("h/j/k/l: move", Extra));
+            hints.push(Hint::action(
+                "v: select",
                 VisibleAction::ToggleSelection,
+                Useful,
             ));
-            segments.push(Segment::text(" · "));
-            segments.push(Segment::action("c/y: copy", VisibleAction::Copy));
-            segments.push(Segment::text(" · "));
-            segments.push(Segment::action("a: all", VisibleAction::SelectAll));
-            segments.push(Segment::text(" · "));
-            segments.push(Segment::action("q/Esc: exit", VisibleAction::ExitCopy));
+            hints.push(Hint::action("c/y: copy", VisibleAction::Copy, Essential));
+            hints.push(Hint::action("a: all", VisibleAction::SelectAll, Extra));
+            hints.push(Hint::action(
+                "Esc: exit",
+                VisibleAction::ExitCopy,
+                Essential,
+            ));
         }
     }
-    segments.push(Segment::text(if view.following {
-        " · LIVE"
-    } else {
-        " · PAUSED"
-    }));
-    segments
+    content.trailing = Some(if view.following { "LIVE" } else { "PAUSED" });
+    content
 }
 
-fn append_warning(segments: &mut Vec<Segment>, warning: ConsoleWarning) {
-    match warning {
-        ConsoleWarning::PasteRejected => segments.push(Segment::text(
+/// Name the keyboard owner. The badge answers the question the footer must
+/// always answer: where will the next key go?
+fn mode_badge(view: ConsoleViewState) -> (&'static str, ModeTone) {
+    if view.search_editing {
+        return ("FIND", ModeTone::Modal);
+    }
+    if view.logs_selection {
+        return ("SELECT", ModeTone::Modal);
+    }
+    match view.mode {
+        ConsoleViewMode::ProcessList => ("PROCESSES", ModeTone::Focus),
+        ConsoleViewMode::Console if view.pane == ConsolePaneKind::Pipe => ("LOGS", ModeTone::Focus),
+        ConsoleViewMode::Console if view.input_enabled => ("INPUT", ModeTone::Input),
+        ConsoleViewMode::Console => ("TERMINAL", ModeTone::Focus),
+        ConsoleViewMode::Copy => ("COPY", ModeTone::Modal),
+    }
+}
+
+fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
+    let (message, follow_ups): (&str, &[(&str, VisibleAction)]) = match warning {
+        ConsoleWarning::PasteRejected => (
             "WARNING: paste rejected; focus an input-enabled console first",
-        )),
-        ConsoleWarning::InputRejected => segments.push(Segment::text(
+            &[],
+        ),
+        ConsoleWarning::InputRejected => (
             "WARNING: terminal input was rejected; Run is stopping or its queue is full",
-        )),
-        ConsoleWarning::InputBackpressure => segments.push(Segment::text(
+            &[],
+        ),
+        ConsoleWarning::InputBackpressure => (
             "WARNING: child input queue is saturated; delivery is bounded",
-        )),
-        ConsoleWarning::OutputTruncated => segments.push(Segment::text(
+            &[],
+        ),
+        ConsoleWarning::OutputTruncated => (
             "Earlier Logs expired at the history limit; recent output continues",
-        )),
-        ConsoleWarning::PasteDeliveryFailed => segments.push(Segment::text(
-            "WARNING: an admitted paste did not reach the child",
-        )),
-        ConsoleWarning::ClipboardFailed => segments.push(Segment::text(
+            &[],
+        ),
+        ConsoleWarning::PasteDeliveryFailed => {
+            ("WARNING: an admitted paste did not reach the child", &[])
+        }
+        ConsoleWarning::ClipboardFailed => (
             "WARNING: clipboard write failed; selection remains available",
-        )),
-        ConsoleWarning::NothingSelected => {
-            segments.push(Segment::text("WARNING: no terminal text is selected · "));
-            segments.push(Segment::action(
-                "v: start selection",
-                VisibleAction::ToggleSelection,
-            ));
-        }
-        ConsoleWarning::NoLogsToCopy => {
-            segments.push(Segment::text("WARNING: no Logs text is available to copy"))
-        }
-        ConsoleWarning::InputDisabled => {
-            segments.push(Segment::text(
-                "WARNING: input is not enabled for this Process · ",
-            ));
-            segments.push(Segment::action(
-                "Ctrl-A: Process list",
-                VisibleAction::FocusProcesses,
-            ));
-        }
-        ConsoleWarning::LogsCommandOnly => {
-            segments.push(Segment::text(
-                "WARNING: Logs accepts commands, not Process input · ",
-            ));
-            segments.push(Segment::action(
-                "Ctrl-F or /: search",
-                VisibleAction::SearchEdit,
-            ));
-            segments.push(Segment::text(" · "));
-            segments.push(Segment::action(
-                "Esc: Processes",
-                VisibleAction::FocusProcesses,
-            ));
-        }
-        ConsoleWarning::SelectionUnavailable => segments.push(Segment::text(
+            &[],
+        ),
+        ConsoleWarning::NothingSelected => (
+            "WARNING: no terminal text is selected",
+            &[("v: start selection", VisibleAction::ToggleSelection)],
+        ),
+        ConsoleWarning::NoLogsToCopy => ("WARNING: no Logs text is available to copy", &[]),
+        ConsoleWarning::InputDisabled => (
+            "WARNING: input is not enabled for this Process",
+            &[("Ctrl-A: Processes", VisibleAction::FocusProcesses)],
+        ),
+        ConsoleWarning::LogsCommandOnly => (
+            "WARNING: Logs accepts commands, not Process input",
+            &[
+                ("Ctrl-F /: find", VisibleAction::SearchEdit),
+                ("Esc: Processes", VisibleAction::FocusProcesses),
+            ],
+        ),
+        ConsoleWarning::SelectionUnavailable => (
             "WARNING: terminal selection is available only in Terminal view",
-        )),
-        ConsoleWarning::LinkOpenFailed => segments.push(Segment::text(
-            "WARNING: could not open the port in a browser",
-        )),
-    }
+            &[],
+        ),
+        ConsoleWarning::LinkOpenFailed => ("WARNING: could not open the port in a browser", &[]),
+    };
+    hints.push(Hint::text(message, Essential));
+    hints.extend(
+        follow_ups
+            .iter()
+            .map(|(label, action)| Hint::action(*label, *action, Essential)),
+    );
 }
 
-fn append_process_list_controls(segments: &mut Vec<Segment>, view: ConsoleViewState) {
+fn append_process_list_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
     if view.profile_menu_open {
-        segments.push(Segment::text("↑/↓: select · "));
-        segments.push(Segment::action(
+        hints.push(Hint::text("↑/↓: select", Useful));
+        hints.push(Hint::action(
             "Enter: choose",
             VisibleAction::ChooseProfile,
+            Essential,
         ));
-        segments.push(Segment::text(" · "));
-        segments.push(Segment::action(
+        hints.push(Hint::action(
             "Esc: close",
             VisibleAction::CloseProfileMenu,
+            Essential,
         ));
         return;
     }
-    segments.push(Segment::text("j/k: select · "));
-    if view.profiles_available {
-        segments.push(Segment::action("p: profiles", VisibleAction::OpenProfiles));
-        segments.push(Segment::text(" · "));
-    }
+    hints.push(Hint::text("j/k: select", Extra));
     if view.profile_changes_pending {
-        segments.push(Segment::action(
+        hints.push(Hint::action(
             "R: apply profile",
             VisibleAction::ApplyProfile,
+            Essential,
         ));
-        segments.push(Segment::text(" · "));
     }
-    segments.push(Segment::action(
-        "s/x/r: lifecycle",
-        VisibleAction::OpenLifecycleMenu,
-    ));
     if view.start_anyway_available {
-        segments.push(Segment::text(" · "));
-        segments.push(Segment::action(
+        hints.push(Hint::action(
             "S: start anyway",
             VisibleAction::StartAnyway,
+            Essential,
         ));
     }
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action("l: view", VisibleAction::ToggleView));
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action(
-        "Ctrl-F or /: search",
-        VisibleAction::SearchEdit,
+    hints.push(Hint::action(
+        "s/x/r: lifecycle",
+        VisibleAction::OpenLifecycleMenu,
+        Useful,
     ));
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action("q: quit", VisibleAction::Quit));
+    append_view_toggle(hints, view);
+    hints.push(Hint::action(
+        "Tab: console",
+        VisibleAction::FocusConsole,
+        Useful,
+    ));
+    append_find_controls(hints, view);
+    if view.profiles_available {
+        hints.push(Hint::action(
+            "p: profiles",
+            VisibleAction::OpenProfiles,
+            Extra,
+        ));
+    }
+    hints.push(Hint::action("q: quit", VisibleAction::Quit, Extra));
 }
 
-fn append_logs_controls(segments: &mut Vec<Segment>, view: ConsoleViewState) {
-    segments.push(Segment::text("↑↓/j/k: scroll · PgUp/PgDn: page · "));
-    segments.push(Segment::action(
-        "Ctrl-F or /: search",
-        VisibleAction::SearchEdit,
-    ));
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action("f: live", VisibleAction::Follow));
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action("c/y: copy", VisibleAction::Copy));
-    if view.terminal_available {
-        segments.push(Segment::text(" · "));
-        segments.push(Segment::action("l: terminal", VisibleAction::ToggleView));
-    }
-    segments.push(Segment::text(" · "));
-    segments.push(Segment::action(
+fn append_logs_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
+    hints.push(Hint::text("j/k PgUp/PgDn: scroll", Extra));
+    append_find_controls(hints, view);
+    append_view_toggle(hints, view);
+    hints.push(Hint::action(
         "Esc: Processes",
         VisibleAction::FocusProcesses,
+        Essential,
     ));
+    if !view.following {
+        hints.push(Hint::action("f: live", VisibleAction::Follow, Useful));
+    }
+    hints.push(Hint::action("c/y: copy", VisibleAction::Copy, Extra));
 }
 
-fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> &'static str {
+fn append_find_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
+    hints.push(Hint::action(
+        "Ctrl-F /: find",
+        VisibleAction::SearchEdit,
+        if view.search_active {
+            Useful
+        } else {
+            Essential
+        },
+    ));
+    if view.search_active {
+        hints.push(Hint::action(
+            "n: next",
+            VisibleAction::SearchNext,
+            Essential,
+        ));
+        hints.push(Hint::action(
+            "N: previous",
+            VisibleAction::SearchPrevious,
+            Useful,
+        ));
+    }
+}
+
+/// Name the view a toggle would show, not the toggle itself.
+fn append_view_toggle(hints: &mut Vec<Hint>, view: ConsoleViewState) {
+    if !view.terminal_available {
+        return;
+    }
+    let label = match view.pane {
+        ConsolePaneKind::Terminal => "l: Logs",
+        ConsolePaneKind::Pipe => "l: Terminal",
+    };
+    hints.push(Hint::action(label, VisibleAction::ToggleView, Essential));
+}
+
+/// Mouse ownership matters only when it differs from the default: the
+/// child owns the mouse, or a Stackhand gesture is in progress.
+fn mouse_owner_text(view: ConsoleViewState, child_mouse_tracking: bool) -> Option<&'static str> {
     if view.stackhand_mouse_gesture {
-        "MOUSE: STACKHAND · selecting"
+        Some("MOUSE: STACKHAND · selecting")
     } else if view.mode == ConsoleViewMode::Console && child_mouse_tracking {
-        "MOUSE: CHILD · Shift+drag: copy"
+        Some("MOUSE: CHILD · Shift+drag: copy")
     } else {
-        "MOUSE: STACKHAND"
+        None
     }
 }
 
@@ -573,7 +738,10 @@ mod tests {
                     frame,
                     Rect::new(0, 4, 100, 1),
                     frame.area(),
-                    ConsoleViewState::default(),
+                    ConsoleViewState {
+                        terminal_available: true,
+                        ..ConsoleViewState::default()
+                    },
                     false,
                 );
             })
@@ -581,12 +749,74 @@ mod tests {
         let line = (0..100)
             .map(|column| terminal.backend().buffer()[(column, 4)].symbol())
             .collect::<String>();
-        let start = line.find("l: view").unwrap() as u16;
+        let start = line[..line.find("l: Logs").unwrap()].chars().count() as u16;
 
         assert_eq!(
             actions.handle_mouse(&click(start, 4)),
             VisibleActionEvent::Selected(VisibleAction::ToggleView)
         );
+    }
+
+    fn fitted_text(view: ConsoleViewState, width: u16) -> String {
+        footer_segments(view, false, width)
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect()
+    }
+
+    #[test]
+    fn narrow_footers_drop_optional_hints_before_essential_exits() {
+        let view = ConsoleViewState {
+            terminal_available: true,
+            profile_changes_pending: true,
+            profiles_available: true,
+            ..ConsoleViewState::default()
+        };
+        let wide = fitted_text(view, 200);
+        assert!(wide.contains("q: quit"), "{wide}");
+        assert!(wide.contains("p: profiles"), "{wide}");
+
+        for width in [60, 80] {
+            let narrow = fitted_text(view, width);
+            assert!(
+                Line::from(narrow.clone()).width() <= usize::from(width),
+                "{narrow}"
+            );
+            assert!(narrow.starts_with(" PROCESSES "), "{narrow}");
+            for essential in ["R: apply profile", "l: Logs", "Ctrl-F /: find"] {
+                assert!(narrow.contains(essential), "{width}: {narrow}");
+            }
+            assert!(!narrow.contains("q: quit"), "{width}: {narrow}");
+        }
+        assert!(fitted_text(view, 80).ends_with("LIVE"));
+    }
+
+    #[test]
+    fn follow_state_yields_only_when_essential_hints_overflow() {
+        let view = ConsoleViewState {
+            mode: ConsoleViewMode::Console,
+            input_enabled: true,
+            terminal_available: true,
+            ..ConsoleViewState::default()
+        };
+        let essentials = " INPUT  Ctrl-A: Processes · Ctrl-A l: Logs";
+        let fits = Line::from(essentials).width() as u16 + 6;
+        assert!(fitted_text(view, fits).ends_with("LIVE"));
+        assert!(!fitted_text(view, fits - 1).contains("LIVE"));
+    }
+
+    #[test]
+    fn terminal_input_footer_always_names_the_exit_and_the_logs_view() {
+        let view = ConsoleViewState {
+            mode: ConsoleViewMode::Console,
+            input_enabled: true,
+            terminal_available: true,
+            ..ConsoleViewState::default()
+        };
+        let narrow = fitted_text(view, 50);
+        assert!(narrow.starts_with(" INPUT "), "{narrow}");
+        assert!(narrow.contains("Ctrl-A: Processes"), "{narrow}");
+        assert!(narrow.contains("Ctrl-A l: Logs"), "{narrow}");
     }
 
     #[test]
@@ -654,7 +884,9 @@ mod tests {
         let line = (0..100)
             .map(|column| terminal.backend().buffer()[(column, 11)].symbol())
             .collect::<String>();
-        let start = line.find("s/x/r: lifecycle").unwrap() as u16;
+        let start = line[..line.find("s/x/r: lifecycle").unwrap()]
+            .chars()
+            .count() as u16;
         assert_eq!(
             actions.handle_mouse(&click(start, 11)),
             VisibleActionEvent::Changed
@@ -681,7 +913,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            actions.handle_mouse(&click(start, restart_row)),
+            actions.handle_mouse(&click(start + 2, restart_row)),
             VisibleActionEvent::Selected(VisibleAction::LifecycleRestart)
         );
     }

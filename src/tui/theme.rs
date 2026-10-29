@@ -24,6 +24,16 @@ pub(crate) enum LifecycleTone {
     Error,
 }
 
+/// Color roles for the footer mode badge. Input stands apart because it is
+/// the one mode where ordinary keys reach the child. Modal covers transient
+/// modes that own keys until they are finished or cancelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ModeTone {
+    Focus,
+    Input,
+    Modal,
+}
+
 pub(super) const TERMINAL_THEME: Theme = Theme {
     focus: Color::Cyan,
     copy: Color::Yellow,
@@ -76,6 +86,17 @@ impl Theme {
             LifecycleTone::Error => self.error,
         };
         Style::default().fg(color)
+    }
+
+    pub(super) fn badge(&self, tone: ModeTone) -> Style {
+        let color = match tone {
+            ModeTone::Focus => self.focus,
+            ModeTone::Input => self.success,
+            ModeTone::Modal => self.copy,
+        };
+        Style::default()
+            .fg(color)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
     }
 
     pub(super) fn footer(&self, warning: bool) -> Style {

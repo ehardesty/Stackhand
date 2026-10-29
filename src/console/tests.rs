@@ -210,6 +210,46 @@ fn read_only_pane_has_immediate_list_commands_and_explicit_console_focus() {
 }
 
 #[test]
+fn tab_toggles_read_only_consoles_but_belongs_to_terminal_input() {
+    let tab = key(KeyCode::Tab);
+
+    let mut logs_focus = ConsoleInteraction::default();
+    let mut logs = ProcessLogs::default();
+    logs_focus.set_pane(ConsolePaneKind::Pipe);
+    assert!(logs_focus.handle_key_read_only(tab, &mut logs, 20));
+    assert_eq!(logs_focus.view().mode, ConsoleViewMode::Console);
+    assert!(logs_focus.handle_key_read_only(tab, &mut logs, 20));
+    assert_eq!(logs_focus.view().mode, ConsoleViewMode::ProcessList);
+
+    let (session, _peer) = session();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let handle = crate::runtime::handle_for_test(&session, &stopped);
+    for input_focused in [false, true] {
+        let mut terminal = ConsoleInteraction::default();
+        let route = |interaction: &mut ConsoleInteraction, logs: &mut ProcessLogs| {
+            interaction.route_pane_key(
+                ConsolePaneKind::Terminal,
+                input_focused,
+                tab,
+                Some(&handle),
+                logs,
+                20,
+            )
+        };
+        assert!(route(&mut terminal, &mut logs));
+        assert_eq!(terminal.view().mode, ConsoleViewMode::Console);
+        route(&mut terminal, &mut logs);
+        let expected = if input_focused {
+            ConsoleViewMode::Console
+        } else {
+            ConsoleViewMode::ProcessList
+        };
+        assert_eq!(terminal.view().mode, expected, "input={input_focused}");
+        assert_eq!(terminal.view().warning, None, "input={input_focused}");
+    }
+}
+
+#[test]
 fn focused_logs_support_navigation_and_a_direct_escape() {
     let mut interaction = ConsoleInteraction::default();
     interaction.set_pane(ConsolePaneKind::Pipe);

@@ -71,6 +71,7 @@ pub(crate) struct ProjectInteraction {
     profile_changes_pending: bool,
     start_anyway_available: bool,
     terminal_available: bool,
+    input_enabled: bool,
     ports_by_process: Vec<Option<PortListView>>,
     process_list: Vec<ProcessListRow>,
     profiles_visible: bool,
@@ -141,6 +142,7 @@ impl ProjectInteraction {
         self.start_anyway_available = process.lifecycle == Lifecycle::Waiting;
         self.terminal_available = process.terminal_mode == crate::model::TerminalMode::Pty
             && process.current_run.is_some();
+        self.input_enabled = process.input_focused;
         let mut commands = std::mem::take(&mut self.project_commands);
         commands.extend(
             self.console
@@ -252,6 +254,7 @@ impl ProjectInteraction {
         view.profile_changes_pending = self.profile_changes_pending;
         view.start_anyway_available = self.start_anyway_available;
         view.terminal_available = self.terminal_available;
+        view.input_enabled = self.input_enabled;
         let (lines, logs_status, search_dialog) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
@@ -450,8 +453,14 @@ impl ProjectInteraction {
         if action == VisibleAction::Quit {
             return InputResult::Quit;
         }
-        if action == VisibleAction::EnterCopy
-            && self.console.view().mode == crate::tui::ConsoleViewMode::Console
+        // Terminal input owns ordinary keys, so a visible action that names
+        // a Process-list key first leaves the child, as Ctrl-A does.
+        let leaves_terminal_input = match action {
+            VisibleAction::EnterCopy => true,
+            VisibleAction::ToggleView => matches!(pane, SelectedPane::Terminal(_)),
+            _ => false,
+        };
+        if leaves_terminal_input && self.console.view().mode == crate::tui::ConsoleViewMode::Console
         {
             let focus_list = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
             self.route_input(
@@ -476,6 +485,7 @@ impl ProjectInteraction {
             VisibleAction::EnterCopy | VisibleAction::ToggleSelection => {
                 KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)
             }
+            VisibleAction::FocusConsole => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             VisibleAction::FocusProcesses => {
                 KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
             }
