@@ -165,7 +165,7 @@ fn prove(
     assert!(
         logs.frame(&retained, usize::from(PAGE_ROWS))
             .status
-            .is_some_and(|status| status.contains("Match 1 of"))
+            .is_some_and(|status| status.contains("/tick- 1 of"))
     );
     assert_eq!(
         logs.handle_key(
@@ -186,8 +186,8 @@ fn prove(
     );
     assert!(
         logs.frame(&retained, usize::from(PAGE_ROWS))
-            .status
-            .is_some_and(|status| status.contains("Search: x_"))
+            .search_prompt
+            .is_some_and(|prompt| prompt.query == "x")
     );
     logs.handle_key(
         key(KeyCode::Esc),

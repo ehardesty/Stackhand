@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph},
+    widgets::Paragraph,
 };
 use ratatui_interact::{
     components::{Select, SelectAction, SelectState, handle_select_key, handle_select_mouse},
@@ -13,7 +13,7 @@ use ratatui_interact::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::log_view::SearchDialogView;
+use crate::log_view::SearchPrompt;
 
 use super::theme::{ModeTone, TERMINAL_THEME};
 use super::view::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning};
@@ -102,7 +102,6 @@ impl Segment {
 /// cannot drift from clipped or conditional footer content.
 pub(crate) struct VisibleActions {
     regions: Vec<ActionRegion>,
-    modal_area: Option<Rect>,
     lifecycle_state: SelectState,
     lifecycle_trigger: Rect,
     lifecycle_regions: Vec<ClickRegion<SelectAction>>,
@@ -112,7 +111,6 @@ impl Default for VisibleActions {
     fn default() -> Self {
         Self {
             regions: Vec::new(),
-            modal_area: None,
             lifecycle_state: SelectState::new(3),
             lifecycle_trigger: Rect::default(),
             lifecycle_regions: Vec::new(),
@@ -179,21 +177,13 @@ impl VisibleActions {
                 VisibleActionEvent::Selected(action)
             };
         }
-        if self
-            .modal_area
-            .is_some_and(|area| contains(area, mouse.column, mouse.row))
-        {
-            VisibleActionEvent::Changed
-        } else {
-            VisibleActionEvent::Ignored
-        }
+        VisibleActionEvent::Ignored
     }
 
     /// Forget the previous frame's regions. Call once before rendering any
     /// visible action.
     pub(crate) fn begin_frame(&mut self) {
         self.regions.clear();
-        self.modal_area = None;
     }
 
     /// Build the console's top-border title: Terminal and Logs tabs, then
@@ -235,6 +225,9 @@ impl VisibleActions {
         self.action_line(title_row, segments, TERMINAL_THEME.secondary_text())
     }
 
+    /// Render the footer. While a search is edited, the footer is the
+    /// search prompt and owns the terminal cursor, so no dialog covers the
+    /// output that the search highlights.
     pub(crate) fn render_footer(
         &mut self,
         frame: &mut Frame<'_>,
@@ -242,13 +235,22 @@ impl VisibleActions {
         screen: Rect,
         view: ConsoleViewState,
         child_mouse_tracking: bool,
+        prompt: Option<&SearchPrompt>,
     ) {
+        let (segments, cursor) = footer_layout(view, child_mouse_tracking, prompt, area.width);
         let line = self.action_line(
             area,
-            footer_segments(view, child_mouse_tracking, area.width),
+            segments,
             TERMINAL_THEME.footer(view.warning.is_some()),
         );
         frame.render_widget(Paragraph::new(line), area);
+        if let Some(x) = cursor
+            .and_then(|offset| u16::try_from(offset).ok())
+            .map(|offset| area.x.saturating_add(offset))
+            .filter(|x| *x < area.right())
+        {
+            frame.set_cursor_position((x, area.y));
+        }
 
         self.lifecycle_trigger = self
             .regions
@@ -272,54 +274,6 @@ impl VisibleActions {
         } else {
             Vec::new()
         };
-    }
-
-    pub(crate) fn render_search_dialog(
-        &mut self,
-        frame: &mut Frame<'_>,
-        dialog: &SearchDialogView,
-        area: Rect,
-    ) {
-        let width = area.width.saturating_sub(4).min(64);
-        let height = area.height.saturating_sub(2).min(7);
-        if width < 20 || height < 5 {
-            return;
-        }
-        let dialog_area = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        self.modal_area = Some(dialog_area);
-        frame.render_widget(Clear, dialog_area);
-        let block = Block::bordered()
-            .border_style(TERMINAL_THEME.focus_border())
-            .title(" Search Logs ");
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled("Search terms", TERMINAL_THEME.secondary_text()),
-                Line::from(format!("{}_", dialog.query)),
-            ]),
-            inner,
-        );
-        if inner.height > 3 {
-            let action_area = Rect::new(inner.x, inner.y + 3, inner.width, 1);
-            let line = self.action_line(
-                action_area,
-                vec![
-                    Segment::styled(&dialog.result, TERMINAL_THEME.secondary_text()),
-                    Segment::text("  ·  "),
-                    Segment::action("Enter: Search", VisibleAction::SearchSubmit),
-                    Segment::text("  ·  "),
-                    Segment::action("Esc: Cancel", VisibleAction::SearchCancel),
-                ],
-                Style::default(),
-            );
-            frame.render_widget(Paragraph::new(line), action_area);
-        }
     }
 
     fn action_line(
@@ -383,6 +337,13 @@ enum Priority {
 use Priority::{Essential, Extra, Useful};
 
 impl Hint {
+    fn styled(text: impl Into<String>, style: Style, priority: Priority) -> Self {
+        Self {
+            segment: Segment::styled(text, style),
+            priority,
+        }
+    }
+
     fn action(text: impl Into<String>, action: VisibleAction, priority: Priority) -> Self {
         Self {
             segment: Segment::action(text, action),
@@ -405,6 +366,8 @@ struct FooterContent {
     tone: ModeTone,
     hints: Vec<Hint>,
     trailing: Option<&'static str>,
+    /// The first hint is an edited search query that owns the cursor.
+    prompt: bool,
 }
 
 const SEPARATOR: &str = " · ";
@@ -430,6 +393,13 @@ impl FooterContent {
             self.hints.remove(drop);
         }
         self
+    }
+
+    /// The cursor column after the edited query, relative to the footer:
+    /// the width of the badge, its gap, and the query hint.
+    fn prompt_cursor(&self) -> Option<usize> {
+        self.prompt
+            .then(|| segments_width(&self.leading_segments()[..3]))
     }
 
     fn width(&self) -> usize {
@@ -478,6 +448,24 @@ fn text_width(text: &str) -> usize {
     Line::from(text.to_owned()).width()
 }
 
+/// Shorten `text` to `width` display cells, starting with `…` when cut.
+fn fit_text_end(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for character in text.chars().rev() {
+        let cells = character.width().unwrap_or(0);
+        if used + cells > width {
+            break;
+        }
+        kept.push(character);
+        used += cells;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
 /// Shorten `text` to `width` display cells, ending with `…` when cut.
 pub(super) fn fit_text(text: &str, width: usize) -> String {
     if text_width(text) <= width {
@@ -499,8 +487,8 @@ pub(super) fn fit_text(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 pub(super) fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) -> String {
-    footer_content(view, child_mouse_tracking)
-        .into_segments(0)
+    footer_layout(view, child_mouse_tracking, None, 400)
+        .0
         .into_iter()
         .map(|segment| segment.text)
         .collect::<String>()
@@ -509,24 +497,46 @@ pub(super) fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) ->
         .join(" ")
 }
 
-fn footer_segments(view: ConsoleViewState, child_mouse_tracking: bool, width: u16) -> Vec<Segment> {
-    footer_content(view, child_mouse_tracking)
-        .fit(width)
-        .into_segments(width)
+/// The fitted footer segments and, while a search is edited, the cursor
+/// column relative to the footer.
+fn footer_layout(
+    view: ConsoleViewState,
+    child_mouse_tracking: bool,
+    prompt: Option<&SearchPrompt>,
+    width: u16,
+) -> (Vec<Segment>, Option<usize>) {
+    let content = footer_content(view, child_mouse_tracking, prompt, width).fit(width);
+    let cursor = content.prompt_cursor();
+    (content.into_segments(width), cursor)
 }
 
-fn footer_content(view: ConsoleViewState, child_mouse_tracking: bool) -> FooterContent {
-    let (badge, tone) = mode_badge(view);
+const PROMPT_EXIT: &str = "Esc: cancel";
+
+fn footer_content(
+    view: ConsoleViewState,
+    child_mouse_tracking: bool,
+    prompt: Option<&SearchPrompt>,
+    width: u16,
+) -> FooterContent {
+    let (badge, tone) = mode_badge(view, prompt.is_some());
     let mut content = FooterContent {
         badge,
         tone,
         hints: Vec::new(),
         trailing: None,
+        prompt: prompt.is_some(),
     };
-    if view.search_editing {
+    if let Some(prompt) = prompt {
+        // A long query shows its end so the cursor and the exit stay visible.
+        let room = usize::from(width).saturating_sub(
+            text_width(badge) + 3 + text_width(SEPARATOR) + text_width(PROMPT_EXIT) + 1,
+        );
+        let query = fit_text_end(&format!("/{}", prompt.query), room);
         content.hints = vec![
-            Hint::action("Enter: search", VisibleAction::SearchSubmit, Essential),
-            Hint::action("Esc: cancel", VisibleAction::SearchCancel, Essential),
+            Hint::styled(query, TERMINAL_THEME.prompt(), Essential),
+            Hint::text(prompt.result.clone(), Useful),
+            Hint::action("Enter: done", VisibleAction::SearchSubmit, Useful),
+            Hint::action(PROMPT_EXIT, VisibleAction::SearchCancel, Essential),
         ];
         return content;
     }
@@ -589,9 +599,9 @@ fn footer_content(view: ConsoleViewState, child_mouse_tracking: bool) -> FooterC
 
 /// Name the keyboard owner. The badge answers the question the footer must
 /// always answer: where will the next key go?
-fn mode_badge(view: ConsoleViewState) -> (&'static str, ModeTone) {
-    if view.search_editing {
-        return ("FIND", ModeTone::Modal);
+fn mode_badge(view: ConsoleViewState, search_editing: bool) -> (&'static str, ModeTone) {
+    if search_editing {
+        return ("SEARCH", ModeTone::Modal);
     }
     if view.logs_selection {
         return ("SELECT", ModeTone::Modal);
@@ -642,7 +652,7 @@ fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
         ConsoleWarning::LogsCommandOnly => (
             "WARNING: Logs accepts commands, not Process input",
             &[
-                ("Ctrl-F /: find", VisibleAction::SearchEdit),
+                ("Ctrl-F /: search", VisibleAction::SearchEdit),
                 ("Esc: Processes", VisibleAction::FocusProcesses),
             ],
         ),
@@ -701,7 +711,7 @@ fn append_process_list_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
         VisibleAction::FocusConsole,
         Useful,
     ));
-    append_find_controls(hints, view);
+    append_search_controls(hints, view);
     if view.profiles_available {
         hints.push(Hint::action(
             "p: profiles",
@@ -714,7 +724,7 @@ fn append_process_list_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
 
 fn append_logs_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
     hints.push(Hint::text("j/k PgUp/PgDn: scroll", Extra));
-    append_find_controls(hints, view);
+    append_search_controls(hints, view);
     append_view_toggle(hints, view);
     hints.push(Hint::action(
         "Esc: Processes",
@@ -727,24 +737,24 @@ fn append_logs_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
     hints.push(Hint::action("c/y: copy", VisibleAction::Copy, Extra));
 }
 
-fn append_find_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
+fn append_search_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
     hints.push(Hint::action(
-        "Ctrl-F /: find",
+        "Ctrl-F /: search",
         VisibleAction::SearchEdit,
-        if view.search_active {
+        if view.match_navigation {
             Useful
         } else {
             Essential
         },
     ));
-    if view.search_active {
+    if view.match_navigation {
         hints.push(Hint::action(
-            "n: next",
+            "n/F3: next",
             VisibleAction::SearchNext,
             Essential,
         ));
         hints.push(Hint::action(
-            "N: previous",
+            "N/⇧F3: previous",
             VisibleAction::SearchPrevious,
             Useful,
         ));
@@ -810,6 +820,7 @@ mod tests {
                         ..ConsoleViewState::default()
                     },
                     false,
+                    None,
                 );
             })
             .unwrap();
@@ -825,7 +836,8 @@ mod tests {
     }
 
     fn fitted_text(view: ConsoleViewState, width: u16) -> String {
-        footer_segments(view, false, width)
+        footer_layout(view, false, None, width)
+            .0
             .into_iter()
             .map(|segment| segment.text)
             .collect()
@@ -850,7 +862,7 @@ mod tests {
                 "{narrow}"
             );
             assert!(narrow.starts_with(" PROCESSES "), "{narrow}");
-            for essential in ["R: apply profile", "l: Logs", "Ctrl-F /: find"] {
+            for essential in ["R: apply profile", "l: Logs", "Ctrl-F /: search"] {
                 assert!(narrow.contains(essential), "{width}: {narrow}");
             }
             assert!(!narrow.contains("q: quit"), "{width}: {narrow}");
@@ -887,50 +899,62 @@ mod tests {
     }
 
     #[test]
-    fn search_dialog_actions_are_clickable_and_own_the_dialog_surface() {
+    fn search_prompt_replaces_footer_hints_and_owns_the_cursor() {
         let mut actions = VisibleActions::default();
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        let prompt = SearchPrompt {
+            query: "timeout".to_string(),
+            result: "2/11".to_string(),
+        };
+        let view = ConsoleViewState {
+            warning: Some(ConsoleWarning::LogsCommandOnly),
+            ..ConsoleViewState::default()
+        };
         terminal
             .draw(|frame| {
+                actions.begin_frame();
                 actions.render_footer(
                     frame,
-                    Rect::new(0, 19, 80, 1),
+                    Rect::new(0, 2, 60, 1),
                     frame.area(),
-                    ConsoleViewState {
-                        search_editing: true,
-                        ..ConsoleViewState::default()
-                    },
+                    view,
                     false,
-                );
-                actions.render_search_dialog(
-                    frame,
-                    &SearchDialogView {
-                        query: "timeout".to_string(),
-                        result: "Match 1 of 2".to_string(),
-                    },
-                    Rect::new(0, 4, 80, 15),
+                    Some(&prompt),
                 );
             })
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        let search_position = (0..20)
-            .find_map(|row| {
-                let line = (0..80)
-                    .map(|column| buffer[(column, row)].symbol())
-                    .collect::<String>();
-                line.find("Enter: Search")
-                    .map(|column| (column as u16, row))
-            })
-            .unwrap();
+        let line = (0..60)
+            .map(|column| terminal.backend().buffer()[(column, 2)].symbol())
+            .collect::<String>();
+        assert!(line.starts_with(" SEARCH  /timeout · 2/11"), "{line}");
+        assert!(!line.contains("WARNING"), "{line}");
+        let query_end = line.find("/timeout").unwrap() + "/timeout".len();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((query_end as u16, 2));
 
+        let cancel = line[..line.find("Esc: cancel").unwrap()].chars().count() as u16;
         assert_eq!(
-            actions.handle_mouse(&click(search_position.0, search_position.1)),
-            VisibleActionEvent::Selected(VisibleAction::SearchSubmit)
+            actions.handle_mouse(&click(cancel + 1, 2)),
+            VisibleActionEvent::Selected(VisibleAction::SearchCancel)
         );
-        assert_eq!(
-            actions.handle_mouse(&click(10, 10)),
-            VisibleActionEvent::Changed
-        );
+    }
+
+    #[test]
+    fn a_long_search_query_shows_its_end_and_keeps_the_exit_visible() {
+        let prompt = SearchPrompt {
+            query: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ".to_string(),
+            result: "no matches".to_string(),
+        };
+        let (segments, cursor) =
+            footer_layout(ConsoleViewState::default(), false, Some(&prompt), 50);
+        let line: String = segments.into_iter().map(|segment| segment.text).collect();
+
+        assert!(Line::from(line.clone()).width() <= 50, "{line}");
+        assert!(line.contains(" …") && line.contains("ABCDEFGHIJ · "), "{line}");
+        assert!(line.ends_with("Esc: cancel"), "{line}");
+        let query_end = line.find('J').unwrap() + 1;
+        assert_eq!(cursor, Some(line[..query_end].chars().count()));
     }
 
     #[test]
@@ -946,6 +970,7 @@ mod tests {
                     frame.area(),
                     ConsoleViewState::default(),
                     false,
+                    None,
                 );
             })
             .unwrap();
@@ -968,6 +993,7 @@ mod tests {
                     frame.area(),
                     ConsoleViewState::default(),
                     false,
+                    None,
                 );
             })
             .unwrap();

@@ -7,7 +7,7 @@ use ratatui::widgets::{
     TableState,
 };
 
-use crate::log_view::SearchDialogView;
+use crate::log_view::SearchPrompt;
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
 use super::footer::{VisibleActions, fit_text};
@@ -79,8 +79,8 @@ pub struct ConsoleViewState {
     pub warning: Option<ConsoleWarning>,
     pub stackhand_mouse_gesture: bool,
     pub pane: ConsolePaneKind,
-    pub search_editing: bool,
-    pub search_active: bool,
+    /// The selected Logs search has matches to move between.
+    pub match_navigation: bool,
     pub logs_selection: bool,
     pub logs_scrollbar: Option<ConsoleScrollbar>,
     pub terminal_available: bool,
@@ -100,8 +100,7 @@ impl Default for ConsoleViewState {
             warning: None,
             stackhand_mouse_gesture: false,
             pane: ConsolePaneKind::default(),
-            search_editing: false,
-            search_active: false,
+            match_navigation: false,
             logs_selection: false,
             logs_scrollbar: None,
             terminal_available: false,
@@ -292,7 +291,8 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConsoleContent<'a> {
     pub(crate) body: ConsoleBody<'a>,
-    pub(crate) search_dialog: Option<&'a SearchDialogView>,
+    /// The edited search query, shown in the footer.
+    pub(crate) search_prompt: Option<&'a SearchPrompt>,
     /// The selected Process and its live Run identity, projected from the
     /// immutable Supervisor snapshot rather than stored UI state.
     pub(crate) header: &'a str,
@@ -396,12 +396,16 @@ pub(crate) fn render_project_with_search(
         }
     };
     let mouse_tracking = terminal.is_some_and(|snap| snap.mouse_tracking);
-    visible_actions.render_footer(frame, footer, area, view, mouse_tracking);
+    visible_actions.render_footer(
+        frame,
+        footer,
+        area,
+        view,
+        mouse_tracking,
+        console.search_prompt,
+    );
     if let Some(trigger) = profile_trigger {
         profile_menu.render(frame, trigger, area);
-    }
-    if let Some(dialog) = console.search_dialog {
-        visible_actions.render_search_dialog(frame, dialog, console_pane);
     }
     // A pipe console has no terminal cursor. Console focus shows the child
     // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
@@ -1325,52 +1329,6 @@ mod tests {
     }
 
     #[test]
-    fn search_dialog_names_the_field_results_and_actions() {
-        let backend = ratatui::backend::TestBackend::new(80, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut profile_menu = ProjectProfileMenu::default();
-        let mut visible_actions = VisibleActions::default();
-        let mut process_table_state = TableState::default();
-        let dialog = SearchDialogView {
-            query: "timeout".to_string(),
-            result: "Match 2 of 4".to_string(),
-        };
-
-        terminal
-            .draw(|frame| {
-                render_project_with_search(
-                    frame,
-                    &[],
-                    &[],
-                    &mut process_table_state,
-                    ConsoleContent {
-                        body: ConsoleBody::Logs(&[]),
-                        search_dialog: Some(&dialog),
-                        header: "demo",
-                        ..ConsoleContent::default()
-                    },
-                    ConsoleViewState {
-                        pane: ConsolePaneKind::Pipe,
-                        search_editing: true,
-                        ..ConsoleViewState::default()
-                    },
-                    "Processes",
-                    &mut profile_menu,
-                    &mut visible_actions,
-                );
-            })
-            .unwrap();
-
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("Search Logs"), "{text:?}");
-        assert!(text.contains("Search terms"), "{text:?}");
-        assert!(text.contains("timeout_"), "{text:?}");
-        assert!(text.contains("Match 2 of 4"), "{text:?}");
-        assert!(text.contains("Enter: Search"), "{text:?}");
-        assert!(text.contains("Esc: Cancel"), "{text:?}");
-    }
-
-    #[test]
     fn terminal_scrollbar_is_rendered_from_ghostty_rows() {
         let backend = ratatui::backend::TestBackend::new(10, 4);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1562,8 +1520,7 @@ mod tests {
                 warning: None,
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
-                search_editing: false,
-                search_active: false,
+                match_navigation: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1579,23 +1536,6 @@ mod tests {
         assert!(text.starts_with("PROCESSES"), "{text}");
         assert!(text.ends_with("PAUSED"), "{text}");
         assert!(text.contains("j/k: select"), "{text}");
-    }
-
-    #[test]
-    fn search_footer_always_shows_submit_and_cancel_actions() {
-        let text = footer_text(
-            ConsoleViewState {
-                search_editing: true,
-                warning: Some(ConsoleWarning::LogsCommandOnly),
-                ..ConsoleViewState::default()
-            },
-            false,
-        );
-
-        assert!(text.starts_with("FIND"), "{text}");
-        assert!(text.contains("Enter: search"), "{text}");
-        assert!(text.contains("Esc: cancel"), "{text}");
-        assert!(!text.contains("WARNING"), "{text}");
     }
 
     #[test]
@@ -1615,13 +1555,13 @@ mod tests {
             ConsoleViewState {
                 pane: ConsolePaneKind::Pipe,
                 mode: ConsoleViewMode::Console,
-                search_active: true,
+                match_navigation: true,
                 ..ConsoleViewState::default()
             },
             false,
         );
-        assert!(active.contains("n: next"), "{active}");
-        assert!(active.contains("N: previous"), "{active}");
+        assert!(active.contains("n/F3: next"), "{active}");
+        assert!(active.contains("N/⇧F3: previous"), "{active}");
     }
 
     #[test]
@@ -1674,8 +1614,7 @@ mod tests {
                 warning: Some(ConsoleWarning::PasteRejected),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
-                search_editing: false,
-                search_active: false,
+                match_navigation: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1701,8 +1640,7 @@ mod tests {
                 warning: Some(ConsoleWarning::PasteDeliveryFailed),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
-                search_editing: false,
-                search_active: false,
+                match_navigation: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1726,8 +1664,7 @@ mod tests {
                 warning: Some(ConsoleWarning::ClipboardFailed),
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
-                search_editing: false,
-                search_active: false,
+                match_navigation: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,

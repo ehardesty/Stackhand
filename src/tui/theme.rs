@@ -106,6 +106,11 @@ impl Theme {
             .add_modifier(Modifier::BOLD | Modifier::REVERSED)
     }
 
+    /// Text the user is typing.
+    pub(super) fn prompt(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
     pub(super) fn footer(&self, warning: bool) -> Style {
         Style::default().fg(if warning {
             self.warning

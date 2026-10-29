@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::log_view::{LogView, LogViewAction, OutputRepresentation, SearchDialogView};
+use crate::log_view::{LogView, LogViewAction, OutputRepresentation, SearchPrompt};
 use crate::output::RetainedOutput;
 use crate::pipe_scroll::PipeScroll;
 use crate::tui::{ConsoleScrollbar, PipeLine};
@@ -30,8 +30,8 @@ pub(crate) enum LogsNavigation {
 pub(crate) struct LogsFrame {
     pub(crate) lines: Vec<PipeLine>,
     pub(crate) status: Option<String>,
-    pub(crate) search_dialog: Option<SearchDialogView>,
-    pub(crate) search_active: bool,
+    pub(crate) search_prompt: Option<SearchPrompt>,
+    pub(crate) match_navigation: bool,
     pub(crate) following: bool,
     pub(crate) has_selection: bool,
     pub(crate) scrollbar: Option<ConsoleScrollbar>,
@@ -127,8 +127,8 @@ impl ProcessLogs {
         LogsFrame {
             lines,
             status: Some(status),
-            search_dialog: self.search.dialog(),
-            search_active: self.search.has_search(),
+            search_prompt: self.search.prompt(),
+            match_navigation: self.search.has_matches(),
             following: self.scroll.following(),
             has_selection: self.scroll.has_selection(),
             scrollbar: self.scroll.scrollbar(),
@@ -303,7 +303,7 @@ mod tests {
         assert!(
             frame
                 .status
-                .is_some_and(|status| status.contains("Match 1 of 1"))
+                .is_some_and(|status| status.contains("/t 1 of 1"))
         );
         assert!(frame.lines.iter().any(|line| line.highlight.is_some()));
         assert!(!frame.following);
@@ -357,7 +357,7 @@ mod tests {
             logs.frame(&retained, 5)
                 .status
                 .unwrap()
-                .contains("Searching older")
+                .contains("searching older")
         );
         for _ in 0..30 {
             logs.refresh(&retained);

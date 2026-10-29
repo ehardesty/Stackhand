@@ -10,8 +10,9 @@ use crate::output::{LogMatch, LogSearch, RetainedOutput};
 
 const SEARCH_QUERY_BYTES: usize = 256;
 
+/// The search query being edited and its live result summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SearchDialogView {
+pub(crate) struct SearchPrompt {
     pub(crate) query: String,
     pub(crate) result: String,
 }
@@ -112,8 +113,13 @@ impl LogView {
             .map_or(!self.query.is_empty(), |editor| !editor.is_empty())
     }
 
-    pub(crate) fn dialog(&self) -> Option<SearchDialogView> {
-        self.editor.as_ref().map(|query| SearchDialogView {
+    /// A committed search found matches that `n` and `N` can visit.
+    pub(crate) fn has_matches(&self) -> bool {
+        self.editor.is_none() && !self.query.is_empty() && !self.search.matches.is_empty()
+    }
+
+    pub(crate) fn prompt(&self) -> Option<SearchPrompt> {
+        self.editor.as_ref().map(|query| SearchPrompt {
             query: query.clone(),
             result: self.match_result(),
         })
@@ -232,38 +238,37 @@ impl LogView {
         true
     }
 
+    /// The committed search for the Logs border. An edited search is shown
+    /// by its prompt instead.
     pub(crate) fn status(&self) -> Option<String> {
-        if let Some(editor) = &self.editor {
-            return Some(format!("Search: {editor}_"));
-        }
-        if self.query.is_empty() {
+        if self.editor.is_some() || self.query.is_empty() {
             return None;
         }
-        Some(format!("Search: {} · {}", self.query, self.match_result()))
+        Some(format!("/{} {}", self.query, self.match_result()))
     }
 
     fn match_result(&self) -> String {
         let query = self.editor.as_deref().unwrap_or(&self.query);
         if query.is_empty() {
-            return "Type a word or phrase".to_string();
+            return "type to search".to_string();
         }
         let count = self.search.matches.len();
         if count == 0 {
             return if self.search.pending {
-                "Searching older output…".into()
+                "searching older Logs…".into()
             } else {
-                "No matches in retained Logs".into()
+                "no matches".into()
             };
         }
         let position = self.current.index().map_or(1, |index| index + 1);
         let suffix = if self.search.limited {
-            " newest matches (limit)"
+            " newest"
         } else if self.search.pending {
-            " · searching older output…"
+            " · searching older Logs…"
         } else {
-            " newest matches"
+            ""
         };
-        format!("Match {position} of {count}{suffix}")
+        format!("{position} of {count}{suffix}")
     }
 
     fn edit_search(&mut self, key: KeyEvent, output: &RetainedOutput) -> LogViewAction {
@@ -369,13 +374,13 @@ mod tests {
         );
         assert!(view.is_editing());
         assert_eq!(
-            view.dialog(),
-            Some(SearchDialogView {
+            view.prompt(),
+            Some(SearchPrompt {
                 query: String::new(),
-                result: "Type a word or phrase".to_string(),
+                result: "type to search".to_string(),
             })
         );
-        assert_eq!(view.status().as_deref(), Some("Search: _"));
+        assert_eq!(view.status(), None, "the prompt shows an edited search");
 
         assert_eq!(
             view.handle_key(key(KeyCode::Esc), false, false, &output),
@@ -467,7 +472,7 @@ mod tests {
             LogViewAction::Changed
         ));
         assert_eq!(
-            view.dialog().map(|dialog| dialog.query),
+            view.prompt().map(|prompt| prompt.query),
             Some("onetwo €".to_string())
         );
         assert!(matches!(
@@ -502,25 +507,16 @@ mod tests {
             LogViewAction::ShowMatch(_)
         ));
         assert_eq!(view.representation(true), OutputRepresentation::Logs);
-        assert_eq!(
-            view.status().as_deref(),
-            Some("Search: hit · Match 1 of 2 newest matches")
-        );
+        assert_eq!(view.status().as_deref(), Some("/hit 1 of 2"));
         view.handle_key(key(KeyCode::Enter), true, true, &snapshot);
-        assert_eq!(
-            view.status().as_deref(),
-            Some("Search: hit · Match 2 of 2 newest matches")
-        );
+        assert_eq!(view.status().as_deref(), Some("/hit 2 of 2"));
         view.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             true,
             true,
             &snapshot,
         );
-        assert_eq!(
-            view.status().as_deref(),
-            Some("Search: hit · Match 1 of 2 newest matches")
-        );
+        assert_eq!(view.status().as_deref(), Some("/hit 1 of 2"));
     }
 
     #[test]
@@ -547,6 +543,6 @@ mod tests {
         let later = output.snapshot();
         assert!(view.refresh(&later));
         assert!(view.current_match().is_none());
-        assert!(view.status().unwrap().contains("No matches"));
+        assert!(view.status().unwrap().contains("no matches"));
     }
 }

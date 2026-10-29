@@ -14,7 +14,7 @@ use ratatui::widgets::TableState;
 use super::view_model::{port_list, process_list_rows, profile_changes_pending, profiles_visible};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand};
-use crate::log_view::{OutputRepresentation, SearchDialogView};
+use crate::log_view::{OutputRepresentation, SearchPrompt};
 use crate::output::RetainedOutput;
 use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{
@@ -47,7 +47,7 @@ pub(super) struct InteractionFrame {
     pub(super) terminal: Option<OwnedTerminalSnapshot>,
     pub(super) lines: Option<Vec<PipeLine>>,
     pub(super) logs_status: Option<String>,
-    pub(super) search_dialog: Option<SearchDialogView>,
+    pub(super) search_prompt: Option<SearchPrompt>,
     pub(super) view: ConsoleViewState,
 }
 
@@ -250,15 +250,14 @@ impl ProjectInteraction {
         view.start_anyway_available = self.start_anyway_available;
         view.terminal_available = self.terminal_available;
         view.input_enabled = self.input_enabled;
-        let (lines, logs_status, search_dialog) = match pane {
+        let (lines, logs_status, search_prompt) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
                 view.following = frame.following;
-                view.search_editing = frame.search_dialog.is_some();
-                view.search_active = frame.search_active;
+                view.match_navigation = frame.match_navigation;
                 view.logs_selection = frame.has_selection;
                 view.logs_scrollbar = frame.scrollbar;
-                (Some(frame.lines), frame.status, frame.search_dialog)
+                (Some(frame.lines), frame.status, frame.search_prompt)
             }
             SelectedPane::Terminal(session) => {
                 let status = terminal
@@ -278,7 +277,7 @@ impl ProjectInteraction {
             terminal,
             lines,
             logs_status,
-            search_dialog,
+            search_prompt,
             view,
         }
     }
