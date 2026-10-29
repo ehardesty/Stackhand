@@ -102,8 +102,8 @@ largest current Process history is trimmed first, preserving smaller histories
 such as a quiet Process's older error. Text storage is shared with readers;
 evicted segments remain charged to the Project budget while a reader holds
 them. Snapshots do not duplicate the whole history. New output continues to
-drain even when history expires. A header and marker identify the retained
-scope and loss of earlier Logs.
+drain even when history expires. The Logs border and a marker identify the
+retained scope and loss of earlier Logs.
 
 The Logs storage budget includes allocated text and segment record capacity.
 Normalization buffers, segment indexes, bounded search results, queues, and

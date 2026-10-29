@@ -27,6 +27,8 @@ MOUSE: CHILD · Shift+mouse: Stackhand
 
 The ownership text stays before lower-priority control hints so it remains visible on an 80-column terminal.
 
+Since the footer gained a mode badge (October 2026), the default owner is implicit: the footer shows `MOUSE: STACKHAND · selecting` during a Stackhand gesture and `MOUSE: CHILD · Shift+drag: copy` while the child tracks the mouse. Both messages are essential hints and stay visible on an 80-column terminal.
+
 ## Automated evidence
 
 The `--fixture-mouse` executable fixture starts a real PTY child. The child enables any-event tracking and SGR mouse output. It then records the bytes that it receives.

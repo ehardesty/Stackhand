@@ -97,7 +97,7 @@ Text labels remain the primary signal, so meaning does not depend on color.
 A compact header may show:
 
 ```text
-api · run 3 · local → devcloud · PID 48122 · READY · 2m14s · 184 MiB · 3.2% CPU · restarts 1 · TERMINAL
+api · run 3 · local → devcloud · PID 48122 · READY · 2m14s · 184 MiB · 3.2% CPU · restarts 1
 ```
 
 For a blocked process:
@@ -121,9 +121,14 @@ Console modes:
 - app command;
 - scroll;
 - selection;
-- search/logs.
+- search/logs;
+- filter.
 
 The footer should make the current focus/mode clear enough that users understand whether keys will reach the child.
+
+The footer starts with a mode badge that names the keyboard owner: `PROCESSES`, `INPUT` (keys reach the child), `TERMINAL` (a read-only terminal), `LOGS`, `COPY`, `SELECT`, `SEARCH`, or `FILTER`. Terminal input always shows how to leave it (`Ctrl-A: Processes`) and how to reach Logs (`Ctrl-A l: Logs`). A click on output focuses that console and does not by itself select text or pause the live tail.
+
+While a search or filter is edited, the footer row is the prompt. It shows the query with the terminal cursor, a live result, and its actions, so no dialog covers the output that the prompt highlights or filters.
 
 ### 24.6 Suggested default keybindings
 
@@ -138,11 +143,15 @@ r              restart/rerun selected
 p              cycle the Project Profile for future Runs
 R              apply a pending profile change; shown only while changes are pending
 z              zoom console
-/              search selected output
+/ or Ctrl-F    search selected output
+&, \, F4, Ctrl-G  filter selected output
 l              toggle Terminal/Logs view
+Tab            focus console; Tab leaves only a read-only console
 q              quit with controlled shutdown
 Ctrl-A         focus console / enter console context
 ```
+
+In a search or filter prompt, `Tab` commits the prompt and opens the other one, `Enter` commits, `Esc` or `Ctrl-C` restores the committed value, and `Ctrl-U` clears the text. A search prompt opens empty and a filter prompt opens with the current filter; committing an empty prompt clears it. After a search, `n`/`F3`/`Enter` and `N`/`Shift-F3`/`Shift-Enter` visit matches.
 
 When the console is in child input mode:
 
@@ -157,6 +166,7 @@ When in application command context:
 Esc            return/cancel
 PageUp/Down    enter or move in scroll mode
 /              search in Logs view
+&              filter Logs
 v              selection mode
 y              copy selection
 f              follow/live tail
@@ -182,6 +192,8 @@ Zoom/full-console mode is required. Layout changes must:
 Define graceful degradation for narrow/small outer terminals:
 
 - hide optional metrics columns;
+- drop optional footer hints before exits and view controls;
+- shorten border text with an ellipsis;
 - reduce borders/padding;
 - allow process-list-only or console-only layouts;
 - keep errors and mode state visible;

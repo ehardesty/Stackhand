@@ -388,7 +388,7 @@ The Logs view is a bounded line-oriented projection:
 - timestamps;
 - stdout/stderr/PTY/hook labels;
 - run boundaries;
-- optional filtering;
+- a line filter (§22.6);
 - invalid UTF-8 replacement policy;
 - deterministic observation order.
 
@@ -416,14 +416,15 @@ Regex is deferred unless it is trivial and safe to bound.
 
 ### 22.4 Navigation between views
 
-The selected process header should show whether the user is viewing:
+The console's top border shows a tab for each available view, so the user can always see which view is shown and how to reach the other:
 
 ```text
-TERMINAL
-LOGS
+┌ Terminal │ Logs  api · run 3 · Ready ─────────┐
 ```
 
-Entering search may switch to Logs view. Returning to Terminal view restores the prior terminal viewport and interaction mode.
+The shown view is highlighted. The other view's tab is clickable; a click shows that view and focuses the console, as a click on its output does. Processes without a Run terminal show only the Logs tab. While a filter hides lines, the tab reads `Logs (filtered)`.
+
+Entering search or filter may switch to Logs view. Returning to Terminal view restores the prior terminal viewport and interaction mode.
 
 When a Process has no active Run terminal, show its retained Logs instead of an empty Terminal view. A later Run returns to the user's selected representation.
 
@@ -435,6 +436,19 @@ For ordinary pipe processes, the application may default to Terminal or Logs vie
 
 - Terminal view provides ANSI rendering and terminal-like scrolling/copying.
 - Logs view provides streams, timestamps, and search.
+
+### 22.6 Line filter
+
+A Logs filter hides retained lines that do not match, like the VS Code Output panel and Debug Console filters:
+
+- comma-separated terms;
+- a term that starts with `!` excludes matching lines;
+- a leading `\` makes the rest of a term literal, for example `\!important`;
+- include terms are OR'd and any exclusion wins;
+- case-insensitive literal substring matching per retained line, unlike case-sensitive search;
+- Run markers and the history-limit notice always stay visible.
+
+The filter previews while it is typed. Committing an empty filter shows every line. Filtering is bounded like search: one UI turn examines at most 512 KiB of unfiltered output, newest first, and shows progress while older output is checked. Search runs only on lines the filter shows, so hidden lines never use the 1,000-match limit. A held Logs page stays in place while its first line is still shown; otherwise it moves to the selected match or the live tail.
 
 ---
 

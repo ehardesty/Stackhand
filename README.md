@@ -21,7 +21,7 @@ control of the whole Project in one terminal.
 - Shows PTY terminal output or separate pipe output.
 - Can find and link to listening TCP ports that development servers select at runtime.
 - Shows a scrollbar for retained PTY history when the output is longer than the pane.
-- Keeps bounded Logs that you can scroll, search, and copy.
+- Keeps bounded Logs that you can scroll, search, filter, and copy.
 - Uses Project Profiles to select Project-wide configuration, such as `local`
   and `cloud`.
 - Supports a machine-local `stackhand.local.yaml` override.
@@ -204,9 +204,14 @@ Focus changes which keys Stackhand receives. Stackhand starts with the Process
 list focused. When an interactive PTY has focus, ordinary keys go to the
 selected command.
 
+The footer starts with a badge that names where keys go: `PROCESSES`, `INPUT`
+(keys reach the command), `LOGS`, `COPY`, and so on. Its hints change with the
+focus, and narrow terminals drop optional hints before the ways out.
+
 Visible underlined actions can also be clicked. A click runs a single action
 directly. The lifecycle and Project Profile controls open a menu because they
-contain more than one choice.
+contain more than one choice. The console's top border shows `Terminal` and
+`Logs` tabs; click the other tab to switch views.
 
 ### Process list
 
@@ -224,8 +229,10 @@ Use these keys while the Process list has focus:
 | `p` | Select the next Project Profile. |
 | `R` | Apply a pending Profile change when Stackhand shows this action. |
 | `l` | Switch the selected PTY between Terminal and Logs. |
+| `/` or `Ctrl-F` | Search the selected Logs. |
+| `&`, `\`, `F4`, or `Ctrl-G` | Filter the selected Logs. |
 | `v` | Enter Copy mode for the selected PTY Terminal. |
-| `Ctrl-A` | Focus the selected console. |
+| `Tab` or `Ctrl-A` | Focus the selected console. |
 | `q` | Stop the Project and quit. |
 | `Ctrl-Q` | Stop the Project and quit from any focus. |
 
@@ -244,22 +251,39 @@ PTY between its Terminal and Logs. When Logs are visible, use:
 | `PageUp` / `PageDown` | Move one page through Logs. |
 | `Home` / `End` | Move to the start or end of Logs. |
 | `f` | Return to the live output tail. |
-| `/` | Start a case-sensitive search. Type text and press `Enter`. |
-| `n` / `N` | Move to the next (older) or previous (newer) search match. |
+| `/` or `Ctrl-F` | Start a case-sensitive search. Type text and press `Enter`. |
+| `n` / `N`, or `F3` / `Shift-F3` | Move to the next (older) or previous (newer) search match. |
+| `&`, `\`, `F4`, or `Ctrl-G` | Edit the Logs filter. |
+| `l` | Switch a PTY back to its Terminal. |
 | `c` / `y` | Copy selected Logs, or the visible Logs when nothing is selected. |
-| `Esc` | Cancel a search, clear a Logs selection, or return to the Process list. |
-| `q` | Return to the Process list. |
+| `Esc` | Clear a Logs selection or return to the Process list. |
+| `Tab` or `q` | Return to the Process list. |
 
-A mouse drag selects Logs text. Press `c` or `y` to copy the selection.
+Search and filter prompts open in the footer, so they do not cover the output.
+In a prompt, `Enter` commits, `Esc` cancels, `Ctrl-U` clears the text, and
+`Tab` commits and switches between search and filter. A search prompt opens
+empty and a filter prompt opens with the current filter. Commit an empty prompt
+to clear a search or filter.
 
-History is configurable in [`settings.output`](docs/configuration.md#output-history).
-Defaults are 16 MiB of terminal scrollback per PTY and 32 MiB of Logs per
-Process, with separate Project budgets. Logs search checks recent output first
-and keeps at most 1,000 matches; it shows progress while checking older output.
-The Logs header shows its Run range and marks expired earlier history. If the
-page you paused on expires, that visible page stays readable until you scroll
-again or press `f` to follow. History stays in memory and ends when Stackhand
-exits; use your application's log files for durable retention.
+A filter hides lines that do not match, like the VS Code output filter. Separate
+terms with commas, start a term with `!` to exclude matching lines, and start it
+with `\` to match a literal `!`. Matching ignores case. For example,
+`error,warn,!retry` shows errors and warnings except retries. Run markers stay
+visible. An empty filter shows every line, and the Logs tab reads
+`Logs (filtered)` while lines are hidden.
+
+A mouse drag selects Logs text. Press `c` or `y` to copy the selection. A plain
+click focuses Logs without selecting text.
+
+History is configurable in
+[`settings.output`](docs/configuration.md#output-history). Defaults are 16 MiB
+of terminal scrollback per PTY and 32 MiB of Logs per Process, with separate
+Project budgets. Logs search checks recent output first and keeps at most 1,000
+matches; it shows progress while checking older output. The bottom border of
+Logs shows the search, the filter, and the Run range, and marks expired earlier
+history. If the page you paused on expires, that visible page stays readable
+until you scroll again or press `f` to follow. History stays in memory and ends
+when Stackhand exits; use your application's log files for durable retention.
 
 
 ### PTY input and Copy mode
