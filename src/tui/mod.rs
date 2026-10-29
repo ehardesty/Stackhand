@@ -12,7 +12,7 @@ pub use restore::OuterTerminal;
 pub(crate) use theme::LifecycleTone;
 #[cfg(test)]
 pub(crate) use view::render_project;
-pub(crate) use view::render_project_with_search;
+pub(crate) use view::{ConsoleBody, ConsoleContent, render_project_with_search};
 pub use view::{
     ConsolePaneKind, ConsoleScrollbar, ConsoleViewMode, ConsoleViewState, ConsoleWarning, PipeLine,
     PortListView, ProcessListRow, ProcessRowView, pane_inner, process_port_at, process_row_at,

@@ -99,6 +99,13 @@ impl Theme {
             .add_modifier(Modifier::BOLD | Modifier::REVERSED)
     }
 
+    /// The shown console view. Focus color marks that keys reach the console.
+    pub(super) fn active_tab(&self, focused: bool) -> Style {
+        Style::default()
+            .fg(if focused { self.focus } else { self.secondary })
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    }
+
     pub(super) fn footer(&self, warning: bool) -> Style {
         Style::default().fg(if warning {
             self.warning

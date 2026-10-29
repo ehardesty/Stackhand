@@ -11,6 +11,8 @@ use ratatui_interact::{
     traits::ClickRegion,
 };
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::log_view::SearchDialogView;
 
 use super::theme::{ModeTone, TERMINAL_THEME};
@@ -42,6 +44,8 @@ pub(crate) enum VisibleAction {
     SearchSubmit,
     SelectAll,
     StartAnyway,
+    /// Show the other console view and focus it, as a console click does.
+    SwitchView,
     ToggleSelection,
     ToggleView,
 }
@@ -185,6 +189,52 @@ impl VisibleActions {
         }
     }
 
+    /// Forget the previous frame's regions. Call once before rendering any
+    /// visible action.
+    pub(crate) fn begin_frame(&mut self) {
+        self.regions.clear();
+        self.modal_area = None;
+    }
+
+    /// Build the console's top-border title: Terminal and Logs tabs, then
+    /// the selected Process header. The inactive tab is a visible action.
+    pub(crate) fn console_title(
+        &mut self,
+        pane: Rect,
+        view: ConsoleViewState,
+        header: &str,
+    ) -> Line<'static> {
+        let focused = view.mode != ConsoleViewMode::ProcessList;
+        let tab = |label: &str, active: bool| {
+            let text = format!(" {label} ");
+            if active {
+                Segment::styled(text, TERMINAL_THEME.active_tab(focused))
+            } else {
+                Segment::action(text, VisibleAction::SwitchView)
+            }
+        };
+        let logs_active = view.pane == ConsolePaneKind::Pipe;
+        let mut segments = Vec::new();
+        if view.terminal_available {
+            segments.push(tab("Terminal", !logs_active));
+            segments.push(Segment::text("│"));
+        }
+        segments.push(tab("Logs", logs_active));
+        // Block titles start one cell after the corner and stop before the
+        // opposite corner, which keeps one border cell after the header.
+        let title_row = Rect::new(
+            pane.x.saturating_add(1),
+            pane.y,
+            pane.width.saturating_sub(3),
+            1,
+        );
+        let room = usize::from(title_row.width).saturating_sub(segments_width(&segments) + 2);
+        if !header.is_empty() && room > 0 {
+            segments.push(Segment::text(format!(" {} ", fit_text(header, room))));
+        }
+        self.action_line(title_row, segments, TERMINAL_THEME.secondary_text())
+    }
+
     pub(crate) fn render_footer(
         &mut self,
         frame: &mut Frame<'_>,
@@ -193,8 +243,6 @@ impl VisibleActions {
         view: ConsoleViewState,
         child_mouse_tracking: bool,
     ) {
-        self.regions.clear();
-        self.modal_area = None;
         let line = self.action_line(
             area,
             footer_segments(view, child_mouse_tracking, area.width),
@@ -428,6 +476,25 @@ fn segments_width(segments: &[Segment]) -> usize {
 
 fn text_width(text: &str) -> usize {
     Line::from(text.to_owned()).width()
+}
+
+/// Shorten `text` to `width` display cells, ending with `…` when cut.
+pub(super) fn fit_text(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cells = character.width().unwrap_or(0);
+        if used + cells + 1 > width {
+            break;
+        }
+        kept.push(character);
+        used += cells;
+    }
+    kept.push('…');
+    kept
 }
 
 #[cfg(test)]
@@ -872,6 +939,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal
             .draw(|frame| {
+                actions.begin_frame();
                 actions.render_footer(
                     frame,
                     Rect::new(0, 11, 100, 1),
@@ -893,6 +961,7 @@ mod tests {
         );
         terminal
             .draw(|frame| {
+                actions.begin_frame();
                 actions.render_footer(
                     frame,
                     Rect::new(0, 11, 100, 1),

@@ -6,10 +6,9 @@ use crate::output::OutputViews;
 use crate::supervisor::{
     Command, Consoles, ProjectShutdownSnapshot, ProjectSnapshot, SupervisorHandle,
 };
-use crate::terminal::OwnedTerminalSnapshot;
 use crate::tui::{
-    OuterTerminal, ProcessListRow, ProcessRowView, ProjectProfileMenu, VisibleActions, pane_inner,
-    project_layout, render_project_with_search,
+    ConsoleBody, ConsoleContent, OuterTerminal, ProcessListRow, ProcessRowView, ProjectProfileMenu,
+    VisibleActions, pane_inner, project_layout, render_project_with_search,
 };
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::Event;
@@ -208,14 +207,6 @@ fn run_event_loop(
             let process_list = interaction.process_list().to_vec();
             let list_title = process_list_title(&snapshot);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
-            let view_label = match frame.representation {
-                crate::log_view::OutputRepresentation::Terminal => "Terminal",
-                crate::log_view::OutputRepresentation::Logs => "Logs",
-            };
-            header.insert_str(0, &format!("{view_label} · "));
-            if let Some(status) = &frame.logs_status {
-                header.push_str(&format!(" · {status}"));
-            }
             if shutting_down {
                 header.insert_str(0, "Project shutdown in progress · ");
             }
@@ -225,12 +216,17 @@ fn run_event_loop(
                 &rows,
                 &process_list,
                 process_table_state,
-                frame.terminal.as_ref(),
-                frame.lines.as_deref(),
+                ConsoleContent {
+                    body: frame.lines.as_deref().map_or(
+                        ConsoleBody::Terminal(frame.terminal.as_ref()),
+                        ConsoleBody::Logs,
+                    ),
+                    search_dialog: frame.search_dialog.as_ref(),
+                    header: &header,
+                    status: frame.logs_status.as_deref(),
+                },
                 frame.view,
-                frame.search_dialog.as_ref(),
                 &list_title,
-                &header,
                 profile_menu,
                 visible_actions,
             )?;
@@ -308,12 +304,9 @@ fn render_frame(
     rows: &[ProcessRowView],
     process_list: &[ProcessListRow],
     process_table_state: &mut ratatui::widgets::TableState,
-    console_snapshot: Option<&OwnedTerminalSnapshot>,
-    pipe_lines: Option<&[crate::tui::PipeLine]>,
+    console: ConsoleContent<'_>,
     view: crate::tui::ConsoleViewState,
-    search_dialog: Option<&crate::log_view::SearchDialogView>,
     process_list_title: &str,
-    selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
     visible_actions: &mut VisibleActions,
 ) -> Result<ratatui::layout::Rect> {
@@ -326,12 +319,9 @@ fn render_frame(
                 rows,
                 process_list,
                 process_table_state,
-                console_snapshot,
-                pipe_lines,
+                console,
                 view,
-                search_dialog,
                 process_list_title,
-                selected_header,
                 profile_menu,
                 visible_actions,
             ));

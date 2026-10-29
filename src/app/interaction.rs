@@ -48,7 +48,6 @@ pub(super) struct InteractionFrame {
     pub(super) lines: Option<Vec<PipeLine>>,
     pub(super) logs_status: Option<String>,
     pub(super) search_dialog: Option<SearchDialogView>,
-    pub(super) representation: OutputRepresentation,
     pub(super) view: ConsoleViewState,
 }
 
@@ -237,10 +236,6 @@ impl ProjectInteraction {
         retained: &RetainedOutput,
         pane_rows: usize,
     ) -> InteractionFrame {
-        let representation = match pane {
-            SelectedPane::Terminal(_) => OutputRepresentation::Terminal,
-            SelectedPane::Logs(_) => OutputRepresentation::Logs,
-        };
         let terminal = match pane {
             SelectedPane::Terminal(view) => view.snapshot(),
             SelectedPane::Logs(_) => None,
@@ -284,7 +279,6 @@ impl ProjectInteraction {
             lines,
             logs_status,
             search_dialog,
-            representation,
             view,
         }
     }
@@ -453,15 +447,29 @@ impl ProjectInteraction {
         if action == VisibleAction::Quit {
             return InputResult::Quit;
         }
+        if action == VisibleAction::SwitchView {
+            match pane {
+                SelectedPane::Terminal(view) => {
+                    view.with(|session| self.console.focus_console(Some(session)));
+                }
+                SelectedPane::Logs(_) => self.console.focus_console(None),
+            }
+            self.logs[self.selected].toggle_representation();
+            self.console.clear_warning();
+            return InputResult::Changed;
+        }
         // Terminal input owns ordinary keys, so a visible action that names
         // a Process-list key first leaves the child, as Ctrl-A does.
+        let mode = self.console.view().mode;
         let leaves_terminal_input = match action {
-            VisibleAction::EnterCopy => true,
-            VisibleAction::ToggleView => matches!(pane, SelectedPane::Terminal(_)),
+            VisibleAction::EnterCopy => mode == crate::tui::ConsoleViewMode::Console,
+            VisibleAction::ToggleView => {
+                matches!(pane, SelectedPane::Terminal(_))
+                    && mode != crate::tui::ConsoleViewMode::ProcessList
+            }
             _ => false,
         };
-        if leaves_terminal_input && self.console.view().mode == crate::tui::ConsoleViewMode::Console
-        {
+        if leaves_terminal_input {
             let focus_list = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
             self.route_input(
                 Event::Key(focus_list),
@@ -501,7 +509,7 @@ impl ProjectInteraction {
             VisibleAction::SelectAll => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
             VisibleAction::StartAnyway => KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
             VisibleAction::ToggleView => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
-            VisibleAction::OpenLifecycleMenu | VisibleAction::Quit => {
+            VisibleAction::OpenLifecycleMenu | VisibleAction::Quit | VisibleAction::SwitchView => {
                 return InputResult::Ignored;
             }
         };
@@ -1319,9 +1327,48 @@ mod tests {
             ..Default::default()
         };
 
+        interaction.update_pane(&pane);
         let frame = interaction.frame(&pane, &retained, 20);
 
-        assert_eq!(frame.representation, OutputRepresentation::Logs);
+        assert_eq!(frame.view.pane, ConsolePaneKind::Pipe);
+    }
+
+    #[test]
+    fn a_console_tab_click_shows_that_view_and_focuses_it_from_any_focus() {
+        let output = crate::output::OutputViews::new(1);
+        let retained = output.for_process(0).unwrap().snapshot();
+        let mut pty = process("api", crate::model::ProcessKind::Service, 0);
+        pty.terminal_mode = crate::model::TerminalMode::Pty;
+        for start_in_console in [false, true] {
+            let mut interaction = ProjectInteraction {
+                logs: vec![ProcessLogs::default()],
+                ..Default::default()
+            };
+            interaction.logs[0].toggle_representation();
+            if start_in_console {
+                interaction.console.focus_console(None);
+            }
+
+            assert_eq!(
+                interaction.route_visible_action(
+                    VisibleAction::SwitchView,
+                    &SelectedPane::Logs(&retained),
+                    &pty,
+                    &retained,
+                    Rect::new(0, 0, 80, 20),
+                ),
+                InputResult::Changed
+            );
+            assert_eq!(
+                interaction.logs[0].representation(true),
+                OutputRepresentation::Terminal
+            );
+            assert_eq!(
+                interaction.console.view().mode,
+                crate::tui::ConsoleViewMode::Console,
+                "start_in_console={start_in_console}"
+            );
+        }
     }
 
     #[test]

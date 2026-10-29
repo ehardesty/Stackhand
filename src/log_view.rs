@@ -84,6 +84,14 @@ impl LogView {
         }
     }
 
+    /// Switch between Terminal and Logs for a Process that has a terminal.
+    pub(crate) fn toggle_representation(&mut self) {
+        self.representation = match self.representation {
+            OutputRepresentation::Terminal => OutputRepresentation::Logs,
+            OutputRepresentation::Logs => OutputRepresentation::Terminal,
+        };
+    }
+
     pub(crate) fn is_editing(&self) -> bool {
         self.editor.is_some()
     }
@@ -168,10 +176,7 @@ impl LogView {
         }
         match key.code {
             KeyCode::Char('l') if has_terminal => {
-                self.representation = match self.representation {
-                    OutputRepresentation::Terminal => OutputRepresentation::Logs,
-                    OutputRepresentation::Logs => OutputRepresentation::Terminal,
-                };
+                self.toggle_representation();
                 LogViewAction::Changed
             }
             KeyCode::Enter | KeyCode::F(3)

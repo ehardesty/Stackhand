@@ -10,7 +10,7 @@ use ratatui::widgets::{
 use crate::log_view::SearchDialogView;
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
-use super::footer::VisibleActions;
+use super::footer::{VisibleActions, fit_text};
 use super::profile_menu::ProjectProfileMenu;
 use super::theme::{LifecycleTone, TERMINAL_THEME};
 
@@ -288,6 +288,32 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
     crate::geometry::TerminalGeometry::from_pane(pane_inner(pane))
 }
 
+/// The selected Process's console for one frame.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConsoleContent<'a> {
+    pub(crate) body: ConsoleBody<'a>,
+    pub(crate) search_dialog: Option<&'a SearchDialogView>,
+    /// The selected Process and its live Run identity, projected from the
+    /// immutable Supervisor snapshot rather than stored UI state.
+    pub(crate) header: &'a str,
+    /// Logs or terminal-history status, shown in the bottom border.
+    pub(crate) status: Option<&'a str>,
+}
+
+/// The one output representation a frame renders.
+#[derive(Clone, Copy)]
+pub(crate) enum ConsoleBody<'a> {
+    /// A live terminal; `None` renders an empty terminal pane.
+    Terminal(Option<&'a OwnedTerminalSnapshot>),
+    Logs(&'a [PipeLine]),
+}
+
+impl Default for ConsoleBody<'_> {
+    fn default() -> Self {
+        Self::Terminal(None)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_project(
@@ -308,12 +334,13 @@ pub fn render_project(
         rows,
         process_list,
         process_table_state,
-        console_snapshot,
-        pipe_lines,
+        ConsoleContent {
+            body: pipe_lines.map_or(ConsoleBody::Terminal(console_snapshot), ConsoleBody::Logs),
+            header: selected_header,
+            ..ConsoleContent::default()
+        },
         view,
-        None,
         process_list_title,
-        selected_header,
         profile_menu,
         &mut visible_actions,
     )
@@ -325,18 +352,16 @@ pub(crate) fn render_project_with_search(
     rows: &[ProcessRowView],
     process_list: &[ProcessListRow],
     process_table_state: &mut TableState,
-    console_snapshot: Option<&OwnedTerminalSnapshot>,
-    pipe_lines: Option<&[PipeLine]>,
+    console: ConsoleContent<'_>,
     view: ConsoleViewState,
-    search_dialog: Option<&SearchDialogView>,
     process_list_title: &str,
-    selected_header: &str,
     profile_menu: &mut ProjectProfileMenu,
     visible_actions: &mut VisibleActions,
 ) -> Rect {
     let area = frame.area();
     let (list, console_pane, footer) = project_layout(area, process_list.len());
     let console_inner = pane_inner(console_pane);
+    visible_actions.begin_frame();
 
     let profile_trigger = render_process_table(
         frame,
@@ -347,46 +372,41 @@ pub(crate) fn render_project_with_search(
         view.mode,
         process_list_title,
     );
-    // The header names the selected Process and its live Run identity; it
-    // is a projection of the immutable Supervisor snapshot, never stored
-    // UI state.
-    let header = if selected_header.is_empty() {
-        " Console ".to_string()
-    } else {
-        format!(" Console · {selected_header} ")
-    };
     let console_border = match view.mode {
         ConsoleViewMode::ProcessList => TERMINAL_THEME.inactive_border(),
         ConsoleViewMode::Console => TERMINAL_THEME.focus_border(),
         ConsoleViewMode::Copy => TERMINAL_THEME.copy_border(),
     };
-    frame.render_widget(
-        Block::bordered().border_style(console_border).title(header),
-        console_pane,
-    );
-
-    let mouse_tracking = console_snapshot.is_some_and(|snap| snap.mouse_tracking);
-    if let Some(lines) = pipe_lines {
-        render_pipe_console(frame, lines, view.logs_scrollbar, console_inner);
-    } else {
-        render_terminal_console(
-            frame,
-            console_snapshot.unwrap_or(&EMPTY_CONSOLE),
-            console_inner,
-        );
+    let mut block = Block::bordered()
+        .border_style(console_border)
+        .title(visible_actions.console_title(console_pane, view, console.header));
+    if let Some(status) = console.status {
+        block = block.title_bottom(status_title(status, console_pane.width));
     }
+    frame.render_widget(block, console_pane);
+
+    let terminal = match console.body {
+        ConsoleBody::Terminal(snapshot) => {
+            render_terminal_console(frame, snapshot.unwrap_or(&EMPTY_CONSOLE), console_inner);
+            snapshot
+        }
+        ConsoleBody::Logs(lines) => {
+            render_pipe_console(frame, lines, view.logs_scrollbar, console_inner);
+            None
+        }
+    };
+    let mouse_tracking = terminal.is_some_and(|snap| snap.mouse_tracking);
     visible_actions.render_footer(frame, footer, area, view, mouse_tracking);
     if let Some(trigger) = profile_trigger {
         profile_menu.render(frame, trigger, area);
     }
-    if let Some(dialog) = search_dialog {
+    if let Some(dialog) = console.search_dialog {
         visible_actions.render_search_dialog(frame, dialog, console_pane);
     }
     // A pipe console has no terminal cursor. Console focus shows the child
     // cursor, while Copy mode shows the terminal-owned keyboard copy cursor.
     if matches!(view.mode, ConsoleViewMode::Console | ConsoleViewMode::Copy)
-        && pipe_lines.is_none()
-        && let Some(cursor) = console_snapshot.and_then(|snap| snap.cursor)
+        && let Some(cursor) = terminal.and_then(|snap| snap.cursor)
     {
         let x = console_inner.x.saturating_add(cursor.position.x);
         let y = console_inner.y.saturating_add(cursor.position.y);
@@ -395,6 +415,17 @@ pub(crate) fn render_project_with_search(
         }
     }
     console_inner
+}
+
+/// Right-align the status in the bottom border. Status parts come in
+/// importance order, so a narrow pane cuts the least important tail.
+fn status_title(status: &str, pane_width: u16) -> Line<'static> {
+    let room = usize::from(pane_width.saturating_sub(6));
+    Line::styled(
+        format!(" {} ", fit_text(status, room)),
+        TERMINAL_THEME.secondary_text(),
+    )
+    .right_aligned()
 }
 
 static EMPTY_CONSOLE: std::sync::LazyLock<OwnedTerminalSnapshot> =
@@ -687,6 +718,7 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
+    use crate::tui::{VisibleAction, VisibleActionEvent};
 
     fn row(name: &str, status: &str, selected: bool) -> ProcessRowView {
         ProcessRowView {
@@ -1193,6 +1225,105 @@ mod tests {
         );
     }
 
+    fn render_console_frame(
+        view: ConsoleViewState,
+        status: Option<&str>,
+        visible_actions: &mut VisibleActions,
+    ) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_project_with_search(
+                    frame,
+                    &[row("api", "Ready", true)],
+                    &[ProcessListRow::Process(0)],
+                    &mut TableState::default(),
+                    ConsoleContent {
+                        body: ConsoleBody::Logs(&[]),
+                        header: "api · run 1",
+                        status,
+                        ..ConsoleContent::default()
+                    },
+                    view,
+                    "Processes",
+                    &mut ProjectProfileMenu::default(),
+                    visible_actions,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    fn text_position(buffer: &Buffer, needle: &str) -> (u16, u16) {
+        (0..buffer.area.height)
+            .find_map(|row| {
+                let line = buffer_line(buffer, row);
+                line.find(needle)
+                    .map(|byte| (line[..byte].chars().count() as u16, row))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} is not rendered"))
+    }
+
+    #[test]
+    fn console_tabs_name_both_views_and_the_hidden_one_is_clickable() {
+        let mut actions = VisibleActions::default();
+        let logs_view = ConsoleViewState {
+            pane: ConsolePaneKind::Pipe,
+            terminal_available: true,
+            ..ConsoleViewState::default()
+        };
+        let buffer = render_console_frame(logs_view, None, &mut actions);
+        let (terminal_x, row) = text_position(&buffer, " Terminal │ Logs  api · run 1 ");
+        let (logs_x, _) = text_position(&buffer, " Logs ");
+
+        assert_eq!(
+            actions.handle_mouse(&click(terminal_x + 2, row)),
+            VisibleActionEvent::Selected(VisibleAction::SwitchView)
+        );
+        assert_eq!(
+            actions.handle_mouse(&click(logs_x + 2, row)),
+            VisibleActionEvent::Ignored,
+            "the shown view is not a toggle"
+        );
+
+        let pipe_only = ConsoleViewState {
+            pane: ConsolePaneKind::Pipe,
+            ..ConsoleViewState::default()
+        };
+        let buffer = render_console_frame(pipe_only, None, &mut actions);
+        assert!(!buffer_text(&buffer).contains("Terminal"));
+        assert!(buffer_text(&buffer).contains(" Logs  api · run 1 "));
+    }
+
+    #[test]
+    fn console_status_sits_in_the_bottom_border_and_keeps_its_head() {
+        let mut actions = VisibleActions::default();
+        let status = "Match 2 of 9 · new output below · Run 4 · since 10:00:00 UTC";
+        let buffer = render_console_frame(ConsoleViewState::default(), Some(status), &mut actions);
+        let (_, console, _) = project_layout(buffer.area, 1);
+        let bottom = buffer_line(&buffer, console.bottom() - 1);
+
+        assert!(bottom.starts_with('└') && bottom.ends_with('┘'), "{bottom}");
+        assert!(
+            bottom.contains("Match 2 of 9 · new output below"),
+            "{bottom}"
+        );
+        assert!(
+            bottom.contains('…'),
+            "a narrow pane cuts the tail: {bottom}"
+        );
+    }
+
     #[test]
     fn search_dialog_names_the_field_results_and_actions() {
         let backend = ratatui::backend::TestBackend::new(80, 20);
@@ -1212,16 +1343,18 @@ mod tests {
                     &[],
                     &[],
                     &mut process_table_state,
-                    None,
-                    Some(&[]),
+                    ConsoleContent {
+                        body: ConsoleBody::Logs(&[]),
+                        search_dialog: Some(&dialog),
+                        header: "demo",
+                        ..ConsoleContent::default()
+                    },
                     ConsoleViewState {
                         pane: ConsolePaneKind::Pipe,
                         search_editing: true,
                         ..ConsoleViewState::default()
                     },
-                    Some(&dialog),
                     "Processes",
-                    "Logs · demo",
                     &mut profile_menu,
                     &mut visible_actions,
                 );

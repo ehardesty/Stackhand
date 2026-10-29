@@ -50,6 +50,10 @@ impl ProcessLogs {
         self.search.representation(has_terminal)
     }
 
+    pub(crate) fn toggle_representation(&mut self) {
+        self.search.toggle_representation();
+    }
+
     pub(crate) fn is_search_editing(&self) -> bool {
         self.search.is_editing()
     }
@@ -107,15 +111,16 @@ impl ProcessLogs {
                 line.content_offset + current.end,
             ));
         }
-        let mut status = output.scope();
+        // Most important first: a narrow border cuts the tail.
+        let mut status = Vec::new();
+        status.extend(self.search.status());
         if self.scroll.expired() {
-            status.push_str(" · paused page expired · f: follow · scroll: retained Logs");
+            status.push("paused page expired · f: follow · scroll: retained Logs".to_string());
         } else if !self.scroll.following() && self.unseen_output {
-            status.push_str(" · new output below · f: follow");
+            status.push("new output below · f: follow".to_string());
         }
-        if let Some(search) = self.search.status() {
-            status.push_str(&format!(" · {search}"));
-        }
+        status.push(output.scope());
+        let status = status.join(" · ");
         if self.scroll.following() {
             self.unseen_output = false;
         }
