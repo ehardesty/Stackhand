@@ -669,7 +669,7 @@ fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
             &[("Ctrl-A: Processes", VisibleAction::FocusProcesses)],
         ),
         ConsoleWarning::LogsCommandOnly => (
-            "WARNING: Logs accepts commands, not Process input",
+            "WARNING: Logs is read-only",
             &[
                 ("Ctrl-F /: search", VisibleAction::SearchEdit),
                 ("Esc: Processes", VisibleAction::FocusProcesses),

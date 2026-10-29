@@ -374,6 +374,39 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
 }
 
 #[test]
+fn a_logs_click_neither_selects_text_nor_pauses_the_live_tail() {
+    let output = crate::output::OutputViews::new(1).for_process(0).unwrap();
+    output.append_at(
+        1,
+        crate::runtime::OutputStream::Stdout,
+        0,
+        b"first\nsecond\n",
+    );
+    let retained = output.snapshot();
+    let mut logs = ProcessLogs::default();
+    logs.frame(&retained, 3);
+    let mut interaction = ConsoleInteraction::default();
+    interaction.set_pane(ConsolePaneKind::Pipe);
+    let area = Rect::new(0, 0, 40, 3);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        let click = MouseEvent {
+            kind,
+            column: 8,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        interaction.handle_read_only_mouse(click, area, 1, &mut logs, &retained);
+    }
+
+    let frame = logs.frame(&retained, 3);
+    assert!(!frame.has_selection);
+    assert!(frame.following);
+}
+
+#[test]
 fn console_click_focuses_and_drag_enters_copy_mode() {
     let (session, peer) = session();
     let stopped = std::sync::atomic::AtomicBool::new(false);

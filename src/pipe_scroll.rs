@@ -181,8 +181,15 @@ impl PipeScroll {
     }
 
     pub fn finish_selection(&mut self, row: usize, column: usize) -> bool {
-        if self.selection.is_none() {
+        let Some(selection) = self.selection else {
             return false;
+        };
+        // A release on the last reported cell before any text is selected
+        // is a click. It focuses Logs without selecting a character or
+        // pausing the live tail.
+        if !self.has_selection() && (selection.cursor_row, selection.cursor_column) == (row, column)
+        {
+            return self.clear_selection();
         }
         self.update_selection(row, column);
         let selection = self.selection.as_mut().expect("selection exists");

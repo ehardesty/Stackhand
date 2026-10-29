@@ -1784,7 +1784,7 @@ mod tests {
     fn footer_makes_input_rejections_visible() {
         for (warning, needle) in [
             (ConsoleWarning::InputDisabled, "input is not enabled"),
-            (ConsoleWarning::LogsCommandOnly, "Logs accepts commands"),
+            (ConsoleWarning::LogsCommandOnly, "Logs is read-only"),
             (
                 ConsoleWarning::SelectionUnavailable,
                 "terminal selection is available only in Terminal view",
