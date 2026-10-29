@@ -7,7 +7,7 @@ use ratatui::widgets::{
     TableState,
 };
 
-use crate::log_view::SearchPrompt;
+use crate::log_view::LogsPrompt;
 use crate::terminal::{OwnedTerminalScrollbar, OwnedTerminalSnapshot};
 
 use super::footer::{VisibleActions, fit_text};
@@ -81,6 +81,8 @@ pub struct ConsoleViewState {
     pub pane: ConsolePaneKind,
     /// The selected Logs search has matches to move between.
     pub match_navigation: bool,
+    /// A filter hides some of the selected Process's Logs lines.
+    pub logs_filtered: bool,
     pub logs_selection: bool,
     pub logs_scrollbar: Option<ConsoleScrollbar>,
     pub terminal_available: bool,
@@ -101,6 +103,7 @@ impl Default for ConsoleViewState {
             stackhand_mouse_gesture: false,
             pane: ConsolePaneKind::default(),
             match_navigation: false,
+            logs_filtered: false,
             logs_selection: false,
             logs_scrollbar: None,
             terminal_available: false,
@@ -291,8 +294,8 @@ pub fn project_console_geometry(process_rows: usize) -> crate::geometry::Termina
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConsoleContent<'a> {
     pub(crate) body: ConsoleBody<'a>,
-    /// The edited search query, shown in the footer.
-    pub(crate) search_prompt: Option<&'a SearchPrompt>,
+    /// The edited search or filter prompt, shown in the footer.
+    pub(crate) logs_prompt: Option<&'a LogsPrompt>,
     /// The selected Process and its live Run identity, projected from the
     /// immutable Supervisor snapshot rather than stored UI state.
     pub(crate) header: &'a str,
@@ -402,7 +405,7 @@ pub(crate) fn render_project_with_search(
         area,
         view,
         mouse_tracking,
-        console.search_prompt,
+        console.logs_prompt,
     );
     if let Some(trigger) = profile_trigger {
         profile_menu.render(frame, trigger, area);
@@ -1521,6 +1524,7 @@ mod tests {
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
                 match_navigation: false,
+                logs_filtered: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1615,6 +1619,7 @@ mod tests {
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
                 match_navigation: false,
+                logs_filtered: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1641,6 +1646,7 @@ mod tests {
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
                 match_navigation: false,
+                logs_filtered: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,
@@ -1665,6 +1671,7 @@ mod tests {
                 stackhand_mouse_gesture: false,
                 pane: ConsolePaneKind::default(),
                 match_navigation: false,
+                logs_filtered: false,
                 logs_selection: false,
                 logs_scrollbar: None,
                 terminal_available: false,

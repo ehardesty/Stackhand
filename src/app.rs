@@ -221,7 +221,7 @@ fn run_event_loop(
                         ConsoleBody::Terminal(frame.terminal.as_ref()),
                         ConsoleBody::Logs,
                     ),
-                    search_prompt: frame.search_prompt.as_ref(),
+                    logs_prompt: frame.logs_prompt.as_ref(),
                     header: &header,
                     status: frame.logs_status.as_deref(),
                 },

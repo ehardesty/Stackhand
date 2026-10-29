@@ -6,13 +6,14 @@ use std::sync::{Arc, Weak};
 
 use super::segments::Segment;
 use super::snapshot::search_chunk;
-use super::{LogSearch, RetainedOutput, SEARCH_MATCH_LIMIT};
+use super::{LineFilter, LogSearch, RetainedOutput, SEARCH_MATCH_LIMIT};
 
 const SEARCH_WORK_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchCache {
     query: String,
+    filter: Option<LineFilter>,
     entries: HashMap<usize, Cached>,
 }
 
@@ -23,9 +24,21 @@ struct Cached {
 }
 
 impl SearchCache {
+    #[cfg(test)]
     pub(crate) fn search(&mut self, output: &RetainedOutput, query: &str) -> LogSearch {
-        if self.query != query {
+        self.search_shown(output, query, None)
+    }
+
+    /// Search only the lines `filter` shows.
+    pub(crate) fn search_shown(
+        &mut self,
+        output: &RetainedOutput,
+        query: &str,
+        filter: Option<&LineFilter>,
+    ) -> LogSearch {
+        if self.query != query || self.filter.as_ref() != filter {
             self.query = query.to_owned();
+            self.filter = filter.cloned();
             self.entries.clear();
         }
         if query.is_empty() {
@@ -51,7 +64,7 @@ impl SearchCache {
                 let mut found = LogSearch::default();
                 for record in segment.records.iter().rev() {
                     work += super::retained_size(record);
-                    search_chunk(record, query, &mut found);
+                    search_chunk(record, query, filter, &mut found);
                     if found.limited {
                         break;
                     }

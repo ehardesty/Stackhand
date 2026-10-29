@@ -13,7 +13,7 @@ use ratatui_interact::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::log_view::SearchPrompt;
+use crate::log_view::{LogsPrompt, PromptKind};
 
 use super::theme::{ModeTone, TERMINAL_THEME};
 use super::view::{ConsolePaneKind, ConsoleViewMode, ConsoleViewState, ConsoleWarning};
@@ -28,6 +28,7 @@ pub(crate) enum VisibleAction {
     Copy,
     EnterCopy,
     ExitCopy,
+    FilterEdit,
     FocusConsole,
     FocusProcesses,
     Follow,
@@ -36,12 +37,14 @@ pub(crate) enum VisibleAction {
     LifecycleRestart,
     OpenLifecycleMenu,
     OpenProfiles,
+    /// Commit the edited prompt and open the other one.
+    PromptSwitch,
     Quit,
-    SearchCancel,
+    PromptCancel,
     SearchEdit,
     SearchNext,
     SearchPrevious,
-    SearchSubmit,
+    PromptSubmit,
     SelectAll,
     StartAnyway,
     /// Show the other console view and focus it, as a console click does.
@@ -209,7 +212,14 @@ impl VisibleActions {
             segments.push(tab("Terminal", !logs_active));
             segments.push(Segment::text("│"));
         }
-        segments.push(tab("Logs", logs_active));
+        segments.push(tab(
+            if view.logs_filtered {
+                "Logs (filtered)"
+            } else {
+                "Logs"
+            },
+            logs_active,
+        ));
         // Block titles start one cell after the corner and stop before the
         // opposite corner, which keeps one border cell after the header.
         let title_row = Rect::new(
@@ -235,7 +245,7 @@ impl VisibleActions {
         screen: Rect,
         view: ConsoleViewState,
         child_mouse_tracking: bool,
-        prompt: Option<&SearchPrompt>,
+        prompt: Option<&LogsPrompt>,
     ) {
         let (segments, cursor) = footer_layout(view, child_mouse_tracking, prompt, area.width);
         let line = self.action_line(
@@ -326,15 +336,17 @@ struct Hint {
 }
 
 /// How long a hint survives as the footer narrows. Essential hints are
-/// clipped rather than hidden.
+/// clipped rather than hidden. The follow state yields after Useful hints
+/// and before Important ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Priority {
     Essential,
+    Important,
     Useful,
     Extra,
 }
 
-use Priority::{Essential, Extra, Useful};
+use Priority::{Essential, Extra, Important, Useful};
 
 impl Hint {
     fn styled(text: impl Into<String>, style: Style, priority: Priority) -> Self {
@@ -376,21 +388,21 @@ const TRAILING_GAP: usize = 2;
 impl FooterContent {
     /// Drop the least important hints until the content fits. Equal
     /// priorities drop from the end, so the visible order never changes.
-    /// The follow state goes last; essential hints are clipped, not hidden.
     fn fit(mut self, width: u16) -> Self {
         while self.width() > usize::from(width) {
-            let Some(drop) = self
+            let drop = self
                 .hints
                 .iter()
                 .enumerate()
                 .filter(|(_, hint)| hint.priority > Essential)
-                .max_by_key(|(index, hint)| (hint.priority, *index))
-                .map(|(index, _)| index)
-            else {
-                self.trailing = None;
-                break;
-            };
-            self.hints.remove(drop);
+                .max_by_key(|(index, hint)| (hint.priority, *index));
+            match drop {
+                Some((index, hint)) if hint.priority >= Useful || self.trailing.is_none() => {
+                    self.hints.remove(index);
+                }
+                _ if self.trailing.is_some() => self.trailing = None,
+                _ => break,
+            }
         }
         self
     }
@@ -502,7 +514,7 @@ pub(super) fn footer_text(view: ConsoleViewState, child_mouse_tracking: bool) ->
 fn footer_layout(
     view: ConsoleViewState,
     child_mouse_tracking: bool,
-    prompt: Option<&SearchPrompt>,
+    prompt: Option<&LogsPrompt>,
     width: u16,
 ) -> (Vec<Segment>, Option<usize>) {
     let content = footer_content(view, child_mouse_tracking, prompt, width).fit(width);
@@ -515,10 +527,10 @@ const PROMPT_EXIT: &str = "Esc: cancel";
 fn footer_content(
     view: ConsoleViewState,
     child_mouse_tracking: bool,
-    prompt: Option<&SearchPrompt>,
+    prompt: Option<&LogsPrompt>,
     width: u16,
 ) -> FooterContent {
-    let (badge, tone) = mode_badge(view, prompt.is_some());
+    let (badge, tone) = mode_badge(view, prompt.map(|prompt| prompt.kind));
     let mut content = FooterContent {
         badge,
         tone,
@@ -531,12 +543,17 @@ fn footer_content(
         let room = usize::from(width).saturating_sub(
             text_width(badge) + 3 + text_width(SEPARATOR) + text_width(PROMPT_EXIT) + 1,
         );
-        let query = fit_text_end(&format!("/{}", prompt.query), room);
+        let (sigil, other) = match prompt.kind {
+            PromptKind::Search => ('/', "Tab: filter"),
+            PromptKind::Filter => ('&', "Tab: search"),
+        };
+        let query = fit_text_end(&format!("{sigil}{}", prompt.query), room);
         content.hints = vec![
             Hint::styled(query, TERMINAL_THEME.prompt(), Essential),
             Hint::text(prompt.result.clone(), Useful),
-            Hint::action("Enter: done", VisibleAction::SearchSubmit, Useful),
-            Hint::action(PROMPT_EXIT, VisibleAction::SearchCancel, Essential),
+            Hint::action(other, VisibleAction::PromptSwitch, Useful),
+            Hint::action("Enter: done", VisibleAction::PromptSubmit, Extra),
+            Hint::action(PROMPT_EXIT, VisibleAction::PromptCancel, Essential),
         ];
         return content;
     }
@@ -599,9 +616,11 @@ fn footer_content(
 
 /// Name the keyboard owner. The badge answers the question the footer must
 /// always answer: where will the next key go?
-fn mode_badge(view: ConsoleViewState, search_editing: bool) -> (&'static str, ModeTone) {
-    if search_editing {
-        return ("SEARCH", ModeTone::Modal);
+fn mode_badge(view: ConsoleViewState, prompt: Option<PromptKind>) -> (&'static str, ModeTone) {
+    match prompt {
+        Some(PromptKind::Search) => return ("SEARCH", ModeTone::Modal),
+        Some(PromptKind::Filter) => return ("FILTER", ModeTone::Modal),
+        None => {}
     }
     if view.logs_selection {
         return ("SELECT", ModeTone::Modal);
@@ -703,7 +722,7 @@ fn append_process_list_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
     hints.push(Hint::action(
         "s/x/r: lifecycle",
         VisibleAction::OpenLifecycleMenu,
-        Useful,
+        Important,
     ));
     append_view_toggle(hints, view);
     hints.push(Hint::action(
@@ -732,7 +751,7 @@ fn append_logs_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
         Essential,
     ));
     if !view.following {
-        hints.push(Hint::action("f: live", VisibleAction::Follow, Useful));
+        hints.push(Hint::action("f: live", VisibleAction::Follow, Important));
     }
     hints.push(Hint::action("c/y: copy", VisibleAction::Copy, Extra));
 }
@@ -746,6 +765,11 @@ fn append_search_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {
         } else {
             Essential
         },
+    ));
+    hints.push(Hint::action(
+        "Ctrl-G &: filter",
+        VisibleAction::FilterEdit,
+        Important,
     ));
     if view.match_navigation {
         hints.push(Hint::action(
@@ -867,7 +891,17 @@ mod tests {
             }
             assert!(!narrow.contains("q: quit"), "{width}: {narrow}");
         }
-        assert!(fitted_text(view, 80).ends_with("LIVE"));
+        let eighty = fitted_text(
+            ConsoleViewState {
+                terminal_available: true,
+                ..ConsoleViewState::default()
+            },
+            80,
+        );
+        for important in ["s/x/r: lifecycle", "Ctrl-G &: filter"] {
+            assert!(eighty.contains(important), "{eighty}");
+        }
+        assert!(fitted_text(view, 120).ends_with("LIVE"));
     }
 
     #[test]
@@ -899,10 +933,11 @@ mod tests {
     }
 
     #[test]
-    fn search_prompt_replaces_footer_hints_and_owns_the_cursor() {
+    fn logs_prompt_replaces_footer_hints_and_owns_the_cursor() {
         let mut actions = VisibleActions::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
-        let prompt = SearchPrompt {
+        let prompt = LogsPrompt {
+            kind: PromptKind::Search,
             query: "timeout".to_string(),
             result: "2/11".to_string(),
         };
@@ -936,13 +971,14 @@ mod tests {
         let cancel = line[..line.find("Esc: cancel").unwrap()].chars().count() as u16;
         assert_eq!(
             actions.handle_mouse(&click(cancel + 1, 2)),
-            VisibleActionEvent::Selected(VisibleAction::SearchCancel)
+            VisibleActionEvent::Selected(VisibleAction::PromptCancel)
         );
     }
 
     #[test]
     fn a_long_search_query_shows_its_end_and_keeps_the_exit_visible() {
-        let prompt = SearchPrompt {
+        let prompt = LogsPrompt {
+            kind: PromptKind::Search,
             query: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ".to_string(),
             result: "no matches".to_string(),
         };
@@ -951,7 +987,10 @@ mod tests {
         let line: String = segments.into_iter().map(|segment| segment.text).collect();
 
         assert!(Line::from(line.clone()).width() <= 50, "{line}");
-        assert!(line.contains(" …") && line.contains("ABCDEFGHIJ · "), "{line}");
+        assert!(
+            line.contains(" …") && line.contains("ABCDEFGHIJ · "),
+            "{line}"
+        );
         assert!(line.ends_with("Esc: cancel"), "{line}");
         let query_end = line.find('J').unwrap() + 1;
         assert_eq!(cursor, Some(line[..query_end].chars().count()));

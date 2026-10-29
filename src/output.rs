@@ -4,15 +4,17 @@
 //! observed bytes and take immutable snapshots. The implementation hides lossy
 //! UTF-8 conversion, terminal-control filtering, long-line splitting, per-Process
 //! limits, the hard Project limit, oldest-first eviction, timestamps, stream
-//! labels, and literal search.
+//! labels, literal search, and filtered views of retained lines.
 //! Output bytes do not enter the Supervisor control queue.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod filter;
 mod search;
 mod segments;
 mod snapshot;
 use crate::output_settings::OutputSettings;
+pub(crate) use filter::{FilterCache, FilteredLines, FilteredOutput, LineFilter};
 pub(crate) use search::SearchCache;
 pub use segments::RetainedChunks;
 pub use snapshot::{LogMatch, LogSearch, RetainedOutput};
@@ -31,6 +33,35 @@ pub const LOGICAL_LINE_BYTES: usize = 16 * 1024;
 /// Search never builds an unbounded result list.
 pub const SEARCH_MATCH_LIMIT: usize = 1_000;
 const LONG_LINE_MARKER: &str = " … [line continued at 16 KiB]";
+
+/// The display-line space that a Logs viewport moves through. Retained
+/// output is one adapter; a filtered view of it is the other. Positions are
+/// display rows, including the history-limit notice at row 0 when older
+/// output expired, and sources are retained `(sequence, line)` identities.
+pub(crate) trait LogLines {
+    fn total_lines(&self) -> usize;
+    /// Older output expired, so row 0 is the history-limit notice.
+    fn truncated(&self) -> bool;
+    fn display_range(&self, start: usize, end: usize) -> Vec<crate::tui::PipeLine>;
+    /// The row of `source`, or of the head for `None`, and the total rows.
+    fn display_position(&self, source: Option<(u64, usize)>) -> Option<(usize, usize)>;
+    fn display_source_at(&self, position: usize) -> Option<(u64, usize)>;
+
+    /// Format only the newest required lines.
+    fn display_lines(&self, tail_limit: usize) -> Vec<crate::tui::PipeLine> {
+        let total = self.total_lines();
+        self.display_range(total.saturating_sub(tail_limit), total)
+    }
+
+    fn display_window_from(
+        &self,
+        anchor: Option<(u64, usize)>,
+        limit: usize,
+    ) -> Option<Vec<crate::tui::PipeLine>> {
+        let start = self.display_position(anchor)?.0;
+        Some(self.display_range(start, start.saturating_add(limit).min(self.total_lines())))
+    }
+}
 
 /// One retained Logs unit. Data retains its Run, observation order, observation
 /// time, and stream identity. PTY output uses [`OutputStream::Combined`].

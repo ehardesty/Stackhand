@@ -14,7 +14,7 @@ use ratatui::widgets::TableState;
 use super::view_model::{port_list, process_list_rows, profile_changes_pending, profiles_visible};
 
 use crate::console::{ConsoleInteraction, LifecycleCommand};
-use crate::log_view::{OutputRepresentation, SearchPrompt};
+use crate::log_view::{LogsPrompt, OutputRepresentation};
 use crate::output::RetainedOutput;
 use crate::process_logs::{LogsInput, ProcessLogs};
 use crate::supervisor::{
@@ -47,7 +47,7 @@ pub(super) struct InteractionFrame {
     pub(super) terminal: Option<OwnedTerminalSnapshot>,
     pub(super) lines: Option<Vec<PipeLine>>,
     pub(super) logs_status: Option<String>,
-    pub(super) search_prompt: Option<SearchPrompt>,
+    pub(super) logs_prompt: Option<LogsPrompt>,
     pub(super) view: ConsoleViewState,
 }
 
@@ -250,14 +250,15 @@ impl ProjectInteraction {
         view.start_anyway_available = self.start_anyway_available;
         view.terminal_available = self.terminal_available;
         view.input_enabled = self.input_enabled;
-        let (lines, logs_status, search_prompt) = match pane {
+        view.logs_filtered = self.logs[self.selected].is_filtered();
+        let (lines, logs_status, logs_prompt) = match pane {
             SelectedPane::Logs(_) => {
                 let frame = self.logs[self.selected].frame(retained, pane_rows);
                 view.following = frame.following;
                 view.match_navigation = frame.match_navigation;
                 view.logs_selection = frame.has_selection;
                 view.logs_scrollbar = frame.scrollbar;
-                (Some(frame.lines), frame.status, frame.search_prompt)
+                (Some(frame.lines), frame.status, frame.logs_prompt)
             }
             SelectedPane::Terminal(session) => {
                 let status = terminal
@@ -277,7 +278,7 @@ impl ProjectInteraction {
             terminal,
             lines,
             logs_status,
-            search_prompt,
+            logs_prompt,
             view,
         }
     }
@@ -295,7 +296,7 @@ impl ProjectInteraction {
             && should_quit(
                 key,
                 self.console.view(),
-                self.logs[self.selected].is_search_editing(),
+                self.logs[self.selected].is_prompt_open(),
             )
         {
             return InputResult::Quit;
@@ -344,9 +345,9 @@ impl ProjectInteraction {
         }
         match event {
             Event::Key(key) => self.route_key(key, pane, process, retained, console_area.height),
-            Event::Paste(data) if self.logs[self.selected].is_search_editing() => {
+            Event::Paste(data) if self.logs[self.selected].is_prompt_open() => {
                 self.console.clear_warning();
-                if self.logs[self.selected].paste_search(&data, retained) {
+                if self.logs[self.selected].paste_prompt(&data, retained) {
                     InputResult::Changed
                 } else {
                     InputResult::Ignored
@@ -483,11 +484,11 @@ impl ProjectInteraction {
             VisibleAction::ApplyProfile => KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
             VisibleAction::ChooseProfile
             | VisibleAction::SearchNext
-            | VisibleAction::SearchSubmit => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            | VisibleAction::PromptSubmit => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             VisibleAction::ClearSelection
             | VisibleAction::CloseProfileMenu
             | VisibleAction::ExitCopy
-            | VisibleAction::SearchCancel => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            | VisibleAction::PromptCancel => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             VisibleAction::Copy => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
             VisibleAction::EnterCopy | VisibleAction::ToggleSelection => {
                 KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)
@@ -504,6 +505,8 @@ impl ProjectInteraction {
             }
             VisibleAction::OpenProfiles => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
             VisibleAction::SearchEdit => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            VisibleAction::FilterEdit => KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            VisibleAction::PromptSwitch => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             VisibleAction::SearchPrevious => KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             VisibleAction::SelectAll => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
             VisibleAction::StartAnyway => KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),

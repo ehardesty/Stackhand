@@ -186,7 +186,7 @@ fn prove(
     );
     assert!(
         logs.frame(&retained, usize::from(PAGE_ROWS))
-            .search_prompt
+            .logs_prompt
             .is_some_and(|prompt| prompt.query == "x")
     );
     logs.handle_key(
@@ -196,7 +196,7 @@ fn prove(
         &retained,
         usize::from(PAGE_ROWS),
     );
-    assert!(!logs.is_search_editing());
+    assert!(!logs.is_prompt_open());
     println!("interaction-logs-ok");
 
     // The Process list owns the keyboard at startup. Ctrl-A moves focus to

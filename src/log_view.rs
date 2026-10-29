@@ -1,18 +1,31 @@
-//! Logs search and representation state used inside `ProcessLogs`.
+//! Logs search, filter, and representation state used inside `ProcessLogs`.
 //!
-//! This implementation hides search editing, bounded result refresh, eviction
-//! invalidation, match navigation, and the active Terminal/Logs representation.
-//! The retained output module remains the source of text.
+//! This implementation hides prompt editing, bounded search and filter
+//! refresh, eviction invalidation, match navigation, and the active
+//! Terminal/Logs representation. The retained output module remains the
+//! source of text; the filter decides which retained lines are shown.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::output::{LogMatch, LogSearch, RetainedOutput};
+use crate::output::{
+    FilterCache, FilteredLines, FilteredOutput, LineFilter, LogMatch, LogSearch, RetainedOutput,
+};
 
-const SEARCH_QUERY_BYTES: usize = 256;
+const PROMPT_BYTES: usize = 256;
 
-/// The search query being edited and its live result summary.
+/// What an edited Logs prompt changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptKind {
+    /// Highlight and visit literal matches.
+    Search,
+    /// Hide retained lines that do not match.
+    Filter,
+}
+
+/// The Logs prompt being edited and its live result summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SearchPrompt {
+pub(crate) struct LogsPrompt {
+    pub(crate) kind: PromptKind,
     pub(crate) query: String,
     pub(crate) result: String,
 }
@@ -29,6 +42,8 @@ pub(crate) enum LogViewAction {
     Changed,
     Pause,
     ShowMatch(LogMatch),
+    /// The shown lines changed, so a held viewport anchor may be hidden.
+    Refiltered,
     Follow,
     Copy,
 }
@@ -50,28 +65,40 @@ impl MatchSelection {
 }
 
 #[derive(Clone, Debug)]
+struct Prompt {
+    kind: PromptKind,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogView {
     representation: OutputRepresentation,
-    editor: Option<String>,
-    search_origin: Option<OutputRepresentation>,
+    prompt: Option<Prompt>,
+    prompt_origin: Option<OutputRepresentation>,
     query: String,
+    filter: String,
     search: LogSearch,
     current: MatchSelection,
     generation: Option<u64>,
     cache: crate::output::SearchCache,
+    filter_cache: FilterCache,
+    filtered: Option<FilteredLines>,
 }
 
 impl Default for LogView {
     fn default() -> Self {
         Self {
             representation: OutputRepresentation::Terminal,
-            editor: None,
-            search_origin: None,
+            prompt: None,
+            prompt_origin: None,
             query: String::new(),
+            filter: String::new(),
             search: LogSearch::default(),
             current: MatchSelection::Inactive,
             generation: None,
             cache: Default::default(),
+            filter_cache: Default::default(),
+            filtered: None,
         }
     }
 }
@@ -94,7 +121,7 @@ impl LogView {
     }
 
     pub(crate) fn is_editing(&self) -> bool {
-        self.editor.is_some()
+        self.prompt.is_some()
     }
 
     pub(crate) fn current_match(&self) -> Option<LogMatch> {
@@ -107,38 +134,54 @@ impl LogView {
         self.current = MatchSelection::Inactive;
     }
 
+    /// The retained lines the viewport shows through the active filter.
+    pub(crate) fn shown<'a>(&'a self, output: &'a RetainedOutput) -> FilteredOutput<'a> {
+        FilteredOutput {
+            output,
+            filtered: self.filtered.as_ref(),
+        }
+    }
+
+    /// A filter hides lines, including one being edited.
+    pub(crate) fn is_filtered(&self) -> bool {
+        self.filtered.is_some()
+    }
+
     pub(crate) fn has_search(&self) -> bool {
-        self.editor
-            .as_ref()
-            .map_or(!self.query.is_empty(), |editor| !editor.is_empty())
+        !self.search_query().is_empty()
     }
 
     /// A committed search found matches that `n` and `N` can visit.
     pub(crate) fn has_matches(&self) -> bool {
-        self.editor.is_none() && !self.query.is_empty() && !self.search.matches.is_empty()
+        self.prompt.is_none() && !self.query.is_empty() && !self.search.matches.is_empty()
     }
 
-    pub(crate) fn prompt(&self) -> Option<SearchPrompt> {
-        self.editor.as_ref().map(|query| SearchPrompt {
-            query: query.clone(),
-            result: self.match_result(),
+    pub(crate) fn prompt(&self) -> Option<LogsPrompt> {
+        let prompt = self.prompt.as_ref()?;
+        Some(LogsPrompt {
+            kind: prompt.kind,
+            query: prompt.text.clone(),
+            result: match prompt.kind {
+                PromptKind::Search => self.match_result(),
+                PromptKind::Filter => self.filter_result(),
+            },
         })
     }
 
-    /// Append a host paste to the active search field. Control characters do
-    /// not become part of a literal query, and the same byte bound as typed
+    /// Append a host paste to the edited prompt. Control characters do not
+    /// become part of a literal query, and the same byte bound as typed
     /// input applies without splitting UTF-8 characters.
-    pub(crate) fn paste_search(&mut self, text: &str, output: &RetainedOutput) -> LogViewAction {
-        let Some(editor) = self.editor.as_mut() else {
+    pub(crate) fn paste_prompt(&mut self, text: &str, output: &RetainedOutput) -> LogViewAction {
+        let Some(prompt) = self.prompt.as_mut() else {
             return LogViewAction::Ignored;
         };
         for character in text.chars().filter(|character| !character.is_control()) {
-            if editor.len() + character.len_utf8() > SEARCH_QUERY_BYTES {
+            if prompt.text.len() + character.len_utf8() > PROMPT_BYTES {
                 break;
             }
-            editor.push(character);
+            prompt.text.push(character);
         }
-        self.preview_search(output)
+        self.preview(output)
     }
 
     /// Handle one Logs command. Process-list focus always owns command keys.
@@ -151,27 +194,22 @@ impl LogView {
         output: &RetainedOutput,
     ) -> LogViewAction {
         if key.kind != KeyEventKind::Press {
-            return if self.editor.is_some() {
+            return if self.prompt.is_some() {
                 LogViewAction::Changed
             } else {
                 LogViewAction::Ignored
             };
         }
-        if self.editor.is_some() {
-            return self.edit_search(key, output);
+        if self.prompt.is_some() {
+            return self.edit_prompt(key, output);
         }
         let logs_active = self.representation(has_terminal) == OutputRepresentation::Logs;
-        let opens_search = key.code == KeyCode::Char('/')
-            || (key.code == KeyCode::Char('f')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT));
-        if opens_search && (command_context || logs_active) {
-            self.search_origin = Some(self.representation(has_terminal));
+        if let Some(kind) = prompt_key(key)
+            && (command_context || logs_active)
+        {
+            self.prompt_origin = Some(self.representation(has_terminal));
             self.representation = OutputRepresentation::Logs;
-            self.editor = Some(String::new());
-            self.search = LogSearch::default();
-            self.current = MatchSelection::Inactive;
-            return LogViewAction::Pause;
+            return self.open_prompt(kind, false, output);
         }
         if (!command_context && !logs_active)
             || key
@@ -213,13 +251,20 @@ impl LogView {
     }
 
     pub(crate) fn refresh(&mut self, output: &RetainedOutput) -> bool {
-        if self.generation == Some(output.generation) && !self.search.pending {
+        let pending =
+            self.search.pending || self.filtered.as_ref().is_some_and(FilteredLines::pending);
+        if self.generation == Some(output.generation) && !pending {
             return false;
         }
+        self.update_results(output);
+        true
+    }
+
+    /// Recompute results for new output or a changed filter, keeping the
+    /// selected match while it is still found.
+    fn update_results(&mut self, output: &RetainedOutput) {
         let previous = self.current_match();
-        self.generation = Some(output.generation);
-        let query = self.editor.as_deref().unwrap_or(&self.query);
-        self.search = self.cache.search(output, query);
+        self.recompute(output);
         self.current = match self.current {
             MatchSelection::Inactive => MatchSelection::Inactive,
             MatchSelection::AwaitingMatch if !self.search.matches.is_empty() => {
@@ -235,21 +280,28 @@ impl LogView {
                 })
                 .map_or(MatchSelection::AwaitingMatch, MatchSelection::Selected),
         };
-        true
     }
 
-    /// The committed search for the Logs border. An edited search is shown
-    /// by its prompt instead.
-    pub(crate) fn status(&self) -> Option<String> {
-        if self.editor.is_some() || self.query.is_empty() {
-            return None;
+    /// Committed search and filter parts for the Logs border. An edited
+    /// prompt shows its own result instead.
+    pub(crate) fn status(&self) -> Vec<String> {
+        let editing = self.prompt.as_ref().map(|prompt| prompt.kind);
+        let mut parts = Vec::new();
+        if editing != Some(PromptKind::Search) && !self.query.is_empty() {
+            parts.push(format!("/{} {}", self.query, self.match_result()));
         }
-        Some(format!("/{} {}", self.query, self.match_result()))
+        if editing != Some(PromptKind::Filter) && self.filtered.is_some() {
+            parts.push(format!("filter {} · {}", self.filter, self.filter_result()));
+        }
+        parts
+    }
+
+    fn search_query(&self) -> &str {
+        active_text(&self.prompt, PromptKind::Search, &self.query)
     }
 
     fn match_result(&self) -> String {
-        let query = self.editor.as_deref().unwrap_or(&self.query);
-        if query.is_empty() {
+        if self.search_query().is_empty() {
             return "type to search".to_string();
         }
         let count = self.search.matches.len();
@@ -271,53 +323,139 @@ impl LogView {
         format!("{position} of {count}{suffix}")
     }
 
-    fn edit_search(&mut self, key: KeyEvent, output: &RetainedOutput) -> LogViewAction {
-        match key.code {
-            KeyCode::Esc => self.cancel_search_edit(output),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cancel_search_edit(output)
+    fn filter_result(&self) -> String {
+        let Some(filtered) = &self.filtered else {
+            return "terms, !exclude".to_string();
+        };
+        let matched = filtered.matched();
+        let lines = if matched == 1 { "line" } else { "lines" };
+        if filtered.pending() {
+            format!("{matched} {lines} · filtering older Logs…")
+        } else {
+            format!("{matched} {lines} shown")
+        }
+    }
+
+    /// Open a prompt. A filter starts from the committed filter. A search
+    /// starts empty, as in `less` and Vim, unless `keep_search` carries the
+    /// committed query over from the filter prompt.
+    fn open_prompt(
+        &mut self,
+        kind: PromptKind,
+        keep_search: bool,
+        output: &RetainedOutput,
+    ) -> LogViewAction {
+        let text = match kind {
+            PromptKind::Search if keep_search => self.query.clone(),
+            PromptKind::Search => String::new(),
+            PromptKind::Filter => self.filter.clone(),
+        };
+        self.prompt = Some(Prompt { kind, text });
+        match kind {
+            PromptKind::Search if keep_search => self.rebuild_search(output),
+            PromptKind::Search => {
+                self.search = LogSearch::default();
+                self.current = MatchSelection::Inactive;
+                LogViewAction::Pause
             }
-            KeyCode::Enter => {
-                self.query = self.editor.take().unwrap_or_default();
-                self.search_origin = None;
-                self.rebuild_current_query(output)
+            PromptKind::Filter => LogViewAction::Changed,
+        }
+    }
+
+    fn edit_prompt(&mut self, key: KeyEvent, output: &RetainedOutput) -> LogViewAction {
+        let prompt = self.prompt.as_mut().expect("the prompt is open");
+        match key.code {
+            KeyCode::Esc => self.close_prompt(false, output),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.close_prompt(false, output)
+            }
+            KeyCode::Enter => self.close_prompt(true, output),
+            // Tab keeps what was typed and moves to the other prompt, so a
+            // filter and a search can be set in one pass.
+            KeyCode::Tab => {
+                let kind = prompt.kind;
+                let text = std::mem::take(&mut prompt.text);
+                self.prompt = None;
+                match kind {
+                    PromptKind::Search => {
+                        self.query = text;
+                        self.rebuild_search(output);
+                        self.open_prompt(PromptKind::Filter, false, output)
+                    }
+                    PromptKind::Filter => {
+                        self.filter = text;
+                        self.update_results(output);
+                        self.open_prompt(PromptKind::Search, true, output);
+                        LogViewAction::Refiltered
+                    }
+                }
             }
             KeyCode::Backspace => {
-                self.editor.as_mut().expect("editor exists").pop();
-                self.preview_search(output)
+                prompt.text.pop();
+                self.preview(output)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                prompt.text.clear();
+                self.preview(output)
             }
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let editor = self.editor.as_mut().expect("editor exists");
-                if editor.len() + character.len_utf8() <= SEARCH_QUERY_BYTES {
-                    editor.push(character);
+                if prompt.text.len() + character.len_utf8() <= PROMPT_BYTES {
+                    prompt.text.push(character);
                 }
-                self.preview_search(output)
+                self.preview(output)
             }
             _ => LogViewAction::Changed,
         }
     }
 
-    fn preview_search(&mut self, output: &RetainedOutput) -> LogViewAction {
-        self.rebuild_current_query(output)
-    }
-
-    fn cancel_search_edit(&mut self, output: &RetainedOutput) -> LogViewAction {
-        self.editor = None;
-        if let Some(origin) = self.search_origin.take() {
+    /// Close the prompt. Committing keeps its text; cancelling restores the
+    /// committed query and the representation that opened the prompt.
+    fn close_prompt(&mut self, commit: bool, output: &RetainedOutput) -> LogViewAction {
+        let prompt = self.prompt.take().expect("the prompt is open");
+        let origin = self.prompt_origin.take();
+        if commit {
+            match prompt.kind {
+                PromptKind::Search => self.query = prompt.text,
+                PromptKind::Filter => self.filter = prompt.text,
+            }
+        } else if let Some(origin) = origin {
             self.representation = origin;
         }
-        self.rebuild_current_query(output)
+        match prompt.kind {
+            PromptKind::Search => self.rebuild_search(output),
+            PromptKind::Filter => {
+                self.update_results(output);
+                LogViewAction::Refiltered
+            }
+        }
     }
 
-    fn rebuild_current_query(&mut self, output: &RetainedOutput) -> LogViewAction {
-        let query = self.editor.as_deref().unwrap_or(&self.query);
+    fn preview(&mut self, output: &RetainedOutput) -> LogViewAction {
+        match self.prompt.as_ref().map(|prompt| prompt.kind) {
+            Some(PromptKind::Filter) => {
+                self.update_results(output);
+                LogViewAction::Refiltered
+            }
+            _ => self.rebuild_search(output),
+        }
+    }
+
+    /// Recompute the filter and the search over the lines it shows.
+    fn recompute(&mut self, output: &RetainedOutput) {
         self.generation = Some(output.generation);
-        self.search = self.cache.search(output, query);
-        self.current = if query.is_empty() {
+        let filter = LineFilter::parse(active_text(&self.prompt, PromptKind::Filter, &self.filter));
+        let query = active_text(&self.prompt, PromptKind::Search, &self.query);
+        self.search = self.cache.search_shown(output, query, filter.as_ref());
+        self.filtered = filter.map(|filter| self.filter_cache.project(output, &filter));
+    }
+
+    fn rebuild_search(&mut self, output: &RetainedOutput) -> LogViewAction {
+        self.recompute(output);
+        self.current = if self.search_query().is_empty() {
             MatchSelection::Inactive
         } else if self.search.matches.is_empty() {
             MatchSelection::AwaitingMatch
@@ -353,6 +491,29 @@ impl LogView {
     }
 }
 
+/// The edited prompt text of `kind`, or the committed text.
+fn active_text<'a>(prompt: &'a Option<Prompt>, kind: PromptKind, committed: &'a str) -> &'a str {
+    match prompt {
+        Some(prompt) if prompt.kind == kind => &prompt.text,
+        _ => committed,
+    }
+}
+
+/// The prompt a key opens. Search follows editors and `less`: Ctrl-F or
+/// `/`. Filter follows `less` (`&`), htop (`\`, F4), and grep (Ctrl-G).
+fn prompt_key(key: KeyEvent) -> Option<PromptKind> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('/') => Some(PromptKind::Search),
+        KeyCode::Char('f') if ctrl && !alt => Some(PromptKind::Search),
+        KeyCode::Char('g') if ctrl && !alt => Some(PromptKind::Filter),
+        KeyCode::Char('&' | '\\') if !ctrl && !alt => Some(PromptKind::Filter),
+        KeyCode::F(4) => Some(PromptKind::Filter),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,12 +536,16 @@ mod tests {
         assert!(view.is_editing());
         assert_eq!(
             view.prompt(),
-            Some(SearchPrompt {
+            Some(LogsPrompt {
+                kind: PromptKind::Search,
                 query: String::new(),
                 result: "type to search".to_string(),
             })
         );
-        assert_eq!(view.status(), None, "the prompt shows an edited search");
+        assert!(
+            view.status().is_empty(),
+            "the prompt shows an edited search"
+        );
 
         assert_eq!(
             view.handle_key(key(KeyCode::Esc), false, false, &output),
@@ -468,7 +633,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char('/')), true, false, &output);
 
         assert!(matches!(
-            view.paste_search("one\ntwo €", &output),
+            view.paste_prompt("one\ntwo €", &output),
             LogViewAction::Changed
         ));
         assert_eq!(
@@ -476,11 +641,11 @@ mod tests {
             Some("onetwo €".to_string())
         );
         assert!(matches!(
-            view.paste_search(&"x".repeat(SEARCH_QUERY_BYTES), &output),
+            view.paste_prompt(&"x".repeat(PROMPT_BYTES), &output),
             LogViewAction::Changed
         ));
-        let editor = view.editor.as_ref().unwrap();
-        assert!(editor.len() <= SEARCH_QUERY_BYTES);
+        let editor = &view.prompt.as_ref().unwrap().text;
+        assert!(editor.len() <= PROMPT_BYTES);
         assert!(editor.is_char_boundary(editor.len()));
     }
 
@@ -507,16 +672,16 @@ mod tests {
             LogViewAction::ShowMatch(_)
         ));
         assert_eq!(view.representation(true), OutputRepresentation::Logs);
-        assert_eq!(view.status().as_deref(), Some("/hit 1 of 2"));
+        assert_eq!(view.status(), ["/hit 1 of 2"]);
         view.handle_key(key(KeyCode::Enter), true, true, &snapshot);
-        assert_eq!(view.status().as_deref(), Some("/hit 2 of 2"));
+        assert_eq!(view.status(), ["/hit 2 of 2"]);
         view.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             true,
             true,
             &snapshot,
         );
-        assert_eq!(view.status().as_deref(), Some("/hit 1 of 2"));
+        assert_eq!(view.status(), ["/hit 1 of 2"]);
     }
 
     #[test]
@@ -543,6 +708,6 @@ mod tests {
         let later = output.snapshot();
         assert!(view.refresh(&later));
         assert!(view.current_match().is_none());
-        assert!(view.status().unwrap().contains("no matches"));
+        assert!(view.status()[0].contains("no matches"));
     }
 }

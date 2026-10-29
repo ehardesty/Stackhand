@@ -183,6 +183,14 @@ impl RetainedChunks {
         }
     }
 
+    /// Each segment with the display line where it starts.
+    pub(super) fn segment_line_starts(&self) -> impl Iterator<Item = (usize, &Arc<Segment>)> {
+        self.segments.iter().enumerate().map(|(index, segment)| {
+            let start = index.checked_sub(1).map_or(0, |i| self.index[i].lines);
+            (start, segment)
+        })
+    }
+
     pub(super) fn total_lines(&self) -> usize {
         self.index.last().map_or(0, |index| index.lines)
     }

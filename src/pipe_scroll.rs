@@ -1,4 +1,5 @@
-//! Stable viewport state for one Process's retained Logs output.
+//! Stable viewport state for one Process's retained Logs output, seen
+//! through any `LogLines` view such as an active filter.
 //!
 //! Following is the only state that moves when output arrives. Scrolling up
 //! anchors the viewport to a retained source line. New output can then arrive
@@ -9,7 +10,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
-use crate::output::RetainedOutput;
+use crate::output::LogLines;
 use crate::tui::{ConsoleScrollbar, PipeLine};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,6 +118,17 @@ impl PipeScroll {
         self.held = true;
     }
 
+    /// The page is live or still starts at a shown line, so a changed
+    /// filter need not move it.
+    pub fn anchor_shown(&self, output: &impl LogLines) -> bool {
+        self.following()
+            || self
+                .visible
+                .iter()
+                .find_map(|line| line.source)
+                .is_none_or(|source| output.display_position(Some(source)).is_some())
+    }
+
     pub fn head(&mut self) {
         self.expired = false;
         self.position = Position::Head;
@@ -206,7 +218,7 @@ impl PipeScroll {
         &mut self,
         mouse: MouseEvent,
         area: Rect,
-        output: &RetainedOutput,
+        output: &impl LogLines,
     ) -> bool {
         let Some(scrollbar) = self.scrollbar else {
             return false;
@@ -252,7 +264,7 @@ impl PipeScroll {
         }
     }
 
-    pub fn selected_text(&self, output: &RetainedOutput) -> Option<String> {
+    pub fn selected_text(&self, output: &impl LogLines) -> Option<String> {
         let (start, end) = self.selection_range()?;
         if start == end {
             return None;
@@ -300,7 +312,7 @@ impl PipeScroll {
     /// Return the visible Logs window. This is the module's main interface:
     /// it owns follow transitions, source anchoring, resize behavior, ordered
     /// navigation, and retention eviction.
-    pub fn window<'a>(&'a mut self, output: &RetainedOutput, pane_rows: usize) -> &'a [PipeLine] {
+    pub fn window<'a>(&'a mut self, output: &impl LogLines, pane_rows: usize) -> &'a [PipeLine] {
         if pane_rows == 0 {
             self.visible.clear();
             self.scrollbar = None;
@@ -338,7 +350,7 @@ impl PipeScroll {
         &self.visible
     }
 
-    fn update_scrollbar(&mut self, output: &RetainedOutput, pane_rows: usize) {
+    fn update_scrollbar(&mut self, output: &impl LogLines, pane_rows: usize) {
         let first_source = self.visible.first().and_then(|line| line.source);
         let metrics = output.display_position(first_source);
         self.scrollbar = metrics.and_then(|(position, content_length)| {
@@ -357,7 +369,7 @@ impl PipeScroll {
 
     fn set_scrollbar_thumb(
         &mut self,
-        output: &RetainedOutput,
+        output: &impl LogLines,
         track_rows: usize,
         thumb_start: usize,
     ) {
@@ -369,7 +381,7 @@ impl PipeScroll {
         let max_position = scrollbar.content_length.saturating_sub(1);
         let thumb_start = thumb_start.min(max_thumb_start);
         let position = scale(thumb_start, max_position, max_thumb_start);
-        self.position = if position == 0 && output.truncated {
+        self.position = if position == 0 && output.truncated() {
             Position::Head
         } else {
             let Some(source) = output.display_source_at(position) else {
@@ -384,7 +396,7 @@ impl PipeScroll {
         self.update_scrollbar(output, scrollbar.viewport_length);
     }
 
-    fn refresh(&mut self, output: &RetainedOutput, pane_rows: usize) {
+    fn refresh(&mut self, output: &impl LogLines, pane_rows: usize) {
         match self.position {
             Position::Following => self.visible = output.display_lines(pane_rows),
             Position::Head => self.refresh_anchor(output, pane_rows, None),
@@ -394,7 +406,7 @@ impl PipeScroll {
 
     fn refresh_anchor(
         &mut self,
-        output: &RetainedOutput,
+        output: &impl LogLines,
         pane_rows: usize,
         anchor: Option<(u64, usize)>,
     ) {
@@ -413,7 +425,7 @@ impl PipeScroll {
         self.visible = lines;
     }
 
-    fn apply_navigation(&mut self, output: &RetainedOutput, pane_rows: usize) {
+    fn apply_navigation(&mut self, output: &impl LogLines, pane_rows: usize) {
         let head = output
             .display_position(None)
             .expect("the retained head always has a display position");
@@ -450,7 +462,7 @@ impl PipeScroll {
         }
     }
 
-    fn place_target(&mut self, output: &RetainedOutput, pane_rows: usize, source: (u64, usize)) {
+    fn place_target(&mut self, output: &impl LogLines, pane_rows: usize, source: (u64, usize)) {
         let (_, total) = output
             .display_position(None)
             .expect("the retained head always has a display position");
@@ -469,10 +481,10 @@ impl PipeScroll {
         self.place(output, height, start, max_start);
     }
 
-    fn place(&mut self, output: &RetainedOutput, height: usize, start: usize, max_start: usize) {
+    fn place(&mut self, output: &impl LogLines, height: usize, start: usize, max_start: usize) {
         if start == max_start && !self.held {
             self.position = Position::Following;
-        } else if start == 0 && output.truncated {
+        } else if start == 0 && output.truncated() {
             self.position = Position::Head;
         } else {
             self.position = Position::Source(
@@ -515,7 +527,7 @@ impl PipeScroll {
         })
     }
 
-    fn selection_is_retained(&self, output: &RetainedOutput) -> bool {
+    fn selection_is_retained(&self, output: &impl LogLines) -> bool {
         let Some(selection) = self.selection else {
             return true;
         };

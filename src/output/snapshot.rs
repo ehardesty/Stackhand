@@ -28,43 +28,24 @@ pub struct RetainedOutput {
     pub generation: u64,
 }
 
-impl RetainedOutput {
-    /// Format only the newest required lines. Timestamps use UTC time-of-day
-    /// derived from the recorded Unix time, so fixed test times are independent
-    /// of the host clock and time zone.
-    pub fn display_lines(&self, tail_limit: usize) -> Vec<crate::tui::PipeLine> {
-        let total = self.total_lines();
-        self.display_range(total.saturating_sub(tail_limit), total)
-    }
-
-    pub fn display_window_from(
-        &self,
-        anchor: Option<(u64, usize)>,
-        limit: usize,
-    ) -> Option<Vec<crate::tui::PipeLine>> {
-        let start = self.display_position(anchor)?.0;
-        Some(self.display_range(start, start.saturating_add(limit).min(self.total_lines())))
-    }
-
-    fn display_range(&self, start: usize, end: usize) -> Vec<crate::tui::PipeLine> {
-        (start..end)
-            .filter_map(|position| {
-                if self.truncated && position == 0 {
-                    return Some(history_limit_line());
-                }
-                let (chunk, line) = self
-                    .chunks
-                    .at_line(position - usize::from(self.truncated))?;
-                formatted_line(chunk, line)
-            })
-            .collect()
-    }
-
-    pub(crate) fn total_lines(&self) -> usize {
+impl super::LogLines for RetainedOutput {
+    fn total_lines(&self) -> usize {
         self.chunks.total_lines() + usize::from(self.truncated)
     }
 
-    pub(crate) fn display_position(&self, source: Option<(u64, usize)>) -> Option<(usize, usize)> {
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Timestamps use UTC time-of-day derived from the recorded Unix time, so
+    /// fixed test times are independent of the host clock and time zone.
+    fn display_range(&self, start: usize, end: usize) -> Vec<crate::tui::PipeLine> {
+        (start..end)
+            .filter_map(|position| self.display_line(position))
+            .collect()
+    }
+
+    fn display_position(&self, source: Option<(u64, usize)>) -> Option<(usize, usize)> {
         let position = match source {
             None => 0,
             Some(source) => self.chunks.position(source)? + usize::from(self.truncated),
@@ -72,11 +53,24 @@ impl RetainedOutput {
         Some((position, self.total_lines()))
     }
 
-    pub(crate) fn display_source_at(&self, position: usize) -> Option<(u64, usize)> {
+    fn display_source_at(&self, position: usize) -> Option<(u64, usize)> {
         let (chunk, line) = self
             .chunks
             .at_line(position.checked_sub(usize::from(self.truncated))?)?;
         Some((sequence(chunk), line))
+    }
+}
+
+impl RetainedOutput {
+    /// Format one display row.
+    pub(super) fn display_line(&self, position: usize) -> Option<crate::tui::PipeLine> {
+        if self.truncated && position == 0 {
+            return Some(history_limit_line());
+        }
+        let (chunk, line) = self
+            .chunks
+            .at_line(position - usize::from(self.truncated))?;
+        formatted_line(chunk, line)
     }
 
     pub(crate) fn scope(&self) -> String {
@@ -121,7 +115,7 @@ impl RetainedOutput {
         }
         let mut found = LogSearch::default();
         for chunk in self.chunks.iter().rev() {
-            search_chunk(chunk, query, &mut found);
+            search_chunk(chunk, query, None, &mut found);
             if found.limited {
                 break;
             }
@@ -193,13 +187,23 @@ fn timestamp(unix_ms: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-pub(super) fn search_chunk(chunk: &RetainedChunk, query: &str, found: &mut LogSearch) {
+/// Collect matches newest first. A filter skips lines it hides, so hidden
+/// lines never use up the match limit.
+pub(super) fn search_chunk(
+    chunk: &RetainedChunk,
+    query: &str,
+    filter: Option<&super::LineFilter>,
+    found: &mut LogSearch,
+) {
     let RetainedChunk::Data { text, sequence, .. } = chunk else {
         return;
     };
     let lines: Vec<_> = text.split_terminator('\n').enumerate().collect();
     for (line, value) in lines.into_iter().rev() {
         let matches: Vec<_> = value.match_indices(query).map(|(start, _)| start).collect();
+        if matches.is_empty() || filter.is_some_and(|filter| !filter.matches(value)) {
+            continue;
+        }
         for start in matches.into_iter().rev() {
             if found.matches.len() == SEARCH_MATCH_LIMIT {
                 found.limited = true;
