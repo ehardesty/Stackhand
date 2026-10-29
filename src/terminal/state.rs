@@ -53,6 +53,14 @@ impl TerminalState {
         })
     }
 
+    pub fn scrollback_limit_bytes(&self) -> Result<usize> {
+        Ok(self.terminal.scrollback_max_bytes()?.unwrap_or(usize::MAX))
+    }
+
+    pub fn memory_usage(&self) -> Result<super::TerminalMemory> {
+        Ok(self.terminal.memory_usage()?.into())
+    }
+
     pub fn compression_activity(&self) -> Result<CompressionActivity> {
         Ok(self.terminal.compression_activity()?)
     }

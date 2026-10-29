@@ -637,7 +637,14 @@ fn real_pty_run_reports_a_live_log_match() {
 #[test]
 fn real_pipe_log_match_is_not_limited_by_retained_history() {
     const MARKER: &str = "retained-history-log-marker";
-    let outputs = Arc::new(OutputViews::new(1));
+    let outputs = Arc::new(OutputViews::with_settings(
+        1,
+        crate::output_settings::OutputSettings {
+            per_process_history_bytes: 1024 * 1024,
+            global_history_bytes: 8 * 1024 * 1024,
+            ..Default::default()
+        },
+    ));
     let seam = RealRunSeam::new(Arc::clone(&outputs));
     let (tx, rx) = crossbeam_channel::unbounded();
     let events = SeamSender::new(tx);
@@ -669,7 +676,7 @@ fn real_pipe_log_match_is_not_limited_by_retained_history() {
         }
         assert!(
             Instant::now() < deadline,
-            "history did not evict output: {snapshot:?}"
+            "history did not evict output within the explicit 1 MiB test budget"
         );
         thread::sleep(Duration::from_millis(2));
     };

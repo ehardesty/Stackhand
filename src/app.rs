@@ -173,7 +173,9 @@ fn run_event_loop(
             .as_ref()
             .filter(|(process_id, _)| *process_id == selected_process.process_id)
             .map(|(_, retained)| retained.generation);
-        if let Some(changed) = output.snapshot_if_changed(known_generation) {
+        if (interaction.needs_logs(selected_process) || known_generation.is_none())
+            && let Some(changed) = output.snapshot_if_changed(known_generation)
+        {
             retained_view = Some((selected_process.process_id, changed));
         }
         let retained = &retained_view

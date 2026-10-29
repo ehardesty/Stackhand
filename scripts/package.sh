@@ -82,8 +82,11 @@ fi
 
 build_root="$release_dir/build"
 native_lib=''
+expected_ghostty=$(metadata_value ghostty_revision)
 for candidate in "$build_root"/libghostty-vt-sys-*/out/ghostty-install/lib/$native_glob; do
-  if [ -f "$candidate" ]; then
+  candidate_stamp=$(dirname "$candidate")/../../ghostty-src/.ghostty-commit
+  if [ -f "$candidate" ] && [ -f "$candidate_stamp" ] &&
+     [ "$(tr -d '[:space:]' < "$candidate_stamp")" = "$expected_ghostty" ]; then
     native_lib=$candidate
     break
   fi

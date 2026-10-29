@@ -12,6 +12,7 @@ pub mod model;
 mod mouse_fixture;
 mod output;
 mod output_pressure;
+pub mod output_settings;
 mod pipe_scroll;
 mod process_logs;
 pub mod project_fixture;

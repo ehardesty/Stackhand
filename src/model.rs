@@ -352,6 +352,7 @@ impl Default for ShellConfig {
 
 /// Project-wide values resolved from configuration.
 pub(crate) struct ProjectSettings {
+    pub(crate) output: crate::output_settings::OutputSettings,
     pub(crate) shell: ShellConfig,
     pub(crate) port_discovery: bool,
     pub(crate) process_groups: Vec<Option<String>>,
@@ -386,6 +387,7 @@ pub struct EffectiveProject {
     process_groups: Vec<Option<String>>,
     shell: ShellConfig,
     port_discovery: bool,
+    output: crate::output_settings::OutputSettings,
 }
 
 impl std::fmt::Debug for EffectiveProject {
@@ -480,6 +482,7 @@ impl EffectiveProject {
             dependency_indices_by_profile: BTreeMap::from([(None, dependency_indices)]),
             shell,
             port_discovery: false,
+            output: Default::default(),
         })
     }
 
@@ -533,6 +536,7 @@ impl EffectiveProject {
             ProjectSettings {
                 shell,
                 port_discovery: false,
+                output: Default::default(),
                 process_groups: vec![None; processes.len()],
             },
         )
@@ -554,6 +558,7 @@ impl EffectiveProject {
         project.base_profile_name = base_profile_name;
         project.process_groups = settings.process_groups;
         project.port_discovery = settings.port_discovery;
+        project.output = settings.output;
         project.process_profile_names = processes_by_profile.keys().cloned().collect();
         project.processes_by_profile = processes_by_profile;
         project.base_process_profile_labels = base_process_profile_labels;
@@ -598,20 +603,17 @@ impl EffectiveProject {
 
     /// The number of visual rows in the Process list at Project startup.
     pub(crate) fn process_list_row_count(&self) -> usize {
-        let heading_count = self
-            .process_groups
-            .iter()
-            .any(Option::is_some)
-            .then(|| {
-                self.process_groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, group)| {
-                        *index == 0 || Some(*group) != self.process_groups.get(index - 1)
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
+        let heading_count = if self.process_groups.iter().any(Option::is_some) {
+            self.process_groups
+                .iter()
+                .enumerate()
+                .filter(|(index, group)| {
+                    *index == 0 || Some(*group) != self.process_groups.get(index - 1)
+                })
+                .count()
+        } else {
+            0
+        };
         self.processes.len().saturating_add(heading_count)
     }
 
@@ -680,6 +682,30 @@ impl EffectiveProject {
     }
 
     /// Whether this Project discovers listening TCP ports for active Runs.
+    pub(crate) fn with_output_settings(
+        mut self,
+        settings: crate::output_settings::OutputSettings,
+    ) -> Self {
+        self.output = settings;
+        self
+    }
+
+    pub fn output_settings(&self) -> crate::output_settings::OutputSettings {
+        self.output
+    }
+
+    pub(crate) fn terminal_process_count(&self) -> usize {
+        (0..self.processes.len())
+            .filter(|index| {
+                self.base_processes[*index].terminal_mode == TerminalMode::Pty
+                    || self
+                        .processes_by_profile
+                        .values()
+                        .any(|processes| processes[*index].terminal_mode == TerminalMode::Pty)
+            })
+            .count()
+    }
+
     pub fn port_discovery(&self) -> bool {
         self.port_discovery
     }
@@ -766,152 +792,4 @@ fn find_dependency_cycle(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn bare(name: &str) -> ProcessSpec {
-        ProcessSpec {
-            name: name.to_string(),
-            kind: ProcessKind::Service,
-            enabled: Enabled::Yes,
-            autostart: Autostart::No,
-            success_exit_codes: vec![0],
-            restart: RestartConfig::default(),
-            command: CommandForm::Direct {
-                program: "sleep".into(),
-                args: vec!["1".into()],
-            },
-            working_dir: std::env::temp_dir(),
-            env: Vec::new(),
-            env_remove: Vec::new(),
-            terminal_mode: TerminalMode::Pipe,
-            input_policy: InputPolicy::Disabled,
-            dependencies: Vec::new(),
-            readiness: None,
-            liveness: None,
-        }
-    }
-
-    fn depending_on(name: &str, dependencies: &[&str]) -> ProcessSpec {
-        let mut spec = bare(name);
-        spec.dependencies = dependencies
-            .iter()
-            .map(|dependency| DependencySpec {
-                name: (*dependency).to_string(),
-                condition: DependencyCondition::Started,
-            })
-            .collect();
-        spec
-    }
-
-    #[test]
-    fn startup_process_list_row_count_includes_group_headings() {
-        let mut project = EffectiveProject::new(vec![
-            bare("database"),
-            bare("cache"),
-            bare("api"),
-            bare("worker"),
-        ])
-        .expect("the Project is valid");
-        project.process_groups = vec![
-            Some("Infrastructure".to_string()),
-            Some("Infrastructure".to_string()),
-            Some("Application".to_string()),
-            None,
-        ];
-
-        assert_eq!(project.process_list_row_count(), 7);
-    }
-
-    #[test]
-    fn unknown_dependency_references_are_rejected() {
-        let error = EffectiveProject::new(vec![depending_on("api", &["db"]), bare("worker")])
-            .expect_err("a missing reference must fail");
-        assert_eq!(
-            error,
-            ProjectError::UnknownDependency {
-                process: "api".into(),
-                dependency: "db".into()
-            }
-        );
-    }
-
-    #[test]
-    fn dependency_cycles_are_rejected_with_the_cycle_path() {
-        let error = EffectiveProject::new(vec![
-            depending_on("api", &["db"]),
-            depending_on("db", &["worker"]),
-            depending_on("worker", &["api"]),
-        ])
-        .expect_err("a cycle must fail");
-        assert_eq!(
-            error,
-            ProjectError::DependencyCycle(vec![
-                "api".into(),
-                "db".into(),
-                "worker".into(),
-                "api".into()
-            ])
-        );
-    }
-
-    #[test]
-    fn a_self_dependency_is_a_cycle() {
-        let error = EffectiveProject::new(vec![depending_on("api", &["api"])])
-            .expect_err("a self-dependency must fail");
-        assert_eq!(
-            error,
-            ProjectError::DependencyCycle(vec!["api".into(), "api".into()])
-        );
-    }
-
-    #[test]
-    fn completed_successfully_requires_a_one_shot_dependency() {
-        let mut setup = bare("setup");
-        setup.kind = ProcessKind::OneShot;
-        let mut api = depending_on("api", &["setup"]);
-        api.dependencies[0].condition = DependencyCondition::CompletedSuccessfully;
-
-        EffectiveProject::new(vec![api.clone(), setup])
-            .expect("a One-shot dependency supports completed_successfully");
-
-        let error = EffectiveProject::new(vec![api, bare("setup")])
-            .expect_err("a Service dependency must reject completed_successfully");
-        assert_eq!(
-            error,
-            ProjectError::InvalidCondition {
-                process: "api".into(),
-                dependency: "setup".into(),
-                condition: "completed_successfully".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn acyclic_shared_dependencies_are_accepted() {
-        let project = EffectiveProject::new(vec![
-            depending_on("api", &["db"]),
-            depending_on("worker", &["db"]),
-            bare("db"),
-        ])
-        .expect("shared dependencies are valid");
-        assert_eq!(project.processes().len(), 3);
-    }
-
-    #[test]
-    fn resolved_dependencies_keep_configuration_order_and_public_names() {
-        let project = EffectiveProject::new(vec![
-            depending_on("api", &["cache", "db"]),
-            bare("db"),
-            bare("cache"),
-        ])
-        .expect("the graph is valid");
-
-        let dependencies = project
-            .resolved_dependencies(project.process_index("api").expect("api is configured"))
-            .map(|(index, dependency)| (index, dependency.name.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(dependencies, [(2, "cache"), (1, "db")]);
-        assert_eq!(project.processes()[0].name, "api");
-    }
-}
+mod tests;

@@ -205,15 +205,9 @@ fn mouse_modifiers(modifiers: MouseModifiers) -> key::Mods {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libghostty_vt::terminal::Options;
 
     fn terminal() -> Terminal<'static, 'static> {
-        Terminal::new(Options {
-            cols: 20,
-            rows: 4,
-            max_scrollback: 64 * 1_024,
-        })
-        .unwrap()
+        crate::terminal::new_terminal(20, 4, 64 * 1_024).unwrap()
     }
 
     fn event(kind: MouseKind, col: u16, row: i32, stackhand_owned: bool) -> TerminalMouseEvent {

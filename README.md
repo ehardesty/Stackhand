@@ -41,7 +41,7 @@ supported.
 
 Homebrew is not required for local builds. The repository pins Rust in
 [`rust-toolchain.toml`](./rust-toolchain.toml). The build helper uses Zig
-`0.15.2` from its cache, `STACKHAND_ZIG`, or `PATH`. If none is available, it
+`0.17.0` from its cache, `STACKHAND_ZIG`, or `PATH`. If none is available, it
 downloads the release, checks its SHA-256 checksum, and caches it in your user
 cache.
 
@@ -56,15 +56,14 @@ cd Stackhand
 The first build may download the Rust dependencies, the pinned Ghostty source,
 and Zig. Later builds reuse the cached tools and build artifacts.
 
-On arm64 macOS, the build helper uses an older installed macOS SDK when the
-current SDK is not readable by Zig `0.15.2`. If you need to provide another
-exact Zig binary, set `STACKHAND_ZIG`:
+To provide another exact Zig binary, set `STACKHAND_ZIG`:
 
 ```sh
 STACKHAND_ZIG=/path/to/zig ./scripts/cargo.sh build --locked
 ```
 
-The Zig binary must report version `0.15.2`.
+The Zig binary must report version `0.17.0`. The native Ghostty parser is also
+optimized in development builds; Rust application code retains debug settings.
 
 ## Build and install
 
@@ -246,12 +245,22 @@ PTY between its Terminal and Logs. When Logs are visible, use:
 | `Home` / `End` | Move to the start or end of Logs. |
 | `f` | Return to the live output tail. |
 | `/` | Start a case-sensitive search. Type text and press `Enter`. |
-| `n` / `N` | Move to the next or previous search match. |
+| `n` / `N` | Move to the next (older) or previous (newer) search match. |
 | `c` / `y` | Copy selected Logs, or the visible Logs when nothing is selected. |
 | `Esc` | Cancel a search, clear a Logs selection, or return to the Process list. |
 | `q` | Return to the Process list. |
 
 A mouse drag selects Logs text. Press `c` or `y` to copy the selection.
+
+History is configurable in [`settings.output`](docs/configuration.md#output-history).
+Defaults are 16 MiB of terminal scrollback per PTY and 32 MiB of Logs per
+Process, with separate Project budgets. Logs search checks recent output first
+and keeps at most 1,000 matches; it shows progress while checking older output.
+The Logs header shows its Run range and marks expired earlier history. If the
+page you paused on expires, that visible page stays readable until you scroll
+again or press `f` to follow. History stays in memory and ends when Stackhand
+exits; use your application's log files for durable retention.
+
 
 ### PTY input and Copy mode
 

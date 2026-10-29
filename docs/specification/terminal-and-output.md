@@ -405,7 +405,8 @@ Requirements:
 - literal search;
 - next and previous match;
 - optional case sensitivity toggle if inexpensive;
-- bounded match count;
+- at most 1,000 matches, with newest matches retained first;
+- bounded incremental search work with visible progress while older output is checked;
 - match navigation disables follow mode;
 - one action returns to live tail;
 - search never blocks output ingestion;
@@ -441,20 +442,24 @@ For ordinary pipe processes, the application may default to Terminal or Logs vie
 
 ### 23.1 Project and per-process budgets
 
-Support settings conceptually like:
+The configured in-memory defaults are:
 
 ```yaml
 settings:
   output:
-    global_history_bytes: 256MiB
-    per_process_history_bytes: 16MiB
     terminal_scrollback_bytes: 16MiB
-    max_logical_line_bytes: 1MiB
-    pending_input_bytes: 256KiB
-    hook_history_bytes: 1MiB
+    terminal_project_bytes: 128MiB
+    per_process_history_bytes: 32MiB
+    global_history_bytes: 256MiB
 ```
 
-Exact defaults must come from profiling. The existence and enforcement of both global and local budgets are mandatory.
+See [Output history](../configuration.md#output-history) for units, validation,
+fixed terminal shares, page granularity, and memory-accounting boundaries.
+Terminal shares reserve all possible PTY Processes before startup; opening a
+Run does not shrink another terminal's history. Native memory measurements and
+parsed output progress are separate metrics. Logs are shared in bounded
+segments; pinned segments remain charged until the final reader releases them.
+History is in memory; disk archiving and snapshot persistence are deferred.
 
 ### 23.2 Budget accounting
 
@@ -472,15 +477,17 @@ Do not assume that a 16 MiB raw history cap implies a 16 MiB total memory cost.
 
 ### 23.3 Eviction policy
 
-- Evict oldest retained history first.
-- Prefer preserving current-run recent output.
-- The selected process may receive a larger soft share, but never bypass the global hard limit.
+- Evict oldest segments within each Process when its budget is reached.
+- At the Project limit, trim the largest current Process history first; break ties by oldest output.
+- Preserve small quiet histories where possible rather than allowing one noisy Process to erase them.
+- Selection does not bypass the shared storage budget.
+- If a paused Logs page expires, freeze only the visible page and label it expired. Explicit scrolling or following returns to retained output. Do not pin a full paused history outside its budget.
 - Eviction must not stop reading from the OS.
 - Search results pointing into evicted content are invalidated cleanly.
 - The UI should indicate truncation, for example:
 
 ```text
-Earlier output discarded due to history limit
+Earlier Logs expired at the history limit; recent output continues
 ```
 
 ### 23.4 Long lines and binary output

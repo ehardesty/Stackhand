@@ -160,6 +160,12 @@ impl ProjectInteraction {
         ProjectUpdate { changed, commands }
     }
 
+    pub(crate) fn needs_logs(&self, process: &ProcessSnapshot) -> bool {
+        process.current_run.is_none()
+            || process.terminal_mode == crate::model::TerminalMode::Pipe
+            || self.logs[self.selected].representation(true) == OutputRepresentation::Logs
+    }
+
     pub(crate) fn refresh_logs(&mut self, output: &RetainedOutput) -> bool {
         self.logs[self.selected].refresh(output)
     }
@@ -200,10 +206,6 @@ impl ProjectInteraction {
                         }
                         TerminalEvent::InputBackpressure { .. } => {
                             self.console.warn(ConsoleWarning::InputBackpressure);
-                            changed = true;
-                        }
-                        TerminalEvent::OutputTruncated => {
-                            self.console.warn(ConsoleWarning::OutputTruncated);
                             changed = true;
                         }
                         TerminalEvent::Exited | TerminalEvent::StateChanged => changed = true,
@@ -260,7 +262,19 @@ impl ProjectInteraction {
                 view.logs_scrollbar = frame.scrollbar;
                 (Some(frame.lines), frame.status, frame.search_dialog)
             }
-            SelectedPane::Terminal(_) => (None, None, None),
+            SelectedPane::Terminal(session) => {
+                let status = terminal
+                    .as_ref()
+                    .filter(|snapshot| !view.following && snapshot.scrollbar.offset == 0)
+                    .and_then(|_| session.with(|handle| handle.metrics().scrollback_limit_bytes))
+                    .map(|limit| {
+                        format!(
+                            "Top of retained terminal history · {} KiB target · l: Logs",
+                            limit / 1024
+                        )
+                    });
+                (None, status, None)
+            }
         };
         InteractionFrame {
             terminal,
@@ -1341,7 +1355,7 @@ mod tests {
             1,
             crate::runtime::OutputStream::Stdout,
             0,
-            b"quadrant log\n".to_vec(),
+            b"quadrant log\n",
         );
         let retained = output.for_process(0).unwrap().snapshot();
         let mut process = process("api", crate::model::ProcessKind::Service, 0);
@@ -1382,7 +1396,7 @@ mod tests {
             (0..30)
                 .map(|line| format!("line-{line}\n"))
                 .collect::<String>()
-                .into_bytes(),
+                .as_bytes(),
         );
         let retained = output.for_process(0).unwrap().snapshot();
         let pane = SelectedPane::Logs(&retained);

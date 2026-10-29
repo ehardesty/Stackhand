@@ -242,7 +242,7 @@ mod tests {
             let mode = parse_mode(arguments.into_iter().map(OsString::from)).unwrap();
             assert!(
                 matches!(mode, Mode::Project { path: Some(path), profile: Some(profile), no_autostart: true }
-                if path == PathBuf::from("project.yaml") && profile == "local")
+                if path == std::path::Path::new("project.yaml") && profile == "local")
             );
         }
         let mode = parse_mode([OsString::from("--no-autostart")].into_iter()).unwrap();

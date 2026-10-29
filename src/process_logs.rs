@@ -41,6 +41,8 @@ pub(crate) struct LogsFrame {
 pub(crate) struct ProcessLogs {
     search: LogView,
     scroll: PipeScroll,
+    generation: Option<u64>,
+    unseen_output: bool,
 }
 
 impl ProcessLogs {
@@ -53,7 +55,22 @@ impl ProcessLogs {
     }
 
     pub(crate) fn refresh(&mut self, output: &RetainedOutput) -> bool {
-        self.search.refresh(output)
+        if self
+            .generation
+            .is_some_and(|previous| previous != output.generation)
+            && !self.scroll.following()
+        {
+            self.unseen_output = true;
+        }
+        self.generation = Some(output.generation);
+        let previous = self.search.current_match();
+        let changed = self.search.refresh(output);
+        if previous.is_none()
+            && let Some(found) = self.search.current_match()
+        {
+            self.scroll.show_source((found.sequence, found.line));
+        }
+        changed
     }
 
     pub(crate) fn handle_key(
@@ -90,9 +107,21 @@ impl ProcessLogs {
                 line.content_offset + current.end,
             ));
         }
+        let mut status = output.scope();
+        if self.scroll.expired() {
+            status.push_str(" · paused page expired · f: follow · scroll: retained Logs");
+        } else if !self.scroll.following() && self.unseen_output {
+            status.push_str(" · new output below · f: follow");
+        }
+        if let Some(search) = self.search.status() {
+            status.push_str(&format!(" · {search}"));
+        }
+        if self.scroll.following() {
+            self.unseen_output = false;
+        }
         LogsFrame {
             lines,
-            status: self.search.status(),
+            status: Some(status),
             search_dialog: self.search.dialog(),
             search_active: self.search.has_search(),
             following: self.scroll.following(),
@@ -106,6 +135,8 @@ impl ProcessLogs {
     }
 
     pub(crate) fn follow(&mut self) {
+        self.unseen_output = false;
+        self.search.follow();
         self.scroll.follow();
     }
 
@@ -120,7 +151,7 @@ impl ProcessLogs {
             KeyCode::PageUp => self.scroll.scroll_page(page_rows, -1),
             KeyCode::PageDown => self.scroll.scroll_page(page_rows, 1),
             KeyCode::Home => self.scroll.head(),
-            KeyCode::End | KeyCode::Char('f') => self.scroll.follow(),
+            KeyCode::End | KeyCode::Char('f') => self.follow(),
             KeyCode::Esc if self.scroll.clear_selection() => return LogsNavigation::Changed,
             KeyCode::Esc | KeyCode::Char('q') => return LogsNavigation::Exit,
             _ => return LogsNavigation::Unknown,
@@ -198,7 +229,7 @@ impl ProcessLogs {
                 LogsInput::Changed
             }
             LogViewAction::Follow => {
-                self.scroll.follow();
+                self.follow();
                 LogsInput::Changed
             }
             LogViewAction::ShowMatch(found) => {
@@ -206,14 +237,19 @@ impl ProcessLogs {
                 LogsInput::Changed
             }
             LogViewAction::Copy => {
-                let text = self.scroll.selected_text(output).unwrap_or_else(|| {
+                let text = if self.scroll.has_selection() {
+                    let Some(text) = self.scroll.selected_text(output) else {
+                        return LogsInput::Changed;
+                    };
+                    text
+                } else {
                     self.scroll
                         .window(output, pane_rows)
                         .iter()
                         .map(|line| line.text.as_str())
                         .collect::<Vec<_>>()
                         .join("\n")
-                });
+                };
                 LogsInput::Copy(text)
             }
         }
@@ -241,7 +277,7 @@ mod tests {
     #[test]
     fn search_navigation_and_highlight_stay_in_one_process_view() {
         let output = OutputViews::new(1).for_process(0).unwrap();
-        output.append_at(1, OutputStream::Stdout, 0, b"one\ntwo\n".to_vec());
+        output.append_at(1, OutputStream::Stdout, 0, b"one\ntwo\n");
         let retained = output.snapshot();
         let mut logs = ProcessLogs::default();
 
@@ -278,7 +314,7 @@ mod tests {
             (0..20)
                 .map(|line| format!("line-{line}\n"))
                 .collect::<String>()
-                .into_bytes(),
+                .as_bytes(),
         );
         let retained = output.snapshot();
         let mut logs = ProcessLogs::default();
@@ -297,5 +333,128 @@ mod tests {
         ));
         logs.frame(&retained, 5);
         assert!(!logs.following());
+    }
+
+    #[test]
+    fn a_match_found_in_a_later_search_batch_becomes_visible_and_selected() {
+        let output = OutputViews::new(1).for_process(0).unwrap();
+        output.append(1, OutputStream::Stdout, b"needle\n");
+        let line = format!("{}\n", "ordinary ".repeat(100));
+        for _ in 0..3_000 {
+            output.append(1, OutputStream::Stdout, line.as_bytes());
+        }
+        let retained = output.snapshot();
+        let mut logs = ProcessLogs::default();
+        logs.handle_key(key(KeyCode::Char('/')), true, false, &retained, 5);
+        logs.paste_search("needle", &retained);
+        logs.handle_key(key(KeyCode::Enter), true, false, &retained, 5);
+        assert!(
+            logs.frame(&retained, 5)
+                .status
+                .unwrap()
+                .contains("Searching older")
+        );
+        for _ in 0..30 {
+            logs.refresh(&retained);
+            let frame = logs.frame(&retained, 5);
+            if frame
+                .lines
+                .iter()
+                .any(|line| line.text.contains("needle") && line.highlight.is_some())
+            {
+                assert!(!frame.following);
+                return;
+            }
+        }
+        panic!("completed incremental search did not reveal its first match");
+    }
+
+    #[test]
+    fn explicit_follow_survives_new_output_and_pending_search_results() {
+        for delayed in [false, true] {
+            for follow in [KeyCode::Char('f'), KeyCode::End] {
+                let output = OutputViews::new(1).for_process(0).unwrap();
+                output.append(1, OutputStream::Stdout, b"needle\n");
+                if delayed {
+                    let line = format!("{}\n", "ordinary ".repeat(100));
+                    for _ in 0..3_000 {
+                        output.append(1, OutputStream::Stdout, line.as_bytes());
+                    }
+                }
+                let retained = output.snapshot();
+                let mut logs = ProcessLogs::default();
+                logs.handle_key(key(KeyCode::Char('/')), true, false, &retained, 5);
+                logs.paste_search("needle", &retained);
+                logs.handle_key(key(KeyCode::Enter), true, false, &retained, 5);
+                if follow == KeyCode::End {
+                    logs.handle_navigation_key(key(follow), 5);
+                } else {
+                    logs.handle_key(key(follow), true, false, &retained, 5);
+                }
+                assert!(logs.frame(&retained, 5).following);
+
+                output.append(1, OutputStream::Stdout, b"live tail sentinel\n");
+                let latest = output.snapshot();
+                for _ in 0..30 {
+                    logs.refresh(&latest);
+                    let frame = logs.frame(&latest, 5);
+                    assert!(frame.following, "{follow:?}, delayed={delayed}");
+                    assert!(
+                        frame
+                            .lines
+                            .last()
+                            .unwrap()
+                            .text
+                            .contains("live tail sentinel")
+                    );
+                    assert!(frame.lines.iter().all(|line| line.highlight.is_none()));
+                }
+                // Following keeps the query available for explicit navigation.
+                logs.handle_key(key(KeyCode::Char('n')), true, false, &latest, 5);
+                let frame = logs.frame(&latest, 5);
+                assert!(!frame.following);
+                assert!(
+                    frame
+                        .lines
+                        .iter()
+                        .any(|line| line.text.contains("needle") && line.highlight.is_some())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copying_an_unavailable_selection_does_not_substitute_the_frozen_page() {
+        let output = OutputViews::new(1).for_process(0).unwrap();
+        for row in 0..20 {
+            output.append(1, OutputStream::Stdout, format!("line-{row}\n").as_bytes());
+        }
+        let retained = output.snapshot();
+        let mut logs = ProcessLogs::default();
+        logs.scroll.head();
+        logs.frame(&retained, 5);
+        logs.scroll.begin_selection(1, 18);
+        logs.scroll.scroll_lines(4, 1);
+        logs.frame(&retained, 5);
+        logs.scroll.finish_selection(2, 30);
+        assert!(matches!(
+            logs.handle_key(key(KeyCode::Char('c')), true, false, &retained, 5),
+            LogsInput::Copy(_)
+        ));
+        let expired = RetainedOutput {
+            chunks: retained.chunks.iter().skip(10).cloned().collect(),
+            truncated: true,
+            generation: retained.generation + 1,
+            ..retained.clone()
+        };
+        logs.frame(&expired, 5);
+        assert!(logs.scroll.expired());
+        assert!(
+            !matches!(
+                logs.handle_key(key(KeyCode::Char('c')), true, false, &expired, 5),
+                LogsInput::Copy(_)
+            ),
+            "an unavailable selection must not copy unselected text"
+        );
     }
 }

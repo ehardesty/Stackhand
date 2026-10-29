@@ -9,14 +9,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::TryRecvError;
-use libghostty_vt::terminal::{
-    ClipboardWrite, ClipboardWriteError, CompressionResult, Options as TerminalOptions, Terminal,
-};
+use libghostty_vt::terminal::{ClipboardWrite, ClipboardWriteError, CompressionResult, Terminal};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::command_gate::CommandReceiver;
-use super::history::{OutputHistoryLedger, OutputHistoryMetrics};
+use super::metrics::TerminalMetrics;
 use super::session::{OwnedCursorState, OwnedTerminalScrollbar};
 use super::state::{PendingInput, TerminalState};
 use crate::geometry::TerminalGeometry;
@@ -37,7 +35,6 @@ pub enum OwnerEvent {
     Exited,
     Failed(String),
     StateChanged,
-    OutputTruncated { evicted_bytes: usize },
 }
 
 #[derive(Clone)]
@@ -55,7 +52,7 @@ struct SharedOwner {
     alive: AtomicBool,
     shutdown: AtomicBool,
     events: Mutex<VecDeque<OwnerEvent>>,
-    history: Mutex<OutputHistoryMetrics>,
+    metrics: Mutex<TerminalMetrics>,
 }
 
 impl SharedOwner {
@@ -70,24 +67,6 @@ impl SharedOwner {
                     .iter()
                     .any(|existing| matches!(existing, OwnerEvent::StateChanged)) =>
             {
-                return;
-            }
-            OwnerEvent::OutputTruncated { evicted_bytes } => {
-                if let Some(OwnerEvent::OutputTruncated {
-                    evicted_bytes: pending,
-                }) = events
-                    .iter_mut()
-                    .find(|existing| matches!(existing, OwnerEvent::OutputTruncated { .. }))
-                {
-                    *pending = pending.saturating_add(*evicted_bytes);
-                    return;
-                }
-                if events.len() == OWNER_EVENT_SLOTS {
-                    return;
-                }
-                events.push_back(OwnerEvent::OutputTruncated {
-                    evicted_bytes: *evicted_bytes,
-                });
                 return;
             }
             _ => {}
@@ -116,6 +95,7 @@ pub struct OwnerHandle {
 }
 
 impl OwnerHandle {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         reader: Box<dyn Read + Send>,
         resizer: PtyResizer,
@@ -124,6 +104,7 @@ impl OwnerHandle {
         geometry: TerminalGeometry,
         wake: impl Fn() + Send + 'static,
         observer: Option<Arc<dyn RunOutputObserver>>,
+        scrollback_bytes: usize,
     ) -> Result<Self> {
         let shared = Arc::new(SharedOwner {
             render: Mutex::new(OwnedRender {
@@ -137,7 +118,10 @@ impl OwnerHandle {
             alive: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
-            history: Mutex::new(OutputHistoryMetrics::default()),
+            metrics: Mutex::new(TerminalMetrics {
+                scrollback_limit_bytes: scrollback_bytes,
+                ..Default::default()
+            }),
         });
         let worker_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -152,6 +136,7 @@ impl OwnerHandle {
                     &worker_shared,
                     &wake,
                     observer,
+                    scrollback_bytes,
                 );
                 if let Err(error) = result {
                     worker_shared.record(OwnerEvent::Failed(error.to_string()));
@@ -204,10 +189,10 @@ impl OwnerHandle {
             .pop_front()
     }
 
-    pub fn history_metrics(&self) -> OutputHistoryMetrics {
+    pub fn metrics(&self) -> TerminalMetrics {
         *self
             .shared
-            .history
+            .metrics
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -274,14 +259,15 @@ fn run_owner(
     shared: &SharedOwner,
     wake: &dyn Fn(),
     observer: Option<Arc<dyn RunOutputObserver>>,
+    scrollback_bytes: usize,
 ) -> Result<()> {
     let (output_tx, output_rx) = crossbeam_channel::bounded(OUTPUT_QUEUE_SLOTS);
     let reader = spawn_reader(reader, output_tx)?;
-    let mut terminal = Box::new(Terminal::new(TerminalOptions {
-        cols: geometry.cols(),
-        rows: geometry.rows(),
-        max_scrollback: super::SCROLLBACK_TARGET_BYTES,
-    })?);
+    let mut terminal = Box::new(crate::terminal::new_terminal(
+        geometry.cols(),
+        geometry.rows(),
+        scrollback_bytes,
+    )?);
     let effects = Rc::new(RefCell::new(Effects::new()));
     terminal.on_pty_write({
         let effects = Rc::clone(&effects);
@@ -289,7 +275,12 @@ fn run_owner(
     })?;
     terminal.on_clipboard_write(deny_child_clipboard)?;
     let mut state = TerminalState::new(terminal, resizer, geometry)?;
-    let mut history = OutputHistoryLedger::new();
+    shared
+        .metrics
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .scrollback_limit_bytes = state.scrollback_limit_bytes()?;
+    let mut next_memory_sample = Instant::now();
     let mut pending_input: Option<PendingInput> = None;
     let mut pending_effect: Option<Vec<u8>> = None;
     let mut next_selection_tick = Instant::now() + SELECTION_AUTOSCROLL_INTERVAL;
@@ -316,17 +307,11 @@ fn run_owner(
             if let Some(observer) = &observer {
                 observer.observe(&data);
             }
-            let evicted = history.push(data.len());
-            *shared
-                .history
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = history.metrics();
-            if evicted > 0 {
-                shared.record(OwnerEvent::OutputTruncated {
-                    evicted_bytes: evicted,
-                });
-            }
             state.write_output(&data);
+            let mut metrics = shared.metrics.lock().unwrap_or_else(|p| p.into_inner());
+            metrics.parsed_bytes = metrics.parsed_bytes.saturating_add(data.len());
+            metrics.parsed_chunks = metrics.parsed_chunks.saturating_add(1);
+            drop(metrics);
             did_work = true;
             output_slice_work += 1;
             if effects.borrow().overflowed {
@@ -351,6 +336,15 @@ fn run_owner(
         }
 
         let now = Instant::now();
+        if now >= next_memory_sample {
+            let memory = state.memory_usage().ok();
+            shared
+                .metrics
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .memory = memory;
+            next_memory_sample = now + Duration::from_secs(2);
+        }
         if now >= next_selection_tick {
             if state.tick_selection_autoscroll()? {
                 did_work = true;
@@ -461,11 +455,8 @@ fn service_input(
     Ok(true)
 }
 
-fn deny_child_clipboard(
-    _terminal: &Terminal<'_, '_>,
-    _write: ClipboardWrite<'_>,
-) -> std::result::Result<(), ClipboardWriteError> {
-    Err(ClipboardWriteError::Denied)
+fn deny_child_clipboard(_terminal: &Terminal<'_, '_>, write: ClipboardWrite<'_>) {
+    write.reply(Err(ClipboardWriteError::Denied), false);
 }
 
 fn spawn_reader(
@@ -511,41 +502,4 @@ fn render(state: &mut TerminalState, shared: &SharedOwner) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-
-    use super::*;
-
-    #[test]
-    fn effect_collector_stops_at_its_byte_limit_and_reports_overflow() {
-        let mut effects = Effects::new();
-        effects.push(&vec![1; EFFECT_BUFFER_BYTES]);
-        effects.push(&[2]);
-
-        assert_eq!(effects.bytes, EFFECT_BUFFER_BYTES);
-        assert_eq!(effects.queue.len(), 1);
-        assert!(effects.overflowed);
-    }
-
-    #[test]
-    fn child_clipboard_reads_are_ignored_and_writes_reach_the_denial_boundary() {
-        let writes = Cell::new(0_u8);
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 10,
-            rows: 2,
-            max_scrollback: 1024,
-        })
-        .unwrap();
-        terminal
-            .on_clipboard_write(|_, _| {
-                writes.set(writes.get() + 1);
-                Err(ClipboardWriteError::Denied)
-            })
-            .unwrap();
-
-        terminal.vt_write(b"\x1b]52;c;?\x07");
-        assert_eq!(writes.get(), 0);
-        terminal.vt_write(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(writes.get(), 1);
-    }
-}
+mod tests;

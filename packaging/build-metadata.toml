@@ -3,18 +3,18 @@
 
 schema_version = 1
 rust_version = "1.93.0"
-zig_version = "0.15.2"
+zig_version = "0.17.0"
 zig_download_base_url = "https://ziglang.org/download"
-zig_aarch64_macos_sha256 = "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b"
-zig_x86_64_macos_sha256 = "375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f"
-zig_aarch64_linux_sha256 = "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
-zig_x86_64_linux_sha256 = "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+zig_aarch64_macos_sha256 = "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
+zig_x86_64_macos_sha256 = "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6"
+zig_aarch64_linux_sha256 = "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
+zig_x86_64_linux_sha256 = "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
 
 ghostty_repository = "https://github.com/ghostty-org/ghostty.git"
-ghostty_revision = "a887df42c56f6de86c0fe6da9c4eeca37931e083"
+ghostty_revision = "521cf2c5d30bd48028ca61546c64e7913764073d"
 
 libghostty_vt_sys_version = "0.2.1"
-libghostty_vt_wrapper_revision = "46a9d2ac941ed600cf43c5e6299c8dfd1d3a1ef0"
+libghostty_vt_wrapper_revision = "326be19c26da0a1bae0873101452b257cbf09d4b"
 libghostty_vt_version = "0.2.1"
 
 # These are the native options passed by libghostty-vt-sys/build.rs.

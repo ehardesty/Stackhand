@@ -121,16 +121,10 @@ fn to_ratatui_style(value: &style::Style) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libghostty_vt::terminal::Options;
 
     #[test]
     fn active_selection_is_visible_in_the_owned_buffer() {
-        let mut terminal = Terminal::new(Options {
-            cols: 8,
-            rows: 2,
-            max_scrollback: 1024,
-        })
-        .unwrap();
+        let mut terminal = crate::terminal::new_terminal(8, 2, 1024).unwrap();
         terminal.vt_write(b"selected");
         let selection = terminal.select_all().unwrap().unwrap();
         terminal.set_selection(Some(&selection)).unwrap();

@@ -176,6 +176,7 @@ fn run_pty_pressure_case() {
             ),
             transport: RunTransport::Pty {
                 initial_geometry: TerminalGeometry::DEFAULT,
+                scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                 on_output_wake: Some(Box::new(move || {
                     wake_counter.fetch_add(1, Ordering::Relaxed);
                 })),
@@ -194,7 +195,7 @@ fn run_pty_pressure_case() {
     let (before_bytes, before_wakes, mut requests) = {
         let session = run.terminal().expect("PTY pressure terminal");
         let output_deadline = Instant::now() + Duration::from_secs(2);
-        while session.output_history_metrics().bytes == 0 && Instant::now() < output_deadline {
+        while session.metrics().parsed_bytes == 0 && Instant::now() < output_deadline {
             while let Some(event) = session.poll_event() {
                 if let TerminalEvent::Failed(error) = event {
                     panic!("PTY pressure terminal failed before shutdown: {error}");
@@ -203,7 +204,7 @@ fn run_pty_pressure_case() {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(
-            session.output_history_metrics().bytes > 0,
+            session.metrics().parsed_bytes > 0,
             "PTY pressure fixture produced no output"
         );
 
@@ -225,8 +226,8 @@ fn run_pty_pressure_case() {
         assert!(saturated, "PTY pressure fixture did not saturate input");
         assert!(!requests.is_empty(), "PTY pressure admitted no paste");
 
-        let before = session.output_history_metrics();
-        let before_bytes = before.bytes + before.evicted_bytes;
+        let before = session.metrics();
+        let before_bytes = before.parsed_bytes;
         let before_wakes = wake_count.load(Ordering::Relaxed);
         let progress_deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -236,8 +237,8 @@ fn run_pty_pressure_case() {
                 }
             }
             requests.retain_mut(|request| request.poll().is_none());
-            let current = session.output_history_metrics();
-            let current_bytes = current.bytes + current.evicted_bytes;
+            let current = session.metrics();
+            let current_bytes = current.parsed_bytes;
             let current_wakes = wake_count.load(Ordering::Relaxed);
             if !requests.is_empty() && current_bytes > before_bytes && current_wakes > before_wakes
             {
@@ -271,8 +272,8 @@ fn run_pty_pressure_case() {
         outcome.worker_join_failures
     );
     let session = run.terminal().expect("retained PTY pressure terminal");
-    let after = session.output_history_metrics();
-    let after_bytes = after.bytes + after.evicted_bytes;
+    let after = session.metrics();
+    let after_bytes = after.parsed_bytes;
     let after_wakes = wake_count.load(Ordering::Relaxed);
     assert!(
         after_bytes > before_bytes || after_wakes > before_wakes,
@@ -437,6 +438,7 @@ fn repeated_cycles_do_not_leak_threads_or_file_descriptors() {
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("true"),
                 transport: RunTransport::Pty {
                     initial_geometry: geometry,
+                    scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                     on_output_wake: None,
                 },
                 events,

@@ -26,6 +26,7 @@ mod pty_seam_tests {
                 command,
                 transport: RunTransport::Pty {
                     initial_geometry: TerminalGeometry::DEFAULT,
+                    scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                     on_output_wake: None,
                 },
                 events,
@@ -57,6 +58,7 @@ mod pty_seam_tests {
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 30"),
                 transport: RunTransport::Pty {
                     initial_geometry: TerminalGeometry::DEFAULT,
+                    scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                     on_output_wake: None,
                 },
                 events: mpsc::channel().0,
@@ -584,6 +586,7 @@ wait";
                 command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 300"),
                 transport: RunTransport::Pty {
                     initial_geometry: geometry,
+                    scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                     on_output_wake: None,
                 },
                 events,

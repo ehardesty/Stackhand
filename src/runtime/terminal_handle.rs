@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::geometry::TerminalGeometry;
 use crate::runtime::outcome::ResizeRejected;
 use crate::terminal::{
-    CopyRequest, InputRejection as SessionInputRejection, OutputHistoryMetrics,
-    OwnedTerminalScrollbar, OwnedTerminalSnapshot, PasteRejection, PasteRequest,
-    SelectionDirection, TerminalEvent, TerminalMouseEvent, TerminalSession,
+    CopyRequest, InputRejection as SessionInputRejection, OwnedTerminalScrollbar,
+    OwnedTerminalSnapshot, PasteRejection, PasteRequest, SelectionDirection, TerminalEvent,
+    TerminalMetrics, TerminalMouseEvent, TerminalSession,
 };
 
 use super::InputRejected;
@@ -153,8 +153,8 @@ impl TerminalHandle<'_> {
         self.session.mouse_tracking()
     }
 
-    pub fn output_history_metrics(&self) -> OutputHistoryMetrics {
-        self.session.output_history_metrics()
+    pub fn metrics(&self) -> TerminalMetrics {
+        self.session.metrics()
     }
 
     pub fn poll_event(&self) -> Option<TerminalEvent> {

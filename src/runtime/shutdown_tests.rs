@@ -217,6 +217,7 @@ fn input_and_resize_are_rejected_after_shutdown_starts() {
             command: SpawnCommand::new("/bin/sh").arg("-c").arg("sleep 60"),
             transport: RunTransport::Pty {
                 initial_geometry: geometry,
+                scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                 on_output_wake: None,
             },
             events,

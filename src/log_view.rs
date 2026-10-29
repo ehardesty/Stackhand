@@ -32,6 +32,22 @@ pub(crate) enum LogViewAction {
     Copy,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MatchSelection {
+    Inactive,
+    AwaitingMatch,
+    Selected(usize),
+}
+
+impl MatchSelection {
+    fn index(self) -> Option<usize> {
+        match self {
+            Self::Selected(index) => Some(index),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LogView {
     representation: OutputRepresentation,
@@ -39,8 +55,9 @@ pub(crate) struct LogView {
     search_origin: Option<OutputRepresentation>,
     query: String,
     search: LogSearch,
-    current: Option<usize>,
+    current: MatchSelection,
     generation: Option<u64>,
+    cache: crate::output::SearchCache,
 }
 
 impl Default for LogView {
@@ -51,8 +68,9 @@ impl Default for LogView {
             search_origin: None,
             query: String::new(),
             search: LogSearch::default(),
-            current: None,
+            current: MatchSelection::Inactive,
             generation: None,
+            cache: Default::default(),
         }
     }
 }
@@ -72,7 +90,12 @@ impl LogView {
 
     pub(crate) fn current_match(&self) -> Option<LogMatch> {
         self.current
+            .index()
             .and_then(|index| self.search.matches.get(index).copied())
+    }
+
+    pub(crate) fn follow(&mut self) {
+        self.current = MatchSelection::Inactive;
     }
 
     pub(crate) fn has_search(&self) -> bool {
@@ -133,7 +156,7 @@ impl LogView {
             self.representation = OutputRepresentation::Logs;
             self.editor = Some(String::new());
             self.search = LogSearch::default();
-            self.current = None;
+            self.current = MatchSelection::Inactive;
             return LogViewAction::Pause;
         }
         if (!command_context && !logs_active)
@@ -166,7 +189,7 @@ impl LogView {
             KeyCode::Char('f')
                 if self.representation(has_terminal) == OutputRepresentation::Logs =>
             {
-                self.current = None;
+                self.follow();
                 LogViewAction::Follow
             }
             KeyCode::Char('c' | 'y')
@@ -179,19 +202,28 @@ impl LogView {
     }
 
     pub(crate) fn refresh(&mut self, output: &RetainedOutput) -> bool {
-        if self.generation == Some(output.generation) {
+        if self.generation == Some(output.generation) && !self.search.pending {
             return false;
         }
         let previous = self.current_match();
         self.generation = Some(output.generation);
         let query = self.editor.as_deref().unwrap_or(&self.query);
-        self.search = output.search(query);
-        self.current = previous.and_then(|wanted| {
-            self.search
-                .matches
-                .iter()
-                .position(|found| *found == wanted)
-        });
+        self.search = self.cache.search(output, query);
+        self.current = match self.current {
+            MatchSelection::Inactive => MatchSelection::Inactive,
+            MatchSelection::AwaitingMatch if !self.search.matches.is_empty() => {
+                MatchSelection::Selected(0)
+            }
+            MatchSelection::AwaitingMatch => MatchSelection::AwaitingMatch,
+            MatchSelection::Selected(_) => previous
+                .and_then(|wanted| {
+                    self.search
+                        .matches
+                        .iter()
+                        .position(|found| *found == wanted)
+                })
+                .map_or(MatchSelection::AwaitingMatch, MatchSelection::Selected),
+        };
         true
     }
 
@@ -212,10 +244,20 @@ impl LogView {
         }
         let count = self.search.matches.len();
         if count == 0 {
-            return "No matches".to_string();
+            return if self.search.pending {
+                "Searching older output…".into()
+            } else {
+                "No matches in retained Logs".into()
+            };
         }
-        let position = self.current.map_or(1, |index| index + 1);
-        let suffix = if self.search.limited { "+" } else { "" };
+        let position = self.current.index().map_or(1, |index| index + 1);
+        let suffix = if self.search.limited {
+            " newest matches (limit)"
+        } else if self.search.pending {
+            " · searching older output…"
+        } else {
+            " newest matches"
+        };
         format!("Match {position} of {count}{suffix}")
     }
 
@@ -264,8 +306,14 @@ impl LogView {
     fn rebuild_current_query(&mut self, output: &RetainedOutput) -> LogViewAction {
         let query = self.editor.as_deref().unwrap_or(&self.query);
         self.generation = Some(output.generation);
-        self.search = output.search(query);
-        self.current = (!self.search.matches.is_empty()).then_some(0);
+        self.search = self.cache.search(output, query);
+        self.current = if query.is_empty() {
+            MatchSelection::Inactive
+        } else if self.search.matches.is_empty() {
+            MatchSelection::AwaitingMatch
+        } else {
+            MatchSelection::Selected(0)
+        };
         self.current_match()
             .map(LogViewAction::ShowMatch)
             .unwrap_or(LogViewAction::Changed)
@@ -274,14 +322,19 @@ impl LogView {
     fn move_match(&mut self, direction: isize, output: &RetainedOutput) -> LogViewAction {
         self.refresh(output);
         if self.search.matches.is_empty() {
-            self.current = None;
+            self.current = if self.has_search() {
+                MatchSelection::AwaitingMatch
+            } else {
+                MatchSelection::Inactive
+            };
             return LogViewAction::Changed;
         }
         let len = self.search.matches.len();
         let current = self
             .current
+            .index()
             .unwrap_or(if direction < 0 { 0 } else { len - 1 });
-        self.current = Some(if direction < 0 {
+        self.current = MatchSelection::Selected(if direction < 0 {
             current.checked_sub(1).unwrap_or(len - 1)
         } else {
             (current + 1) % len
@@ -424,7 +477,7 @@ mod tests {
     #[test]
     fn search_switches_to_logs_and_navigates_literal_matches() {
         let output = OutputViews::new(1).for_process(0).unwrap();
-        output.append_at(1, OutputStream::Stdout, 0, b"hit\nmiss\nhit\n".to_vec());
+        output.append_at(1, OutputStream::Stdout, 0, b"hit\nmiss\nhit\n");
         let snapshot = output.snapshot();
         let mut view = LogView::default();
 
@@ -444,22 +497,40 @@ mod tests {
             LogViewAction::ShowMatch(_)
         ));
         assert_eq!(view.representation(true), OutputRepresentation::Logs);
-        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 1 of 2"));
+        assert_eq!(
+            view.status().as_deref(),
+            Some("Search: hit · Match 1 of 2 newest matches")
+        );
         view.handle_key(key(KeyCode::Enter), true, true, &snapshot);
-        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 2 of 2"));
+        assert_eq!(
+            view.status().as_deref(),
+            Some("Search: hit · Match 2 of 2 newest matches")
+        );
         view.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             true,
             true,
             &snapshot,
         );
-        assert_eq!(view.status().as_deref(), Some("Search: hit · Match 1 of 2"));
+        assert_eq!(
+            view.status().as_deref(),
+            Some("Search: hit · Match 1 of 2 newest matches")
+        );
     }
 
     #[test]
     fn eviction_clears_a_match_that_no_longer_exists() {
-        let output = OutputViews::new(1).for_process(0).unwrap();
-        output.append_at(1, OutputStream::Stdout, 0, b"needle\n".to_vec());
+        let output = OutputViews::with_settings(
+            1,
+            crate::output_settings::OutputSettings {
+                per_process_history_bytes: 128 * 1024,
+                global_history_bytes: 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .for_process(0)
+        .unwrap();
+        output.append_at(1, OutputStream::Stdout, 0, b"needle\n");
         let mut view = LogView::default();
         let first = output.snapshot();
         view.handle_key(key(KeyCode::Char('/')), true, true, &first);
@@ -467,12 +538,7 @@ mod tests {
             view.handle_key(key(KeyCode::Char(character)), true, true, &first);
         }
         view.handle_key(key(KeyCode::Enter), true, true, &first);
-        output.append_at(
-            1,
-            OutputStream::Stdout,
-            1,
-            vec![b'x'; crate::output::RETAINED_BYTES],
-        );
+        output.append_at(1, OutputStream::Stdout, 1, &vec![b'x'; 128 * 1024]);
         let later = output.snapshot();
         assert!(view.refresh(&later));
         assert!(view.current_match().is_none());

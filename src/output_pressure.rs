@@ -99,6 +99,11 @@ pub fn run_output_pressure_fixture() -> Result<OutputPressureReport> {
     let project = EffectiveProject::new(processes)
         .map_err(|error| anyhow::anyhow!("the pressure Project is invalid: {error:?}"))?;
 
+    let project = project.with_output_settings(crate::output_settings::OutputSettings {
+        per_process_history_bytes: 1024 * 1024,
+        global_history_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    });
     let (supervisor, _consoles, outputs) = crate::supervisor::start(project)?;
     supervisor.command(Command::StartAutostart);
 

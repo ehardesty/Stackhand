@@ -1,13 +1,7 @@
 use super::*;
-use libghostty_vt::terminal::Options;
 
 fn terminal(cols: u16, rows: u16) -> Terminal<'static, 'static> {
-    Terminal::new(Options {
-        cols,
-        rows,
-        max_scrollback: 64 * 1_024,
-    })
-    .unwrap()
+    crate::terminal::new_terminal(cols, rows, 64 * 1_024).unwrap()
 }
 
 #[test]

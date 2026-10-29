@@ -17,6 +17,8 @@ mod exit_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]
+mod output_tests;
+#[cfg(test)]
 mod path_tests;
 #[cfg(test)]
 mod profile_tests;
@@ -281,6 +283,14 @@ fn load_file_with_local(
         .as_ref()
         .and_then(|settings| settings.port_discovery)
         .unwrap_or(false);
+    let output = file
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.output.as_ref())
+        .map(crate::output_settings::OutputSettingsFile::resolve)
+        .transpose()
+        .map_err(|message| diagnostics::with_source(ConfigError { message }, &last_layer))?
+        .unwrap_or_default();
     let shell = build_shell(file.settings.as_ref())
         .map_err(|error| diagnostics::with_source(error, &last_layer))?;
     let raw_processes = document
@@ -420,6 +430,7 @@ fn load_file_with_local(
         profile.map(str::to_owned),
         base_profile_name,
         ProjectSettings {
+            output,
             shell,
             port_discovery,
             process_groups,
@@ -428,6 +439,13 @@ fn load_file_with_local(
     .map_err(|error| {
         let detail = format_project_error(error);
         diagnostics::with_source(config_error(anyhow::anyhow!(detail)), &last_layer)
+    })
+    .and_then(|project| {
+        project
+            .output_settings()
+            .terminal_limit_for_slots(project.terminal_process_count())
+            .map_err(|message| diagnostics::with_source(ConfigError { message }, &last_layer))?;
+        Ok(project)
     })
 }
 

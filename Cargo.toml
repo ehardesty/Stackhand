@@ -11,7 +11,7 @@ anyhow = "1.0.100"
 arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.15"
-libghostty-vt = { version = "0.2.1", default-features = false }
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "326be19c26da0a1bae0873101452b257cbf09d4b", default-features = false }
 portable-pty = "0.9.0"
 ratatui = "0.30.2"
 ratatui-interact = "0.5.3"
@@ -26,6 +26,12 @@ predicates = "3.1.3"
 [profile.release]
 strip = true
 lto = "thin"
+
+# Optimize native terminal parsing in development and tests.
+# Rust application code keeps its normal debug settings.
+[profile.dev.package.libghostty-vt-sys]
+opt-level = 3
+debug = false
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

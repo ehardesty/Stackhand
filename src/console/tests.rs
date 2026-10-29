@@ -290,7 +290,7 @@ fn logs_mouse_drag_selects_visible_text_for_copy() {
         1,
         crate::runtime::OutputStream::Stdout,
         0,
-        b"first\nsecond\nthird\n".to_vec(),
+        b"first\nsecond\nthird\n",
     );
     let retained = output.snapshot();
     let mut logs = ProcessLogs::default();
@@ -567,9 +567,7 @@ fn a_wheel_burst_does_not_block_the_next_mouse_selection() {
     peer.write_all(output.as_bytes()).unwrap();
 
     let output_deadline = Instant::now() + Duration::from_secs(2);
-    while session.output_history_metrics().bytes < output_bytes
-        || session.snapshot().cursor.is_some()
-    {
+    while session.metrics().parsed_bytes < output_bytes || session.snapshot().cursor.is_some() {
         assert!(
             Instant::now() < output_deadline,
             "log output and hidden cursor state were not applied"

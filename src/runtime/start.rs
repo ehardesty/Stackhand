@@ -24,6 +24,8 @@ pub enum RunTransport {
     /// Interactive transport with terminal semantics.
     Pty {
         initial_geometry: TerminalGeometry,
+        /// Primary-screen byte target, including its active screen.
+        scrollback_bytes: usize,
         /// Optional redraw notification. It never carries output bytes.
         on_output_wake: Option<Box<dyn Fn() + Send + 'static>>,
     },

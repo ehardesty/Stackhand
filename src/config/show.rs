@@ -76,6 +76,23 @@ pub(super) fn render(project: &EffectiveProject) -> Result<String, ConfigError> 
         "port_discovery",
         Value::Bool(project.port_discovery()),
     );
+    let limits = project.output_settings();
+    let mut output = Mapping::new();
+    for (name, bytes) in [
+        (
+            "terminal_scrollback_bytes",
+            limits.terminal_scrollback_bytes,
+        ),
+        ("terminal_project_bytes", limits.terminal_project_bytes),
+        (
+            "per_process_history_bytes",
+            limits.per_process_history_bytes,
+        ),
+        ("global_history_bytes", limits.global_history_bytes),
+    ] {
+        insert(&mut output, name, number(bytes as u64));
+    }
+    insert(&mut settings, "output", Value::Mapping(output));
     insert(&mut root, "settings", Value::Mapping(settings));
 
     serde_yaml::to_string(&Value::Mapping(root)).map_err(|error| ConfigError {

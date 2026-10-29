@@ -60,6 +60,58 @@ processes: {}
 - `settings.port_discovery` shows listening TCP ports for each Process. The default is `false`.
 - `processes` can be empty.
 
+## Output history
+
+`settings.output` controls two in-memory representations. Terminal scrollback
+preserves the current Run's terminal grid. Logs keep normalized, searchable
+output across Runs, including hook output. These are the defaults:
+
+```yaml
+settings:
+  output:
+    terminal_scrollback_bytes: 16MiB
+    terminal_project_bytes: 128MiB
+    per_process_history_bytes: 32MiB
+    global_history_bytes: 256MiB
+```
+
+Values accept integer bytes or whole numbers with `B`, `KiB`, `MiB`, or `GiB`
+suffixes. Each must be at least 1 MiB. A per-Process target cannot exceed its
+corresponding Project budget. Invalid units, overflow, and unknown fields are
+configuration errors. `stackhand config show` prints resolved byte values.
+Local overrides merge individual settings using the normal configuration rules.
+Budgets are resolved at startup; restart Stackhand after changing them.
+
+Terminal shares are fixed before startup using every Process that can use a PTY
+in any selectable profile, including idle Processes. Each reserves 1 MiB of
+page/active-screen headroom. The effective per-PTY target is the smaller of
+`terminal_scrollback_bytes` and the remaining Project budget divided by that
+Process count. The Project budget must allow at least 2 MiB per possible PTY.
+Starting another Run does not trim an existing terminal's history. Ghostty's
+separate line-count limit is disabled; retention uses the byte target.
+
+Terminal limits operate on pages. The active screen, native minimum allocation,
+page rounding, geometry, and compression mean a byte target is not an exact
+resident-memory cap. Native page, resident, and compressed memory are sampled
+periodically for diagnostics. Incremental compression runs during idle periods.
+A new Run gets a fresh terminal; its previous Run remains available in Logs
+while that output is retained.
+
+Logs evict the oldest segments within a Process. At the Project limit, the
+largest current Process history is trimmed first, preserving smaller histories
+such as a quiet Process's older error. Text storage is shared with readers;
+evicted segments remain charged to the Project budget while a reader holds
+them. Snapshots do not duplicate the whole history. New output continues to
+drain even when history expires. A header and marker identify the retained
+scope and loss of earlier Logs.
+
+The Logs storage budget includes allocated text and segment record capacity.
+Normalization buffers, segment indexes, bounded search results, queues, and
+visible render pages also use memory. Terminal and Logs budgets are separate,
+and neither describes total application RSS. There is no disk archive or
+restart persistence. Increase these settings for a longer recent window; retain
+application log files when complete, durable output is required.
+
 ## Process Groups
 
 Process Groups divide the Process list into visual sections:

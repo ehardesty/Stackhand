@@ -15,10 +15,7 @@ use anyhow::{Result, bail, ensure};
 use crate::fixtures::start_fixture_run;
 use crate::geometry::TerminalGeometry;
 use crate::runtime::SpawnCommand;
-use crate::terminal::{
-    OUTPUT_HISTORY_BYTES, OUTPUT_HISTORY_CHUNKS, PASTE_LIMIT_BYTES, PasteCompletion,
-    PasteRejection, TerminalEvent,
-};
+use crate::terminal::{PASTE_LIMIT_BYTES, PasteCompletion, PasteRejection, TerminalEvent};
 
 /// A redraw request gate. Many output chunks can set the gate, but only the
 /// transition from clean to pending produces a notification.
@@ -72,8 +69,8 @@ pub struct StressReport {
     pub scrolled_snapshots: usize,
     pub output_callbacks_during_unfocused: usize,
     pub peak_rss_delta_kib: Option<u64>,
-    pub history_bytes: usize,
-    pub history_evicted_bytes: usize,
+    pub terminal_page_bytes: usize,
+    pub parsed_output_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +176,6 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
                     // a failed stress run.
                     TerminalEvent::Exited => {}
                     TerminalEvent::StateChanged => {}
-                    TerminalEvent::OutputTruncated => {}
                 }
             }
 
@@ -249,19 +245,15 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
             latest_text.contains("1b5b"),
             "stress acknowledgement did not contain the terminal query response: {latest_text:?}"
         );
-        let history = session.output_history_metrics();
+        let metrics = session.metrics();
         ensure!(
-            history.bytes <= OUTPUT_HISTORY_BYTES,
-            "output history exceeded byte limit"
-        );
-        ensure!(
-            history.chunks <= OUTPUT_HISTORY_CHUNKS,
-            "output history exceeded chunk limit"
+            metrics.memory.is_some(),
+            "native terminal memory was not sampled"
         );
         Ok::<_, anyhow::Error>(())
     })();
 
-    let history = session.output_history_metrics();
+    let history = session.metrics();
     fixture_result?;
     run.shutdown()?;
 
@@ -284,8 +276,8 @@ printf '\r\nstress-ack:%s:%s\r\n' "$reply_hex" "$probe_hex""#,
         output_callbacks_during_unfocused: output_callbacks_after_unfocused
             .saturating_sub(output_callbacks_before_unfocused),
         peak_rss_delta_kib,
-        history_bytes: history.bytes,
-        history_evicted_bytes: history.evicted_bytes,
+        terminal_page_bytes: history.memory.map_or(0, |memory| memory.page_bytes),
+        parsed_output_bytes: history.parsed_bytes,
     })
 }
 
@@ -316,13 +308,10 @@ sleep 5"#,
     let session = run.terminal().expect("stress fixture is PTY-mode");
     let fixture_result = (|| {
         let start_deadline = Instant::now() + Duration::from_secs(2);
-        while session.output_history_metrics().bytes == 0 && Instant::now() < start_deadline {
+        while session.metrics().parsed_bytes == 0 && Instant::now() < start_deadline {
             thread::sleep(Duration::from_millis(1));
         }
-        ensure!(
-            session.output_history_metrics().bytes > 0,
-            "no fixture output"
-        );
+        ensure!(session.metrics().parsed_bytes > 0, "no fixture output");
 
         let paste = "p".repeat(PASTE_LIMIT_BYTES);
         let mut requests = Vec::new();
@@ -345,8 +334,8 @@ sleep 5"#,
             "blocked-input fixture admitted no paste"
         );
 
-        let before = session.output_history_metrics();
-        let output_bytes_before = before.bytes + before.evicted_bytes;
+        let before = session.metrics();
+        let output_bytes_before = before.parsed_bytes;
         let wakes_before = redraw.requests();
         let accepted_pastes = requests.len();
         let progress_deadline = Instant::now() + Duration::from_secs(2);
@@ -361,8 +350,8 @@ sleep 5"#,
             }
             requests.retain_mut(|request| request.poll().is_none());
             pending_pastes_during_flood = requests.len();
-            let after = session.output_history_metrics();
-            output_bytes_after = after.bytes + after.evicted_bytes;
+            let after = session.metrics();
+            output_bytes_after = after.parsed_bytes;
             wakes_after = redraw.requests();
             if pending_pastes_during_flood > 0
                 && output_bytes_after > output_bytes_before

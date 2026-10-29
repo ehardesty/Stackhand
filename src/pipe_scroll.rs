@@ -2,8 +2,8 @@
 //!
 //! Following is the only state that moves when output arrives. Scrolling up
 //! anchors the viewport to a retained source line. New output can then arrive
-//! without moving that anchor. If retention evicts the anchor, the viewport
-//! moves to the retained head instead of guessing from the live tail.
+//! without moving that anchor. If retention evicts the anchor, the visible
+//! page stays frozen until the user navigates or follows again.
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -54,12 +54,17 @@ pub struct PipeScroll {
     target: Option<(u64, usize)>,
     visible: Vec<PipeLine>,
     held: bool,
+    expired: bool,
     selection: Option<LogSelection>,
     scrollbar: Option<ConsoleScrollbar>,
     scrollbar_gesture: Option<ScrollbarGesture>,
 }
 
 impl PipeScroll {
+    pub fn expired(&self) -> bool {
+        self.expired
+    }
+
     pub fn following(&self) -> bool {
         self.position == Position::Following && self.pending.is_empty() && self.target.is_none()
     }
@@ -113,6 +118,7 @@ impl PipeScroll {
     }
 
     pub fn head(&mut self) {
+        self.expired = false;
         self.position = Position::Head;
         self.pending.clear();
         self.target = None;
@@ -121,6 +127,7 @@ impl PipeScroll {
     }
 
     pub fn follow(&mut self) {
+        self.expired = false;
         self.position = Position::Following;
         self.pending.clear();
         self.target = None;
@@ -250,7 +257,21 @@ impl PipeScroll {
         if start == end {
             return None;
         }
-        let lines = output.display_window_from(Some(start.source), usize::MAX)?;
+        let lines = if self.expired {
+            let start_row = self
+                .visible
+                .iter()
+                .position(|line| line.source == Some(start.source))?;
+            let end_row = self
+                .visible
+                .iter()
+                .position(|line| line.source == Some(end.source))?;
+            self.visible.get(start_row..=end_row)?.to_vec()
+        } else {
+            let start_row = output.display_position(Some(start.source))?.0;
+            let end_row = output.display_position(Some(end.source))?.0;
+            output.display_window_from(Some(start.source), end_row.saturating_sub(start_row) + 1)?
+        };
         let mut selected = Vec::new();
         for line in lines {
             let source = line.source?;
@@ -286,6 +307,22 @@ impl PipeScroll {
             self.scrollbar_gesture = None;
             return &self.visible;
         }
+        let navigating = !self.pending.is_empty() || self.target.is_some();
+        if !self.following() && !navigating && !self.visible.is_empty() {
+            let anchor = self.visible.iter().find_map(|line| line.source);
+            if self.expired
+                || anchor.is_some_and(|source| output.display_position(Some(source)).is_none())
+            {
+                // Freeze only the visible page, not another full history.
+                self.expired = true;
+                self.visible.truncate(pane_rows);
+                self.scrollbar = None;
+                self.scrollbar_gesture = None;
+                self.apply_selection();
+                return &self.visible;
+            }
+        }
+        self.expired = false;
         if !self.selection_is_retained(output) {
             self.selection = None;
         }
@@ -484,7 +521,7 @@ impl PipeScroll {
         };
         [selection.anchor.source, selection.cursor.source]
             .into_iter()
-            .all(|source| output.display_window_from(Some(source), 1).is_some())
+            .all(|source| output.display_position(Some(source)).is_some())
     }
 
     fn extend_drag_selection(&mut self) {
@@ -596,356 +633,4 @@ fn byte_at_column(text: &str, column: usize, include_character: bool) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use ratatui::buffer::Buffer;
-    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
-
-    use crate::output::{RetainedChunk, RetainedOutput};
-    use crate::runtime::OutputStream;
-
-    use super::*;
-
-    fn output(range: std::ops::Range<usize>, generation: u64) -> RetainedOutput {
-        RetainedOutput {
-            chunks: range
-                .map(|line| RetainedChunk::Data {
-                    run_id: 1,
-                    stream: OutputStream::Stdout,
-                    text: format!("line-{line:05}\n"),
-                    sequence: line as u64,
-                    observed_at_ms: line as u64,
-                    continued: false,
-                })
-                .collect(),
-            generation,
-            ..RetainedOutput::default()
-        }
-    }
-
-    fn sources(lines: &[PipeLine]) -> Vec<Option<(u64, usize)>> {
-        lines.iter().map(|line| line.source).collect()
-    }
-
-    #[test]
-    fn paused_window_stays_anchored_when_lines_append() {
-        let mut scroll = PipeScroll::default();
-        let first = output(0..25, 1);
-        scroll.scroll_lines(5, -1);
-        let before = sources(scroll.window(&first, 20));
-
-        let later = output(0..30, 2);
-
-        assert_eq!(sources(scroll.window(&later, 20)), before);
-        assert!(!scroll.following());
-    }
-
-    #[test]
-    fn an_empty_search_target_returns_to_the_live_tail() {
-        let mut scroll = PipeScroll::default();
-        scroll.show_source((1, 0));
-
-        assert!(scroll.window(&RetainedOutput::default(), 20).is_empty());
-        assert!(scroll.following());
-    }
-
-    #[test]
-    fn search_pause_keeps_the_same_visible_lines_as_output_arrives() {
-        let mut scroll = PipeScroll::default();
-        let first = output(0..25, 1);
-        let before = sources(scroll.window(&first, 20));
-        scroll.pause();
-
-        let later = output(0..30, 2);
-
-        assert_eq!(sources(scroll.window(&later, 20)), before);
-        assert!(!scroll.following());
-    }
-
-    #[test]
-    fn logs_mouse_selection_is_visible_and_returns_selected_text() {
-        let mut scroll = PipeScroll::default();
-        let retained = output(0..25, 1);
-        scroll.window(&retained, 20);
-
-        assert!(scroll.begin_selection(0, 0));
-        assert!(scroll.update_selection(1, 5));
-
-        let visible = scroll.window(&retained, 20);
-        assert!(visible[0].selection.is_some());
-        assert!(visible[1].selection.is_some());
-        assert!(scroll.selected_text(&retained).unwrap().contains('\n'));
-        assert!(!scroll.following());
-    }
-
-    #[test]
-    fn scrolling_preserves_a_logs_selection() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.window(&retained, 20);
-        scroll.begin_selection(5, 0);
-        scroll.update_selection(10, 5);
-        scroll.finish_selection(10, 5);
-        let selected = scroll.selected_text(&retained);
-
-        scroll.scroll_lines(3, -1);
-        scroll.window(&retained, 20);
-
-        assert_eq!(scroll.selected_text(&retained), selected);
-        assert!(
-            scroll
-                .window(&retained, 20)
-                .iter()
-                .any(|line| line.selection.is_some())
-        );
-    }
-
-    #[test]
-    fn wheel_scrolling_extends_an_active_logs_selection() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.window(&retained, 10);
-        scroll.begin_selection(5, 0);
-        scroll.update_selection(6, 5);
-        let before = scroll.selected_text(&retained).unwrap();
-
-        scroll.scroll_lines(5, -1);
-        scroll.window(&retained, 10);
-
-        let after = scroll.selected_text(&retained).unwrap();
-        assert!(after.len() > before.len());
-        assert!(after.contains("line-00031"));
-        assert!(!after.contains("line-00030"));
-    }
-
-    #[test]
-    fn selected_text_includes_lines_outside_the_visible_window() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.window(&retained, 10);
-        scroll.begin_selection(8, 0);
-        scroll.update_selection(9, 5);
-        scroll.scroll_lines(10, -1);
-        scroll.window(&retained, 10);
-        scroll.finish_selection(9, 5);
-
-        let selected = scroll.selected_text(&retained).unwrap();
-        assert!(selected.contains("line-00029"));
-        assert!(!selected.contains("line-00028"));
-        assert!(selected.contains("line-00037"));
-    }
-
-    #[test]
-    fn scrollbar_reports_the_retained_viewport_and_hides_when_logs_fit() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-
-        scroll.window(&retained, 10);
-
-        assert_eq!(
-            scroll.scrollbar(),
-            Some(ConsoleScrollbar {
-                position: 30,
-                content_length: 31,
-                viewport_length: 10,
-            })
-        );
-        let short = output(0..10, 2);
-        scroll.follow();
-        scroll.window(&short, 10);
-        assert_eq!(scroll.scrollbar(), None);
-    }
-
-    #[test]
-    fn scrollbar_hit_area_matches_ratatui_thumb_geometry() {
-        for track_rows in 1..=8 {
-            let area = Rect::new(0, 0, 1, track_rows as u16);
-            for content_length in 1..=10 {
-                for viewport_length in 1..=5 {
-                    for position in 0..content_length {
-                        let scrollbar = ConsoleScrollbar {
-                            position,
-                            content_length,
-                            viewport_length,
-                        };
-                        let mut buffer = Buffer::empty(area);
-                        let mut state = ScrollbarState::new(content_length)
-                            .position(position)
-                            .viewport_content_length(viewport_length);
-                        StatefulWidget::render(
-                            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                                .begin_symbol(None)
-                                .end_symbol(None),
-                            area,
-                            &mut buffer,
-                            &mut state,
-                        );
-                        let thumb_rows = (0..track_rows)
-                            .filter(|row| buffer[(0, *row as u16)].symbol() == "█")
-                            .collect::<Vec<_>>();
-                        let rendered = (thumb_rows.first().copied().unwrap_or(0), thumb_rows.len());
-
-                        assert_eq!(scrollbar_thumb(scrollbar, track_rows), rendered);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn scrollbar_thumb_drag_maps_to_a_stable_logs_position() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-        let area = Rect::new(5, 5, 20, 10);
-        scroll.window(&retained, 10);
-        let mouse = |kind, column, row| MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        assert!(scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 24, 13),
-            area,
-            &retained,
-        ));
-        assert!(scroll.scrollbar_gesture_active());
-        assert!(scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Drag(MouseButton::Left), 30, 8),
-            area,
-            &retained,
-        ));
-        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((8, 0)));
-        assert_eq!(
-            scroll.scrollbar(),
-            Some(ConsoleScrollbar {
-                position: 8,
-                content_length: 31,
-                viewport_length: 10,
-            })
-        );
-        assert!(scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), 30, 2),
-            area,
-            &retained,
-        ));
-        assert!(!scroll.scrollbar_gesture_active());
-
-        assert!(scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 24, 14),
-            area,
-            &retained,
-        ));
-        assert_eq!(sources(scroll.window(&retained, 10))[0], Some((30, 0)));
-        assert!(scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
-            area,
-            &retained,
-        ));
-        assert!(!scroll.scrollbar_gesture_active());
-    }
-
-    #[test]
-    fn scrollbar_navigation_preserves_a_finished_logs_selection() {
-        let retained = output(0..40, 1);
-        let mut scroll = PipeScroll::default();
-        let area = Rect::new(0, 0, 20, 10);
-        scroll.window(&retained, 10);
-        scroll.begin_selection(5, 0);
-        scroll.update_selection(6, 5);
-        scroll.finish_selection(6, 5);
-        let selected = scroll.selected_text(&retained);
-        let mouse = |kind, row| MouseEvent {
-            kind,
-            column: 19,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 0),
-            area,
-            &retained,
-        );
-        scroll.handle_scrollbar_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), 0),
-            area,
-            &retained,
-        );
-
-        assert_eq!(scroll.selected_text(&retained), selected);
-    }
-
-    #[test]
-    fn selection_columns_keep_wide_and_combining_characters_whole() {
-        assert_eq!(byte_at_column("界a", 0, false), 0);
-        assert_eq!(byte_at_column("界a", 1, true), "界".len());
-        assert_eq!(byte_at_column("e\u{301}x", 0, true), "e\u{301}".len());
-    }
-
-    #[test]
-    fn reaching_the_tail_resumes_following() {
-        let retained = output(0..30, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.scroll_lines(10, -1);
-        scroll.window(&retained, 20);
-        assert!(!scroll.following());
-
-        scroll.scroll_lines(10, 1);
-
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((10, 0)));
-        assert!(scroll.following());
-    }
-
-    #[test]
-    fn evicted_anchor_moves_to_the_new_retained_head() {
-        let mut scroll = PipeScroll::default();
-        let first = output(0..25, 1);
-        scroll.scroll_lines(5, -1);
-        scroll.window(&first, 20);
-
-        let mut later = output(5..30, 2);
-        later.truncated = true;
-        let visible = scroll.window(&later, 20);
-
-        assert!(visible[0].marker);
-        assert_eq!(visible[0].source, None);
-        assert_eq!(visible[1].source, Some((5, 0)));
-        assert!(!scroll.following());
-    }
-
-    #[test]
-    fn retained_history_is_not_hidden_by_a_second_navigation_limit() {
-        let retained = output(0..5_000, 1);
-        let mut scroll = PipeScroll::default();
-
-        scroll.scroll_lines(10_000, -1);
-
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((0, 0)));
-    }
-
-    #[test]
-    fn extra_scroll_up_at_the_retained_head_has_no_scroll_debt() {
-        let retained = output(0..25, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.scroll_lines(6, -1);
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((0, 0)));
-
-        scroll.scroll_lines(1, 1);
-
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((1, 0)));
-    }
-
-    #[test]
-    fn follow_returns_to_the_live_tail() {
-        let retained = output(0..100, 1);
-        let mut scroll = PipeScroll::default();
-        scroll.scroll_page(20, -1);
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((61, 0)));
-
-        scroll.follow();
-
-        assert_eq!(sources(scroll.window(&retained, 20))[0], Some((80, 0)));
-        assert!(scroll.following());
-    }
-}
+mod tests;

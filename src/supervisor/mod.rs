@@ -83,8 +83,19 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, A
     // Size each first PTY like the pane that will render it, so children
     // never observe a stale default size.
     let initial_geometry = crate::tui::project_console_geometry(project.process_list_row_count());
-    let outputs = Arc::new(OutputViews::new(project.processes().len()));
-    let seam = RealRunSeam::new(Arc::clone(&outputs)).with_port_discovery(project.port_discovery());
+    let settings = project.output_settings();
+    // Reserve for every configured Process, including later profile switches.
+    // Existing Runs never lose history just because another Process starts.
+    let terminal_bytes = settings
+        .terminal_limit_for_slots(project.terminal_process_count())
+        .map_err(anyhow::Error::msg)?;
+    let outputs = Arc::new(OutputViews::with_settings(
+        project.processes().len(),
+        settings,
+    ));
+    let seam = RealRunSeam::new(Arc::clone(&outputs))
+        .with_port_discovery(project.port_discovery())
+        .with_scrollback_bytes(terminal_bytes);
     let consoles = seam.consoles();
     Ok((
         start_with(

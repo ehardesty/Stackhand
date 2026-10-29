@@ -9,7 +9,7 @@ fn sustained_output_keeps_the_terminal_responsive_and_bounded() {
     assert!(report.active_snapshots > 0);
     assert!(report.scrolled_snapshots > 0);
     assert!(report.output_callbacks_during_unfocused > 0);
-    assert!(report.history_bytes > 0);
+    assert!(report.terminal_page_bytes > 0);
 }
 
 #[test]

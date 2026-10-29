@@ -414,7 +414,7 @@ fn append_warning(segments: &mut Vec<Segment>, warning: ConsoleWarning) {
             "WARNING: child input queue is saturated; delivery is bounded",
         )),
         ConsoleWarning::OutputTruncated => segments.push(Segment::text(
-            "WARNING: oldest Process output was removed at the history bound",
+            "Earlier Logs expired at the history limit; recent output continues",
         )),
         ConsoleWarning::PasteDeliveryFailed => segments.push(Segment::text(
             "WARNING: an admitted paste did not reach the child",

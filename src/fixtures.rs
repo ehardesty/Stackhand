@@ -34,6 +34,7 @@ pub(crate) fn start_fixture_run(
         command,
         transport: RunTransport::Pty {
             initial_geometry: geometry,
+            scrollback_bytes: 128 * 1024,
             on_output_wake,
         },
         events,
@@ -267,9 +268,7 @@ fn wait_for_fixture_text(session: &TerminalHandle<'_>, expected: &str) -> Result
                 TerminalEvent::InputBackpressure { .. } => {
                     bail!("fixture filled the bounded child-input queue")
                 }
-                TerminalEvent::Exited
-                | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated => {}
+                TerminalEvent::Exited | TerminalEvent::StateChanged => {}
             }
         }
         if session.is_dirty() {
@@ -298,9 +297,7 @@ fn wait_for_input_backpressure(session: &TerminalHandle<'_>) -> Result<String> {
                     ));
                 }
                 TerminalEvent::Failed(error) => bail!("terminal owner failed: {error}"),
-                TerminalEvent::Exited
-                | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated => {}
+                TerminalEvent::Exited | TerminalEvent::StateChanged => {}
             }
         }
         thread::sleep(Duration::from_millis(5));
@@ -484,9 +481,7 @@ pub(crate) fn wait_for_snapshot(
                 TerminalEvent::InputBackpressure { .. } => {
                     bail!("{fixture} fixture filled the child-input queue")
                 }
-                TerminalEvent::Exited
-                | TerminalEvent::StateChanged
-                | TerminalEvent::OutputTruncated => {}
+                TerminalEvent::Exited | TerminalEvent::StateChanged => {}
             }
         }
         if session.is_dirty() {

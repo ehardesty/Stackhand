@@ -160,6 +160,7 @@ impl<'de> Deserialize<'de> for DependencyCollection {
 pub(super) struct SettingsFile {
     pub(super) shell: Option<ShellFile>,
     pub(super) port_discovery: Option<bool>,
+    pub(super) output: Option<crate::output_settings::OutputSettingsFile>,
 }
 
 #[derive(Deserialize)]

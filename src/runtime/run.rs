@@ -159,15 +159,17 @@ impl RunRuntime {
         let (tree, inner) = match transport {
             RunTransport::Pty {
                 initial_geometry,
+                scrollback_bytes,
                 on_output_wake,
             } => {
                 let spawned = PtyProcess::spawn(command, initial_geometry)?;
                 let wake = on_output_wake.unwrap_or_else(|| Box::new(|| {}));
-                let session = TerminalSession::spawn_with_observer(
+                let session = TerminalSession::spawn_configured(
                     spawned.io,
                     initial_geometry,
                     wake,
                     output_observer,
+                    scrollback_bytes,
                 )?;
                 let tree = spawned.process.process_id().map(UnixProcessTree::from_root);
                 (

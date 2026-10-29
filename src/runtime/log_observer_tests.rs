@@ -42,6 +42,7 @@ fn start_observed_run(
         TestTransport::Pty => (
             RunTransport::Pty {
                 initial_geometry: TerminalGeometry::DEFAULT,
+                scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
                 on_output_wake: None,
             },
             None,

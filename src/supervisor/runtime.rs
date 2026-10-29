@@ -40,6 +40,7 @@ pub(crate) struct RealRunSeam {
     runs: RunRegistry,
     outputs: Arc<OutputViews>,
     port_discovery: bool,
+    scrollback_bytes: usize,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -50,9 +51,15 @@ impl RealRunSeam {
             runs: Arc::new(Mutex::new(HashMap::new())),
             outputs,
             port_discovery: false,
+            scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
+    }
+
+    pub(crate) fn with_scrollback_bytes(mut self, bytes: usize) -> Self {
+        self.scrollback_bytes = bytes;
+        self
     }
 
     pub(crate) fn with_port_discovery(mut self, enabled: bool) -> Self {
@@ -137,6 +144,7 @@ impl RunSeam for RealRunSeam {
         let runs = Arc::clone(&self.runs);
         let outputs = Arc::clone(&self.outputs);
         let port_discovery = self.port_discovery;
+        let scrollback_bytes = self.scrollback_bytes;
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             // Mark the Run before starting its readers. This gives every
@@ -154,6 +162,7 @@ impl RunSeam for RealRunSeam {
                 StartTransport::Pty { initial_geometry } => (
                     RunTransport::Pty {
                         initial_geometry,
+                        scrollback_bytes,
                         on_output_wake: None,
                     },
                     None,
@@ -289,7 +298,7 @@ impl RunOutputObserver for PtyLogsObserver {
         self.output.append(
             self.run_id.get(),
             crate::runtime::OutputStream::Combined,
-            data.to_vec(),
+            data,
         );
     }
 }
@@ -338,7 +347,7 @@ fn drain_retained_output(
     thread::spawn(move || {
         loop {
             match output_rx.recv_timeout(OUTPUT_DRAIN_POLL) {
-                Ok(chunk) => module.append(chunk.run_id.get(), chunk.stream, chunk.data),
+                Ok(chunk) => module.append(chunk.run_id.get(), chunk.stream, &chunk.data),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
