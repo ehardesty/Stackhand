@@ -229,7 +229,7 @@ Use these keys while the Process list has focus:
 | `p` | Select the next Project Profile. |
 | `R` | Apply a pending Profile change when Stackhand shows this action. |
 | `l` | Switch the selected PTY between Terminal and Logs. |
-| `/` or `Ctrl-F` | Search the selected Logs. |
+| `/` or `Ctrl-F` | Search the selected Logs. From a Terminal, this shows Logs; `Esc` returns. |
 | `&`, `\`, `F4`, or `Ctrl-G` | Filter the selected Logs. |
 | `v` | Enter Copy mode for the selected PTY Terminal. |
 | `Tab` or `Ctrl-A` | Focus the selected console. |
@@ -290,7 +290,8 @@ when Stackhand exits; use your application's log files for durable retention.
 
 Press `Ctrl-A` to focus the selected console. A PTY accepts keyboard input by
 default while its console has focus. This includes `Ctrl-C`, which is sent to
-the child command. Press `Ctrl-A` again to return to the Process list. A Process
+the child command, as is `Ctrl-F`. Press `Ctrl-A` again to return to the
+Process list; follow it with `/` to search Logs or `l` to show them. A Process
 with `terminal.input: disabled` does not accept keyboard input.
 
 When PTY output is longer than the pane, Stackhand shows a scrollbar on the

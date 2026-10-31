@@ -587,6 +587,11 @@ fn footer_content(
                 Essential,
             ));
             hints.push(Hint::action(
+                "Ctrl-A /: search Logs",
+                VisibleAction::SearchEdit,
+                Useful,
+            ));
+            hints.push(Hint::action(
                 "Ctrl-A v: copy",
                 VisibleAction::EnterCopy,
                 Useful,
@@ -930,6 +935,8 @@ mod tests {
         assert!(narrow.starts_with(" INPUT "), "{narrow}");
         assert!(narrow.contains("Ctrl-A: Processes"), "{narrow}");
         assert!(narrow.contains("Ctrl-A l: Logs"), "{narrow}");
+        let eighty = fitted_text(view, 80);
+        assert!(eighty.contains("Ctrl-A /: search Logs"), "{eighty}");
     }
 
     #[test]

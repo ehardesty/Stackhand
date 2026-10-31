@@ -463,7 +463,7 @@ impl ProjectInteraction {
         let mode = self.console.view().mode;
         let leaves_terminal_input = match action {
             VisibleAction::EnterCopy => mode == crate::tui::ConsoleViewMode::Console,
-            VisibleAction::ToggleView => {
+            VisibleAction::ToggleView | VisibleAction::SearchEdit | VisibleAction::FilterEdit => {
                 matches!(pane, SelectedPane::Terminal(_))
                     && mode != crate::tui::ConsoleViewMode::ProcessList
             }

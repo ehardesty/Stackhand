@@ -126,7 +126,7 @@ Console modes:
 
 The footer should make the current focus/mode clear enough that users understand whether keys will reach the child.
 
-The footer starts with a mode badge that names the keyboard owner: `PROCESSES`, `INPUT` (keys reach the child), `TERMINAL` (a read-only terminal), `LOGS`, `COPY`, `SELECT`, `SEARCH`, or `FILTER`. Terminal input always shows how to leave it (`Ctrl-A: Processes`) and how to reach Logs (`Ctrl-A l: Logs`). A click on output focuses that console and does not by itself select text or pause the live tail.
+The footer starts with a mode badge that names the keyboard owner: `PROCESSES`, `INPUT` (keys reach the child), `TERMINAL` (a read-only terminal), `LOGS`, `COPY`, `SELECT`, `SEARCH`, or `FILTER`. Terminal input always shows how to leave it (`Ctrl-A: Processes`) and how to reach Logs (`Ctrl-A l: Logs`); when space allows it also offers `Ctrl-A /: search Logs`, because search always opens Logs. A click on output focuses that console and does not by itself select text or pause the live tail.
 
 While a search or filter is edited, the footer row is the prompt. It shows the query with the terminal cursor, a live result, and its actions, so no dialog covers the output that the prompt highlights or filters.
 
