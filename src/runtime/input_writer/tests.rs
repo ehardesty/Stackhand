@@ -134,14 +134,7 @@ fn writer_retries_temporary_os_backpressure_without_losing_paste_bytes() {
     queued.write_all(b"retry-this-paste").unwrap();
     drop(queued);
     owner.join().unwrap();
-    assert_eq!(
-        owner.poll_event(),
-        Some(PtyWriterEvent::Backpressure {
-            attempted_bytes: 16,
-            pending_bytes: 16,
-            limit_bytes: 64,
-        })
-    );
+    assert_eq!(owner.poll_event(), None);
     assert_eq!(
         read_bytes
             .lock()
@@ -309,6 +302,7 @@ fn writer_status_bounds_diagnostics_and_preserves_failure() {
 fn cancellation_fails_in_flight_and_queued_pastes_without_a_writer_fault() {
     struct BlockedWriter {
         released: Arc<std::sync::atomic::AtomicBool>,
+        attempted: Option<mpsc::Sender<()>>,
         closed: mpsc::Sender<()>,
     }
 
@@ -317,6 +311,9 @@ fn cancellation_fails_in_flight_and_queued_pastes_without_a_writer_fault() {
             if self.released.load(Ordering::Acquire) {
                 Ok(data.len())
             } else {
+                if let Some(attempted) = self.attempted.take() {
+                    let _ = attempted.send(());
+                }
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
         }
@@ -333,9 +330,11 @@ fn cancellation_fails_in_flight_and_queued_pastes_without_a_writer_fault() {
     }
 
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempted, blocked) = mpsc::channel();
     let (closed, stopped) = mpsc::channel();
     let writer = BlockedWriter {
         released: Arc::clone(&released),
+        attempted: Some(attempted),
         closed,
     };
     let (queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
@@ -350,18 +349,7 @@ fn cancellation_fails_in_flight_and_queued_pastes_without_a_writer_fault() {
     drop((completion_a, completion_b));
     let mut request_a = crate::terminal::PasteRequest::new(1, outcome_a);
     let mut request_b = crate::terminal::PasteRequest::new(2, outcome_b);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut backpressure = false;
-    while Instant::now() < deadline {
-        if matches!(
-            owner.poll_event(),
-            Some(PtyWriterEvent::Backpressure { .. })
-        ) {
-            backpressure = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+    let blocked = blocked.recv_timeout(Duration::from_secs(2));
 
     owner.cancel();
     let joined = owner.join_until(Instant::now() + Duration::from_secs(2));
@@ -370,7 +358,7 @@ fn cancellation_fails_in_flight_and_queued_pastes_without_a_writer_fault() {
     let stopped = stopped.recv_timeout(Duration::from_secs(2));
 
     assert!(
-        backpressure,
+        blocked.is_ok(),
         "the current paste never reached OS backpressure"
     );
     assert!(

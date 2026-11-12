@@ -216,19 +216,12 @@ pub(crate) fn spawn_bounded_pty_writer(
     let status = Arc::new(WriterStatus::default());
     let thread_budget = budget.clone();
     let thread_status = Arc::clone(&status);
-    let thread_limit = limit_bytes;
     let thread = thread::Builder::new()
         .name("pty-writer".to_string())
         .spawn(move || {
             let mut writer = writer;
             while let Ok(item) = receiver.recv() {
-                let result = write_with_retry(
-                    &mut writer,
-                    &item.data,
-                    &thread_status,
-                    &thread_budget,
-                    thread_limit,
-                );
+                let result = write_with_retry(&mut writer, &item.data, &thread_status);
                 thread_budget.release(item.data.len());
                 if let Err(stop) = result {
                     let message = match &stop {
@@ -271,11 +264,8 @@ fn write_with_retry(
     writer: &mut Box<dyn Write + Send>,
     data: &[u8],
     status: &WriterStatus,
-    budget: &ByteBudget,
-    limit_bytes: usize,
 ) -> Result<(), WriteStop> {
     let mut offset = 0;
-    let mut reported_backpressure = false;
     while offset < data.len() {
         if status.cancelled.load(Ordering::Acquire) {
             return Err(WriteStop::Cancelled);
@@ -289,13 +279,7 @@ fn write_with_retry(
             }
             Ok(written) => offset += written,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                retry_or_stop(
-                    status,
-                    &mut reported_backpressure,
-                    data.len(),
-                    budget,
-                    limit_bytes,
-                )?;
+                retry_or_stop(status)?;
             }
             Err(error) => return Err(WriteStop::Failed(error)),
         }
@@ -308,36 +292,16 @@ fn write_with_retry(
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                retry_or_stop(
-                    status,
-                    &mut reported_backpressure,
-                    data.len(),
-                    budget,
-                    limit_bytes,
-                )?;
+                retry_or_stop(status)?;
             }
             Err(error) => return Err(WriteStop::Failed(error)),
         }
     }
 }
 
-fn retry_or_stop(
-    status: &WriterStatus,
-    reported_backpressure: &mut bool,
-    attempted_bytes: usize,
-    budget: &ByteBudget,
-    limit_bytes: usize,
-) -> Result<(), WriteStop> {
+fn retry_or_stop(status: &WriterStatus) -> Result<(), WriteStop> {
     if status.cancelled.load(Ordering::Acquire) {
         return Err(WriteStop::Cancelled);
-    }
-    if !*reported_backpressure {
-        status.record(PtyWriterEvent::Backpressure {
-            attempted_bytes,
-            pending_bytes: budget.pending_bytes(),
-            limit_bytes,
-        });
-        *reported_backpressure = true;
     }
     thread::sleep(Duration::from_millis(1));
     Ok(())
