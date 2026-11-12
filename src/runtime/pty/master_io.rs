@@ -8,10 +8,9 @@ pub(super) fn split(master: &dyn portable_pty::MasterPty) -> io::Result<(PtyRead
         .ok_or_else(|| io::Error::other("PTY master has no descriptor"))?;
     // SAFETY: master owns raw and remains borrowed throughout duplication.
     let master_fd = unsafe { BorrowedFd::borrow_raw(raw) };
+    set_nonblocking(master_fd)?;
     let reader = File::from(master_fd.try_clone_to_owned()?);
     let writer = File::from(master_fd.try_clone_to_owned()?);
-    // O_NONBLOCK is shared by all master duplicates, before either worker starts.
-    set_nonblocking(writer.as_fd())?;
     Ok((PtyReader { file: reader }, writer))
 }
 

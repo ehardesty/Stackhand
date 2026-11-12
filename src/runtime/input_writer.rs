@@ -120,9 +120,8 @@ struct WriterItem {
 impl BoundedPtyWriter {
     /// Admit one complete encoded input or effect item.
     ///
-    /// `Ok` is a durable acknowledgement. The writer owner will retry partial
-    /// operating-system writes until this full item is delivered or it emits
-    /// a terminal failure. `WouldBlock` means that no byte was admitted.
+    /// `Ok` admits the full item for ordered delivery. Delivery can fail or be
+    /// cancelled. `WouldBlock` means that no byte was admitted.
     pub(crate) fn try_enqueue(&self, data: &[u8]) -> io::Result<()> {
         self.try_enqueue_with_completion(data, None)
     }
