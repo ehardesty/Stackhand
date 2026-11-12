@@ -60,7 +60,7 @@ fn console_ctrl_c_is_data_and_quit_cleans_both_process_trees() {
 }
 
 #[test]
-fn term_reports_cleanup_and_cleans_both_process_trees() {
+fn term_shows_shutdown_progress_and_cleans_both_process_trees() {
     let mut project = Project::new();
     let mut terminal = Terminal::start(&project, &[], None);
     project.capture_trees();
@@ -71,6 +71,7 @@ fn term_reports_cleanup_and_cleans_both_process_trees() {
         );
     }
     assert!(terminal.wait().success(), "{}", terminal.text());
+    assert!(terminal.text().contains("Project shutdown in progress"));
     assert!(terminal.text().contains("Project shutdown complete"));
     project.assert_trees_gone();
 }
@@ -114,7 +115,6 @@ fn term_cleans_process_trees_while_outer_output_stays_stalled() {
             0
         );
     }
-    // wait resumes output only after observing application exit.
     assert!(terminal.wait().success());
     project.assert_trees_gone();
 }
@@ -152,9 +152,32 @@ fn redirected_regular_file_keeps_the_interactive_shutdown_report() {
     wait_until(|| terminal.text().contains("pty"), "Project UI to render");
     terminal.send(b"q");
     assert!(terminal.wait().success());
-    assert!(
-        fs::read_to_string(report)
-            .unwrap()
-            .contains("Project shutdown complete")
+    let report = fs::read_to_string(report).unwrap();
+    assert!(report.contains("Project shutdown complete"));
+    assert!(!report.contains('\r'));
+}
+
+#[test]
+fn quit_shows_progress_before_cleanup_and_reports_stalled_finalization() {
+    let mut project = Project::new();
+    let report = project.root.join("report.txt");
+    let redirect = format!("2>'{}'", report.display());
+    let mut terminal = Terminal::start(&project, &[], Some(&redirect));
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "Project console to render",
     );
+    terminal.send(b"q");
+    wait_until(
+        || terminal.text().contains("Project shutdown in progress"),
+        "shutdown progress before Process cleanup finishes",
+    );
+    terminal.pause_output_and_resize();
+    assert!(!terminal.wait().success());
+    project.assert_trees_gone();
+    let report = fs::read_to_string(report).unwrap();
+    assert!(report.contains("Project shutdown complete"));
+    assert!(report.contains("terminal protocol restoration was incomplete"));
+    assert!(!report.contains('\r'));
 }

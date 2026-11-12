@@ -52,6 +52,7 @@ struct Shared {
     ready: Condvar,
     space: Condvar,
     shutdown: AtomicBool,
+    discarding: AtomicBool,
     stop: SessionStop,
 }
 
@@ -70,6 +71,7 @@ impl InputScheduler {
             ready: Condvar::new(),
             space: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            discarding: AtomicBool::new(false),
             stop,
         });
         let reader_shared = Arc::clone(&shared);
@@ -97,6 +99,13 @@ impl InputScheduler {
 
     pub(super) fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.space.notify_all();
+        self.shared.ready.notify_all();
+    }
+
+    pub(super) fn discard(&self) {
+        self.shared.discarding.store(true, Ordering::Release);
+        lock(&self.shared.state).actions.clear();
         self.shared.space.notify_all();
         self.shared.ready.notify_all();
     }
@@ -139,7 +148,13 @@ impl Drop for InputScheduler {
 }
 
 fn read_host(mut source: HostReader, shared: Arc<Shared>) {
-    while !shared.shutdown.load(Ordering::Acquire) && !shared.stop.requested() {
+    while !shared.shutdown.load(Ordering::Acquire) {
+        if shared.discarding.load(Ordering::Acquire) || shared.stop.requested() {
+            if !source.discard_batch(READER_POLL_INTERVAL).unwrap_or(false) {
+                return;
+            }
+            continue;
+        }
         match source.next_batch(READER_POLL_INTERVAL) {
             Ok(batch) => {
                 {
@@ -150,7 +165,7 @@ fn read_host(mut source: HostReader, shared: Arc<Shared>) {
                 shared.ready.notify_all();
                 for action in batch {
                     if !push(&shared, action, || source.check()) {
-                        return;
+                        break;
                     }
                 }
             }
@@ -158,7 +173,6 @@ fn read_host(mut source: HostReader, shared: Arc<Shared>) {
                 shared.stop.fail(crate::host::HostFault::InputFailed);
                 lock(&shared.state).error = Some(format!("terminal input failed: {error}"));
                 shared.ready.notify_all();
-                return;
             }
         }
     }
@@ -171,7 +185,10 @@ fn push(
 ) -> bool {
     let mut state = lock(&shared.state);
     loop {
-        if shared.shutdown.load(Ordering::Acquire) || shared.stop.requested() {
+        if shared.shutdown.load(Ordering::Acquire)
+            || shared.discarding.load(Ordering::Acquire)
+            || shared.stop.requested()
+        {
             return false;
         }
         if let Err(error) = check() {

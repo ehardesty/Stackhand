@@ -555,6 +555,13 @@ SIGHUP, and fatal host-input faults interrupt output through poll intervals of
 at most 10 ms, subject to scheduling. Once interrupted or failed, output cannot
 resume ordinary frames. Partial transactions retain their exact suffix.
 
+With healthy output, shutdown continues to show progress. Each shutdown frame
+has a 100 ms write budget. A stalled shutdown frame ends rendering permanently
+and cleanup continues without output. Host input is drained and discarded during
+cleanup. Pending host input is also flushed at terminal finalization, so capture
+reports and keys accumulated during cleanup are not passed to the invoking shell.
+This cannot prevent input that the host sends after Stackhand has exited.
+
 Project cleanup retains its 20-second deadline and five-second observation grace.
 Raw mode remains active through cleanup. Local termios is restored before final
 output waits. One shared 500 ms output budget covers a retained suffix, mode
@@ -574,6 +581,10 @@ same finalization budget. Interactive reports to redirected pipes and other
 nonregular nonterminal sinks are omitted, because a portable independently opened
 nonblocking sink is unavailable. Configuration and other preflight diagnostics
 retain their existing CLI path.
+Terminal reports use carriage return and line feed. Regular-file reports use
+normal line feeds. Late restoration failures are appended
+to regular-file reports after terminal finalization; terminal delivery remains
+subject to the shared finalization budget.
 
 ### 23.6 Input backpressure
 

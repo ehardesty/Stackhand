@@ -39,8 +39,9 @@ upstream commit `36d95b26a26e64b0f8c12edfe11f410a6d56a812`,
 boundaries and excludes upstream tests. The full MIT notice is retained in
 `src/host/decoder/LICENSE.crossterm`.
 
-The local adapter changes only the event representation, the raw-mode assumption,
-and bracketed-paste opener recognition. Framing and query replies remain private
+The local adapter changes only the event representation, the raw-mode assumption
+(cooked newline branches are removed), and bracketed-paste opener recognition.
+Framing and query replies remain private
 inside `host/`. Malformed zero mouse and cursor coordinates use checked subtraction
 instead of upstream's unsigned subtraction, so invalid input cannot panic.
 `io::Error::other` and rustfmt account for mechanical differences. The rest of the

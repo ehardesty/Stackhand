@@ -8,6 +8,7 @@ fn shared() -> Shared {
         ready: Condvar::new(),
         space: Condvar::new(),
         shutdown: AtomicBool::new(false),
+        discarding: AtomicBool::new(false),
         stop: SessionStop::default(),
     }
 }

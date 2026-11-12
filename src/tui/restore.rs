@@ -16,7 +16,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::host::{
     HostOutput, HostReader, ProtocolDelivery, RawMode, RestoreOutcome, SessionStop, open_terminal,
-    shares_output_terminal, write_redirected_report,
+    shares_output_terminal, terminal_report, write_redirected_report,
 };
 use crate::terminal::{CursorShape, OwnedCursorState};
 
@@ -24,7 +24,13 @@ mod staging;
 use staging::CommandStager;
 
 const FINAL_OUTPUT_BUDGET: Duration = Duration::from_millis(500);
+const SHUTDOWN_FRAME_BUDGET: Duration = Duration::from_millis(100);
 type ApplicationTerminal = Terminal<CrosstermBackend<CommandStager>>;
+
+pub(crate) enum RenderPhase {
+    Running,
+    ShuttingDown,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -161,6 +167,7 @@ impl OuterTerminal {
     pub(crate) fn draw(
         &mut self,
         cursor: Option<OwnedCursorState>,
+        phase: RenderPhase,
         render: impl FnOnce(&mut ratatui::Frame<'_>),
     ) -> Result<()> {
         let result = (|| -> Result<()> {
@@ -182,7 +189,12 @@ impl OuterTerminal {
                 execute!(self.terminal.backend_mut(), style)?;
             }
             let bytes = self.staging.take()?;
-            self.output.send(bytes)?;
+            match phase {
+                RenderPhase::Running => self.output.send(bytes)?,
+                RenderPhase::ShuttingDown => self
+                    .output
+                    .send_until(bytes, Instant::now() + SHUTDOWN_FRAME_BUDGET)?,
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -207,6 +219,7 @@ impl OuterTerminal {
         }
         self.finished = true;
         self.quiesce();
+        let _ = self.raw.discard_input();
         let local_termios = self.raw.restore();
         let deadline = Instant::now() + FINAL_OUTPUT_BUDGET;
         let mut protocol = self.output.finish_pending(deadline);
@@ -214,14 +227,15 @@ impl OuterTerminal {
             let mut bytes = Vec::new();
             self.modes.restore(|mode| mode.disable(&mut bytes));
             if shares_output_terminal() {
-                bytes.extend_from_slice(report.as_bytes());
+                bytes.extend_from_slice(&terminal_report(report));
             }
             protocol = self.output.finish_batch(bytes, deadline);
         }
         write_redirected_report(report, deadline);
-        if !self.output.finish_kernel_output(deadline) {
+        if !self.output.drain_or_abandon_leader_output(deadline) {
             protocol = ProtocolDelivery::Incomplete;
         }
+        let _ = self.raw.discard_input();
         RestoreOutcome {
             local_termios,
             protocol,

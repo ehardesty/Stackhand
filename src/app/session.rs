@@ -45,6 +45,15 @@ impl ProjectSession {
             .expect("unfinished Project session")
     }
 
+    pub(super) fn is_shutting_down(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    pub(super) fn shutdown_wait_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline + SHUTDOWN_OBSERVATION_GRACE)
+    }
+
     pub(super) fn begin(&mut self) -> Instant {
         *self.deadline.get_or_insert_with(|| {
             let deadline = Instant::now() + PROJECT_SHUTDOWN_WAIT;
@@ -127,11 +136,16 @@ pub(super) fn shutdown_result(result: &ProjectShutdownSnapshot) -> Result<()> {
 pub(super) struct SessionReport {
     pub(super) text: String,
     pub(super) result: Result<()>,
+    reported_errors: Vec<String>,
 }
 
 impl SessionReport {
     pub(super) fn fail(&mut self, error: anyhow::Error) {
-        self.text.push_str(&format!("Error: {error:#}\r\n"));
+        let message = format!("{error:#}");
+        if !self.reported_errors.contains(&message) {
+            self.text.push_str(&format!("Error: {message}\n"));
+            self.reported_errors.push(message);
+        }
         if self.result.is_ok() {
             self.result = Err(error);
         }
@@ -143,9 +157,10 @@ pub(super) fn report(
     signal: Option<SessionSignal>,
     cleanup: Result<()>,
 ) -> SessionReport {
-    let mut text = String::from("Stackhand is shutting down the Project…\r\n");
+    let mut text = String::from("Stackhand is shutting down the Project…\n");
+    let mut reported_errors = Vec::new();
     if cleanup.is_ok() {
-        text.push_str("Project shutdown complete.\r\n");
+        text.push_str("Project shutdown complete.\n");
     }
     let result = match (end, signal) {
         (Err(error), None) => match cleanup {
@@ -153,15 +168,25 @@ pub(super) fn report(
             Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
         },
         (Err(error), Some(signal)) => {
-            text.push_str(&format!("Error after {signal:?} request: {error:#}\r\n"));
+            let message = format!("{error:#}");
+            text.push_str(&format!("Error after {signal:?} request: {message}\n"));
+            reported_errors.push(message);
             cleanup
         }
         _ => cleanup,
     };
     if let Err(error) = &result {
-        text.push_str(&format!("Error: {error:#}\r\n"));
+        let message = format!("{error:#}");
+        if !reported_errors.contains(&message) {
+            text.push_str(&format!("Error: {message}\n"));
+            reported_errors.push(message);
+        }
     }
-    SessionReport { text, result }
+    SessionReport {
+        text,
+        result,
+        reported_errors,
+    }
 }
 
 #[cfg(test)]

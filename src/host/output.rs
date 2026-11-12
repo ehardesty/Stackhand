@@ -46,6 +46,14 @@ impl<W: OutputSink> HostOutput<W> {
     }
 
     pub(crate) fn send(&mut self, bytes: Vec<u8>) -> io::Result<()> {
+        self.submit(bytes, None)
+    }
+
+    pub(crate) fn send_until(&mut self, bytes: Vec<u8>, deadline: Instant) -> io::Result<()> {
+        self.submit(bytes, Some(deadline))
+    }
+
+    fn submit(&mut self, bytes: Vec<u8>, deadline: Option<Instant>) -> io::Result<()> {
         if !self.live {
             return Err(io::Error::other("host output is quiescent"));
         }
@@ -56,7 +64,7 @@ impl<W: OutputSink> HostOutput<W> {
             ));
         }
         self.pending = Some(Pending { bytes, written: 0 });
-        let result = self.drain(None);
+        let result = self.drain(deadline);
         if result.is_err() {
             self.quiesce();
         }
@@ -106,11 +114,10 @@ impl<W: OutputSink> HostOutput<W> {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "terminal finalization deadline",
+                        "terminal output deadline expired",
                     ));
                 }
             } else if self.stop.requested() {
-                // write_all retries Interrupted, so cancellation must use another kind.
                 return Err(io::Error::other(
                     "terminal output cancelled by session stop",
                 ));
@@ -142,12 +149,11 @@ impl<W: OutputSink> HostOutput<W> {
 mod tests;
 
 impl HostOutput<File> {
-    pub(crate) fn finish_kernel_output(&mut self, deadline: Instant) -> bool {
+    pub(crate) fn drain_or_abandon_leader_output(&mut self, deadline: Instant) -> bool {
         #[cfg(target_os = "macos")]
         {
             use std::os::fd::AsRawFd;
             // Darwin drains a session leader's controlling tty during exit.
-            // Abandon its kernel queue only at session end, after the shared budget.
             if unsafe { libc::getsid(0) == libc::getpid() } {
                 loop {
                     let mut queued: libc::c_int = 0;

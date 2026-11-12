@@ -111,6 +111,13 @@ impl RawMode {
         }
         Ok(())
     }
+
+    pub(crate) fn discard_input(&self) -> io::Result<()> {
+        if unsafe { libc::tcflush(self.file.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RawMode {

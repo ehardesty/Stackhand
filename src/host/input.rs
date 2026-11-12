@@ -43,6 +43,23 @@ impl HostReader {
         }
     }
 
+    pub(crate) fn discard_batch(&mut self, timeout: Duration) -> io::Result<bool> {
+        tty::poll(&self.file, libc::POLLIN, timeout)?;
+        let mut buffer = [0; 1024];
+        match self.file.read(&mut buffer) {
+            Ok(count) => Ok(count != 0),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn next_batch(&mut self, timeout: Duration) -> io::Result<Vec<HostAction>> {
         self.check()?;
         tty::poll(
