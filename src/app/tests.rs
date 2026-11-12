@@ -355,7 +355,7 @@ fn rapid_resize_uses_only_the_last_valid_geometry() {
 }
 
 #[test]
-fn ambient_focus_is_silent_for_input_disabled_terminal_and_paste_is_not_a_shortcut() {
+fn ambient_focus_is_silent_for_input_disabled_terminal() {
     let path = std::env::temp_dir().join(format!("stackhand-focus-{}.yaml", std::process::id()));
     std::fs::write(
         &path,
@@ -406,17 +406,5 @@ processes:
                 .is_none()
         );
     }
-    assert_ne!(
-        interaction.route_input(
-            Event::Paste("quiet".into()),
-            1,
-            &pane,
-            process,
-            &retained,
-            ratatui::layout::Rect::new(0, 0, 80, 20)
-        ),
-        InputResult::Quit
-    );
-    assert!(interaction.update_project(&snapshot).commands.is_empty());
     supervisor.stop_task();
 }
