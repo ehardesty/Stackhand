@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::geometry::TerminalGeometry;
 use crate::output::OutputViews;
-use crate::supervisor::{
-    Command, Consoles, ProjectShutdownSnapshot, ProjectSnapshot, SupervisorHandle,
-};
+use crate::supervisor::{Command, Consoles, ProjectSnapshot};
 use crate::tui::{
     ConsoleBody, ConsoleContent, OuterTerminal, ProcessListRow, ProcessRowView, ProjectProfileMenu,
     VisibleActions, pane_inner, project_layout, render_project_with_search,
@@ -15,10 +13,14 @@ use crossterm::event::Event;
 
 use self::input_scheduler::InputScheduler;
 use self::resize::PendingResize;
+use self::session::{LoopEnd, ProjectSession};
+use self::signals::{SessionSignal, SessionSignals};
 
 mod input_scheduler;
 pub(crate) mod interaction;
 mod resize;
+mod session;
+mod signals;
 mod view_model;
 
 use interaction::{InputResult, ProjectInteraction, SelectedPane};
@@ -26,8 +28,6 @@ use view_model::{process_list_title, process_rows, selected_header};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(16);
-/// One shared bound for waiting out every Run's existing shutdown ladder.
-const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
 /// Load the explicit Project, start enabled autostart Processes, and
 /// supervise them interactively until the user quits with a controlled
@@ -70,58 +70,48 @@ pub fn run_project_session(
     // Invalid configuration starts no Processes and never enters the TUI.
     let resolution =
         crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
-    let (supervisor, consoles, outputs) = crate::supervisor::start(resolution.into_project())?;
-    if autostart {
-        supervisor.command(Command::StartAutostart);
+    session::require_interactive_terminal()?;
+    let signals = SessionSignals::install()?;
+    let mut outer = OuterTerminal::enter()?;
+    let input = InputScheduler::start()?;
+    let (mut project, consoles, outputs) = ProjectSession::start(resolution.into_project())?;
+    if autostart && signals.received().is_none() {
+        project.supervisor().command(Command::StartAutostart);
     }
 
-    // The TUI remains active while shutdown progresses. This scope restores
-    // the outer terminal before the already-observed result reaches the CLI.
-    let shutdown = {
-        let mut outer = OuterTerminal::enter()?;
-        run_event_loop(&mut outer, &supervisor, &consoles, &outputs)
-    }?;
-    finish_project(supervisor, shutdown)
-}
-
-/// Stop the Supervisor task and report the immutable result already observed
-/// by the interactive quit operation. This does not start or wait for a
-/// second Project shutdown.
-fn finish_project(supervisor: SupervisorHandle, result: ProjectShutdownSnapshot) -> Result<()> {
-    eprintln!("Stackhand is shutting down the Project…");
-    supervisor.stop_task();
-    report_shutdown_result(&result)
-}
-
-fn report_shutdown_result(result: &ProjectShutdownSnapshot) -> Result<()> {
-    if result.failures.is_empty() {
-        eprintln!("Project shutdown complete.");
-        return Ok(());
-    }
-    let details = result
-        .failures
-        .iter()
-        .map(|failure| {
-            if failure.remaining_pids.is_empty() {
-                format!("{}: {}", failure.process, failure.detail)
-            } else {
-                format!(
-                    "{}: {} (remaining PIDs: {:?})",
-                    failure.process, failure.detail, failure.remaining_pids
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    bail!("Project shutdown did not finish cleanly: {details}")
+    let mut first_signal = None;
+    let end = run_event_loop(
+        &mut outer,
+        &input,
+        &mut project,
+        &consoles,
+        &outputs,
+        &signals,
+        &mut first_signal,
+    );
+    // A draw can discover a hangup before the next signal check. Freeze the
+    // cause before cleanup so a later signal cannot hide an application error.
+    first_signal = first_signal.or_else(|| signals.received());
+    let observed = match &end {
+        Ok(LoopEnd::Completed(snapshot)) => Some(snapshot.clone()),
+        _ => None,
+    };
+    let cleanup = project.finish(observed);
+    drop(input);
+    drop(outer);
+    drop(signals);
+    session::report(end, first_signal, cleanup)
 }
 
 fn run_event_loop(
     outer: &mut OuterTerminal,
-    supervisor: &SupervisorHandle,
+    input: &InputScheduler,
+    project: &mut ProjectSession,
     consoles: &Consoles,
     outputs: &OutputViews,
-) -> Result<ProjectShutdownSnapshot> {
+    signals: &SessionSignals,
+    first_signal: &mut Option<SessionSignal>,
+) -> Result<LoopEnd> {
     let mut interaction = ProjectInteraction::default();
     let mut pending_resize = PendingResize::default();
     let mut console_area =
@@ -132,24 +122,26 @@ fn run_event_loop(
     let mut retained_view: Option<(crate::runtime::ProcessId, crate::output::RetainedOutput)> =
         None;
     let mut last_project_snapshot: Option<ProjectSnapshot> = None;
-    let mut shutting_down = false;
     let mut dirty = true;
-    let input = InputScheduler::start()?;
 
     loop {
+        if observe_signal(project, signals, first_signal, &mut dirty) {
+            return Ok(LoopEnd::Hangup);
+        }
         if interaction.poll_requests() {
             dirty = true;
         }
-        let snapshot: ProjectSnapshot = supervisor
+        let snapshot: ProjectSnapshot = project
+            .supervisor()
             .snapshot()
             .ok_or_else(|| anyhow!("the Supervisor stopped"))?;
         if snapshot.processes.is_empty() {
             bail!("this Project has no Processes");
         }
-        if shutting_down
+        if project.is_shutting_down()
             && let Some(result) = snapshot.shutdown.as_ref().filter(|result| result.complete)
         {
-            return Ok(result.clone());
+            return Ok(LoopEnd::Completed(result.clone()));
         }
         if last_project_snapshot.as_ref().is_none_or(|previous| {
             previous.processes != snapshot.processes
@@ -161,7 +153,7 @@ fn run_event_loop(
         let update = interaction.update_project(&snapshot);
         dirty |= update.changed;
         for command in update.commands {
-            supervisor.command(command);
+            project.supervisor().command(command);
         }
         let selected = interaction.selected();
         let selected_process = &snapshot.processes[selected];
@@ -196,6 +188,9 @@ fn run_event_loop(
             dirty = true;
         }
 
+        if observe_signal(project, signals, first_signal, &mut dirty) {
+            return Ok(LoopEnd::Hangup);
+        }
         if dirty || ProjectInteraction::terminal_is_dirty(&pane) {
             dirty = false;
             // Terminal snapshots and formatted Logs lines exist only for a
@@ -207,7 +202,7 @@ fn run_event_loop(
             let process_list = interaction.process_list().to_vec();
             let list_title = process_list_title(&snapshot);
             let mut header = selected_header(&snapshot.processes[selected], snapshot.now_ms);
-            if shutting_down {
+            if project.is_shutting_down() {
                 header.insert_str(0, "Project shutdown in progress · ");
             }
             let (process_table_state, profile_menu, visible_actions) = interaction.render_state();
@@ -231,15 +226,24 @@ fn run_event_loop(
                 visible_actions,
             )?;
             let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
+            if observe_signal(project, signals, first_signal, &mut dirty) {
+                return Ok(LoopEnd::Hangup);
+            }
             outer.set_cursor_shape(cursor)?;
         }
 
+        if observe_signal(project, signals, first_signal, &mut dirty) {
+            return Ok(LoopEnd::Hangup);
+        }
         let input_batch = input.receive(pending_resize.poll_interval(Instant::now()))?;
         if input_batch.is_empty() {
             continue;
         }
 
         for (input_event, repeats) in input_batch {
+            if observe_signal(project, signals, first_signal, &mut dirty) {
+                return Ok(LoopEnd::Hangup);
+            }
             if let Event::Resize(cols, rows) = input_event {
                 // The child sees exactly the rendered console pane.
                 let area = ratatui::layout::Rect::new(0, 0, cols, rows);
@@ -258,11 +262,8 @@ fn run_event_loop(
                 retained,
                 console_area,
             ) {
-                InputResult::Quit if !shutting_down => {
-                    supervisor.command(Command::Shutdown {
-                        deadline: Instant::now() + PROJECT_SHUTDOWN_WAIT,
-                    });
-                    shutting_down = true;
+                InputResult::Quit if !project.is_shutting_down() => {
+                    project.begin();
                     dirty = true;
                 }
                 InputResult::Changed => dirty = true,
@@ -276,6 +277,26 @@ fn run_event_loop(
             }
         }
     }
+}
+
+fn observe_signal(
+    project: &mut ProjectSession,
+    signals: &SessionSignals,
+    first_signal: &mut Option<SessionSignal>,
+    dirty: &mut bool,
+) -> bool {
+    let Some(signal) = signals.received() else {
+        return false;
+    };
+    first_signal.get_or_insert(signal);
+    if signal == SessionSignal::Hangup {
+        return true;
+    }
+    if !project.is_shutting_down() {
+        project.begin();
+        *dirty = true;
+    }
+    false
 }
 
 fn open_local_port(port: u16) -> std::io::Result<()> {
