@@ -2,6 +2,8 @@
 // Copyright (c) 2019 Timon. MIT license in LICENSE.crossterm.
 // Upstream commit 36d95b26a26e64b0f8c12edfe11f410a6d56a812.
 
+use super::*;
+
 pub(crate) fn parse_csi_rxvt_mouse(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // rxvt mouse encoding:
     // ESC [ Cb ; Cx ; Cy ; M
@@ -18,8 +20,12 @@ pub(crate) fn parse_csi_rxvt_mouse(buffer: &[u8]) -> io::Result<Option<InternalE
         .ok_or_else(could_not_parse_event_error)?;
     let (kind, modifiers) = parse_cb(cb)?;
 
-    let cx = next_parsed::<u16>(&mut split)? - 1;
-    let cy = next_parsed::<u16>(&mut split)? - 1;
+    let cx = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let cy = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -46,8 +52,12 @@ pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<Interna
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
     // Subtract 1 to keep it synced with cursor
-    let cx = u16::from(buffer[4].saturating_sub(32)) - 1;
-    let cy = u16::from(buffer[5].saturating_sub(32)) - 1;
+    let cx = u16::from(buffer[4])
+        .checked_sub(33)
+        .ok_or_else(could_not_parse_event_error)?;
+    let cy = u16::from(buffer[5])
+        .checked_sub(33)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -76,8 +86,12 @@ pub(crate) fn parse_csi_sgr_mouse(buffer: &[u8]) -> io::Result<Option<InternalEv
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
     // Subtract 1 to keep it synced with cursor
-    let cx = next_parsed::<u16>(&mut split)? - 1;
-    let cy = next_parsed::<u16>(&mut split)? - 1;
+    let cx = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let cy = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     // When button 3 in Cb is used to represent mouse release, you can't tell which button was
     // released. SGR mode solves this by having the sequence end with a lowercase m if it's a
@@ -151,17 +165,9 @@ fn parse_cb(cb: u8) -> io::Result<(MouseEventKind, KeyModifiers)> {
     Ok((kind, modifiers))
 }
 
-#[cfg(feature = "bracketed-paste")]
 pub(crate) fn parse_csi_bracketed_paste(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    // ESC [ 2 0 0 ~ pasted text ESC 2 0 1 ~
     assert!(buffer.starts_with(b"\x1B[200~"));
-
-    if !buffer.ends_with(b"\x1b[201~") {
-        Ok(None)
-    } else {
-        let paste = String::from_utf8_lossy(&buffer[6..buffer.len() - 6]).to_string();
-        Ok(Some(InternalEvent::Event(Event::Paste(paste))))
-    }
+    Ok(Some(InternalEvent::PasteStart))
 }
 
 pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {

@@ -32,6 +32,7 @@ fn successful_cleanup_does_not_hide_an_application_error() {
         None,
         Ok(()),
     )
+    .result
     .unwrap_err();
     assert_eq!(
         error
@@ -49,6 +50,7 @@ fn cleanup_failure_keeps_the_original_error_and_adds_context() {
         None,
         Err(anyhow!("Project cleanup not confirmed")),
     )
+    .result
     .unwrap_err();
     assert_eq!(
         error
@@ -68,6 +70,7 @@ fn hangup_draw_error_follows_the_cleanup_result() {
             Some(SessionSignal::Hangup),
             Ok(())
         )
+        .result
         .is_ok()
     );
     let error = report(
@@ -75,6 +78,7 @@ fn hangup_draw_error_follows_the_cleanup_result() {
         Some(SessionSignal::Hangup),
         Err(anyhow!("cleanup failed")),
     )
+    .result
     .unwrap_err();
     assert_eq!(error.to_string(), "cleanup failed");
 }

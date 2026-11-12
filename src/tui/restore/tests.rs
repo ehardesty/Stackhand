@@ -1,5 +1,4 @@
 use super::*;
-use std::cell::RefCell;
 
 fn count(bytes: &[u8], sequence: &[u8]) -> usize {
     bytes
@@ -39,123 +38,63 @@ fn modes_restore_once_in_reverse_order_with_paste_and_keyboard_pop() {
     assert_eq!(bytes.len(), end);
 }
 
-struct FailingOutput {
-    bytes: Vec<u8>,
-    successful_flushes: usize,
-    fail_flush: Option<usize>,
-}
-
-impl Write for FailingOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        if self.fail_flush == Some(self.successful_flushes) {
-            self.fail_flush = None;
-            return Err(io::Error::other("lost terminal"));
-        }
-        self.successful_flushes += 1;
-        Ok(())
-    }
-}
-
 #[test]
-fn failed_entry_restores_attempted_modes_but_never_pops_an_unconfirmed_push() {
-    for failure in 0..6 {
-        let mut out = FailingOutput {
-            bytes: Vec::new(),
-            successful_flushes: 0,
-            fail_flush: Some(failure),
-        };
-        let mut modes = OuterModes::default();
-        assert!(modes.enter(&mut out, true).is_err());
-        let start = out.bytes.len();
-        modes.restore(|mode| mode.disable(&mut out));
-        let restored = &out.bytes[start..];
-        for (index, reset) in [
-            b"\x1b[?1049l".as_slice(),
-            b"\x1b[?2004l",
-            b"\x1b[?1004l",
-            b"\x1b[?1006l",
-            b"\x1b[?25h",
-        ]
-        .iter()
-        .enumerate()
-        {
-            assert_eq!(count(restored, reset), usize::from(index <= failure));
-        }
-        assert_eq!(count(restored, b"\x1b[<1u"), 0);
-        let end = out.bytes.len();
-        modes.restore(|mode| mode.disable(&mut out));
-        assert_eq!(out.bytes.len(), end);
-    }
-}
-
-#[derive(Default)]
-struct OutputState {
-    fail: bool,
-    writes: usize,
-    flushes: usize,
-    drops: usize,
-}
-
-struct LostOutput(Rc<RefCell<OutputState>>);
-impl Write for LostOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut state = self.0.borrow_mut();
-        state.writes += 1;
-        if state.fail {
-            Err(io::Error::other("lost terminal"))
-        } else {
-            Ok(bytes.len())
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        let mut state = self.0.borrow_mut();
-        state.flushes += 1;
-        if state.fail {
-            Err(io::Error::other("lost terminal"))
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Drop for LostOutput {
-    fn drop(&mut self) {
-        self.0.borrow_mut().drops += 1;
-    }
-}
-
-#[test]
-fn cleanup_frees_ratatui_after_output_loss_without_second_cursor_restore() {
-    let state = Rc::new(RefCell::new(OutputState::default()));
-    let ignore_errors = Rc::new(Cell::new(false));
-    let mut out = TerminalOutput {
-        writer: LostOutput(Rc::clone(&state)),
-        ignore_errors: Rc::clone(&ignore_errors),
-    };
-    let mut modes = OuterModes::default();
-    modes.enter(&mut out, true).unwrap();
+fn ratatui_drop_is_inert_after_staging_failure_and_quiescence() {
+    let mut stager = CommandStager::default();
     let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(out),
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 2, 2)),
+        CrosstermBackend::new(stager.clone()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, 2, 2)),
         },
     )
     .unwrap();
     terminal.hide_cursor().unwrap();
-    state.borrow_mut().fail = true;
-    assert!(terminal.show_cursor().is_err());
-    assert!(terminal.backend_mut().flush().is_err());
-    ignore_errors.set(true);
-    modes.restore_terminal(&mut terminal);
-    let writes = state.borrow().writes;
-    drop(terminal);
-    assert_eq!(
-        state.borrow().writes,
-        writes,
-        "Ratatui restored the cursor twice"
+    assert!(
+        stager
+            .write_all(&vec![0; crate::host::output::STAGING_LIMIT + 1])
+            .is_err()
     );
-    assert_eq!(state.borrow().drops, 1, "terminal output was leaked");
+    stager.close();
+    terminal.show_cursor().unwrap();
+    assert!(stager.take().is_err());
+    drop(terminal);
+}
+
+#[test]
+fn staging_limit_supports_large_styled_host_frames_and_fails_atomically() {
+    let mut stager = CommandStager::default();
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(stager.clone()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, 500, 200)),
+        },
+    )
+    .unwrap();
+    terminal
+        .draw(|frame| {
+            for y in 0..200 {
+                for x in 0..500 {
+                    frame.buffer_mut()[(x, y)]
+                        .set_symbol(if x % 2 == 0 { "é" } else { "界" })
+                        .set_fg(ratatui::style::Color::Rgb(
+                            (x % 256) as u8,
+                            (y % 256) as u8,
+                            ((x + y) % 256) as u8,
+                        ));
+                }
+            }
+        })
+        .unwrap();
+    let bytes = stager.take().unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("界"));
+    assert!(bytes.len() < crate::host::output::STAGING_LIMIT);
+    stager.write_all(b"partial staging").unwrap();
+    assert!(
+        stager
+            .write_all(&vec![0; crate::host::output::STAGING_LIMIT])
+            .is_err()
+    );
+    assert!(stager.take().is_err());
+    stager.close();
+    terminal.show_cursor().unwrap();
 }

@@ -4,6 +4,7 @@ mod config;
 mod console;
 mod fixtures;
 mod geometry;
+mod host;
 mod ingest_fixture;
 pub mod interaction_fixture;
 mod lifecycle_fixture;
@@ -29,8 +30,8 @@ mod tui;
 mod worker_handle;
 
 pub use app::{
-    run_discovered_project, run_discovered_project_with_profile, run_project, run_project_session,
-    run_project_with_profile,
+    SessionExit, run_discovered_project, run_discovered_project_with_profile, run_project,
+    run_project_cli_session, run_project_session, run_project_with_profile,
 };
 pub use config::{
     EffectiveProjectView, ResolutionSources, show_project, validate_project,

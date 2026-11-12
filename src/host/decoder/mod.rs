@@ -4,12 +4,24 @@
 
 use std::io;
 
-use crate::event::{
+use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use super::super::super::InternalEvent;
+mod keys;
+mod mouse;
+use keys::*;
+use mouse::*;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum InternalEvent {
+    Event(Event),
+    PasteStart,
+    KeyboardEnhancementFlags(KeyboardEnhancementFlags),
+    PrimaryDeviceAttributes,
+    CursorPosition(u16, u16),
+}
 
 // Event parsing
 //
@@ -23,8 +35,8 @@ use super::super::super::InternalEvent;
 // Ok(Some(event)) -> we have event, clear the buffer
 //
 
-fn could_not_parse_event_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "Could not parse an event.")
+pub(super) fn could_not_parse_event_error() -> io::Error {
+    io::Error::other("Could not parse an event.")
 }
 
 pub(crate) fn parse_event(
@@ -100,9 +112,9 @@ pub(crate) fn parse_event(
         // newlines as input is because the terminal converts \r into \n for us. When we
         // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
         // use Ctrl+J. Waiting to handle it here means it gets picked up later
-        b'\n' if !crate::terminal::sys::is_raw_mode_enabled() => Ok(Some(InternalEvent::Event(
-            Event::Key(KeyCode::Enter.into()),
-        ))),
+        b'\n' if false => Ok(Some(InternalEvent::Event(Event::Key(
+            KeyCode::Enter.into(),
+        )))),
         b'\t' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Tab.into())))),
         b'\x7F' => Ok(Some(InternalEvent::Event(Event::Key(
             KeyCode::Backspace.into(),
@@ -197,7 +209,6 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                 if !(64..=126).contains(&last_byte) {
                     None
                 } else {
-                    #[cfg(feature = "bracketed-paste")]
                     if buffer.starts_with(b"\x1B[200~") {
                         return parse_csi_bracketed_paste(buffer);
                     }
@@ -254,8 +265,12 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
 
     let mut split = s.split(';');
 
-    let y = next_parsed::<u16>(&mut split)? - 1;
-    let x = next_parsed::<u16>(&mut split)? - 1;
+    let y = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let x = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::CursorPosition(x, y)))
 }

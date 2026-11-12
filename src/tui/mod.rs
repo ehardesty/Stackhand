@@ -8,7 +8,7 @@ mod view;
 pub(crate) use footer::{VisibleAction, VisibleActionEvent, VisibleActions};
 pub use mouse::MouseRouter;
 pub(crate) use profile_menu::{ProjectProfileMenu, ProjectProfileMenuAction};
-pub use restore::OuterTerminal;
+pub(crate) use restore::OuterTerminal;
 pub(crate) use theme::LifecycleTone;
 #[cfg(test)]
 pub(crate) use view::render_project;

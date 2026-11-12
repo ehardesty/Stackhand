@@ -1,6 +1,6 @@
 //! Bounded application input scheduling.
 //!
-//! One reader owns Crossterm input. The application receives semantic batches
+//! One reader owns host input. The application receives semantic batches
 //! through a small interface instead of replaying an unbounded host queue.
 //! Repeated wheels share one queue entry, stale movement is replaced, and old
 //! lossy mouse input yields to current input. Ordered keys, clicks, drags,
@@ -12,8 +12,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::host::{HostAction, HostReader, SessionStop};
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{self, Event, MouseEventKind};
+use crossterm::event::{Event, MouseEventKind};
 
 use crate::worker_handle::WorkerHandle;
 
@@ -22,7 +23,7 @@ const READER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub(super) struct InputBatch {
-    actions: Vec<(Event, usize)>,
+    actions: Vec<(HostAction, usize)>,
 }
 
 impl InputBatch {
@@ -32,7 +33,7 @@ impl InputBatch {
 }
 
 impl IntoIterator for InputBatch {
-    type Item = (Event, usize);
+    type Item = (HostAction, usize);
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -51,31 +52,53 @@ struct Shared {
     ready: Condvar,
     space: Condvar,
     shutdown: AtomicBool,
+    stop: SessionStop,
 }
 
 #[derive(Default)]
 struct QueueState {
-    actions: VecDeque<(Event, usize)>,
+    actions: VecDeque<(HostAction, usize)>,
     error: Option<String>,
+    keyboard_supported: bool,
+    device_attributes: bool,
 }
 
 impl InputScheduler {
-    pub(super) fn start() -> Result<Self> {
+    pub(super) fn start(source: HostReader, stop: SessionStop) -> Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
             space: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            stop,
         });
         let reader_shared = Arc::clone(&shared);
         let reader = thread::Builder::new()
             .name("stackhand-input".to_string())
-            .spawn(move || read_crossterm(reader_shared))
+            .spawn(move || read_host(source, reader_shared))
             .context("could not start the terminal input reader")?;
         Ok(Self {
             shared,
             reader: Some(WorkerHandle::new(reader)),
         })
+    }
+
+    pub(super) fn keyboard_support(&self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = lock(&self.shared.state);
+        while !state.keyboard_supported && !state.device_attributes {
+            if self.shared.stop.requested() || Instant::now() >= deadline {
+                return false;
+            }
+            state = wait_timeout(&self.shared.ready, state, READER_POLL_INTERVAL);
+        }
+        state.keyboard_supported
+    }
+
+    pub(super) fn stop(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.space.notify_all();
+        self.shared.ready.notify_all();
     }
 
     /// Wait until useful input is ready or the caller's current scheduling
@@ -84,6 +107,9 @@ impl InputScheduler {
         let deadline = Instant::now() + timeout;
         let mut state = lock(&self.shared.state);
         loop {
+            if let Some(error) = self.shared.stop.error() {
+                return Err(anyhow!(error));
+            }
             if let Some(error) = state.error.take() {
                 return Err(anyhow!(error));
             }
@@ -105,47 +131,61 @@ impl InputScheduler {
 
 impl Drop for InputScheduler {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.space.notify_all();
-        self.shared.ready.notify_all();
+        self.stop();
         if let Some(reader) = self.reader.take() {
-            // Crossterm 0.29 mio.rs:94-117 spins inside poll on EOF/EIO.
-            // It cannot observe shutdown after a hangup; process exit ends it.
             let _ = reader.join_until(Instant::now() + Duration::from_millis(100));
         }
     }
 }
 
-fn read_crossterm(shared: Arc<Shared>) {
-    while !shared.shutdown.load(Ordering::Acquire) {
-        let next = match event::poll(READER_POLL_INTERVAL) {
-            Ok(true) => event::read().map(Some),
-            Ok(false) => Ok(None),
-            Err(error) => Err(error),
-        };
-        match next {
-            Ok(Some(input)) => push(&shared, input),
-            Ok(None) => {}
+fn read_host(mut source: HostReader, shared: Arc<Shared>) {
+    while !shared.shutdown.load(Ordering::Acquire) && !shared.stop.requested() {
+        match source.next_batch(READER_POLL_INTERVAL) {
+            Ok(batch) => {
+                {
+                    let mut state = lock(&shared.state);
+                    state.keyboard_supported = source.keyboard_supported;
+                    state.device_attributes = source.device_attributes;
+                }
+                shared.ready.notify_all();
+                for action in batch {
+                    if !push(&shared, action, || source.check()) {
+                        return;
+                    }
+                }
+            }
             Err(error) => {
-                let mut state = lock(&shared.state);
-                state.error = Some(format!("terminal input failed: {error}"));
-                drop(state);
-                shared.ready.notify_one();
+                shared.stop.fail(crate::host::HostFault::InputFailed);
+                lock(&shared.state).error = Some(format!("terminal input failed: {error}"));
+                shared.ready.notify_all();
                 return;
             }
         }
     }
 }
 
-fn push(shared: &Shared, event: Event) {
+fn push(
+    shared: &Shared,
+    event: HostAction,
+    mut check: impl FnMut() -> std::io::Result<()>,
+) -> bool {
     let mut state = lock(&shared.state);
-    if merge_tail(&mut state.actions, &event) {
-        drop(state);
-        shared.ready.notify_one();
-        return;
-    }
-
-    while state.actions.len() == INPUT_QUEUE_LIMIT {
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) || shared.stop.requested() {
+            return false;
+        }
+        if let Err(error) = check() {
+            state.error = Some(error.to_string());
+            shared.ready.notify_all();
+            return false;
+        }
+        if merge_tail(&mut state.actions, &event) {
+            shared.ready.notify_one();
+            return true;
+        }
+        if state.actions.len() < INPUT_QUEUE_LIMIT {
+            break;
+        }
         if let Some(index) = state
             .actions
             .iter()
@@ -154,18 +194,18 @@ fn push(shared: &Shared, event: Event) {
             state.actions.remove(index);
             break;
         }
-        if is_lossy_mouse(&event) || shared.shutdown.load(Ordering::Acquire) {
-            return;
+        if is_lossy_mouse(&event) {
+            return true;
         }
-        state = wait(&shared.space, state);
+        state = wait_timeout(&shared.space, state, READER_POLL_INTERVAL);
     }
-
     state.actions.push_back((event, 1));
     drop(state);
     shared.ready.notify_one();
+    true
 }
 
-fn merge_tail(actions: &mut VecDeque<(Event, usize)>, event: &Event) -> bool {
+fn merge_tail(actions: &mut VecDeque<(HostAction, usize)>, event: &HostAction) -> bool {
     let Some((tail, repeats)) = actions.back_mut() else {
         return false;
     };
@@ -181,14 +221,14 @@ fn merge_tail(actions: &mut VecDeque<(Event, usize)>, event: &Event) -> bool {
     false
 }
 
-fn is_lossy_mouse(event: &Event) -> bool {
+fn is_lossy_mouse(event: &HostAction) -> bool {
     is_wheel(event) || is_motion(event)
 }
 
-fn is_wheel(event: &Event) -> bool {
+fn is_wheel(event: &HostAction) -> bool {
     matches!(
         event,
-        Event::Mouse(mouse)
+        HostAction::Input(Event::Mouse(mouse))
             if matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp
@@ -199,19 +239,13 @@ fn is_wheel(event: &Event) -> bool {
     )
 }
 
-fn is_motion(event: &Event) -> bool {
-    matches!(event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
+fn is_motion(event: &HostAction) -> bool {
+    matches!(event, HostAction::Input(Event::Mouse(mouse)) if mouse.kind == MouseEventKind::Moved)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-    condvar
-        .wait(guard)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -227,136 +261,4 @@ fn wait_timeout<'a, T>(
 }
 
 #[cfg(test)]
-mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-
-    use super::*;
-
-    fn shared() -> Shared {
-        Shared {
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
-            space: Condvar::new(),
-            shutdown: AtomicBool::new(false),
-        }
-    }
-
-    fn mouse(kind: MouseEventKind, column: u16) -> Event {
-        Event::Mouse(MouseEvent {
-            kind,
-            column,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        })
-    }
-
-    fn quit() -> Event {
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
-    }
-
-    #[test]
-    fn repeated_wheels_use_one_bounded_queue_entry() {
-        let shared = shared();
-        let wheel = mouse(MouseEventKind::ScrollUp, 20);
-        for _ in 0..10_000 {
-            push(&shared, wheel.clone());
-        }
-        let state = lock(&shared.state);
-        assert_eq!(state.actions, VecDeque::from([(wheel, 10_000)]));
-    }
-
-    #[test]
-    fn movement_keeps_only_the_latest_position() {
-        let shared = shared();
-        push(&shared, mouse(MouseEventKind::Moved, 20));
-        let latest = mouse(MouseEventKind::Moved, 40);
-        push(&shared, latest.clone());
-        let state = lock(&shared.state);
-        assert_eq!(state.actions, VecDeque::from([(latest, 1)]));
-    }
-
-    #[test]
-    fn current_input_replaces_stale_wheels_when_the_queue_is_full() {
-        let shared = shared();
-        for index in 0..INPUT_QUEUE_LIMIT {
-            let direction = if index % 2 == 0 {
-                MouseEventKind::ScrollUp
-            } else {
-                MouseEventKind::ScrollDown
-            };
-            push(&shared, mouse(direction, index as u16));
-        }
-
-        push(&shared, quit());
-
-        let state = lock(&shared.state);
-        assert_eq!(state.actions.len(), INPUT_QUEUE_LIMIT);
-        assert_eq!(state.actions.back(), Some(&(quit(), 1)));
-        assert_eq!(
-            state.actions.front().unwrap().0,
-            mouse(MouseEventKind::ScrollDown, 1)
-        );
-    }
-
-    #[test]
-    fn opposite_wheels_keep_order_until_overload_requires_shedding() {
-        let shared = shared();
-        let up = mouse(MouseEventKind::ScrollUp, 20);
-        let down = mouse(MouseEventKind::ScrollDown, 20);
-        push(&shared, up.clone());
-        push(&shared, down.clone());
-        push(&shared, up.clone());
-
-        let state = lock(&shared.state);
-        assert_eq!(
-            state.actions,
-            VecDeque::from([(up.clone(), 1), (down, 1), (up, 1)])
-        );
-    }
-
-    #[test]
-    fn receive_wakes_for_new_input() {
-        let shared = Arc::new(shared());
-        let scheduler = InputScheduler {
-            shared: Arc::clone(&shared),
-            reader: None,
-        };
-        let producer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            push(&shared, quit());
-        });
-
-        let batch = scheduler.receive(Duration::from_secs(1)).unwrap();
-
-        assert_eq!(batch.actions, vec![(quit(), 1)]);
-        producer.join().unwrap();
-    }
-
-    #[test]
-    fn receive_returns_after_its_timeout() {
-        let scheduler = InputScheduler {
-            shared: Arc::new(shared()),
-            reader: None,
-        };
-        let started = Instant::now();
-
-        let batch = scheduler.receive(Duration::from_millis(10)).unwrap();
-
-        assert!(batch.is_empty());
-        assert!(started.elapsed() >= Duration::from_millis(5));
-    }
-
-    #[test]
-    fn receive_reports_reader_errors() {
-        let shared = Arc::new(shared());
-        lock(&shared.state).error = Some("terminal input failed: test".to_string());
-        let scheduler = InputScheduler {
-            shared,
-            reader: None,
-        };
-
-        let error = scheduler.receive(Duration::from_secs(1)).unwrap_err();
-
-        assert_eq!(error.to_string(), "terminal input failed: test");
-    }
-}
+mod tests;

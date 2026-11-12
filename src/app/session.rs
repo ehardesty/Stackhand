@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use crate::model::EffectiveProject;
 use crate::output::OutputViews;
 use crate::supervisor::{Command, Consoles, ProjectShutdownSnapshot, SupervisorHandle};
 
-use super::signals::SessionSignal;
+use crate::host::SessionSignal;
 
 const PROJECT_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 const SHUTDOWN_OBSERVATION_GRACE: Duration = Duration::from_secs(5);
@@ -19,11 +19,6 @@ pub(super) fn require_interactive_terminal() -> Result<()> {
         bail!("an interactive terminal is required on both stdin and stdout");
     }
     Ok(())
-}
-
-pub(super) enum LoopEnd {
-    Completed(ProjectShutdownSnapshot),
-    Hangup,
 }
 
 pub(super) struct ProjectSession {
@@ -48,10 +43,6 @@ impl ProjectSession {
         self.supervisor
             .as_ref()
             .expect("unfinished Project session")
-    }
-
-    pub(super) fn is_shutting_down(&self) -> bool {
-        self.deadline.is_some()
     }
 
     pub(super) fn begin(&mut self) -> Instant {
@@ -133,26 +124,44 @@ pub(super) fn shutdown_result(result: &ProjectShutdownSnapshot) -> Result<()> {
     bail!("Project shutdown did not finish cleanly: {details}")
 }
 
+pub(super) struct SessionReport {
+    pub(super) text: String,
+    pub(super) result: Result<()>,
+}
+
+impl SessionReport {
+    pub(super) fn fail(&mut self, error: anyhow::Error) {
+        self.text.push_str(&format!("Error: {error:#}\r\n"));
+        if self.result.is_ok() {
+            self.result = Err(error);
+        }
+    }
+}
+
 pub(super) fn report(
-    end: Result<LoopEnd>,
+    end: Result<()>,
     signal: Option<SessionSignal>,
     cleanup: Result<()>,
-) -> Result<()> {
-    let _ = writeln!(io::stderr(), "Stackhand is shutting down the Project…");
+) -> SessionReport {
+    let mut text = String::from("Stackhand is shutting down the Project…\r\n");
     if cleanup.is_ok() {
-        let _ = writeln!(io::stderr(), "Project shutdown complete.");
+        text.push_str("Project shutdown complete.\r\n");
     }
-    match (end, signal) {
+    let result = match (end, signal) {
         (Err(error), None) => match cleanup {
             Ok(()) => Err(error),
             Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
         },
         (Err(error), Some(signal)) => {
-            let _ = writeln!(io::stderr(), "Error after {signal:?} request: {error:#}");
+            text.push_str(&format!("Error after {signal:?} request: {error:#}\r\n"));
             cleanup
         }
         _ => cleanup,
+    };
+    if let Err(error) = &result {
+        text.push_str(&format!("Error: {error:#}\r\n"));
     }
+    SessionReport { text, result }
 }
 
 #[cfg(test)]

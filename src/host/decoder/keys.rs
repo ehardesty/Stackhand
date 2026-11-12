@@ -2,6 +2,8 @@
 // Copyright (c) 2019 Timon. MIT license in LICENSE.crossterm.
 // Upstream commit 36d95b26a26e64b0f8c12edfe11f410a6d56a812.
 
+use super::*;
+
 fn parse_modifiers(mask: u8) -> KeyModifiers {
     let modifier_mask = mask.saturating_sub(1);
     let mut modifiers = KeyModifiers::empty();
@@ -49,7 +51,7 @@ fn parse_key_event_kind(kind: u8) -> KeyEventKind {
 
 pub(crate) fn parse_csi_modifier_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     assert!(buffer.starts_with(b"\x1B[")); // ESC [
-                                           //
+    //
     let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
@@ -196,6 +198,7 @@ fn translate_functional_key_code(codepoint: u32) -> Option<(KeyCode, KeyEventSta
     None
 }
 
+#[allow(clippy::collapsible_if)] // Preserve the upstream decoder structure.
 pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     assert!(buffer.starts_with(b"\x1B[")); // ESC [
     assert!(buffer.ends_with(b"u"));
@@ -251,7 +254,7 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
                     // newlines as input is because the terminal converts \r into \n for us. When we
                     // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
                     // use Ctrl+J. Waiting to handle it here means it gets picked up later
-                    '\n' if !crate::terminal::sys::is_raw_mode_enabled() => KeyCode::Enter,
+                    '\n' if false => KeyCode::Enter,
                     '\t' => {
                         if modifiers.contains(KeyModifiers::SHIFT) {
                             KeyCode::BackTab
