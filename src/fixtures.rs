@@ -108,7 +108,7 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 pub fn run_fixture_input() -> Result<()> {
     let geometry = TerminalGeometry::DEFAULT;
     let events = input_fixture_events();
-    let mut expected = b"\x1b[4;1R\r\t\x7f\x1b\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1b[15~\x1b[24~x\x03\x1b[Z\x1b[1;5A".to_vec();
+    let mut expected = b"\x1b[4;1R\r\t\x7f\x1b\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1b[15~\x1b[24~\x1bx\x03\x1b[Z\x1b[1;5A".to_vec();
     expected.extend_from_slice(b"\x1b[I\x1b[O");
     let expected_hex = bytes_to_hex(&expected);
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
@@ -118,6 +118,7 @@ pub fn run_fixture_input() -> Result<()> {
     let session = run.terminal().expect("PTY fixture");
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
+    ensure!(session.send_focus(true).is_ok(), "focus command was not admitted");
     let _ = session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     let _ = session.send_raw(vec![b'\n']);
     let second_phase = wait_for_fixture_text(&session, "input-ready")?;
