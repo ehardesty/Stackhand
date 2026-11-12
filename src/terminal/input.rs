@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use libghostty_vt::key;
-use libghostty_vt::terminal::{Mode, Terminal};
+use libghostty_vt::terminal::Terminal;
 
 pub fn encode_key(
     encoder: &mut key::Encoder,
@@ -8,6 +8,7 @@ pub fn encode_key(
     terminal: &Terminal,
 ) -> Result<Vec<u8>, libghostty_vt::Error> {
     encoder.set_options_from_terminal(terminal);
+    encoder.set_macos_option_as_alt(key::OptionAsAlt::True);
     let mut input = key::Event::new()?;
     input
         .set_action(match event.kind {
@@ -28,18 +29,6 @@ pub fn encode_key(
     let mut bytes = Vec::new();
     encoder.encode_to_vec(&input, &mut bytes)?;
     Ok(bytes)
-}
-
-pub fn encode_focus(gained: bool) -> &'static [u8] {
-    if gained { b"\x1b[I" } else { b"\x1b[O" }
-}
-
-pub fn encode_paste(data: &[u8], terminal: &Terminal) -> Vec<u8> {
-    if terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false) {
-        [b"\x1b[200~".as_slice(), data, b"\x1b[201~".as_slice()].concat()
-    } else {
-        data.to_vec()
-    }
 }
 
 fn key_modifiers(modifiers: KeyModifiers) -> key::Mods {

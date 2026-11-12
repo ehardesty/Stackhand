@@ -108,16 +108,20 @@ pub fn run_fixture_round_trip(text: &str) -> Result<()> {
 pub fn run_fixture_input() -> Result<()> {
     let geometry = TerminalGeometry::DEFAULT;
     let events = input_fixture_events();
-    let mut expected = b"\x1b[4;1R\r\t\x7f\x1b\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1b[15~\x1b[24~x\x03\x1b[Z\x1b[1;5A".to_vec();
+    let mut expected = b"\x1b[4;1R\r\t\x7f\x1b\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF\x1b[2~\x1b[3~\x1b[5~\x1b[6~\x1bOP\x1b[15~\x1b[24~\x1bx\x03\x1b[Z\x1b[1;5A".to_vec();
     expected.extend_from_slice(b"\x1b[I\x1b[O");
     let expected_hex = bytes_to_hex(&expected);
     let command = SpawnCommand::new("/bin/sh").arg("-c").arg(
-        "stty raw -echo; printf '\\033[?1linput-normal-ready\\r\\n'; IFS= read -r normal; normal_hex=$(printf '%s' \"$normal\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nnormal-bytes:%s\\r\\n' \"$normal_hex\"; printf '\\033[?1h\\033[?1004h\\033[?1036h\\033[6ninput-ready\\r\\n'; IFS= read -r bytes; hex=$(printf '%s' \"$bytes\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\ninput-bytes:%s\\r\\n' \"$hex\"",
+        "stty raw -echo; printf '\\033[?1linput-normal-ready\\r\\n'; IFS= read -r normal; normal_hex=$(printf '%s' \"$normal\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nnormal-bytes:%s\\r\\n' \"$normal_hex\"; printf '\\033[?1h\\033[?1004h\\033[?1036h\\033[6ninput-ready\\r\\n'; IFS= read -r bytes; hex=$(printf '%s' \"$bytes\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\ninput-bytes:%s\\r\\n' \"$hex\"; printf '\\033[?1004lfocus-off-ready\\r\\n'; IFS= read -r off; off_hex=$(printf '%s' \"$off\" | od -An -tx1 | tr -d ' \\n'); printf '\\r\\nfocus-off-bytes:%s\\r\\n' \"$off_hex\"",
     );
     let mut run = start_fixture_run(command, geometry, None)?;
     let session = run.terminal().expect("PTY fixture");
 
     wait_for_fixture_text(&session, "input-normal-ready")?;
+    ensure!(
+        session.send_focus(true).is_ok(),
+        "focus command was not admitted"
+    );
     let _ = session.send_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     let _ = session.send_raw(vec![b'\n']);
     let second_phase = wait_for_fixture_text(&session, "input-ready")?;
@@ -136,6 +140,24 @@ pub fn run_fixture_input() -> Result<()> {
 
     let marker = format!("input-bytes:{expected_hex}");
     let output = wait_for_fixture_text(&session, &marker)?;
+    wait_for_fixture_text(&session, "focus-off-ready")?;
+    ensure!(
+        session.send_focus(false).is_ok(),
+        "focus command was not admitted"
+    );
+    ensure!(
+        session.send_focus(true).is_ok(),
+        "focus command was not admitted"
+    );
+    ensure!(
+        session.send_raw(b"off\n".to_vec()).is_ok(),
+        "fixture input was not admitted"
+    );
+    let off = wait_for_fixture_text(&session, "focus-off-bytes:")?;
+    ensure!(
+        off.contains("focus-off-bytes:6f6666"),
+        "disabled focus leaked bytes: {off:?}"
+    );
     run.shutdown()?;
 
     println!("{output}");
@@ -152,6 +174,11 @@ printf '\r\nnormal-bytes:%s\r\n' "$normal"
 printf '\033[?2004hfixture-bracketed-ready\r\n'
 bracketed=$(dd bs=1 count=27 2>/dev/null | od -An -tx1 | tr -d ' \n')
 printf '\r\nbracketed-bytes:%s\r\n' "$bracketed"
+printf 'fixture-sanitize-ready\r\n'
+sanitized=$(dd bs=1 count=21 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf '\r\nsanitized-bytes:%s\r\n' "$sanitized"
+printf 'fixture-boundary-ready\r\n'
+perl -e 'binmode STDIN; my $buf = ""; while (length($buf) < 65548) { my $n = sysread(STDIN, my $part, 65548 - length($buf)); die "short paste" unless $n; $buf .= $part; } die "changed paste" unless $buf eq "\e[200~" . ("\n" x 65536) . "\e[201~"; print "boundary-ok\r\n";'
 printf 'fixture-oversized-ready\r\n'
 safe=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
 printf 'safe-bytes:%s\r\n' "$safe"
@@ -162,6 +189,13 @@ sleep 3"#,
 
     let fixture_result = (|| {
         wait_for_fixture_text(&session, "fixture-normal-ready")?;
+        for text in ["a\nb", "a\rb"] {
+            let mut request = session.send_paste(text)?;
+            ensure!(
+                wait_for_paste_completion(&mut request)? == PasteCompletion::Refused,
+                "unbracketed line break was not refused"
+            );
+        }
         let mut normal_request = session
             .send_paste("normal-paste")
             .map_err(|error| anyhow::anyhow!("normal paste was rejected: {error}"))?;
@@ -183,6 +217,27 @@ sleep 3"#,
                 .contains("bracketed-bytes:1b5b3230307e627261636b657465642d70617374651b5b3230317e"),
             "bracketed paste markers or bytes were changed: {bracketed:?}"
         );
+
+        wait_for_fixture_text(&session, "fixture-sanitize-ready")?;
+        let mut refused = session.send_paste("x\x1b[201~y")?;
+        ensure!(
+            wait_for_paste_completion(&mut refused)? == PasteCompletion::Refused,
+            "bracketed paste terminator was not refused"
+        );
+        let mut sanitized = session.send_paste("a\nb\x1b[31mc")?;
+        wait_for_paste_delivery(&mut sanitized)?;
+        let sanitized = wait_for_fixture_text(&session, "sanitized-bytes:")?;
+        ensure!(
+            sanitized
+                .replace('\n', "")
+                .contains("sanitized-bytes:1b5b3230307e610a62205b33316d631b5b3230317e"),
+            "multiline paste sanitization or refusal atomicity failed: {sanitized:?}"
+        );
+
+        wait_for_fixture_text(&session, "fixture-boundary-ready")?;
+        let mut boundary = session.send_paste(&"\n".repeat(PASTE_LIMIT_BYTES))?;
+        wait_for_paste_delivery(&mut boundary)?;
+        wait_for_fixture_text(&session, "boundary-ok")?;
 
         wait_for_fixture_text(&session, "fixture-oversized-ready")?;
         let oversized = "x".repeat(PASTE_LIMIT_BYTES + 1);
@@ -306,15 +361,20 @@ fn wait_for_input_backpressure(session: &TerminalHandle<'_>) -> Result<String> {
 }
 
 fn wait_for_paste_delivery(request: &mut PasteRequest) -> Result<()> {
+    match wait_for_paste_completion(request)? {
+        PasteCompletion::Delivered => Ok(()),
+        PasteCompletion::Refused => bail!("paste request {} was refused", request.id()),
+        PasteCompletion::Failed(error) => bail!("paste request {} failed: {error}", request.id()),
+    }
+}
+
+fn wait_for_paste_completion(request: &mut PasteRequest) -> Result<PasteCompletion> {
     let deadline = Instant::now() + FIXTURE_TIMEOUT;
     while Instant::now() < deadline {
-        match request.poll() {
-            Some(PasteCompletion::Delivered) => return Ok(()),
-            Some(PasteCompletion::Failed(error)) => {
-                bail!("paste request {} failed: {error}", request.id())
-            }
-            None => thread::sleep(Duration::from_millis(1)),
+        if let Some(outcome) = request.poll() {
+            return Ok(outcome);
         }
+        thread::sleep(Duration::from_millis(1));
     }
     bail!("paste request {} did not complete", request.id())
 }

@@ -1,10 +1,13 @@
-use std::io::{self, Stdout};
+use std::cell::Cell;
+use std::io::{self, Stdout, Write};
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{self, SetCursorStyle};
 use crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -13,67 +16,150 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::terminal::{CursorShape, OwnedCursorState};
 
-pub type ApplicationTerminal = Terminal<CrosstermBackend<Stdout>>;
+pub type ApplicationTerminal = Terminal<CrosstermBackend<TerminalOutput<Stdout>>>;
+
+pub struct TerminalOutput<W> {
+    writer: W,
+    ignore_errors: Rc<Cell<bool>>,
+}
+
+impl<W: Write> Write for TerminalOutput<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.ignore_errors.get() {
+            let _ = self.writer.write_all(bytes);
+            Ok(bytes.len())
+        } else {
+            self.writer.write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let result = self.writer.flush();
+        if self.ignore_errors.get() {
+            Ok(())
+        } else {
+            result
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    AlternateScreen,
+    BracketedPaste,
+    Focus,
+    Mouse,
+    Cursor,
+    Keyboard,
+}
+
+impl Mode {
+    fn enable(self, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::AlternateScreen => execute!(out, EnterAlternateScreen),
+            Self::BracketedPaste => execute!(out, EnableBracketedPaste),
+            Self::Focus => execute!(out, EnableFocusChange),
+            Self::Mouse => execute!(out, EnableMouseCapture),
+            Self::Cursor => execute!(out, cursor::Hide),
+            Self::Keyboard => execute!(
+                out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+                )
+            ),
+        }
+    }
+
+    fn disable(self, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::AlternateScreen => {
+                let screen = execute!(out, LeaveAlternateScreen);
+                let cursor = execute!(out, SetCursorStyle::DefaultUserShape);
+                screen.and(cursor)
+            }
+            Self::BracketedPaste => execute!(out, DisableBracketedPaste),
+            Self::Focus => execute!(out, DisableFocusChange),
+            Self::Mouse => execute!(out, DisableMouseCapture),
+            Self::Cursor => execute!(out, cursor::Show),
+            Self::Keyboard => execute!(out, PopKeyboardEnhancementFlags),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OuterModes(Vec<Mode>);
+
+impl OuterModes {
+    fn enter(&mut self, out: &mut impl Write, keyboard: bool) -> io::Result<()> {
+        for mode in [
+            Mode::AlternateScreen,
+            Mode::BracketedPaste,
+            Mode::Focus,
+            Mode::Mouse,
+            Mode::Cursor,
+        ] {
+            self.0.push(mode);
+            mode.enable(out)?;
+        }
+        if keyboard {
+            Mode::Keyboard.enable(out)?;
+            self.0.push(Mode::Keyboard);
+        }
+        Ok(())
+    }
+
+    fn restore_terminal<W: Write>(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<TerminalOutput<W>>>,
+    ) {
+        self.restore(|mode| {
+            if mode == Mode::Cursor {
+                terminal.show_cursor()
+            } else {
+                mode.disable(terminal.backend_mut())
+            }
+        });
+    }
+
+    fn restore(&mut self, mut disable: impl FnMut(Mode) -> io::Result<()>) {
+        while let Some(mode) = self.0.pop() {
+            let _ = disable(mode);
+        }
+    }
+}
 
 pub struct OuterTerminal {
     terminal: ApplicationTerminal,
-    keyboard_enhancement_enabled: bool,
+    modes: OuterModes,
+    ignore_errors: Rc<Cell<bool>>,
 }
 
 impl OuterTerminal {
     pub fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("could not enable raw mode")?;
-        let keyboard_enhancement_enabled =
-            terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableFocusChange,
-            EnableMouseCapture,
-            cursor::Hide
-        ) {
+        let mut modes = OuterModes::default();
+        if let Err(error) = modes.enter(&mut stdout, keyboard) {
+            modes.restore(|mode| mode.disable(&mut stdout));
             let _ = terminal::disable_raw_mode();
-            return Err(error).context("could not enter the alternate screen");
-        }
-        if keyboard_enhancement_enabled
-            && let Err(error) = execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-                )
-            )
-        {
-            let _ = execute!(
-                stdout,
-                DisableFocusChange,
-                DisableMouseCapture,
-                LeaveAlternateScreen,
-                cursor::Show
-            );
-            let _ = terminal::disable_raw_mode();
-            return Err(error).context("could not enable enhanced keyboard events");
+            return Err(error).context("could not enable terminal modes");
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let ignore_errors = Rc::new(Cell::new(false));
+        let backend = CrosstermBackend::new(TerminalOutput {
+            writer: stdout,
+            ignore_errors: Rc::clone(&ignore_errors),
+        });
         match Terminal::new(backend) {
             Ok(terminal) => Ok(Self {
                 terminal,
-                keyboard_enhancement_enabled,
+                modes,
+                ignore_errors,
             }),
             Err(error) => {
-                let mut stdout = io::stdout();
-                if keyboard_enhancement_enabled {
-                    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-                }
-                let _ = execute!(
-                    stdout,
-                    DisableFocusChange,
-                    DisableMouseCapture,
-                    LeaveAlternateScreen,
-                    cursor::Show
-                );
+                modes.restore(|mode| mode.disable(&mut io::stdout()));
                 let _ = terminal::disable_raw_mode();
                 Err(error).context("could not initialize Ratatui")
             }
@@ -105,16 +191,11 @@ impl OuterTerminal {
 impl Drop for OuterTerminal {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        if self.keyboard_enhancement_enabled {
-            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableFocusChange,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            cursor::Show,
-            SetCursorStyle::DefaultUserShape
-        );
+        // ratatui-core 0.1.2's Drop prints errors if its cursor remains hidden.
+        self.ignore_errors.set(true);
+        self.modes.restore_terminal(&mut self.terminal);
     }
 }
+
+#[cfg(test)]
+mod tests;

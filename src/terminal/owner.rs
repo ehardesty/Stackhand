@@ -218,9 +218,16 @@ impl OwnerHandle {
     }
 }
 
-struct Effects {
+pub(super) struct Effects {
     queue: VecDeque<Vec<u8>>,
     bytes: usize,
+    overflowed: bool,
+    capture: Option<PasteCapture>,
+}
+
+struct PasteCapture {
+    bytes: Vec<u8>,
+    limit: usize,
     overflowed: bool,
 }
 
@@ -230,10 +237,46 @@ impl Effects {
             queue: VecDeque::new(),
             bytes: 0,
             overflowed: false,
+            capture: None,
         }
     }
 
+    pub(super) fn capture<T>(
+        effects: &RefCell<Self>,
+        limit: usize,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Result<Vec<u8>, super::paste::PasteCompletion>) {
+        effects.borrow_mut().capture = Some(PasteCapture {
+            bytes: Vec::with_capacity(limit),
+            limit,
+            overflowed: false,
+        });
+        let outcome = operation();
+        let capture = effects
+            .borrow_mut()
+            .capture
+            .take()
+            .expect("paste capture was started");
+        let bytes = if capture.overflowed {
+            Err(super::paste::PasteCompletion::Failed(
+                "encoded paste exceeded its reserved byte limit".to_string(),
+            ))
+        } else {
+            Ok(capture.bytes)
+        };
+        (outcome, bytes)
+    }
+
     fn push(&mut self, data: &[u8]) {
+        if let Some(capture) = &mut self.capture {
+            if capture.bytes.len().saturating_add(data.len()) > capture.limit {
+                capture.overflowed = true;
+            }
+            if !capture.overflowed {
+                capture.bytes.extend_from_slice(data);
+            }
+            return;
+        }
         if self.bytes.saturating_add(data.len()) > EFFECT_BUFFER_BYTES {
             self.overflowed = true;
             return;
@@ -274,7 +317,7 @@ fn run_owner(
         move |_, data| effects.borrow_mut().push(data)
     })?;
     terminal.on_clipboard_write(deny_child_clipboard)?;
-    let mut state = TerminalState::new(terminal, resizer, geometry)?;
+    let mut state = TerminalState::new(terminal, Rc::clone(&effects), resizer, geometry)?;
     shared
         .metrics
         .lock()

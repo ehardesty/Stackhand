@@ -29,3 +29,26 @@ fn child_clipboard_reads_are_ignored_and_writes_reach_the_denial_boundary() {
     terminal.vt_write(b"\x1b]52;c;aGk=\x07");
     assert_eq!(writes.get(), 1);
 }
+
+#[test]
+fn overflowing_paste_capture_discards_all_paste_bytes_without_poisoning_effects() {
+    let effects = RefCell::new(Effects::new());
+    effects.borrow_mut().push(b"before");
+    let (_, captured) = Effects::capture(&effects, 4, || {
+        let mut effects = effects.borrow_mut();
+        effects.push(b"1234");
+        effects.push(b"5");
+        effects.push(&[6; 1024]);
+        assert_eq!(effects.capture.as_ref().unwrap().bytes.len(), 4);
+    });
+    assert!(matches!(
+        captured,
+        Err(super::super::paste::PasteCompletion::Failed(_))
+    ));
+    let mut effects = effects.borrow_mut();
+    effects.push(b"after");
+    assert!(!effects.overflowed);
+    assert_eq!(effects.pop().unwrap(), b"before");
+    assert_eq!(effects.pop().unwrap(), b"after");
+    assert!(effects.pop().is_none());
+}

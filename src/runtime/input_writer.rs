@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::byte_budget::ByteBudget;
+use crate::terminal::PasteCompletion;
 
 pub const WRITER_QUEUE_SLOTS: usize = 1_024;
 pub const WRITER_EVENT_SLOTS: usize = 64;
@@ -104,7 +105,7 @@ pub(crate) struct BoundedPtyWriter {
 
 struct WriterItem {
     data: Vec<u8>,
-    completion: Option<CompletionSender<Result<(), String>>>,
+    completion: Option<CompletionSender<PasteCompletion>>,
 }
 
 impl BoundedPtyWriter {
@@ -120,11 +121,11 @@ impl BoundedPtyWriter {
     pub(crate) fn try_enqueue_with_completion(
         &self,
         data: &[u8],
-        completion: Option<&CompletionSender<Result<(), String>>>,
+        completion: Option<&CompletionSender<PasteCompletion>>,
     ) -> io::Result<()> {
         if data.is_empty() {
             if let Some(completion) = completion {
-                let _ = completion.send(Ok(()));
+                let _ = completion.send(PasteCompletion::Delivered);
             }
             return Ok(());
         }
@@ -163,7 +164,9 @@ impl BoundedPtyWriter {
             Err(TrySendError::Disconnected(item)) => {
                 drop(reservation);
                 if let Some(completion) = item.completion {
-                    let _ = completion.send(Err("PTY writer is not available".to_string()));
+                    let _ = completion.send(PasteCompletion::Failed(
+                        "PTY writer is not available".to_string(),
+                    ));
                 }
                 self.status.record(PtyWriterEvent::Failed(
                     "PTY writer is not available".to_string(),
@@ -220,13 +223,13 @@ pub(crate) fn spawn_bounded_pty_writer(
                 thread_budget.release(item.data.len());
                 if let Err(error) = result {
                     if let Some(completion) = item.completion {
-                        let _ = completion.send(Err(error.to_string()));
+                        let _ = completion.send(PasteCompletion::Failed(error.to_string()));
                     }
                     thread_status.record(PtyWriterEvent::Failed(error.to_string()));
                     break;
                 }
                 if let Some(completion) = item.completion {
-                    let _ = completion.send(Ok(()));
+                    let _ = completion.send(PasteCompletion::Delivered);
                 }
             }
         })?;
@@ -342,45 +345,56 @@ mod tests {
     }
 
     #[test]
-    fn writer_retries_partial_writes_until_the_full_paste_is_delivered() {
-        #[derive(Clone)]
+    fn paste_completion_waits_for_partial_writes_and_flush() {
         struct PartialWriter {
             bytes: Arc<Mutex<Vec<u8>>>,
-            maximum: usize,
+            flushing: mpsc::Sender<()>,
+            finish: mpsc::Receiver<io::Result<()>>,
         }
-
         impl Write for PartialWriter {
             fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-                let count = self.maximum.min(data.len());
-                self.bytes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend_from_slice(&data[..count]);
+                let count = 2.min(data.len());
+                self.bytes.lock().unwrap().extend_from_slice(&data[..count]);
                 Ok(count)
             }
-
             fn flush(&mut self) -> io::Result<()> {
-                Ok(())
+                self.flushing.send(()).unwrap();
+                self.finish.recv().unwrap()
             }
         }
 
-        let bytes = Arc::new(Mutex::new(Vec::new()));
-        let read_bytes = Arc::clone(&bytes);
-        let writer = PartialWriter { bytes, maximum: 2 };
-        let (mut queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
-
-        queued.write_all(b"normal-paste").unwrap();
-        queued.write_all(b"-bracketed-paste").unwrap();
-        drop(queued);
-        owner.join().unwrap();
-
-        assert_eq!(
-            read_bytes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            b"normal-paste-bracketed-paste"
-        );
+        for fail_flush in [false, true] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let (flushing, started) = mpsc::channel();
+            let (finish, finishing) = mpsc::channel();
+            let writer = PartialWriter {
+                bytes: Arc::clone(&bytes),
+                flushing,
+                finish: finishing,
+            };
+            let (queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
+            let (completion, outcome) = mpsc::channel();
+            queued
+                .try_enqueue_with_completion(b"normal-paste", Some(&completion))
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(outcome.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            let result = if fail_flush {
+                Err(io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            };
+            finish.send(result).unwrap();
+            let result = outcome.recv_timeout(Duration::from_secs(2)).unwrap();
+            if fail_flush {
+                assert_eq!(result, PasteCompletion::Failed("flush failed".to_string()));
+            } else {
+                assert_eq!(result, PasteCompletion::Delivered);
+            }
+            assert_eq!(bytes.lock().unwrap().as_slice(), b"normal-paste");
+            drop(queued);
+            owner.join().unwrap();
+        }
     }
 
     #[test]

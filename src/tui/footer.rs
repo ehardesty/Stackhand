@@ -645,6 +645,13 @@ fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
             "WARNING: paste rejected; focus an input-enabled console first",
             &[],
         ),
+        ConsoleWarning::PasteTooLarge => {
+            ("WARNING: paste exceeds the 64 KiB limit; nothing sent", &[])
+        }
+        ConsoleWarning::PasteRefused => (
+            "WARNING: paste not sent: the focused process could treat it as commands (line break without bracketed paste, or a paste terminator)",
+            &[],
+        ),
         ConsoleWarning::InputRejected => (
             "WARNING: terminal input was rejected; Run is stopping or its queue is full",
             &[],
@@ -657,9 +664,10 @@ fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
             "Earlier Logs expired at the history limit; recent output continues",
             &[],
         ),
-        ConsoleWarning::PasteDeliveryFailed => {
-            ("WARNING: an admitted paste did not reach the child", &[])
-        }
+        ConsoleWarning::PasteDeliveryFailed => (
+            "WARNING: an admitted paste may not have fully reached the child",
+            &[],
+        ),
         ConsoleWarning::ClipboardFailed => (
             "WARNING: clipboard write failed; selection remains available",
             &[],

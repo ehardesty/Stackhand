@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossterm::event::KeyEvent;
 
 use super::mouse::TerminalMouseEvent;
+use super::paste::{PASTE_FRAMING_BYTES, PasteCompletion};
 use super::selection::SelectionDirection;
 use crate::byte_budget::ByteBudget;
 use crate::geometry::TerminalGeometry;
@@ -22,7 +23,7 @@ pub enum TerminalCommand {
     Raw(Vec<u8>),
     Paste {
         data: Vec<u8>,
-        completion: CompletionSender<Result<(), String>>,
+        completion: CompletionSender<PasteCompletion>,
     },
     Resize(TerminalGeometry),
     Scroll(isize),
@@ -45,7 +46,7 @@ impl TerminalCommand {
             Self::Focus(_) => input_focus_bytes(),
             Self::Mouse(_) => 64,
             Self::Raw(data) => data.len(),
-            Self::Paste { data, .. } => data.len().saturating_add(12),
+            Self::Paste { data, .. } => data.len().saturating_add(PASTE_FRAMING_BYTES),
             Self::Resize(_) => 4,
             Self::Scroll(_) | Self::ScrollTo(_) | Self::ScrollBatch(_) => {
                 std::mem::size_of::<isize>()

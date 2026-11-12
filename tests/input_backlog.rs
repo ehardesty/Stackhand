@@ -48,10 +48,14 @@ processes:
 
     let mut reader = pair.master.try_clone_reader().unwrap();
     let (ready_tx, ready_rx) = mpsc::channel();
+    let (paste_tx, paste_rx) = mpsc::channel();
     let drain = thread::spawn(move || {
         let mut recent = Vec::new();
         let mut buffer = [0; 8 * 1_024];
         let mut reported_ready = false;
+        let mut reported_paste = false;
+        let mut paste_enabled = false;
+        let mut paste_disabled = false;
         while let Ok(count) = reader.read(&mut buffer) {
             if count == 0 {
                 break;
@@ -65,10 +69,21 @@ processes:
                 let _ = ready_tx.send(());
                 reported_ready = true;
             }
-            if recent.len() > 2 * b"scroll-ready".len() {
-                recent.drain(..recent.len() - b"scroll-ready".len());
+            paste_enabled |= recent.windows(8).any(|part| part == b"\x1b[?2004h");
+            paste_disabled |= recent.windows(8).any(|part| part == b"\x1b[?2004l");
+            if !reported_paste
+                && recent
+                    .windows(b"paste rejected".len())
+                    .any(|part| part == b"paste rejected")
+            {
+                paste_tx.send(()).unwrap();
+                reported_paste = true;
+            }
+            if recent.len() > 256 {
+                recent.drain(..recent.len() - 256);
             }
         }
+        (paste_enabled, paste_disabled)
     });
     let mut writer = pair.master.take_writer().unwrap();
     if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(4)) {
@@ -77,6 +92,15 @@ processes:
         let _ = fs::remove_file(&config);
         panic!("active PTY pane did not render its readiness marker: {error}");
     }
+
+    writer.write_all(b"\x1b[200~quiet\x1b[201~").unwrap();
+    if let Err(error) = paste_rx.recv_timeout(Duration::from_secs(4)) {
+        let _ = child.kill();
+        let _ = drain.join();
+        let _ = fs::remove_file(&config);
+        panic!("paste was not handled as a paste event: {error}");
+    }
+    assert!(child.try_wait().unwrap().is_none(), "pasted q invoked quit");
 
     let (delivered_tx, delivered_rx) = mpsc::channel();
     let input = thread::spawn(move || {
@@ -124,6 +148,10 @@ processes:
     }
 
     input.join().unwrap();
-    drain.join().unwrap();
+    let (paste_enabled, paste_disabled) = drain.join().unwrap();
     fs::remove_file(config).unwrap();
+    assert!(
+        paste_enabled && paste_disabled,
+        "outer bracketed paste was not restored"
+    );
 }

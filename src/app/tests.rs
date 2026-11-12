@@ -353,3 +353,58 @@ fn rapid_resize_uses_only_the_last_valid_geometry() {
         None
     );
 }
+
+#[test]
+fn ambient_focus_is_silent_for_input_disabled_terminal() {
+    let path = std::env::temp_dir().join(format!("stackhand-focus-{}.yaml", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"version: 1
+processes:
+  muted:
+    terminal: {mode: pty, input: disabled}
+    command: [/bin/sh, -c, "sleep 60"]
+"#,
+    )
+    .unwrap();
+    let project = crate::config::load(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let (supervisor, consoles, outputs) = crate::supervisor::start(project).unwrap();
+    supervisor.command(Command::StartAutostart);
+    let snapshot =
+        crate::interaction_fixture::wait_for(&supervisor, Duration::from_secs(5), |snapshot| {
+            snapshot.processes[0].lifecycle == crate::supervisor::Lifecycle::Running
+        })
+        .unwrap();
+    let process = &snapshot.processes[0];
+    let retained = outputs
+        .for_process_id(process.process_id)
+        .unwrap()
+        .snapshot();
+    let mut interaction = ProjectInteraction::default();
+    interaction.update_project(&snapshot);
+    let pane = interaction.pane(&consoles, process, &retained);
+    assert!(matches!(pane, SelectedPane::Terminal(_)));
+    interaction.update_pane(&pane);
+    for event in [Event::FocusGained, Event::FocusLost] {
+        assert_eq!(
+            interaction.route_input(
+                event,
+                1,
+                &pane,
+                process,
+                &retained,
+                ratatui::layout::Rect::new(0, 0, 80, 20)
+            ),
+            InputResult::Ignored
+        );
+        assert!(
+            interaction
+                .frame(&pane, &retained, 20)
+                .view
+                .warning
+                .is_none()
+        );
+    }
+    supervisor.stop_task();
+}
