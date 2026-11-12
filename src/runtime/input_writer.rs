@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,6 +11,8 @@ use crate::terminal::PasteCompletion;
 
 pub const WRITER_QUEUE_SLOTS: usize = 1_024;
 pub const WRITER_EVENT_SLOTS: usize = 64;
+
+const CANCELLED_MESSAGE: &str = "terminal stopped before the input was delivered";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PtyWriterEvent {
@@ -24,6 +27,7 @@ pub enum PtyWriterEvent {
 #[derive(Default)]
 struct WriterStatus {
     events: Mutex<WriterEvents>,
+    cancelled: AtomicBool,
 }
 
 #[derive(Default)]
@@ -65,7 +69,9 @@ pub struct PtyWriterOwner {
 }
 
 impl PtyWriterOwner {
-    pub fn cancel(&self) {}
+    pub fn cancel(&self) {
+        self.status.cancelled.store(true, Ordering::Release);
+    }
 
     pub fn poll_event(&self) -> Option<PtyWriterEvent> {
         self.status.take()
@@ -94,6 +100,7 @@ impl PtyWriterOwner {
 
 impl Drop for PtyWriterOwner {
     fn drop(&mut self) {
+        self.cancel();
         let _ = self.join();
     }
 }
@@ -223,11 +230,17 @@ pub(crate) fn spawn_bounded_pty_writer(
                     thread_limit,
                 );
                 thread_budget.release(item.data.len());
-                if let Err(error) = result {
+                if let Err(stop) = result {
+                    let message = match &stop {
+                        WriteStop::Cancelled => CANCELLED_MESSAGE.to_string(),
+                        WriteStop::Failed(error) => error.to_string(),
+                    };
                     if let Some(completion) = item.completion {
-                        let _ = completion.send(PasteCompletion::Failed(error.to_string()));
+                        let _ = completion.send(PasteCompletion::Failed(message.clone()));
                     }
-                    thread_status.record(PtyWriterEvent::Failed(error.to_string()));
+                    if matches!(stop, WriteStop::Failed(_)) {
+                        thread_status.record(PtyWriterEvent::Failed(message));
+                    }
                     break;
                 }
                 if let Some(completion) = item.completion {
@@ -249,56 +262,85 @@ pub(crate) fn spawn_bounded_pty_writer(
     Ok((queued_writer, owner))
 }
 
+enum WriteStop {
+    Cancelled,
+    Failed(io::Error),
+}
+
 fn write_with_retry(
     writer: &mut Box<dyn Write + Send>,
     data: &[u8],
     status: &WriterStatus,
     budget: &ByteBudget,
     limit_bytes: usize,
-) -> io::Result<()> {
+) -> Result<(), WriteStop> {
     let mut offset = 0;
     let mut reported_backpressure = false;
     while offset < data.len() {
+        if status.cancelled.load(Ordering::Acquire) {
+            return Err(WriteStop::Cancelled);
+        }
         match writer.write(&data[offset..]) {
             Ok(0) => {
-                return Err(io::Error::new(
+                return Err(WriteStop::Failed(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "PTY writer made no progress",
-                ));
+                )));
             }
             Ok(written) => offset += written,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !reported_backpressure {
-                    status.record(PtyWriterEvent::Backpressure {
-                        attempted_bytes: data.len(),
-                        pending_bytes: budget.pending_bytes(),
-                        limit_bytes,
-                    });
-                    reported_backpressure = true;
-                }
-                thread::sleep(Duration::from_millis(1));
+                retry_or_stop(
+                    status,
+                    &mut reported_backpressure,
+                    data.len(),
+                    budget,
+                    limit_bytes,
+                )?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(WriteStop::Failed(error)),
         }
     }
 
     loop {
+        if status.cancelled.load(Ordering::Acquire) {
+            return Err(WriteStop::Cancelled);
+        }
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !reported_backpressure {
-                    status.record(PtyWriterEvent::Backpressure {
-                        attempted_bytes: data.len(),
-                        pending_bytes: budget.pending_bytes(),
-                        limit_bytes,
-                    });
-                    reported_backpressure = true;
-                }
-                thread::sleep(Duration::from_millis(1));
+                retry_or_stop(
+                    status,
+                    &mut reported_backpressure,
+                    data.len(),
+                    budget,
+                    limit_bytes,
+                )?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(WriteStop::Failed(error)),
         }
     }
+}
+
+fn retry_or_stop(
+    status: &WriterStatus,
+    reported_backpressure: &mut bool,
+    attempted_bytes: usize,
+    budget: &ByteBudget,
+    limit_bytes: usize,
+) -> Result<(), WriteStop> {
+    if status.cancelled.load(Ordering::Acquire) {
+        return Err(WriteStop::Cancelled);
+    }
+    if !*reported_backpressure {
+        status.record(PtyWriterEvent::Backpressure {
+            attempted_bytes,
+            pending_bytes: budget.pending_bytes(),
+            limit_bytes,
+        });
+        *reported_backpressure = true;
+    }
+    thread::sleep(Duration::from_millis(1));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -6,6 +6,9 @@ use crate::geometry::TerminalGeometry;
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+#[cfg(unix)]
+mod master_io;
+
 pub type PtyResizer = Box<
     dyn FnMut(u16, u16) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> + Send,
 >;
@@ -141,14 +144,21 @@ impl PtyProcess {
         let process = Self { child: Some(child) };
         drop(pair.slave);
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("could not open the PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("could not open the PTY writer")?;
+        #[cfg(unix)]
+        let (reader, writer) = {
+            let (reader, writer) = master_io::split(pair.master.as_ref())
+                .context("could not open the PTY descriptors")?;
+            (Box::new(reader), Box::new(writer))
+        };
+        #[cfg(not(unix))]
+        let (reader, writer) = (
+            pair.master
+                .try_clone_reader()
+                .context("could not open the PTY reader")?,
+            pair.master
+                .take_writer()
+                .context("could not open the PTY writer")?,
+        );
         let master = pair.master;
 
         let io = PtyIo {
