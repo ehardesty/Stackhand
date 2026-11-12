@@ -10,7 +10,7 @@ use crate::pipe_scroll::{scale, scrollbar_thumb};
 use crate::process_logs::{LogsNavigation, ProcessLogs};
 use crate::runtime::TerminalHandle;
 use crate::terminal::{
-    CopyRequest, OwnedTerminalScrollbar, PasteCompletion, PasteRequest,
+    CopyRequest, OwnedTerminalScrollbar, PasteCompletion, PasteRejection, PasteRequest,
     SelectionDirection as CopyDirection,
 };
 use crate::tui::{
@@ -137,6 +137,8 @@ impl ConsoleInteraction {
                     | ConsoleWarning::LogsCommandOnly
                     | ConsoleWarning::SelectionUnavailable
                     | ConsoleWarning::PasteRejected
+                    | ConsoleWarning::PasteTooLarge
+                    | ConsoleWarning::PasteRefused
             )
         ) {
             view.warning = None;
@@ -375,7 +377,12 @@ impl ConsoleInteraction {
                 self.paste_requests.push(request);
                 self.view.warning = None;
             }
-            Err(_) => self.view.warning = Some(ConsoleWarning::PasteRejected),
+            Err(PasteRejection::TooLarge { .. }) => {
+                self.view.warning = Some(ConsoleWarning::PasteTooLarge);
+            }
+            Err(PasteRejection::Busy { .. } | PasteRejection::Stopping) => {
+                self.view.warning = Some(ConsoleWarning::InputRejected);
+            }
         }
     }
 
@@ -568,20 +575,24 @@ impl ConsoleInteraction {
     }
 
     fn poll_paste_requests(&mut self) -> bool {
-        let mut failed = false;
+        let mut warning = None;
         self.paste_requests
             .retain_mut(|request| match request.poll() {
                 Some(PasteCompletion::Delivered) => false,
+                Some(PasteCompletion::Refused) => {
+                    warning.get_or_insert(ConsoleWarning::PasteRefused);
+                    false
+                }
                 Some(PasteCompletion::Failed(_)) => {
-                    failed = true;
+                    warning = Some(ConsoleWarning::PasteDeliveryFailed);
                     false
                 }
                 None => true,
             });
-        if failed {
-            self.view.warning = Some(ConsoleWarning::PasteDeliveryFailed);
+        if warning.is_some() {
+            self.view.warning = warning;
         }
-        failed
+        warning.is_some()
     }
 
     fn apply_terminal_command(

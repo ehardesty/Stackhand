@@ -29,6 +29,8 @@ pub enum ConsoleViewMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleWarning {
     PasteRejected,
+    PasteTooLarge,
+    PasteRefused,
     InputRejected,
     InputBackpressure,
     OutputTruncated,
@@ -1658,7 +1660,7 @@ mod tests {
             },
             false,
         );
-        assert!(text.contains("admitted paste did not reach the child"));
+        assert!(text.contains("admitted paste may not have fully reached the child"));
     }
 
     #[test]

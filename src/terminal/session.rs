@@ -220,10 +220,10 @@ impl TerminalSession {
     /// Admit one whole paste to the bounded terminal owner.
     ///
     /// The returned token acknowledges bounded command admission only. Poll
-    /// it for request-specific PTY delivery or failure. Saturation rejects the
+    /// it for PTY delivery, child-mode refusal, or failure. Saturation rejects the
     /// complete paste before admission. This call does not wait for delivery.
     pub fn send_paste(&self, data: &str) -> Result<PasteRequest, PasteRejection> {
-        paste::validate(data)?;
+        paste::admit_size(data)?;
         let request_id = self.next_paste_request_id.fetch_add(1, Ordering::Relaxed);
         let (completion_tx, completion_rx) = mpsc::channel();
         match self.commands.try_send(TerminalCommand::Paste {

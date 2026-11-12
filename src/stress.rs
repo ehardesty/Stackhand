@@ -397,7 +397,11 @@ sleep 5"#,
         ensure!(
             matches!(
                 request.poll(),
-                Some(PasteCompletion::Delivered | PasteCompletion::Failed(_))
+                Some(
+                    PasteCompletion::Delivered
+                        | PasteCompletion::Refused
+                        | PasteCompletion::Failed(_)
+                )
             ),
             "paste request {} had no terminal completion after shutdown",
             request.id()

@@ -218,9 +218,16 @@ impl OwnerHandle {
     }
 }
 
-struct Effects {
+pub(super) struct Effects {
     queue: VecDeque<Vec<u8>>,
     bytes: usize,
+    overflowed: bool,
+    capture: Option<PasteCapture>,
+}
+
+struct PasteCapture {
+    bytes: Vec<u8>,
+    limit: usize,
     overflowed: bool,
 }
 
@@ -230,10 +237,38 @@ impl Effects {
             queue: VecDeque::new(),
             bytes: 0,
             overflowed: false,
+            capture: None,
         }
     }
 
+    pub(super) fn begin_capture(&mut self, limit: usize) {
+        self.capture = Some(PasteCapture {
+            bytes: Vec::with_capacity(limit),
+            limit,
+            overflowed: false,
+        });
+    }
+
+    pub(super) fn end_capture(&mut self) -> Result<Vec<u8>, super::paste::PasteCompletion> {
+        let capture = self.capture.take().expect("paste capture was started");
+        if capture.overflowed {
+            return Err(super::paste::PasteCompletion::Failed(
+                "encoded paste exceeded its reserved byte limit".to_string(),
+            ));
+        }
+        Ok(capture.bytes)
+    }
+
     fn push(&mut self, data: &[u8]) {
+        if let Some(capture) = &mut self.capture {
+            if capture.bytes.len().saturating_add(data.len()) > capture.limit {
+                capture.overflowed = true;
+            }
+            if !capture.overflowed {
+                capture.bytes.extend_from_slice(data);
+            }
+            return;
+        }
         if self.bytes.saturating_add(data.len()) > EFFECT_BUFFER_BYTES {
             self.overflowed = true;
             return;
@@ -274,7 +309,7 @@ fn run_owner(
         move |_, data| effects.borrow_mut().push(data)
     })?;
     terminal.on_clipboard_write(deny_child_clipboard)?;
-    let mut state = TerminalState::new(terminal, resizer, geometry)?;
+    let mut state = TerminalState::new(terminal, Rc::clone(&effects), resizer, geometry)?;
     shared
         .metrics
         .lock()

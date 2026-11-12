@@ -373,20 +373,17 @@ impl ProjectInteraction {
                 let SelectedPane::Terminal(view) = pane else {
                     return InputResult::Ignored;
                 };
-                let gained = matches!(event, Event::FocusGained);
-                let delivered = if process.input_focused {
-                    view.with(|session| session.send_focus(gained).is_ok())
-                        .unwrap_or(false)
-                } else {
-                    self.console.warn(ConsoleWarning::InputDisabled);
-                    false
-                };
-                if !delivered && process.input_focused {
-                    self.console.warn(ConsoleWarning::InputRejected);
+                if !process.input_focused {
+                    return InputResult::Ignored;
                 }
-                if delivered {
+                let gained = matches!(event, Event::FocusGained);
+                if view
+                    .with(|session| session.send_focus(gained).is_ok())
+                    .unwrap_or(false)
+                {
                     InputResult::Ignored
                 } else {
+                    self.console.warn(ConsoleWarning::InputRejected);
                     InputResult::Changed
                 }
             }

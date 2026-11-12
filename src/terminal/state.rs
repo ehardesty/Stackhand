@@ -1,17 +1,22 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::mpsc::Sender as CompletionSender;
 
 use anyhow::{Result, anyhow};
-use libghostty_vt::key;
 use libghostty_vt::render::RenderState;
 use libghostty_vt::terminal::{
-    CompressionActivity, CompressionMode, CompressionResult, ScrollViewport, Terminal,
+    ClipboardMime, CompressionActivity, CompressionMode, CompressionResult, Mode, ScrollViewport,
+    Terminal,
 };
+use libghostty_vt::{focus, key, paste};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 
 use super::command_gate::TerminalCommand;
 use super::input;
 use super::mouse::MouseController;
+use super::owner::Effects;
+use super::paste::{PASTE_FRAMING_BYTES, PasteCompletion};
 use super::render;
 use super::selection::SelectionController;
 use super::session::{OwnedCursorState, OwnedTerminalScrollbar};
@@ -21,11 +26,12 @@ use crate::runtime::PtyResizer;
 pub(super) struct PendingInput {
     pub data: Vec<u8>,
     pub command_bytes: usize,
-    pub completion: Option<CompletionSender<std::result::Result<(), String>>>,
+    pub completion: Option<CompletionSender<PasteCompletion>>,
 }
 
 pub(super) struct TerminalState {
     terminal: Box<Terminal<'static, 'static>>,
+    effects: Rc<RefCell<Effects>>,
     render: RenderState<'static>,
     key_encoder: key::Encoder<'static>,
     mouse: MouseController,
@@ -38,11 +44,13 @@ pub(super) struct TerminalState {
 impl TerminalState {
     pub fn new(
         terminal: Box<Terminal<'static, 'static>>,
+        effects: Rc<RefCell<Effects>>,
         resizer: PtyResizer,
         geometry: TerminalGeometry,
     ) -> Result<Self> {
         Ok(Self {
             terminal,
+            effects,
             render: RenderState::new()?,
             key_encoder: key::Encoder::new()?,
             mouse: MouseController::new()?,
@@ -82,7 +90,7 @@ impl TerminalState {
             }
             TerminalCommand::Focus(gained) => {
                 self.focused = gained;
-                input::encode_focus(gained).to_vec()
+                self.focus_report(gained)?
             }
             TerminalCommand::Mouse(event) => {
                 self.mouse
@@ -90,11 +98,17 @@ impl TerminalState {
             }
             TerminalCommand::Raw(data) => data,
             TerminalCommand::Paste { data, completion } => {
-                return Ok(Some(PendingInput {
-                    data: input::encode_paste(&data, &self.terminal),
-                    command_bytes,
-                    completion: Some(completion),
-                }));
+                return Ok(match self.paste(&data) {
+                    Ok(data) => Some(PendingInput {
+                        data,
+                        command_bytes,
+                        completion: Some(completion),
+                    }),
+                    Err(outcome) => {
+                        let _ = completion.send(outcome);
+                        None
+                    }
+                });
             }
             TerminalCommand::Resize(geometry) => {
                 self.terminal
@@ -163,6 +177,39 @@ impl TerminalState {
                 completion: None,
             }))
         }
+    }
+
+    fn paste(&mut self, data: &[u8]) -> Result<Vec<u8>, PasteCompletion> {
+        self.effects
+            .borrow_mut()
+            .begin_capture(data.len() + PASTE_FRAMING_BYTES);
+        // Native paste invokes on_pty_write synchronously. Release the borrow
+        // before calling it, and finish capture even when Ghostty refuses.
+        let result = self.terminal.paste(
+            paste::Options::new(),
+            &[ClipboardMime::new("text/plain")],
+            |_, writer| writer.write_all(data),
+        );
+        let captured = self.effects.borrow_mut().end_capture();
+        match result {
+            Ok(_) => captured,
+            Err(libghostty_vt::Error::Rejected) => Err(PasteCompletion::Refused),
+            Err(error) => Err(PasteCompletion::Failed(error.to_string())),
+        }
+    }
+
+    fn focus_report(&self, gained: bool) -> Result<Vec<u8>> {
+        if !self.terminal.mode(Mode::FOCUS_EVENT)? {
+            return Ok(Vec::new());
+        }
+        let event = if gained {
+            focus::Event::Gained
+        } else {
+            focus::Event::Lost
+        };
+        let mut bytes = [0; 3];
+        let len = event.encode(&mut bytes)?;
+        Ok(bytes[..len].to_vec())
     }
 
     pub fn write_output(&mut self, data: &[u8]) {
