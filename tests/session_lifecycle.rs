@@ -60,7 +60,7 @@ fn console_ctrl_c_is_data_and_quit_cleans_both_process_trees() {
 }
 
 #[test]
-fn term_shows_progress_and_cleans_both_process_trees() {
+fn term_reports_cleanup_and_cleans_both_process_trees() {
     let mut project = Project::new();
     let mut terminal = Terminal::start(&project, &[], None);
     project.capture_trees();
@@ -71,7 +71,7 @@ fn term_shows_progress_and_cleans_both_process_trees() {
         );
     }
     assert!(terminal.wait().success(), "{}", terminal.text());
-    assert!(terminal.text().contains("Project shutdown in progress"));
+    assert!(terminal.text().contains("Project shutdown complete"));
     project.assert_trees_gone();
 }
 
@@ -95,4 +95,66 @@ fn no_autostart_leaves_all_processes_stopped() {
     project.assert_no_start();
     terminal.send(b"q");
     assert!(terminal.wait().success(), "{}", terminal.text());
+}
+
+#[test]
+fn term_cleans_process_trees_while_outer_output_stays_stalled() {
+    let mut project = Project::new();
+    let mut terminal = Terminal::start(&project, &[], None);
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "PTY console to render",
+    );
+    terminal.pause_output_and_resize();
+    thread::sleep(Duration::from_millis(300));
+    unsafe {
+        assert_eq!(
+            libc::kill(terminal.child.process_id().unwrap() as i32, libc::SIGTERM),
+            0
+        );
+    }
+    // wait resumes output only after observing application exit.
+    assert!(terminal.wait().success());
+    project.assert_trees_gone();
+}
+
+#[test]
+fn oversized_host_paste_never_delivers_its_command_like_suffix() {
+    let mut project = Project::new();
+    let mut terminal = Terminal::start(&project, &[], None);
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "PTY console to render",
+    );
+    terminal.send(b"\t");
+    terminal.send(b"\x1b[200~");
+    terminal.send(&vec![b'p'; 64 * 1024 + 1]);
+    terminal.send(b"\nexecute-me\r\x03\x1b[201x\x1b[20");
+    terminal.send(b"1~x");
+    wait_until(
+        || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == b"x"),
+        "only the post-paste key to reach the child",
+    );
+    terminal.send(b"\x11");
+    assert!(terminal.wait().success());
+    assert_eq!(fs::read(project.root.join("input")).unwrap(), b"x");
+    project.assert_trees_gone();
+}
+
+#[test]
+fn redirected_regular_file_keeps_the_interactive_shutdown_report() {
+    let project = Project::new();
+    let report = project.root.join("report.txt");
+    let redirect = format!("2>'{}'", report.display());
+    let mut terminal = Terminal::start(&project, &["--no-autostart"], Some(&redirect));
+    wait_until(|| terminal.text().contains("pty"), "Project UI to render");
+    terminal.send(b"q");
+    assert!(terminal.wait().success());
+    assert!(
+        fs::read_to_string(report)
+            .unwrap()
+            .contains("Project shutdown complete")
+    );
 }
