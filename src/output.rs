@@ -15,10 +15,11 @@ mod segments;
 mod snapshot;
 use crate::output_settings::OutputSettings;
 pub(crate) use filter::{FilterCache, FilteredLines, FilteredOutput, LineFilter};
+use parking_lot::FairMutex;
 pub(crate) use search::SearchCache;
 pub use segments::RetainedChunks;
 pub use snapshot::{LogMatch, LogSearch, RetainedOutput};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime::{OutputStream, ProcessId};
@@ -86,7 +87,7 @@ pub enum RetainedChunk {
 /// A handle to one Process inside the Project Logs owner.
 pub struct ProcessOutput {
     process: usize,
-    project: Arc<Mutex<ProjectHistory>>,
+    project: Arc<FairMutex<ProjectHistory>>,
 }
 
 struct ProcessHistory {
@@ -128,7 +129,7 @@ impl ProcessOutput {
         observed_at_ms: u64,
         data: &[u8],
     ) {
-        let mut project = lock(&self.project);
+        let mut project = self.project.lock();
         if project.processes[self.process]
             .latest_run
             .is_some_and(|latest| run_id < latest)
@@ -191,7 +192,7 @@ impl ProcessOutput {
     }
 
     pub(crate) fn mark_run_at(&self, run_id: u64, observed_at_ms: u64) {
-        let mut project = lock(&self.project);
+        let mut project = self.project.lock();
         if project.processes[self.process]
             .latest_run
             .is_some_and(|latest| run_id <= latest)
@@ -228,7 +229,7 @@ impl ProcessOutput {
     /// view operations can reuse their prior snapshot instead of cloning the
     /// full retained history for every input batch.
     pub fn snapshot_if_changed(&self, known_generation: Option<u64>) -> Option<RetainedOutput> {
-        let mut project = lock(&self.project);
+        let mut project = self.project.lock();
         let process = &project.processes[self.process];
         if known_generation == Some(process.generation) {
             return None;
@@ -421,12 +422,6 @@ fn retained_size(chunk: &RetainedChunk) -> usize {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Registry of one Logs handle per Process and one hard Project budget.
 #[derive(Clone)]
 pub struct OutputViews {
@@ -440,7 +435,7 @@ impl OutputViews {
 
     pub fn with_settings(process_count: usize, limits: OutputSettings) -> Self {
         let allocation = Arc::new(AtomicUsize::new(0));
-        let project = Arc::new(Mutex::new(ProjectHistory {
+        let project = Arc::new(FairMutex::new(ProjectHistory {
             processes: (0..process_count)
                 .map(|_| ProcessHistory {
                     chunks: RetainedChunks::new(Arc::clone(&allocation)),

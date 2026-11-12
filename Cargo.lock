@@ -1598,6 +1598,7 @@ dependencies = [
  "crossterm",
  "libc",
  "libghostty-vt",
+ "parking_lot",
  "portable-pty",
  "predicates",
  "ratatui",

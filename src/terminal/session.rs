@@ -385,6 +385,7 @@ impl TerminalSession {
         while self.owner.is_alive() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
+        self.writer.cancel();
         if self.owner.is_alive() {
             let owner_joined = self.owner.abandon_nonblocking();
             let writer_joined = self.writer.abandon_nonblocking();
@@ -426,6 +427,7 @@ impl TerminalSession {
         }
         self.commands.close();
         self.owner.request_shutdown();
+        self.writer.cancel();
         let owner_joined = self.owner.abandon_nonblocking();
         let writer_joined = self.writer.abandon_nonblocking();
         *complete = true;
