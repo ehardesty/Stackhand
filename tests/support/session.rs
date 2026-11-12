@@ -257,6 +257,7 @@ impl Terminal {
             "Stackhand to exit",
         );
         if let Some(reader) = self.reader.take() {
+            wait_until(|| reader.is_finished(), "terminal output reader to finish");
             reader.join().unwrap();
         }
         status.unwrap()

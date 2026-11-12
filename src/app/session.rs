@@ -77,14 +77,14 @@ impl ProjectSession {
     fn drain(&mut self) -> Result<()> {
         let deadline = self.begin() + SHUTDOWN_OBSERVATION_GRACE;
         loop {
-            if Instant::now() + crate::supervisor::SNAPSHOT_WAIT >= deadline {
-                bail!("Project cleanup not confirmed before the shutdown deadline");
-            }
             let snapshot = self.supervisor().snapshot().ok_or_else(|| {
                 anyhow!("Project cleanup not confirmed: the Supervisor stopped responding")
             })?;
             if let Some(result) = snapshot.shutdown.filter(|result| result.complete) {
                 return shutdown_result(&result);
+            }
+            if Instant::now() + crate::supervisor::SNAPSHOT_WAIT >= deadline {
+                bail!("Project cleanup not confirmed before the shutdown deadline");
             }
             std::thread::sleep(
                 SNAPSHOT_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
@@ -148,7 +148,7 @@ pub(super) fn report(
             Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
         },
         (Err(error), Some(signal)) => {
-            let _ = writeln!(io::stderr(), "Terminal error after {signal:?}: {error:#}");
+            let _ = writeln!(io::stderr(), "Error after {signal:?} request: {error:#}");
             cleanup
         }
         _ => cleanup,
