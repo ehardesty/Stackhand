@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn late_cleanup_observation_recognizes_a_completed_shutdown() {
+    let path = std::env::temp_dir().join(format!(
+        "stackhand-completed-shutdown-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        "version: 1\nprocesses:\n  idle:\n    command: [/bin/sh, -c, 'true']\n",
+    )
+    .unwrap();
+    let project = crate::config::load(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let (mut session, _, _) = ProjectSession::start(project).unwrap();
+    let expired = Instant::now() - SHUTDOWN_OBSERVATION_GRACE - Duration::from_secs(1);
+    session
+        .supervisor()
+        .command(Command::Shutdown { deadline: expired });
+    let shutdown = session.supervisor().snapshot().unwrap().shutdown.unwrap();
+    assert!(shutdown.complete && !shutdown.timed_out);
+    session.deadline = Some(expired);
+
+    session.finish(None).unwrap();
+}
+
+#[test]
 fn successful_cleanup_does_not_hide_an_application_error() {
     let error = report(
         Err(std::io::Error::from_raw_os_error(libc::EIO).into()),
