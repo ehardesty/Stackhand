@@ -241,22 +241,30 @@ impl Effects {
         }
     }
 
-    pub(super) fn begin_capture(&mut self, limit: usize) {
-        self.capture = Some(PasteCapture {
+    pub(super) fn capture<T>(
+        effects: &RefCell<Self>,
+        limit: usize,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Result<Vec<u8>, super::paste::PasteCompletion>) {
+        effects.borrow_mut().capture = Some(PasteCapture {
             bytes: Vec::with_capacity(limit),
             limit,
             overflowed: false,
         });
-    }
-
-    pub(super) fn end_capture(&mut self) -> Result<Vec<u8>, super::paste::PasteCompletion> {
-        let capture = self.capture.take().expect("paste capture was started");
-        if capture.overflowed {
-            return Err(super::paste::PasteCompletion::Failed(
+        let outcome = operation();
+        let capture = effects
+            .borrow_mut()
+            .capture
+            .take()
+            .expect("paste capture was started");
+        let bytes = if capture.overflowed {
+            Err(super::paste::PasteCompletion::Failed(
                 "encoded paste exceeded its reserved byte limit".to_string(),
-            ));
-        }
-        Ok(capture.bytes)
+            ))
+        } else {
+            Ok(capture.bytes)
+        };
+        (outcome, bytes)
     }
 
     fn push(&mut self, data: &[u8]) {

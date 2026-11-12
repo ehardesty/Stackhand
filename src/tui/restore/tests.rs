@@ -130,10 +130,10 @@ impl Drop for LostOutput {
 #[test]
 fn cleanup_attempts_all_modes_and_frees_ratatui_after_output_loss() {
     let state = Rc::new(RefCell::new(OutputState::default()));
-    let cleanup = Rc::new(Cell::new(false));
+    let ignore_errors = Rc::new(Cell::new(false));
     let mut out = TerminalOutput {
         writer: LostOutput(Rc::clone(&state)),
-        cleanup: Rc::clone(&cleanup),
+        ignore_errors: Rc::clone(&ignore_errors),
     };
     let mut modes = OuterModes::default();
     modes.enter(&mut out, true).unwrap();
@@ -149,7 +149,7 @@ fn cleanup_attempts_all_modes_and_frees_ratatui_after_output_loss() {
     assert!(terminal.show_cursor().is_err());
     assert!(terminal.backend_mut().flush().is_err());
     let before = state.borrow().flushes;
-    cleanup.set(true);
+    ignore_errors.set(true);
     modes.restore_terminal(&mut terminal);
     assert_eq!(state.borrow().flushes - before, 7);
     let writes = state.borrow().writes;

@@ -20,12 +20,12 @@ pub type ApplicationTerminal = Terminal<CrosstermBackend<TerminalOutput<Stdout>>
 
 pub struct TerminalOutput<W> {
     writer: W,
-    cleanup: Rc<Cell<bool>>,
+    ignore_errors: Rc<Cell<bool>>,
 }
 
 impl<W: Write> Write for TerminalOutput<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.cleanup.get() {
+        if self.ignore_errors.get() {
             let _ = self.writer.write_all(bytes);
             Ok(bytes.len())
         } else {
@@ -35,7 +35,11 @@ impl<W: Write> Write for TerminalOutput<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         let result = self.writer.flush();
-        if self.cleanup.get() { Ok(()) } else { result }
+        if self.ignore_errors.get() {
+            Ok(())
+        } else {
+            result
+        }
     }
 }
 
@@ -94,19 +98,13 @@ impl OuterModes {
             Mode::Focus,
             Mode::Mouse,
             Mode::Cursor,
-            Mode::Keyboard,
         ] {
-            if mode == Mode::Keyboard {
-                if keyboard {
-                    // A failed push may be partial. Popping without a confirmed
-                    // push risks removing the caller's keyboard stack entry.
-                    mode.enable(out)?;
-                    self.0.push(mode);
-                }
-            } else {
-                self.0.push(mode);
-                mode.enable(out)?;
-            }
+            self.0.push(mode);
+            mode.enable(out)?;
+        }
+        if keyboard {
+            Mode::Keyboard.enable(out)?;
+            self.0.push(Mode::Keyboard);
         }
         Ok(())
     }
@@ -134,7 +132,7 @@ impl OuterModes {
 pub struct OuterTerminal {
     terminal: ApplicationTerminal,
     modes: OuterModes,
-    cleanup: Rc<Cell<bool>>,
+    ignore_errors: Rc<Cell<bool>>,
 }
 
 impl OuterTerminal {
@@ -149,16 +147,16 @@ impl OuterTerminal {
             return Err(error).context("could not enable terminal modes");
         }
 
-        let cleanup = Rc::new(Cell::new(false));
+        let ignore_errors = Rc::new(Cell::new(false));
         let backend = CrosstermBackend::new(TerminalOutput {
             writer: stdout,
-            cleanup: Rc::clone(&cleanup),
+            ignore_errors: Rc::clone(&ignore_errors),
         });
         match Terminal::new(backend) {
             Ok(terminal) => Ok(Self {
                 terminal,
                 modes,
-                cleanup,
+                ignore_errors,
             }),
             Err(error) => {
                 modes.restore(|mode| mode.disable(&mut io::stdout()));
@@ -194,9 +192,7 @@ impl Drop for OuterTerminal {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
         // ratatui-core 0.1.2's Drop prints errors if its cursor remains hidden.
-        // Cleanup writes remain best effort; show_cursor clears that flag so
-        // Ratatui can free its buffers without a second restoration attempt.
-        self.cleanup.set(true);
+        self.ignore_errors.set(true);
         self.modes.restore_terminal(&mut self.terminal);
     }
 }

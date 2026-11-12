@@ -180,17 +180,14 @@ impl TerminalState {
     }
 
     fn paste(&mut self, data: &[u8]) -> Result<Vec<u8>, PasteCompletion> {
-        self.effects
-            .borrow_mut()
-            .begin_capture(data.len() + PASTE_FRAMING_BYTES);
-        // Native paste invokes on_pty_write synchronously. Release the borrow
-        // before calling it, and finish capture even when Ghostty refuses.
-        let result = self.terminal.paste(
-            paste::Options::new(),
-            &[ClipboardMime::new("text/plain")],
-            |_, writer| writer.write_all(data),
-        );
-        let captured = self.effects.borrow_mut().end_capture();
+        let (result, captured) =
+            Effects::capture(&self.effects, data.len() + PASTE_FRAMING_BYTES, || {
+                self.terminal.paste(
+                    paste::Options::new(),
+                    &[ClipboardMime::new("text/plain")],
+                    |_, writer| writer.write_all(data),
+                )
+            });
         match result {
             Ok(_) => captured,
             Err(libghostty_vt::Error::Rejected) => Err(PasteCompletion::Refused),
