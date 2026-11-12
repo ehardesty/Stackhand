@@ -278,12 +278,10 @@ mod tests {
             .local_addr()
             .expect("listener has an address")
             .port();
-        #[cfg(target_os = "linux")]
-        let root = std::process::id();
-        #[cfg(target_os = "macos")]
-        let root = unsafe { libc::getpgrp() as u32 };
+        let group = unsafe { libc::getpgrp() } as u32;
 
-        let observation = collect(root).expect("the platform collector inspects this Process Tree");
+        let observation =
+            collect(group).expect("the platform collector inspects this Process Tree");
         assert!(
             observation.ports.contains(&port),
             "the real listener is discovered: {observation:?}"

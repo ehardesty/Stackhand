@@ -12,6 +12,7 @@ arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.15"
 libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "326be19c26da0a1bae0873101452b257cbf09d4b", default-features = false }
+parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 ratatui = "0.30.2"
 ratatui-interact = "0.5.3"

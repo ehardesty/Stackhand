@@ -244,7 +244,7 @@ fn pinned_history_stays_immutable_and_charged_until_its_reader_releases_it() {
     assert_eq!(old.display_lines(200), text);
     assert!(new.search("original").matches.is_empty());
     assert_eq!(new.search("latest sentinel").matches.len(), 1);
-    let allocation = Arc::clone(&lock(&output.project).allocation);
+    let allocation = Arc::clone(&output.project.lock().allocation);
     let pinned = allocation.load(Ordering::Relaxed);
     assert!(pinned <= limits.global_history_bytes);
     drop(old);
