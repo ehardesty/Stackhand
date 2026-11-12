@@ -30,3 +30,11 @@ native memory measurements. Both wrappers and their native source are pinned;
 `Cargo.lock` and the packaging source stamp must agree with this inventory.
 Ghostty's incremental compression remains caller-driven. Snapshot persistence
 is not enabled. The pinned native build requires Zig 0.17.0.
+
+## Host decoder snapshot
+
+`src/host/decoder/` contains the production Unix decoder from Crossterm 0.29.0,
+upstream commit `36d95b26a26e64b0f8c12edfe11f410a6d56a812`,
+`src/event/sys/unix/parse.rs`. The import splits the unchanged source at function
+boundaries and excludes upstream tests. The full MIT notice is retained in
+`src/host/decoder/LICENSE.crossterm`.
