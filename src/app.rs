@@ -79,7 +79,6 @@ pub fn run_project_session(
         project.supervisor().command(Command::StartAutostart);
     }
 
-    let mut first_signal = None;
     let end = run_event_loop(
         &mut outer,
         &input,
@@ -87,11 +86,8 @@ pub fn run_project_session(
         &consoles,
         &outputs,
         &signals,
-        &mut first_signal,
     );
-    // A draw can discover a hangup before the next signal check. Freeze the
-    // cause before cleanup so a later signal cannot hide an application error.
-    first_signal = first_signal.or_else(|| signals.received());
+    let first_signal = signals.first_observed();
     let observed = match &end {
         Ok(LoopEnd::Completed(snapshot)) => Some(snapshot.clone()),
         _ => None,
@@ -110,7 +106,6 @@ fn run_event_loop(
     consoles: &Consoles,
     outputs: &OutputViews,
     signals: &SessionSignals,
-    first_signal: &mut Option<SessionSignal>,
 ) -> Result<LoopEnd> {
     let mut interaction = ProjectInteraction::default();
     let mut pending_resize = PendingResize::default();
@@ -125,7 +120,7 @@ fn run_event_loop(
     let mut dirty = true;
 
     loop {
-        if observe_signal(project, signals, first_signal, &mut dirty) {
+        if observe_signal(project, signals, &mut dirty) {
             return Ok(LoopEnd::Hangup);
         }
         if interaction.poll_requests() {
@@ -188,7 +183,7 @@ fn run_event_loop(
             dirty = true;
         }
 
-        if observe_signal(project, signals, first_signal, &mut dirty) {
+        if observe_signal(project, signals, &mut dirty) {
             return Ok(LoopEnd::Hangup);
         }
         if dirty || ProjectInteraction::terminal_is_dirty(&pane) {
@@ -226,13 +221,13 @@ fn run_event_loop(
                 visible_actions,
             )?;
             let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
-            if observe_signal(project, signals, first_signal, &mut dirty) {
+            if observe_signal(project, signals, &mut dirty) {
                 return Ok(LoopEnd::Hangup);
             }
             outer.set_cursor_shape(cursor)?;
         }
 
-        if observe_signal(project, signals, first_signal, &mut dirty) {
+        if observe_signal(project, signals, &mut dirty) {
             return Ok(LoopEnd::Hangup);
         }
         let input_batch = input.receive(pending_resize.poll_interval(Instant::now()))?;
@@ -241,7 +236,7 @@ fn run_event_loop(
         }
 
         for (input_event, repeats) in input_batch {
-            if observe_signal(project, signals, first_signal, &mut dirty) {
+            if observe_signal(project, signals, &mut dirty) {
                 return Ok(LoopEnd::Hangup);
             }
             if let Event::Resize(cols, rows) = input_event {
@@ -282,13 +277,11 @@ fn run_event_loop(
 fn observe_signal(
     project: &mut ProjectSession,
     signals: &SessionSignals,
-    first_signal: &mut Option<SessionSignal>,
     dirty: &mut bool,
 ) -> bool {
     let Some(signal) = signals.received() else {
         return false;
     };
-    first_signal.get_or_insert(signal);
     if signal == SessionSignal::Hangup {
         return true;
     }

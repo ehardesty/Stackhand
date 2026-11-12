@@ -40,8 +40,7 @@ impl IntoIterator for InputBatch {
     }
 }
 
-/// Owns the host-input reader and bounded semantic queue. Dropping the
-/// scheduler bounds the reader join before terminal cleanup.
+/// Owns the host-input reader and bounded semantic queue.
 pub(super) struct InputScheduler {
     shared: Arc<Shared>,
     reader: Option<WorkerHandle>,

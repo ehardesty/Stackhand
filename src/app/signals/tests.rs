@@ -1,13 +1,13 @@
 use super::*;
 
 #[test]
-fn dispositions_are_scoped_and_exclusive() {
+fn session_dispositions_restore_and_keep_reads_restartable() {
     const CHILD: &str = "STACKHAND_SIGNAL_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "app::signals::tests::dispositions_are_scoped_and_exclusive",
+                "app::signals::tests::session_dispositions_restore_and_keep_reads_restartable",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -17,7 +17,6 @@ fn dispositions_are_scoped_and_exclusive() {
         return;
     }
 
-    // Global disposition changes live only in this dedicated test subprocess.
     unsafe {
         let mut ignored: libc::sigaction = std::mem::zeroed();
         ignored.sa_sigaction = libc::SIG_IGN;
@@ -49,6 +48,7 @@ fn dispositions_are_scoped_and_exclusive() {
         assert_eq!(lease.received(), Some(SessionSignal::Terminate));
         libc::raise(libc::SIGHUP);
         assert_eq!(lease.received(), Some(SessionSignal::Hangup));
+        assert_eq!(lease.first_observed(), Some(SessionSignal::Terminate));
         same_action(&before_int, &action(libc::SIGINT));
         drop(lease);
         same_action(&before_hup, &action(libc::SIGHUP));

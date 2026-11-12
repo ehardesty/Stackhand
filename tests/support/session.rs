@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{
     Child, CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem,
 };
+
+const INITIALLY_SELECTED_PROCESS: &str = "pty";
 
 pub const WAIT: Duration = Duration::from_secs(25);
 static NEXT_PROJECT: AtomicUsize = AtomicUsize::new(0);
@@ -61,9 +63,11 @@ sleep 1 while 1;
         .unwrap();
         let config = root.join("stackhand.yaml");
         let mut yaml = String::from("version: 1\nprocesses:\n");
-        // PTY first so Tab focuses the input observer without selection shortcuts.
-        for mode in ["pty", "pipe"] {
-            yaml.push_str(&format!("  {mode}:\n    command: [perl, '{}', '{}', {mode}]\n    terminal:\n      mode: {mode}\n      input: {}\n", script.display(), root.display(), if mode == "pty" { "focused" } else { "disabled" }));
+        for (mode, input) in [
+            (INITIALLY_SELECTED_PROCESS, "focused"),
+            ("pipe", "disabled"),
+        ] {
+            yaml.push_str(&format!("  {mode}:\n    command: [perl, '{}', '{}', {mode}]\n    terminal:\n      mode: {mode}\n      input: {}\n", script.display(), root.display(), input));
         }
         fs::write(&config, yaml).unwrap();
         Self {
@@ -114,26 +118,29 @@ sleep 1 while 1;
 
 impl Drop for Project {
     fn drop(&mut self) {
-        // Capture uncatalogued children too if an assertion failed during startup.
-        if let Ok(entries) = fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "pid")
-                    && let Ok(pid) = fs::read_to_string(entry.path())
-                        .unwrap_or_default()
-                        .parse::<u32>()
-                    && process_identity(pid)
-                        .is_some_and(|identity| identity.contains(self.root.to_str().unwrap()))
-                {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
+        kill_every_recorded_fixture_process(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn kill_every_recorded_fixture_process(root: &Path) {
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "pid")
+                && let Ok(pid) = fs::read_to_string(entry.path())
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                && process_identity(pid)
+                    .is_some_and(|identity| identity.contains(root.to_str().unwrap()))
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
         }
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

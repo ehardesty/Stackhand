@@ -1,5 +1,3 @@
-//! One owner for the interactive session's Project shutdown obligation.
-
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,8 +77,7 @@ impl ProjectSession {
     fn drain(&mut self) -> Result<()> {
         let deadline = self.begin() + SHUTDOWN_OBSERVATION_GRACE;
         loop {
-            // snapshot() can wait one second. Reserve that wait inside the grace.
-            if Instant::now() + Duration::from_secs(1) >= deadline {
+            if Instant::now() + crate::supervisor::SNAPSHOT_WAIT >= deadline {
                 bail!("Project cleanup not confirmed before the shutdown deadline");
             }
             let snapshot = self.supervisor().snapshot().ok_or_else(|| {
@@ -104,7 +101,6 @@ impl ProjectSession {
 
 impl Drop for ProjectSession {
     fn drop(&mut self) {
-        // Panic fallback uses existing Run drop cleanup, not another shutdown wait.
         self.stop_task();
     }
 }

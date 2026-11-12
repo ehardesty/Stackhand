@@ -1,5 +1,4 @@
-//! Scoped ownership of the interactive session's HUP and TERM dispositions.
-
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use anyhow::{Result, bail};
@@ -18,6 +17,7 @@ pub(super) enum SessionSignal {
 pub(super) struct SessionSignals {
     previous_hup: libc::sigaction,
     previous_term: libc::sigaction,
+    first_observed: Cell<Option<SessionSignal>>,
 }
 
 impl SessionSignals {
@@ -28,9 +28,7 @@ impl SessionSignals {
         {
             bail!("another interactive session already owns the signal handlers");
         }
-        PENDING.store(0, Ordering::Relaxed);
-        // sigaction initializes the saved actions. An empty mask leaves unrelated
-        // signals alone; SA_RESTART prevents the PTY reader treating EINTR as EOF.
+        discard_signals_from_previous_session();
         let result = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = record as *const () as usize;
@@ -48,6 +46,7 @@ impl SessionSignals {
                 Ok(Self {
                     previous_hup,
                     previous_term,
+                    first_observed: Cell::new(None),
                 })
             }
         };
@@ -60,18 +59,29 @@ impl SessionSignals {
 
     pub(super) fn received(&self) -> Option<SessionSignal> {
         let pending = PENDING.load(Ordering::Relaxed);
-        if pending & HANGUP != 0 {
+        let signal = if pending & HANGUP != 0 {
             Some(SessionSignal::Hangup)
         } else if pending & TERMINATE != 0 {
             Some(SessionSignal::Terminate)
         } else {
             None
-        }
+        };
+        self.first_observed
+            .set(self.first_observed.get().or(signal));
+        signal
+    }
+
+    pub(super) fn first_observed(&self) -> Option<SessionSignal> {
+        self.received();
+        self.first_observed.get()
     }
 }
 
+fn discard_signals_from_previous_session() {
+    PENDING.store(0, Ordering::Relaxed);
+}
+
 extern "C" fn record(signal: libc::c_int) {
-    // AtomicU8 is lock-free on the supported macOS and Linux targets.
     PENDING.fetch_or(
         if signal == libc::SIGHUP {
             HANGUP
@@ -84,8 +94,6 @@ extern "C" fn record(signal: libc::c_int) {
 
 impl Drop for SessionSignals {
     fn drop(&mut self) {
-        // Keep pending bits until the next install so an in-flight handler is
-        // never raced by a teardown reset.
         unsafe {
             libc::sigaction(libc::SIGTERM, &self.previous_term, std::ptr::null_mut());
             libc::sigaction(libc::SIGHUP, &self.previous_hup, std::ptr::null_mut());
