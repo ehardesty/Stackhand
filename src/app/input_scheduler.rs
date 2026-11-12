@@ -9,11 +9,13 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{self, Event, MouseEventKind};
+
+use crate::worker_handle::WorkerHandle;
 
 const INPUT_QUEUE_LIMIT: usize = 256;
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -38,11 +40,10 @@ impl IntoIterator for InputBatch {
     }
 }
 
-/// Owns the host-input reader and bounded semantic queue. Dropping the
-/// scheduler stops and joins its reader before terminal cleanup.
+/// Owns the host-input reader and bounded semantic queue.
 pub(super) struct InputScheduler {
     shared: Arc<Shared>,
-    reader: Option<JoinHandle<()>>,
+    reader: Option<WorkerHandle>,
 }
 
 struct Shared {
@@ -73,7 +74,7 @@ impl InputScheduler {
             .context("could not start the terminal input reader")?;
         Ok(Self {
             shared,
-            reader: Some(reader),
+            reader: Some(WorkerHandle::new(reader)),
         })
     }
 
@@ -108,7 +109,9 @@ impl Drop for InputScheduler {
         self.shared.space.notify_all();
         self.shared.ready.notify_all();
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            // Crossterm 0.29 mio.rs:94-117 spins inside poll on EOF/EIO.
+            // It cannot observe shutdown after a hangup; process exit ends it.
+            let _ = reader.join_until(Instant::now() + Duration::from_millis(100));
         }
     }
 }

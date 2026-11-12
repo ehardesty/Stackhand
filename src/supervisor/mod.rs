@@ -67,7 +67,7 @@ pub use crate::output::{
 };
 
 /// How long a snapshot request waits for the control task before giving up.
-const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
 
 enum Inbox {
     Command(Command),

@@ -1,11 +1,13 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
 use super::interaction::{is_quit, mouse_changes_focus, mouse_starts_console_focus, should_quit};
+use super::session::shutdown_result as report_shutdown_result;
 use super::view_model::{
     format_age, format_cpu, format_rss, lifecycle_tone, metric_precision, process_list_rows,
     process_list_title, process_rows, selected_header, status_label,
 };
 use super::*;
+use crate::supervisor::ProjectShutdownSnapshot;
 use crate::tui::{ProcessListRow, process_row_at};
 
 #[test]
