@@ -16,7 +16,6 @@ pub(super) enum ColorReply {
 }
 
 // Ghostty's OSC parser classifies color operations but does not expose their data.
-// Framing stays in the host reader; Ghostty parses each color specification.
 pub(super) fn parse_reply(bytes: &[u8]) -> Vec<ColorReply> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Vec::new();

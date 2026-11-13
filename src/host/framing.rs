@@ -77,11 +77,7 @@ impl Parser {
             .escape_since
             .is_some_and(|since| now >= since + ESCAPE_WAIT)
         {
-            self.sequence.clear();
-            self.escape_since = None;
-            out.push(Decoded::Event(Event::Key(
-                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc),
-            )));
+            self.release_keys(now, &mut out);
         }
         for (index, &byte) in bytes.iter().enumerate() {
             match &mut self.state {
@@ -99,9 +95,21 @@ impl Parser {
                         break;
                     }
                     self.sequence.push(byte);
-                    if self.sequence == b"\x1b]" {
-                        self.sequence.clear();
-                        self.state = State::Osc(OscReply::new(now));
+                    if self.sequence.starts_with(b"\x1b]") {
+                        let prefix = &self.sequence[2..];
+                        let commands: &[&[u8]] = &[b"4;", b"10;", b"11;"];
+                        if commands.contains(&prefix) {
+                            let mut frame = OscReply::new(now);
+                            for &byte in prefix {
+                                frame.advance(byte);
+                            }
+                            self.sequence.clear();
+                            self.state = State::Osc(frame);
+                        } else if commands.iter().any(|command| command.starts_with(prefix)) {
+                            self.escape_since = Some(now);
+                        } else {
+                            self.release_keys(now, &mut out);
+                        }
                         continue;
                     }
                     if self.sequence == b"\x1b" {
@@ -180,6 +188,21 @@ impl Parser {
             }
         }
         out
+    }
+
+    fn release_keys(&mut self, now: Instant, out: &mut Vec<Decoded>) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let bytes = std::mem::take(&mut self.sequence);
+        self.escape_since = None;
+        if bytes == b"\x1b" {
+            out.push(Decoded::Event(Event::Key(KeyCode::Esc.into())));
+        } else {
+            out.push(Decoded::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char(']'),
+                KeyModifiers::ALT,
+            ))));
+            out.extend(self.advance(&bytes[2..], false, now));
+        }
     }
 }
 

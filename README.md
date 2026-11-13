@@ -320,8 +320,9 @@ queued for the application.
 Each new PTY terminal inherits the captured colors through Ghostty's default
 color APIs. Child color queries, OSC color changes, and resets use that pane's
 Ghostty state. Changes in one pane do not alter another pane or the host palette.
-Named ANSI colors use the inherited palette, including bright ANSI colors for
-bold text. Indexed colors, truecolor, and underline colors retain their RGB values.
+Named ANSI colors use the inherited palette. Bold text keeps the same palette
+entry, matching Ghostty's default. Indexed colors, truecolor, and underline colors
+retain their RGB values.
 An unchanged inherited default background uses the host's default background,
 so transparent host backgrounds remain transparent. Explicit child backgrounds
 and erased backgrounds retain their resolved colors.
@@ -333,13 +334,20 @@ require restarting Stackhand. SSH and outer tmux sessions depend on the terminal
 or multiplexer answering these standard queries and supporting RGB output.
 Stackhand does not modify tmux options or the host palette.
 
-Late color replies are consumed before key decoding and do not update the
-captured profile. Reply framing accepts BEL and ESC-backslash terminators and
+Color replies with the prefixes `ESC ] 4 ;`, `ESC ] 10 ;`, and `ESC ] 11 ;` are
+consumed before key decoding. Late replies do not update the captured profile.
+Other Alt-] input remains keyboard input. Reply framing accepts BEL and
+ESC-backslash terminators and
 buffers at most 16 KiB per frame. Oversized or malformed frames are discarded
 through their terminator. An unterminated frame ends the session after 30 seconds
 to prevent its payload from becoming child input. Bracketed paste takes priority,
 including literal OSC text in a paste. A standalone Escape key has a 25 ms
 sequence disambiguation window.
+If a reply's initial ESC arrives more than 25 ms before the rest of its prefix,
+the prefix can be interpreted as keyboard input. This is a legacy terminal
+sequence ambiguity. Kitty keyboard enhancement avoids the Alt-key ambiguity
+when the outer terminal or multiplexer supports it. Missing query answers use
+fallback colors; a stalled query write that exhausts its budget aborts startup.
 
 ## Examples
 

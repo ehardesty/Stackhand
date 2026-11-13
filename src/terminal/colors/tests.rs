@@ -52,18 +52,20 @@ fn buffer(terminal: &Terminal<'_, '_>) -> Buffer {
 #[test]
 fn inherited_colors_render_exactly_with_bold_underline_inverse_and_erase() {
     let mut terminal = new_terminal_with_colors(24, 3, 1024, &profile()).unwrap();
-    terminal.vt_write(b"d\x1b[31mr\x1b[1mb\x1b[0;38;5;200mi\x1b[38;2;7;8;9mt\x1b[4;58;5;15mu\x1b[58;2;111;112;113mv\x1b[0;7mn\x1b[0m\r\n\x1b[48;5;201m\x1b[K\x1b[0m");
+    terminal.vt_write(b"d\x1b[31mr\x1b[1mb\x1b[0;38;5;200mi\x1b[38;2;7;8;9mt\x1b[4;58;5;15mu\x1b[58;2;111;112;113mv\x1b[0;7mn\x1b[0;1;38;5;1me\x1b[0m\r\n\x1b[48;5;201m\x1b[K\x1b[0m");
     let rendered = buffer(&terminal);
     assert_eq!(rendered[(0, 0)].fg, Color::Rgb(18, 52, 86));
     assert_eq!(rendered[(0, 0)].bg, Color::Reset);
     assert_eq!(rendered[(1, 0)].fg, Color::Rgb(1, 27, 73));
-    assert_eq!(rendered[(2, 0)].fg, Color::Rgb(9, 27, 73));
+    assert_eq!(rendered[(2, 0)].fg, Color::Rgb(1, 27, 73));
     assert!(rendered[(2, 0)].modifier.contains(Modifier::BOLD));
     assert_eq!(rendered[(3, 0)].fg, Color::Rgb(200, 27, 73));
     assert_eq!(rendered[(4, 0)].fg, Color::Rgb(7, 8, 9));
     assert_eq!(rendered[(5, 0)].underline_color, Color::Rgb(15, 27, 73));
     assert_eq!(rendered[(6, 0)].underline_color, Color::Rgb(111, 112, 113));
     assert!(rendered[(7, 0)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(rendered[(8, 0)].fg, Color::Rgb(1, 27, 73));
+    assert!(rendered[(8, 0)].modifier.contains(Modifier::BOLD));
     assert_eq!(rendered[(23, 1)].bg, Color::Rgb(201, 27, 73));
     terminal.vt_write(b"\x1b[48;2;3;4;5m\x1b[3;1H\x1b[K\x1b[0m");
     assert_eq!(buffer(&terminal)[(23, 2)].bg, Color::Rgb(3, 4, 5));
@@ -75,7 +77,7 @@ fn inherited_colors_render_exactly_with_bold_underline_inverse_and_erase() {
 }
 
 #[test]
-fn child_queries_overrides_and_resets_stay_in_their_pane() {
+fn builtin_rgb_override_stays_visible_and_reset_restores_inherited_colors_per_pane() {
     let profile = profile();
     let mut first = new_terminal_with_colors(24, 3, 1024, &profile).unwrap();
     let mut second = new_terminal_with_colors(24, 3, 1024, &profile).unwrap();
@@ -93,7 +95,6 @@ fn child_queries_overrides_and_resets_stay_in_their_pane() {
     assert!(answers.contains("4;1;rgb:0101/1b1b/4949"), "{answers:?}");
     assert!(answers.contains("4;255;rgb:ffff/1b1b/4949"), "{answers:?}");
 
-    // An explicit override can equal Ghostty's original RGB, unlike the host palette.
     let original_red = Palette::default().get(PaletteIndex(1));
     first.vt_write(
         format!(

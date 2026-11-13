@@ -259,3 +259,39 @@ fn standalone_escape_is_delivered_after_disambiguation() {
         vec![key(KeyCode::Esc, KeyModifiers::NONE)]
     );
 }
+
+#[test]
+fn legacy_alt_bracket_keeps_following_keys_and_ctrl_c_out_of_reply_quarantine() {
+    let now = Instant::now();
+    for chunk in [1, 2, 3, 20] {
+        let stop = SessionStop::default();
+        let mut parser = Parser::new(stop.clone());
+        let out = b"\x1b]x\x03\x1b]1z"
+            .chunks(chunk)
+            .flat_map(|part| parser.advance(part, false, now))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            out,
+            vec![
+                key(KeyCode::Char(']'), KeyModifiers::ALT),
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                key(KeyCode::Char(']'), KeyModifiers::ALT),
+                key(KeyCode::Char('1'), KeyModifiers::NONE),
+                key(KeyCode::Char('z'), KeyModifiers::NONE),
+            ]
+        );
+        parser.tick(now + Duration::from_secs(31));
+        assert!(!stop.requested());
+    }
+    let mut parser = Parser::new(SessionStop::default());
+    assert!(parser.advance(b"\x1b]", false, now).is_empty());
+    assert_eq!(
+        parser.advance(b"", false, now + ESCAPE_WAIT),
+        vec![key(KeyCode::Char(']'), KeyModifiers::ALT)]
+    );
+    assert_eq!(
+        parser.advance(b"\x03", false, now + ESCAPE_WAIT),
+        vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]
+    );
+}

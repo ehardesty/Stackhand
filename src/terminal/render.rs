@@ -44,12 +44,7 @@ pub fn render<'alloc, 'cb>(
                 symbol.push(' ');
             }
             let style = cell.style()?;
-            let foreground = match style.fg_color {
-                StyleColor::Palette(index) if style.bold && index.0 < 8 => {
-                    rgb(colors.palette[usize::from(index.0) + 8])
-                }
-                _ => cell.fg_color()?.map(rgb).unwrap_or(default_fg),
-            };
+            let foreground = cell.fg_color()?.map(rgb).unwrap_or(default_fg);
             let mut cell_style = to_ratatui_style(&style)
                 .fg(foreground)
                 .bg(cell.bg_color()?.map(rgb).unwrap_or(default_bg))
