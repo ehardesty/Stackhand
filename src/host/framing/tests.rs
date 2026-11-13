@@ -295,3 +295,33 @@ fn legacy_alt_bracket_keeps_following_keys_and_ctrl_c_out_of_reply_quarantine() 
         vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]
     );
 }
+
+#[test]
+fn ready_color_reply_continuations_survive_reader_scheduling_delays() {
+    use super::super::colors::ColorReply;
+    use libghostty_vt::style::RgbColor;
+
+    let reply = b"\x1b]4;1;rgb:1111/2222/3333\x07x";
+    for split in 1..=3 {
+        let stop = SessionStop::default();
+        let mut parser = Parser::new(stop.clone());
+        let now = Instant::now();
+        assert!(parser.advance(&reply[..split], true, now).is_empty());
+        assert_eq!(
+            parser.advance(&reply[split..], false, now + Duration::from_millis(100)),
+            vec![
+                Decoded::Color(ColorReply::Indexed(
+                    1,
+                    RgbColor {
+                        r: 17,
+                        g: 34,
+                        b: 51
+                    }
+                )),
+                Decoded::Event(Event::Key(KeyCode::Char('x').into())),
+            ],
+            "split {split}"
+        );
+        assert!(!stop.requested());
+    }
+}

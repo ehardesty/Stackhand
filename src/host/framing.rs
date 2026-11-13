@@ -73,9 +73,10 @@ impl Parser {
     pub(super) fn advance(&mut self, bytes: &[u8], more: bool, now: Instant) -> Vec<Decoded> {
         self.tick(now);
         let mut out = Vec::new();
-        if self
-            .escape_since
-            .is_some_and(|since| now >= since + ESCAPE_WAIT)
+        if bytes.is_empty()
+            && self
+                .escape_since
+                .is_some_and(|since| now >= since + ESCAPE_WAIT)
         {
             self.release_keys(now, &mut out);
         }

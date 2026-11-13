@@ -343,8 +343,8 @@ through their terminator. An unterminated frame ends the session after 30 second
 to prevent its payload from becoming child input. Bracketed paste takes priority,
 including literal OSC text in a paste. A standalone Escape key has a 25 ms
 sequence disambiguation window.
-If a reply's initial ESC arrives more than 25 ms before the rest of its prefix,
-the prefix can be interpreted as keyboard input. This is a legacy terminal
+If a reply prefix pauses for more than 25 ms and the reader observes idle input,
+the remaining prefix can be interpreted as keyboard input. This is a legacy terminal
 sequence ambiguity. Kitty keyboard enhancement avoids the Alt-key ambiguity
 when the outer terminal or multiplexer supports it. Missing query answers use
 fallback colors; a stalled query write that exhausts its budget aborts startup.
