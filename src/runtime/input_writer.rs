@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender as CompletionSender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,6 +11,8 @@ use crate::terminal::PasteCompletion;
 
 pub const WRITER_QUEUE_SLOTS: usize = 1_024;
 pub const WRITER_EVENT_SLOTS: usize = 64;
+
+const CANCELLED_MESSAGE: &str = "terminal stopped before the input was delivered";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PtyWriterEvent {
@@ -24,6 +27,7 @@ pub enum PtyWriterEvent {
 #[derive(Default)]
 struct WriterStatus {
     events: Mutex<WriterEvents>,
+    cancelled: AtomicBool,
 }
 
 #[derive(Default)]
@@ -65,6 +69,10 @@ pub struct PtyWriterOwner {
 }
 
 impl PtyWriterOwner {
+    pub fn cancel(&self) {
+        self.status.cancelled.store(true, Ordering::Release);
+    }
+
     pub fn poll_event(&self) -> Option<PtyWriterEvent> {
         self.status.take()
     }
@@ -92,6 +100,7 @@ impl PtyWriterOwner {
 
 impl Drop for PtyWriterOwner {
     fn drop(&mut self) {
+        self.cancel();
         let _ = self.join();
     }
 }
@@ -111,9 +120,8 @@ struct WriterItem {
 impl BoundedPtyWriter {
     /// Admit one complete encoded input or effect item.
     ///
-    /// `Ok` is a durable acknowledgement. The writer owner will retry partial
-    /// operating-system writes until this full item is delivered or it emits
-    /// a terminal failure. `WouldBlock` means that no byte was admitted.
+    /// `Ok` admits the full item for ordered delivery. Delivery can fail or be
+    /// cancelled. `WouldBlock` means that no byte was admitted.
     pub(crate) fn try_enqueue(&self, data: &[u8]) -> io::Result<()> {
         self.try_enqueue_with_completion(data, None)
     }
@@ -207,25 +215,24 @@ pub(crate) fn spawn_bounded_pty_writer(
     let status = Arc::new(WriterStatus::default());
     let thread_budget = budget.clone();
     let thread_status = Arc::clone(&status);
-    let thread_limit = limit_bytes;
     let thread = thread::Builder::new()
         .name("pty-writer".to_string())
         .spawn(move || {
             let mut writer = writer;
             while let Ok(item) = receiver.recv() {
-                let result = write_with_retry(
-                    &mut writer,
-                    &item.data,
-                    &thread_status,
-                    &thread_budget,
-                    thread_limit,
-                );
+                let result = write_with_retry(&mut writer, &item.data, &thread_status);
                 thread_budget.release(item.data.len());
-                if let Err(error) = result {
+                if let Err(stop) = result {
+                    let message = match &stop {
+                        WriteStop::Cancelled => CANCELLED_MESSAGE.to_string(),
+                        WriteStop::Failed(error) => error.to_string(),
+                    };
                     if let Some(completion) = item.completion {
-                        let _ = completion.send(PasteCompletion::Failed(error.to_string()));
+                        let _ = completion.send(PasteCompletion::Failed(message.clone()));
                     }
-                    thread_status.record(PtyWriterEvent::Failed(error.to_string()));
+                    if matches!(stop, WriteStop::Failed(_)) {
+                        thread_status.record(PtyWriterEvent::Failed(message));
+                    }
                     break;
                 }
                 if let Some(completion) = item.completion {
@@ -247,365 +254,57 @@ pub(crate) fn spawn_bounded_pty_writer(
     Ok((queued_writer, owner))
 }
 
+enum WriteStop {
+    Cancelled,
+    Failed(io::Error),
+}
+
 fn write_with_retry(
     writer: &mut Box<dyn Write + Send>,
     data: &[u8],
     status: &WriterStatus,
-    budget: &ByteBudget,
-    limit_bytes: usize,
-) -> io::Result<()> {
+) -> Result<(), WriteStop> {
     let mut offset = 0;
-    let mut reported_backpressure = false;
     while offset < data.len() {
+        if status.cancelled.load(Ordering::Acquire) {
+            return Err(WriteStop::Cancelled);
+        }
         match writer.write(&data[offset..]) {
             Ok(0) => {
-                return Err(io::Error::new(
+                return Err(WriteStop::Failed(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "PTY writer made no progress",
-                ));
+                )));
             }
             Ok(written) => offset += written,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !reported_backpressure {
-                    status.record(PtyWriterEvent::Backpressure {
-                        attempted_bytes: data.len(),
-                        pending_bytes: budget.pending_bytes(),
-                        limit_bytes,
-                    });
-                    reported_backpressure = true;
-                }
-                thread::sleep(Duration::from_millis(1));
+                retry_or_stop(status)?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(WriteStop::Failed(error)),
         }
     }
 
     loop {
+        if status.cancelled.load(Ordering::Acquire) {
+            return Err(WriteStop::Cancelled);
+        }
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !reported_backpressure {
-                    status.record(PtyWriterEvent::Backpressure {
-                        attempted_bytes: data.len(),
-                        pending_bytes: budget.pending_bytes(),
-                        limit_bytes,
-                    });
-                    reported_backpressure = true;
-                }
-                thread::sleep(Duration::from_millis(1));
+                retry_or_stop(status)?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(WriteStop::Failed(error)),
         }
     }
+}
+
+fn retry_or_stop(status: &WriterStatus) -> Result<(), WriteStop> {
+    if status.cancelled.load(Ordering::Acquire) {
+        return Err(WriteStop::Cancelled);
+    }
+    thread::sleep(Duration::from_millis(1));
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    #[derive(Clone, Default)]
-    struct CapturedBytes(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedBytes {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .extend_from_slice(data);
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn writer_preserves_order() {
-        let capture = CapturedBytes::default();
-        let read_capture = capture.clone();
-        let (mut writer, owner) = spawn_bounded_pty_writer(Box::new(capture), 64).unwrap();
-
-        writer.write_all(b"user-").unwrap();
-        writer.write_all(b"query-").unwrap();
-        writer.write_all(b"focus").unwrap();
-        drop(writer);
-        owner.join().unwrap();
-
-        assert_eq!(
-            read_capture
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            b"user-query-focus"
-        );
-    }
-
-    #[test]
-    fn paste_completion_waits_for_partial_writes_and_flush() {
-        struct PartialWriter {
-            bytes: Arc<Mutex<Vec<u8>>>,
-            flushing: mpsc::Sender<()>,
-            finish: mpsc::Receiver<io::Result<()>>,
-        }
-        impl Write for PartialWriter {
-            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-                let count = 2.min(data.len());
-                self.bytes.lock().unwrap().extend_from_slice(&data[..count]);
-                Ok(count)
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                self.flushing.send(()).unwrap();
-                self.finish.recv().unwrap()
-            }
-        }
-
-        for fail_flush in [false, true] {
-            let bytes = Arc::new(Mutex::new(Vec::new()));
-            let (flushing, started) = mpsc::channel();
-            let (finish, finishing) = mpsc::channel();
-            let writer = PartialWriter {
-                bytes: Arc::clone(&bytes),
-                flushing,
-                finish: finishing,
-            };
-            let (queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
-            let (completion, outcome) = mpsc::channel();
-            queued
-                .try_enqueue_with_completion(b"normal-paste", Some(&completion))
-                .unwrap();
-            started.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(matches!(outcome.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            let result = if fail_flush {
-                Err(io::Error::other("flush failed"))
-            } else {
-                Ok(())
-            };
-            finish.send(result).unwrap();
-            let result = outcome.recv_timeout(Duration::from_secs(2)).unwrap();
-            if fail_flush {
-                assert_eq!(result, PasteCompletion::Failed("flush failed".to_string()));
-            } else {
-                assert_eq!(result, PasteCompletion::Delivered);
-            }
-            assert_eq!(bytes.lock().unwrap().as_slice(), b"normal-paste");
-            drop(queued);
-            owner.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn writer_retries_temporary_os_backpressure_without_losing_paste_bytes() {
-        #[derive(Clone)]
-        struct TemporarilyBlockedWriter {
-            bytes: Arc<Mutex<Vec<u8>>>,
-            blocked: Arc<AtomicUsize>,
-        }
-
-        impl Write for TemporarilyBlockedWriter {
-            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-                if self.blocked.load(Ordering::Acquire) > 0 {
-                    self.blocked.fetch_sub(1, Ordering::AcqRel);
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "fixture backpressure",
-                    ));
-                }
-                self.bytes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend_from_slice(data);
-                Ok(data.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let bytes = Arc::new(Mutex::new(Vec::new()));
-        let read_bytes = Arc::clone(&bytes);
-        let writer = TemporarilyBlockedWriter {
-            bytes,
-            blocked: Arc::new(AtomicUsize::new(1)),
-        };
-        let (mut queued, owner) = spawn_bounded_pty_writer(Box::new(writer), 64).unwrap();
-
-        queued.write_all(b"retry-this-paste").unwrap();
-        drop(queued);
-        owner.join().unwrap();
-        assert_eq!(
-            owner.poll_event(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 16,
-                pending_bytes: 16,
-                limit_bytes: 64,
-            })
-        );
-        assert_eq!(
-            read_bytes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            b"retry-this-paste"
-        );
-    }
-
-    #[test]
-    fn oversized_write_reports_backpressure_without_partial_data() {
-        let capture = CapturedBytes::default();
-        let read_capture = capture.clone();
-        let (mut writer, owner) = spawn_bounded_pty_writer(Box::new(capture), 4).unwrap();
-
-        let error = writer.write_all(b"12345").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(
-            owner.poll_event(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 5,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        drop(writer);
-        owner.join().unwrap();
-
-        assert!(
-            read_capture
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn writer_reports_backpressure_events_in_order() {
-        let (mut writer, owner) =
-            spawn_bounded_pty_writer(Box::new(CapturedBytes::default()), 4).unwrap();
-
-        assert_eq!(
-            writer.write(b"12345").unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(
-            writer.write(b"67890").unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-
-        assert_eq!(
-            owner.poll_event(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 5,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(
-            owner.poll_event(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 5,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(owner.poll_event(), None);
-
-        drop(writer);
-        owner.join().unwrap();
-    }
-
-    #[test]
-    fn writer_status_preserves_event_order() {
-        let status = WriterStatus::default();
-        status.record(PtyWriterEvent::Backpressure {
-            attempted_bytes: 5,
-            pending_bytes: 0,
-            limit_bytes: 4,
-        });
-        status.record(PtyWriterEvent::Failed("write failed".to_string()));
-        status.record(PtyWriterEvent::Backpressure {
-            attempted_bytes: 6,
-            pending_bytes: 0,
-            limit_bytes: 4,
-        });
-
-        assert_eq!(
-            status.take(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 5,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(
-            status.take(),
-            Some(PtyWriterEvent::Failed("write failed".to_string()))
-        );
-        assert_eq!(
-            status.take(),
-            Some(PtyWriterEvent::Backpressure {
-                attempted_bytes: 6,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(status.take(), None);
-    }
-
-    #[test]
-    fn writer_status_bounds_diagnostics_and_preserves_failure() {
-        let status = WriterStatus::default();
-        for attempted_bytes in 0..WRITER_EVENT_SLOTS + 1 {
-            status.record(PtyWriterEvent::Backpressure {
-                attempted_bytes,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            });
-        }
-        status.record(PtyWriterEvent::Failed("write failed".to_string()));
-
-        let events = status.events.lock().unwrap();
-        assert_eq!(events.queue.len(), WRITER_EVENT_SLOTS);
-        assert_eq!(
-            events.queue.front(),
-            Some(&PtyWriterEvent::Backpressure {
-                attempted_bytes: 0,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(
-            events.queue.back(),
-            Some(&PtyWriterEvent::Backpressure {
-                attempted_bytes: WRITER_EVENT_SLOTS - 1,
-                pending_bytes: 0,
-                limit_bytes: 4,
-            })
-        );
-        assert_eq!(
-            events.latched_failure,
-            Some(PtyWriterEvent::Failed("write failed".to_string()))
-        );
-        drop(events);
-
-        for attempted_bytes in 0..WRITER_EVENT_SLOTS {
-            assert_eq!(
-                status.take(),
-                Some(PtyWriterEvent::Backpressure {
-                    attempted_bytes,
-                    pending_bytes: 0,
-                    limit_bytes: 4,
-                })
-            );
-        }
-        assert_eq!(
-            status.take(),
-            Some(PtyWriterEvent::Failed("write failed".to_string()))
-        );
-        assert_eq!(status.take(), None);
-    }
-}
+mod tests;

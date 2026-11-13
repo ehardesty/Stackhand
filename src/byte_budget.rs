@@ -67,6 +67,7 @@ impl ByteBudget {
         self.pending.fetch_sub(amount, Ordering::AcqRel);
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_bytes(&self) -> usize {
         self.pending.load(Ordering::Acquire)
     }
