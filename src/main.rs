@@ -3,13 +3,38 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-fn main() -> Result<()> {
-    match parse_mode(std::env::args_os().skip(1))? {
-        Mode::Project {
-            path,
-            profile,
-            no_autostart,
-        } => stackhand::run_project_session(path.as_deref(), profile.as_deref(), !no_autostart),
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<std::process::ExitCode> {
+    let mode = parse_mode(std::env::args_os().skip(1))?;
+    if let Mode::Project {
+        path,
+        profile,
+        no_autostart,
+    } = mode
+    {
+        return stackhand::run_project_cli_session(
+            path.as_deref(),
+            profile.as_deref(),
+            !no_autostart,
+        )
+        .map(|exit| exit.exit_code());
+    }
+    run_noninteractive(mode)?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn run_noninteractive(mode: Mode) -> Result<()> {
+    match mode {
+        Mode::Project { .. } => unreachable!("interactive mode handled before dispatch"),
         Mode::ConfigValidate { path, profile } => {
             let sources = stackhand::validate_project_sources(path.as_deref(), profile.as_deref())
                 .map_err(|error| anyhow!("configuration error: {error}"))?;

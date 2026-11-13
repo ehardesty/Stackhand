@@ -180,7 +180,8 @@ This result does not define a supported-product platform or a release boundary.
   identities. Non-US physical keys, composed input, and IME input remain
   unproved.
 - Alt-character input on macOS remains partial. The automated fixture records
-  Alt-X as `x` without an Escape prefix.
+  Alt-X as `x` without an Escape prefix in that historical run. The encoder now
+  sets `OptionAsAlt::True`; physical Option-key settings remain unverified.
 - Cursor shape is best effort because the outer terminal can ignore a shape
   request.
 - Focus forwarding is not filtered by the child's mode 1004 state.

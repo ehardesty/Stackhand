@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,7 +171,10 @@ pub struct Terminal {
     writer: Option<Box<dyn Write + Send>>,
     reader: Option<JoinHandle<()>>,
     stop_reader: Arc<AtomicBool>,
+    pause_reader: Arc<AtomicBool>,
     output: Arc<Mutex<Vec<u8>>>,
+    #[cfg(target_os = "linux")]
+    stopped_output: Option<OwnedFd>,
     pub child: Box<dyn Child + Send + Sync>,
 }
 
@@ -196,15 +201,22 @@ impl Terminal {
         command.args(arguments);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
+
         let fd = pair.master.as_raw_fd().unwrap();
         let mut input = pair.master.try_clone_reader().unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&output);
         let stop_reader = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stop_reader);
+        let pause_reader = Arc::new(AtomicBool::new(false));
+        let pause = Arc::clone(&pause_reader);
         let reader = thread::spawn(move || {
             let mut buffer = [0; 8192];
             while !stop.load(Ordering::Acquire) {
+                if pause.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 let mut poll = libc::pollfd {
                     fd,
                     events: libc::POLLIN,
@@ -225,7 +237,10 @@ impl Terminal {
             writer: Some(writer),
             reader: Some(reader),
             stop_reader,
+            pause_reader,
             output,
+            #[cfg(target_os = "linux")]
+            stopped_output: None,
             child,
         }
     }
@@ -238,6 +253,35 @@ impl Terminal {
 
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    pub fn pause_output_and_resize(&mut self) {
+        self.pause_reader.store(true, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        {
+            let master = self.master.as_ref().unwrap().as_raw_fd().unwrap();
+            let slave = unsafe {
+                libc::ioctl(
+                    master,
+                    libc::TIOCGPTPEER,
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(slave >= 0, "{}", std::io::Error::last_os_error());
+            let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+            assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+            self.stopped_output = Some(slave);
+        }
+        self.master
+            .as_ref()
+            .unwrap()
+            .resize(PtySize {
+                rows: 200,
+                cols: 500,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
     }
 
     pub fn hangup(&mut self) {
@@ -256,16 +300,26 @@ impl Terminal {
             },
             "Stackhand to exit",
         );
+        self.resume_output();
         if let Some(reader) = self.reader.take() {
             wait_until(|| reader.is_finished(), "terminal output reader to finish");
             reader.join().unwrap();
         }
         status.unwrap()
     }
+
+    fn resume_output(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(slave) = self.stopped_output.take() {
+            unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOON) };
+        }
+        self.pause_reader.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.resume_output();
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.stop_reader.store(true, Ordering::Release);

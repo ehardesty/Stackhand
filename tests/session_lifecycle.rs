@@ -60,7 +60,7 @@ fn console_ctrl_c_is_data_and_quit_cleans_both_process_trees() {
 }
 
 #[test]
-fn term_shows_progress_and_cleans_both_process_trees() {
+fn term_shows_shutdown_progress_and_cleans_both_process_trees() {
     let mut project = Project::new();
     let mut terminal = Terminal::start(&project, &[], None);
     project.capture_trees();
@@ -72,6 +72,7 @@ fn term_shows_progress_and_cleans_both_process_trees() {
     }
     assert!(terminal.wait().success(), "{}", terminal.text());
     assert!(terminal.text().contains("Project shutdown in progress"));
+    assert!(terminal.text().contains("Project shutdown complete"));
     project.assert_trees_gone();
 }
 
@@ -95,4 +96,93 @@ fn no_autostart_leaves_all_processes_stopped() {
     project.assert_no_start();
     terminal.send(b"q");
     assert!(terminal.wait().success(), "{}", terminal.text());
+}
+
+#[test]
+fn term_cleans_process_trees_while_outer_output_stays_stalled() {
+    let mut project = Project::new();
+    let mut terminal = Terminal::start(&project, &[], None);
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "PTY console to render",
+    );
+    terminal.pause_output_and_resize();
+    thread::sleep(Duration::from_millis(300));
+    unsafe {
+        assert_eq!(
+            libc::kill(terminal.child.process_id().unwrap() as i32, libc::SIGTERM),
+            0
+        );
+    }
+    assert!(terminal.wait().success());
+    project.assert_trees_gone();
+}
+
+#[test]
+fn oversized_host_paste_never_delivers_its_command_like_suffix() {
+    let mut project = Project::new();
+    let mut terminal = Terminal::start(&project, &[], None);
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "PTY console to render",
+    );
+    terminal.send(b"\t");
+    terminal.send(b"\x1b[200~");
+    terminal.send(&vec![b'p'; 64 * 1024 + 1]);
+    terminal.send(b"\nexecute-me\r\x03\x1b[201x\x1b[20");
+    terminal.send(b"1~");
+    wait_until(
+        || terminal.text().contains("paste exceeds the 64 KiB limit"),
+        "oversized host paste warning to describe its size limit",
+    );
+    terminal.send(b"x");
+    wait_until(
+        || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == b"x"),
+        "only the post-paste key to reach the child",
+    );
+    terminal.send(b"\x11");
+    assert!(terminal.wait().success());
+    assert_eq!(fs::read(project.root.join("input")).unwrap(), b"x");
+    project.assert_trees_gone();
+}
+
+#[test]
+fn redirected_regular_file_keeps_the_interactive_shutdown_report() {
+    let project = Project::new();
+    let report = project.root.join("report.txt");
+    let redirect = format!("2>'{}'", report.display());
+    let mut terminal = Terminal::start(&project, &["--no-autostart"], Some(&redirect));
+    wait_until(|| terminal.text().contains("pty"), "Project UI to render");
+    terminal.send(b"q");
+    assert!(terminal.wait().success());
+    let report = fs::read_to_string(report).unwrap();
+    assert!(report.contains("Project shutdown complete"));
+    assert!(!report.contains('\r'));
+}
+
+#[test]
+fn quit_shows_progress_before_cleanup_and_reports_stalled_finalization() {
+    let mut project = Project::new();
+    let report = project.root.join("report.txt");
+    let redirect = format!("2>'{}'", report.display());
+    let mut terminal = Terminal::start(&project, &[], Some(&redirect));
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "Project console to render",
+    );
+    terminal.send(b"q");
+    wait_until(
+        || terminal.text().contains("Project shutdown in progress"),
+        "shutdown progress before Process cleanup finishes",
+    );
+    terminal.pause_output_and_resize();
+    assert!(!terminal.wait().success());
+    project.assert_trees_gone();
+    let report = fs::read_to_string(report).unwrap();
+    assert!(report.contains("Project shutdown complete"));
+    assert!(report.contains("terminal protocol restoration was incomplete"));
+    assert!(!report.contains('\r'));
 }

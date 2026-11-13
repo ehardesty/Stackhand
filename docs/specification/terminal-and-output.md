@@ -273,6 +273,18 @@ Paste should:
 - flow through the bounded PTY writer queue;
 - surface backpressure/errors instead of dropping data.
 
+The host reader admits at most 64 KiB of raw paste and of decoded UTF-8 text.
+An oversized paste is rejected atomically, with one warning. Its suffix stays
+quarantined until the closing marker. A frame has a 30-second absolute lifetime
+from its opener. Expiry ends host parsing permanently and starts controlled
+Project cleanup. Late closing markers cannot resume child input. Ordinary escape
+sequences are capped at 1 KiB; exceeding that cap also ends the session.
+
+Parser storage holds at most 64 KiB of paste, five tentative delimiter bytes,
+a 1 KiB sequence, and one 1 KiB read batch. Lossy conversion can temporarily use
+three times the paste storage. The separate semantic queue admits 256 entries,
+which can retain about 16 MiB of accepted paste plus event overhead.
+
 ### 20.9 Clipboard policy
 
 - User-initiated copy to the system clipboard is allowed.
@@ -531,6 +543,48 @@ Output flooding must not monopolize:
 - UI redraw.
 
 Use batching, bounded work per scheduling turn, and coalesced notifications.
+
+The outer terminal uses independently opened nonblocking descriptors. Inherited
+stdin, stdout, and stderr flags are unchanged. A complete draw and cursor batch
+is staged before its first OS write. The staging cap is 16 MiB. It accommodates
+large styled hosts such as 500 columns by 200 rows. A larger encoded batch fails
+the session before submission; there is no silent dimension reduction.
+
+Ordinary host output applies backpressure without a frame deadline. SIGTERM,
+SIGHUP, and fatal host-input faults interrupt output through poll intervals of
+at most 10 ms, subject to scheduling. Once interrupted or failed, output cannot
+resume ordinary frames. Partial transactions retain their exact suffix.
+
+With healthy output, shutdown continues to show progress. Each shutdown frame
+has a 100 ms write budget. A stalled shutdown frame ends rendering permanently
+and cleanup continues without output. Host input is drained and discarded during
+cleanup. Pending host input is also flushed at terminal finalization, so capture
+reports and keys accumulated during cleanup are not passed to the invoking shell.
+This cannot prevent input that the host sends after Stackhand has exited.
+
+Project cleanup retains its 20-second deadline and five-second observation grace.
+Raw mode remains active through cleanup. Local termios is restored before final
+output waits. One shared 500 ms output budget covers a retained suffix, mode
+restoration, and terminal reporting, in that order. If the suffix cannot finish,
+restoration and report bytes are not injected into it. OS acceptance does not
+prove that the host displays restoration. Scheduler, kernel, and existing
+Supervisor joins are outside any hard realtime guarantee. On macOS, a controlling
+session leader also waits for its terminal kernel queue within that same output
+budget. If the queue remains nonempty at expiry, finalization discards that queue
+with `TCOFLUSH` and records incomplete delivery. This happens only at session end,
+never during ordinary drawing. It prevents Darwin's implicit terminal drain on
+session-leader exit from adding an unbounded wait.
+
+Interactive completion returns an explicit exit code. Regular-file stderr
+reports are preserved. Terminal stderr uses private bounded output within the
+same finalization budget. Interactive reports to redirected pipes and other
+nonregular nonterminal sinks are omitted, because a portable independently opened
+nonblocking sink is unavailable. Configuration and other preflight diagnostics
+retain their existing CLI path.
+Terminal reports use carriage return and line feed. Regular-file reports use
+normal line feeds. Late restoration failures are appended
+to regular-file reports after terminal finalization; terminal delivery remains
+subject to the shared finalization budget.
 
 ### 23.6 Input backpressure
 

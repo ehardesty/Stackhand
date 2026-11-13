@@ -7,7 +7,7 @@ fn session_dispositions_restore_and_keep_reads_restartable() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "app::signals::tests::session_dispositions_restore_and_keep_reads_restartable",
+                "host::signals::tests::session_dispositions_restore_and_keep_reads_restartable",
                 "--nocapture",
             ])
             .env(CHILD, "1")

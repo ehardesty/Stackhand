@@ -6,21 +6,20 @@ use crate::output::OutputViews;
 use crate::supervisor::{Command, Consoles, ProjectSnapshot};
 use crate::tui::{
     ConsoleBody, ConsoleContent, OuterTerminal, ProcessListRow, ProcessRowView, ProjectProfileMenu,
-    VisibleActions, pane_inner, project_layout, render_project_with_search,
+    RenderPhase, VisibleActions, pane_inner, project_layout, render_project_with_search,
 };
 use anyhow::{Result, anyhow, bail};
 use crossterm::event::Event;
 
 use self::input_scheduler::InputScheduler;
 use self::resize::PendingResize;
-use self::session::{LoopEnd, ProjectSession};
-use self::signals::{SessionSignal, SessionSignals};
+use self::session::ProjectSession;
+use crate::host::{HostAction, SessionSignal, SessionSignals, SessionStop, write_regular_report};
 
 mod input_scheduler;
 pub(crate) mod interaction;
 mod resize;
 mod session;
-mod signals;
 mod view_model;
 
 use interaction::{InputResult, ProjectInteraction, SelectedPane};
@@ -60,6 +59,43 @@ pub fn run_project_session(
     profile: Option<&str>,
     autostart: bool,
 ) -> Result<()> {
+    run_project_cli_session(config_path, profile, autostart)?.into_result()
+}
+
+/// Interactive completion whose diagnostics have already passed through the
+/// terminal finalizer. The CLI must return its exit code without printing again.
+pub struct SessionExit {
+    result: Result<()>,
+    protocol_submitted: bool,
+}
+
+impl SessionExit {
+    pub fn exit_code(&self) -> std::process::ExitCode {
+        if self.result.is_ok() {
+            std::process::ExitCode::SUCCESS
+        } else {
+            std::process::ExitCode::FAILURE
+        }
+    }
+
+    /// Whether final terminal commands were accepted by the OS. This does not
+    /// confirm host display.
+    pub fn protocol_submitted(&self) -> bool {
+        self.protocol_submitted
+    }
+
+    pub fn into_result(self) -> Result<()> {
+        self.result
+    }
+}
+
+/// Resolve configuration before acquiring the host. Errors returned directly
+/// are preflight errors; SessionExit carries completion after host acquisition.
+pub fn run_project_cli_session(
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+    autostart: bool,
+) -> Result<SessionExit> {
     let request = match config_path {
         Some(path) => crate::config::ResolutionRequest::explicit_with_profile(
             path,
@@ -67,36 +103,66 @@ pub fn run_project_session(
         ),
         None => crate::config::ResolutionRequest::discover_with_profile(profile.map(str::to_owned)),
     };
-    // Invalid configuration starts no Processes and never enters the TUI.
     let resolution =
         crate::config::resolve(request).map_err(|error| anyhow!("configuration error: {error}"))?;
     session::require_interactive_terminal()?;
     let signals = SessionSignals::install()?;
-    let mut outer = OuterTerminal::enter()?;
-    let input = InputScheduler::start()?;
-    let (mut project, consoles, outputs) = ProjectSession::start(resolution.into_project())?;
-    if autostart && signals.received().is_none() {
-        project.supervisor().command(Command::StartAutostart);
-    }
-
-    let end = run_event_loop(
-        &mut outer,
-        &input,
-        &mut project,
-        &consoles,
-        &outputs,
-        &signals,
-    );
-    let first_signal = signals.first_observed();
-    let observed = match &end {
-        Ok(LoopEnd::Completed(snapshot)) => Some(snapshot.clone()),
-        _ => None,
-    };
-    let cleanup = project.finish(observed);
+    let stop = SessionStop::default();
+    let (mut outer, source) = OuterTerminal::acquire(stop.clone())?;
+    let mut input = None;
+    let outcome = (|| -> Result<(Result<()>, Result<()>)> {
+        input = Some(InputScheduler::start(source, stop.clone())?);
+        let input = input.as_ref().expect("input scheduler started");
+        outer.query_keyboard()?;
+        let keyboard = input.keyboard_support();
+        outer.enable_modes(keyboard)?;
+        if let Some(error) = stop.error() {
+            bail!(error);
+        }
+        if stop.requested() {
+            return Ok((Ok(()), Ok(())));
+        }
+        let (mut project, consoles, outputs) = ProjectSession::start(resolution.into_project())?;
+        if autostart && !stop.requested() {
+            project.supervisor().command(Command::StartAutostart);
+        }
+        let end = run_event_loop(
+            &mut outer,
+            input,
+            &mut project,
+            &consoles,
+            &outputs,
+            &signals,
+            &stop,
+        );
+        input.discard();
+        outer.quiesce();
+        let cleanup = project.finish(None);
+        Ok((end, cleanup))
+    })();
+    stop.stop();
     drop(input);
-    drop(outer);
-    drop(signals);
-    session::report(end, first_signal, cleanup)
+    let (end, cleanup) = outcome.unwrap_or_else(|error| (Err(error), Ok(())));
+    let mut report = session::report(end, signals.first_observed(), cleanup);
+    if let Some(error) = stop.error()
+        && (signals.received().is_none() || stop.framing_fault())
+    {
+        report.fail(anyhow!(error));
+    }
+    let reported_length = report.text.len();
+    let restoration = outer.finish(&report.text);
+    if let Err(error) = restoration.local_termios {
+        report.fail(error.into());
+    }
+    let protocol_submitted = restoration.protocol == crate::host::ProtocolDelivery::Submitted;
+    if !protocol_submitted && signals.received().is_none() {
+        report.fail(anyhow!("terminal protocol restoration was incomplete"));
+    }
+    write_regular_report(&report.text[reported_length..]);
+    Ok(SessionExit {
+        result: report.result,
+        protocol_submitted,
+    })
 }
 
 fn run_event_loop(
@@ -106,7 +172,8 @@ fn run_event_loop(
     consoles: &Consoles,
     outputs: &OutputViews,
     signals: &SessionSignals,
-) -> Result<LoopEnd> {
+    stop: &SessionStop,
+) -> Result<()> {
     let mut interaction = ProjectInteraction::default();
     let mut pending_resize = PendingResize::default();
     let mut console_area =
@@ -120,8 +187,11 @@ fn run_event_loop(
     let mut dirty = true;
 
     loop {
-        if observe_signal(project, signals, &mut dirty) {
-            return Ok(LoopEnd::Hangup);
+        if let Some(error) = stop.error() {
+            bail!(error);
+        }
+        if observe_shutdown_signal(project, input, signals, &mut dirty) {
+            return Ok(());
         }
         if interaction.poll_requests() {
             dirty = true;
@@ -134,9 +204,13 @@ fn run_event_loop(
             bail!("this Project has no Processes");
         }
         if project.is_shutting_down()
-            && let Some(result) = snapshot.shutdown.as_ref().filter(|result| result.complete)
+            && (snapshot
+                .shutdown
+                .as_ref()
+                .is_some_and(|result| result.complete)
+                || project.shutdown_wait_expired())
         {
-            return Ok(LoopEnd::Completed(result.clone()));
+            return Ok(());
         }
         if last_project_snapshot.as_ref().is_none_or(|previous| {
             previous.processes != snapshot.processes
@@ -183,8 +257,8 @@ fn run_event_loop(
             dirty = true;
         }
 
-        if observe_signal(project, signals, &mut dirty) {
-            return Ok(LoopEnd::Hangup);
+        if observe_shutdown_signal(project, input, signals, &mut dirty) {
+            return Ok(());
         }
         if dirty || ProjectInteraction::terminal_is_dirty(&pane) {
             dirty = false;
@@ -201,8 +275,14 @@ fn run_event_loop(
                 header.insert_str(0, "Project shutdown in progress · ");
             }
             let (process_table_state, profile_menu, visible_actions) = interaction.render_state();
-            console_area = render_frame(
+            let rendered = render_frame(
                 outer,
+                frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor),
+                if project.is_shutting_down() {
+                    RenderPhase::ShuttingDown
+                } else {
+                    RenderPhase::Running
+                },
                 &rows,
                 &process_list,
                 process_table_state,
@@ -219,25 +299,36 @@ fn run_event_loop(
                 &list_title,
                 profile_menu,
                 visible_actions,
-            )?;
-            let cursor = frame.terminal.as_ref().and_then(|snapshot| snapshot.cursor);
-            if observe_signal(project, signals, &mut dirty) {
-                return Ok(LoopEnd::Hangup);
-            }
-            outer.set_cursor_shape(cursor)?;
+            );
+            console_area = match rendered {
+                Ok(area) => area,
+                Err(_) if project.is_shutting_down() => return Ok(()),
+                Err(error) => return Err(error),
+            };
         }
 
-        if observe_signal(project, signals, &mut dirty) {
-            return Ok(LoopEnd::Hangup);
+        if observe_shutdown_signal(project, input, signals, &mut dirty) {
+            return Ok(());
         }
         let input_batch = input.receive(pending_resize.poll_interval(Instant::now()))?;
         if input_batch.is_empty() {
             continue;
         }
 
-        for (input_event, repeats) in input_batch {
-            if observe_signal(project, signals, &mut dirty) {
-                return Ok(LoopEnd::Hangup);
+        for (action, repeats) in input_batch {
+            let input_event = match action {
+                HostAction::Input(event) => event,
+                HostAction::PasteRejected => {
+                    interaction.warn(crate::tui::ConsoleWarning::PasteTooLarge);
+                    dirty = true;
+                    continue;
+                }
+            };
+            if observe_shutdown_signal(project, input, signals, &mut dirty) {
+                return Ok(());
+            }
+            if project.is_shutting_down() {
+                continue;
             }
             if let Event::Resize(cols, rows) = input_event {
                 // The child sees exactly the rendered console pane.
@@ -257,8 +348,9 @@ fn run_event_loop(
                 retained,
                 console_area,
             ) {
-                InputResult::Quit if !project.is_shutting_down() => {
+                InputResult::Quit => {
                     project.begin();
+                    input.discard();
                     dirty = true;
                 }
                 InputResult::Changed => dirty = true,
@@ -268,28 +360,28 @@ fn run_event_loop(
                     }
                     dirty = true;
                 }
-                InputResult::Ignored | InputResult::Quit => {}
+                InputResult::Ignored => {}
             }
         }
     }
 }
 
-fn observe_signal(
+fn observe_shutdown_signal(
     project: &mut ProjectSession,
+    input: &InputScheduler,
     signals: &SessionSignals,
     dirty: &mut bool,
 ) -> bool {
-    let Some(signal) = signals.received() else {
-        return false;
-    };
-    if signal == SessionSignal::Hangup {
-        return true;
+    match signals.received() {
+        Some(SessionSignal::Hangup) => true,
+        Some(SessionSignal::Terminate) if !project.is_shutting_down() => {
+            project.begin();
+            input.discard();
+            *dirty = true;
+            false
+        }
+        _ => false,
     }
-    if !project.is_shutting_down() {
-        project.begin();
-        *dirty = true;
-    }
-    false
 }
 
 fn open_local_port(port: u16) -> std::io::Result<()> {
@@ -315,6 +407,8 @@ fn open_local_port(port: u16) -> std::io::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     outer: &mut OuterTerminal,
+    cursor: Option<crate::terminal::OwnedCursorState>,
+    phase: RenderPhase,
     rows: &[ProcessRowView],
     process_list: &[ProcessListRow],
     process_table_state: &mut ratatui::widgets::TableState,
@@ -326,8 +420,7 @@ fn render_frame(
 ) -> Result<ratatui::layout::Rect> {
     let mut pane = None;
     outer
-        .terminal_mut()
-        .draw(|frame| {
+        .draw(cursor, phase, |frame| {
             pane = Some(render_project_with_search(
                 frame,
                 rows,
