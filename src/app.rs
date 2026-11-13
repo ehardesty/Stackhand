@@ -319,7 +319,7 @@ fn run_event_loop(
             let input_event = match action {
                 HostAction::Input(event) => event,
                 HostAction::PasteRejected => {
-                    interaction.warn(crate::tui::ConsoleWarning::PasteRejected);
+                    interaction.warn(crate::tui::ConsoleWarning::PasteTooLarge);
                     dirty = true;
                     continue;
                 }

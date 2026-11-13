@@ -137,6 +137,10 @@ fn oversized_host_paste_never_delivers_its_command_like_suffix() {
         || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == b"x"),
         "only the post-paste key to reach the child",
     );
+    wait_until(
+        || terminal.text().contains("paste exceeds the 64 KiB limit"),
+        "oversized host paste warning to describe its size limit",
+    );
     terminal.send(b"\x11");
     assert!(terminal.wait().success());
     assert_eq!(fs::read(project.root.join("input")).unwrap(), b"x");
