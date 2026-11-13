@@ -118,6 +118,7 @@ pub(crate) enum HostFault {
     SequenceTooLong = 2,
     InputClosed = 3,
     InputFailed = 4,
+    UnterminatedColorReply = 5,
 }
 
 impl SessionStop {
@@ -138,7 +139,7 @@ impl SessionStop {
     }
 
     pub(crate) fn framing_fault(&self) -> bool {
-        matches!(self.fault.load(Ordering::Acquire), 1 | 2)
+        matches!(self.fault.load(Ordering::Acquire), 1 | 2 | 5)
     }
 
     pub(crate) fn error(&self) -> Option<&'static str> {
@@ -147,6 +148,7 @@ impl SessionStop {
             1 => Some("host paste framing exceeded the 30-second limit"),
             2 => Some("host input sequence exceeded its size limit"),
             3 => Some("host terminal input closed"),
+            5 => Some("host color reply framing exceeded the 30-second limit"),
             _ => Some("host terminal input failed"),
         }
     }

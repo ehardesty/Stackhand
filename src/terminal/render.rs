@@ -1,5 +1,5 @@
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
-use libghostty_vt::style::{self, Underline};
+use libghostty_vt::style::{self, StyleColor, Underline};
 use libghostty_vt::terminal::Terminal;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -18,7 +18,12 @@ pub fn render<'alloc, 'cb>(
     let colors = snapshot.colors()?;
     let cursor = cursor_state(&snapshot, focused, area);
     let default_fg = rgb(colors.foreground);
-    let default_bg = rgb(colors.background);
+    let default_bg = if terminal.default_bg_color()? == Some(colors.background) {
+        // SGR 49 keeps the host's default background, including transparency.
+        Color::Reset
+    } else {
+        rgb(colors.background)
+    };
     let mut rows = RowIterator::new()?;
     let mut cells = CellIterator::new()?;
     let mut row_iteration = rows.update(&snapshot)?;
@@ -38,10 +43,16 @@ pub fn render<'alloc, 'cb>(
             if symbol.is_empty() {
                 symbol.push(' ');
             }
-            let mut cell_style = cell.style().map(|value| to_ratatui_style(&value))?;
-            cell_style = cell_style
-                .fg(cell.fg_color()?.map(rgb).unwrap_or(default_fg))
-                .bg(cell.bg_color()?.map(rgb).unwrap_or(default_bg));
+            let style = cell.style()?;
+            let foreground = cell.fg_color()?.map(rgb).unwrap_or(default_fg);
+            let mut cell_style = to_ratatui_style(&style)
+                .fg(foreground)
+                .bg(cell.bg_color()?.map(rgb).unwrap_or(default_bg))
+                .underline_color(match style.underline_color {
+                    StyleColor::None => Color::Reset,
+                    StyleColor::Rgb(color) => rgb(color),
+                    StyleColor::Palette(index) => rgb(colors.palette[usize::from(index.0)]),
+                });
             if cell.is_selected()? {
                 cell_style = if cell_style.add_modifier.contains(Modifier::REVERSED) {
                     cell_style.remove_modifier(Modifier::REVERSED)

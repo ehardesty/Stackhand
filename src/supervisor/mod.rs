@@ -80,6 +80,13 @@ enum Inbox {
 /// [`OutputViews`] registry is the data-plane view of each Process's
 /// retained output; neither carries lifecycle authority.
 pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, Arc<OutputViews>)> {
+    start_with_colors(project, Arc::default())
+}
+
+pub(crate) fn start_with_colors(
+    project: EffectiveProject,
+    colors: Arc<crate::terminal::colors::HostColorProfile>,
+) -> Result<(SupervisorHandle, Consoles, Arc<OutputViews>)> {
     // Size each first PTY like the pane that will render it, so children
     // never observe a stale default size.
     let initial_geometry = crate::tui::project_console_geometry(project.process_list_row_count());
@@ -94,6 +101,7 @@ pub fn start(project: EffectiveProject) -> Result<(SupervisorHandle, Consoles, A
         settings,
     ));
     let seam = RealRunSeam::new(Arc::clone(&outputs))
+        .with_colors(colors)
         .with_port_discovery(project.port_discovery())
         .with_scrollback_bytes(terminal_bytes);
     let consoles = seam.consoles();

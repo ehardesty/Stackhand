@@ -1,3 +1,4 @@
+pub(crate) mod colors;
 mod command_gate;
 mod input;
 mod metrics;
@@ -18,13 +19,24 @@ pub(crate) use session::{
     TerminalEvent, TerminalSession,
 };
 
-/// Configure both limits explicitly; upstream also has a default line cap.
+#[cfg(test)]
 fn new_terminal<'cb>(
     cols: u16,
     rows: u16,
     bytes: usize,
 ) -> libghostty_vt::error::Result<libghostty_vt::terminal::Terminal<'static, 'cb>> {
+    new_terminal_with_colors(cols, rows, bytes, &colors::HostColorProfile::default())
+}
+
+/// Configure both limits explicitly; upstream also has a default line cap.
+fn new_terminal_with_colors<'cb>(
+    cols: u16,
+    rows: u16,
+    bytes: usize,
+    colors: &colors::HostColorProfile,
+) -> libghostty_vt::error::Result<libghostty_vt::terminal::Terminal<'static, 'cb>> {
     let mut terminal = libghostty_vt::terminal::Terminal::new(cols, rows)?;
+    colors.apply(&mut terminal)?;
     terminal.set_scrollback_max_bytes(Some(bytes))?;
     terminal.set_scrollback_max_lines(None)?;
     Ok(terminal)

@@ -41,6 +41,7 @@ pub(crate) struct RealRunSeam {
     outputs: Arc<OutputViews>,
     port_discovery: bool,
     scrollback_bytes: usize,
+    colors: Arc<crate::terminal::colors::HostColorProfile>,
     #[cfg(test)]
     test_hooks: AdapterTestHooks,
 }
@@ -51,10 +52,19 @@ impl RealRunSeam {
             runs: Arc::new(Mutex::new(HashMap::new())),
             outputs,
             port_discovery: false,
+            colors: Arc::default(),
             scrollback_bytes: crate::terminal::SCROLLBACK_TARGET_BYTES,
             #[cfg(test)]
             test_hooks: AdapterTestHooks::default(),
         }
+    }
+
+    pub(crate) fn with_colors(
+        mut self,
+        colors: Arc<crate::terminal::colors::HostColorProfile>,
+    ) -> Self {
+        self.colors = colors;
+        self
     }
 
     pub(crate) fn with_scrollback_bytes(mut self, bytes: usize) -> Self {
@@ -145,6 +155,7 @@ impl RunSeam for RealRunSeam {
         let outputs = Arc::clone(&self.outputs);
         let port_discovery = self.port_discovery;
         let scrollback_bytes = self.scrollback_bytes;
+        let colors = Arc::clone(&self.colors);
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel::<RunEvent>();
             // Mark the Run before starting its readers. This gives every
@@ -178,7 +189,7 @@ impl RunSeam for RealRunSeam {
                 metrics_interval: Some(METRICS_INTERVAL),
                 output_observer,
             };
-            match RunRuntime.start(request) {
+            match RunRuntime.start_with_colors(request, colors) {
                 Ok(mut run) => {
                     if port_discovery {
                         run.enable_port_discovery();

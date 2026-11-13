@@ -186,3 +186,79 @@ fn quit_shows_progress_before_cleanup_and_reports_stalled_finalization() {
     assert!(report.contains("terminal protocol restoration was incomplete"));
     assert!(!report.contains('\r'));
 }
+
+#[test]
+fn host_palette_reaches_child_queries_and_late_replies_never_reach_child_input() {
+    let mut project = Project::new();
+    let script = project.root.join("process.pl");
+    let source = fs::read_to_string(&script).unwrap().replace(
+        "print \"session-ready\\n\";",
+        "print \"\\e]10;?\\a\\e]11;?\\a\\e]4;1;?;255;?\\a\\e[31mCOLOR\\e[0m session-ready\\n\";",
+    );
+    fs::write(script, source).unwrap();
+    let mut terminal = Terminal::start(&project, &[], None);
+    wait_until(
+        || terminal.text().contains("\x1b]4;255;?"),
+        "batched host palette query",
+    );
+    let mut replies = b"\x1b]10;rgb:1212/3434/5656\x07\x1b]11;#214365\x1b\\".to_vec();
+    for index in 0..256 {
+        replies.extend_from_slice(format!("\x1b]4;{index};rgb:{index:02x}/1b/49\x07").as_bytes());
+    }
+    terminal.send(&replies[..1]);
+    thread::sleep(Duration::from_millis(2));
+    terminal.send(&replies[1..]);
+    terminal.send(b"\x1b[?3u\x1b[?1;2c\t");
+    project.capture_trees();
+    wait_until(
+        || terminal.text().contains("session-ready"),
+        "inherited pane to render",
+    );
+    wait_until(
+        || {
+            fs::read_to_string(project.root.join("input"))
+                .is_ok_and(|text| text.contains("4;255;rgb:ffff/1b1b/4949"))
+        },
+        "child color query answers",
+    );
+    let answers = fs::read_to_string(project.root.join("input")).unwrap();
+    assert!(answers.contains("10;rgb:1212/3434/5656"), "{answers:?}");
+    assert!(answers.contains("11;rgb:2121/4343/6565"), "{answers:?}");
+    assert!(answers.contains("4;1;rgb:0101/1b1b/4949"), "{answers:?}");
+    assert!(
+        terminal.text().contains("38;2;1;27;73"),
+        "{}",
+        terminal.text()
+    );
+    fs::write(project.root.join("input"), []).unwrap();
+    terminal.send(b"\x1b]10;invalid\x07\x1b]11;#ffffff\x1b\\\x1b]4;1;#ffffff\x07x\x1b[200~literal\x1b]4;1;?\x07\x1b[201~\x03");
+    let expected = b"xliteral ]4;1;?\x07\x03";
+    wait_until(
+        || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == expected),
+        "only real keys and literal paste at the child",
+    );
+    terminal.send(b"\x11");
+    assert!(terminal.wait().success(), "{}", terminal.text());
+    project.assert_trees_gone();
+}
+
+#[test]
+fn term_during_color_negotiation_restores_terminal_without_starting_processes() {
+    let project = Project::new();
+    let mut terminal = Terminal::start(&project, &[], None);
+    wait_until(
+        || terminal.text().contains("\x1b]10;?"),
+        "startup color query",
+    );
+    let started = Instant::now();
+    unsafe {
+        assert_eq!(
+            libc::kill(terminal.child.process_id().unwrap() as i32, libc::SIGTERM),
+            0
+        );
+    }
+    assert!(terminal.wait().success(), "{}", terminal.text());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(terminal.text().contains("Project shutdown complete"));
+    project.assert_no_start();
+}

@@ -1,7 +1,9 @@
 pub(crate) mod clipboard;
+pub(crate) mod colors;
 mod decoder;
 mod framing;
 mod input;
+mod osc_reply;
 pub(crate) mod output;
 mod report;
 mod signals;

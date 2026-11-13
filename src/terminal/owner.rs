@@ -105,6 +105,7 @@ impl OwnerHandle {
         wake: impl Fn() + Send + 'static,
         observer: Option<Arc<dyn RunOutputObserver>>,
         scrollback_bytes: usize,
+        colors: Arc<super::colors::HostColorProfile>,
     ) -> Result<Self> {
         let shared = Arc::new(SharedOwner {
             render: Mutex::new(OwnedRender {
@@ -137,6 +138,7 @@ impl OwnerHandle {
                     &wake,
                     observer,
                     scrollback_bytes,
+                    colors,
                 );
                 if let Err(error) = result {
                     worker_shared.record(OwnerEvent::Failed(error.to_string()));
@@ -303,13 +305,15 @@ fn run_owner(
     wake: &dyn Fn(),
     observer: Option<Arc<dyn RunOutputObserver>>,
     scrollback_bytes: usize,
+    colors: Arc<super::colors::HostColorProfile>,
 ) -> Result<()> {
     let (output_tx, output_rx) = crossbeam_channel::bounded(OUTPUT_QUEUE_SLOTS);
     let reader = spawn_reader(reader, output_tx)?;
-    let mut terminal = Box::new(crate::terminal::new_terminal(
+    let mut terminal = Box::new(crate::terminal::new_terminal_with_colors(
         geometry.cols(),
         geometry.rows(),
         scrollback_bytes,
+        &colors,
     )?);
     let effects = Rc::new(RefCell::new(Effects::new()));
     terminal.on_pty_write({
