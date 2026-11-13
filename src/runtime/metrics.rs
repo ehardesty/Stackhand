@@ -134,9 +134,12 @@ impl MetricsSampler {
                     }
                     let observation = collect_tree(root_pid);
 
-                    let (mut cpu_percent, rss_kib, member_count) = observation.aggregate();
                     #[cfg(target_os = "linux")]
-                    {
+                    let (_, rss_kib, member_count) = observation.aggregate();
+                    #[cfg(not(target_os = "linux"))]
+                    let (cpu_percent, rss_kib, member_count) = observation.aggregate();
+                    #[cfg(target_os = "linux")]
+                    let cpu_percent = {
                         // Convert summed tick deltas into a percentage where
                         // one fully used logical CPU is 100.
                         let mut delta = 0.0f64;
@@ -148,10 +151,8 @@ impl MetricsSampler {
                         }
                         let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
                         let seconds = window.as_secs_f64().max(0.001);
-                        cpu_percent = delta / (clock_ticks * seconds) * 100.0;
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    let _ = &mut cpu_percent; // macOS ps pcpu sums directly.
+                        delta / (clock_ticks * seconds) * 100.0
+                    };
 
                     let snapshot = RunMetrics {
                         process_id,
