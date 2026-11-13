@@ -13,7 +13,7 @@ fn late_cleanup_observation_recognizes_a_completed_shutdown() {
     .unwrap();
     let project = crate::config::load(&path).unwrap();
     std::fs::remove_file(path).unwrap();
-    let (mut session, _, _) = ProjectSession::start(project).unwrap();
+    let (mut session, _, _) = ProjectSession::start(project, Arc::default()).unwrap();
     let expired = Instant::now() - SHUTDOWN_OBSERVATION_GRACE - Duration::from_secs(1);
     session
         .supervisor()

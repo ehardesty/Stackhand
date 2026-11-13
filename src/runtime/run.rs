@@ -146,6 +146,14 @@ pub struct RunRuntime;
 
 impl RunRuntime {
     pub fn start(&self, request: RunStartRequest) -> Result<OwnedRun> {
+        self.start_with_colors(request, Arc::default())
+    }
+
+    pub(crate) fn start_with_colors(
+        &self,
+        request: RunStartRequest,
+        colors: Arc<crate::terminal::colors::HostColorProfile>,
+    ) -> Result<OwnedRun> {
         let RunStartRequest {
             process_id,
             run_id,
@@ -170,6 +178,7 @@ impl RunRuntime {
                     wake,
                     output_observer,
                     scrollback_bytes,
+                    colors,
                 )?;
                 let tree = spawned.process.process_id().map(UnixProcessTree::from_root);
                 (

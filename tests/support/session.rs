@@ -197,6 +197,7 @@ impl Terminal {
             CommandBuilder::new(env!("CARGO_BIN_EXE_stackhand"))
         };
         command.env("TERM", "xterm-256color");
+        command.env("NO_COLOR", "");
         command.arg(&project.config);
         command.args(arguments);
         let child = pair.slave.spawn_command(command).unwrap();

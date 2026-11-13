@@ -112,6 +112,8 @@ pub(crate) struct OuterTerminal {
     raw: RawMode,
     modes: OuterModes,
     finished: bool,
+    colors: crate::host::colors::HostColorQuery,
+    stop: SessionStop,
 }
 
 impl OuterTerminal {
@@ -132,18 +134,38 @@ impl OuterTerminal {
                 viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
             },
         )?;
-        let reader = HostReader::new(input, stop.clone())?;
+        let colors = crate::host::colors::HostColorQuery::new(
+            Instant::now() + crate::host::colors::QUERY_BUDGET,
+        );
+        let reader = HostReader::new(input, stop.clone(), colors.clone())?;
         Ok((
             Self {
                 terminal,
                 staging,
-                output: HostOutput::new(output, stop),
+                output: HostOutput::new(output, stop.clone()),
                 raw,
                 modes: OuterModes::default(),
                 finished: false,
+                colors,
+                stop,
             },
             reader,
         ))
+    }
+
+    pub(crate) fn query_colors(&mut self) -> Result<()> {
+        self.output
+            .send_until(
+                crate::host::colors::HostColorQuery::request(),
+                self.colors.deadline(),
+            )
+            .context("could not query host colors")
+    }
+
+    pub(crate) fn color_profile(
+        &self,
+    ) -> std::sync::Arc<crate::terminal::colors::HostColorProfile> {
+        self.colors.finish(&self.stop)
     }
 
     pub(crate) fn query_keyboard(&mut self) -> Result<()> {

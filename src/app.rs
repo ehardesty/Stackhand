@@ -113,8 +113,10 @@ pub fn run_project_cli_session(
     let outcome = (|| -> Result<(Result<()>, Result<()>)> {
         input = Some(InputScheduler::start(source, stop.clone())?);
         let input = input.as_ref().expect("input scheduler started");
+        outer.query_colors()?;
         outer.query_keyboard()?;
         let keyboard = input.keyboard_support();
+        let colors = outer.color_profile();
         outer.enable_modes(keyboard)?;
         if let Some(error) = stop.error() {
             bail!(error);
@@ -122,7 +124,8 @@ pub fn run_project_cli_session(
         if stop.requested() {
             return Ok((Ok(()), Ok(())));
         }
-        let (mut project, consoles, outputs) = ProjectSession::start(resolution.into_project())?;
+        let (mut project, consoles, outputs) =
+            ProjectSession::start(resolution.into_project(), colors)?;
         if autostart && !stop.requested() {
             project.supervisor().command(Command::StartAutostart);
         }

@@ -2,11 +2,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 
+use super::colors::ColorReply;
 use super::decoder::{InternalEvent, parse_event};
+use super::osc_reply::OscReply;
 use super::{HostFault, SessionStop};
 use crate::terminal::PASTE_LIMIT_BYTES;
 
 pub(super) const PASTE_FRAME_LIMIT: Duration = Duration::from_secs(30);
+const ESCAPE_WAIT: Duration = Duration::from_millis(25);
 const SEQUENCE_LIMIT: usize = 1024;
 const END: &[u8] = b"\x1b[201~";
 
@@ -14,10 +17,12 @@ pub(super) struct Parser {
     sequence: Vec<u8>,
     state: State,
     stop: SessionStop,
+    escape_since: Option<Instant>,
 }
 
 enum State {
     Normal,
+    Osc(OscReply),
     Collecting {
         bytes: Vec<u8>,
         matched: usize,
@@ -34,6 +39,7 @@ enum State {
 pub(super) enum Decoded {
     Event(Event),
     PasteRejected,
+    Color(ColorReply),
     KeyboardSupported,
     DeviceAttributes,
 }
@@ -44,6 +50,7 @@ impl Parser {
             sequence: Vec::new(),
             state: State::Normal,
             stop,
+            escape_since: None,
         }
     }
 
@@ -51,6 +58,9 @@ impl Parser {
         if matches!(self.state, State::Collecting { deadline, .. } | State::Discarding { deadline, .. } if now >= deadline)
         {
             self.end(HostFault::UnterminatedPaste);
+        }
+        if matches!(&self.state, State::Osc(frame) if frame.expired(now)) {
+            self.end(HostFault::UnterminatedColorReply);
         }
     }
 
@@ -63,15 +73,41 @@ impl Parser {
     pub(super) fn advance(&mut self, bytes: &[u8], more: bool, now: Instant) -> Vec<Decoded> {
         self.tick(now);
         let mut out = Vec::new();
+        if self
+            .escape_since
+            .is_some_and(|since| now >= since + ESCAPE_WAIT)
+        {
+            self.sequence.clear();
+            self.escape_since = None;
+            out.push(Decoded::Event(Event::Key(
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc),
+            )));
+        }
         for (index, &byte) in bytes.iter().enumerate() {
             match &mut self.state {
                 State::Ended => break,
+                State::Osc(frame) => {
+                    if let Some(replies) = frame.advance(byte) {
+                        out.extend(replies.into_iter().map(Decoded::Color));
+                        self.state = State::Normal;
+                    }
+                }
                 State::Normal => {
+                    self.escape_since = None;
                     if self.sequence.len() == SEQUENCE_LIMIT {
                         self.end(HostFault::SequenceTooLong);
                         break;
                     }
                     self.sequence.push(byte);
+                    if self.sequence == b"\x1b]" {
+                        self.sequence.clear();
+                        self.state = State::Osc(OscReply::new(now));
+                        continue;
+                    }
+                    if self.sequence == b"\x1b" {
+                        self.escape_since = Some(now);
+                        continue;
+                    }
                     match parse_event(&self.sequence, index + 1 < bytes.len() || more) {
                         Ok(Some(event)) => {
                             self.sequence.clear();

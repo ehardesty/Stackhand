@@ -160,7 +160,14 @@ impl TerminalSession {
         wake: impl Fn() + Send + 'static,
         observer: Option<Arc<dyn RunOutputObserver>>,
     ) -> Result<Self> {
-        Self::spawn_configured(io, geometry, wake, observer, SCROLLBACK_TARGET_BYTES)
+        Self::spawn_configured(
+            io,
+            geometry,
+            wake,
+            observer,
+            SCROLLBACK_TARGET_BYTES,
+            Arc::default(),
+        )
     }
 
     pub(crate) fn spawn_configured(
@@ -169,6 +176,7 @@ impl TerminalSession {
         wake: impl Fn() + Send + 'static,
         observer: Option<Arc<dyn RunOutputObserver>>,
         scrollback_bytes: usize,
+        colors: Arc<super::colors::HostColorProfile>,
     ) -> Result<Self> {
         let (writer, writer_owner) = spawn_bounded_pty_writer(io.writer, INPUT_QUEUE_LIMIT_BYTES)
             .context("could not start the bounded PTY writer")?;
@@ -182,6 +190,7 @@ impl TerminalSession {
             wake,
             observer,
             scrollback_bytes,
+            colors,
         )?;
         Ok(Self {
             owner,

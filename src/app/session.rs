@@ -27,8 +27,12 @@ pub(super) struct ProjectSession {
 }
 
 impl ProjectSession {
-    pub(super) fn start(project: EffectiveProject) -> Result<(Self, Consoles, Arc<OutputViews>)> {
-        let (supervisor, consoles, outputs) = crate::supervisor::start(project)?;
+    pub(super) fn start(
+        project: EffectiveProject,
+        colors: Arc<crate::terminal::colors::HostColorProfile>,
+    ) -> Result<(Self, Consoles, Arc<OutputViews>)> {
+        let (supervisor, consoles, outputs) =
+            crate::supervisor::start_with_colors(project, colors)?;
         Ok((
             Self {
                 supervisor: Some(supervisor),

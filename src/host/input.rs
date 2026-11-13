@@ -18,15 +18,21 @@ pub(crate) struct HostReader {
     parser: Parser,
     stop: SessionStop,
     last_size: (u16, u16),
+    colors: super::colors::HostColorQuery,
     pub(crate) keyboard_supported: bool,
     pub(crate) device_attributes: bool,
 }
 
 impl HostReader {
-    pub(crate) fn new(file: File, stop: SessionStop) -> io::Result<Self> {
+    pub(crate) fn new(
+        file: File,
+        stop: SessionStop,
+        colors: super::colors::HostColorQuery,
+    ) -> io::Result<Self> {
         let last_size = terminal_size(&file)?;
         Ok(Self {
             file,
+            colors,
             parser: Parser::new(stop.clone()),
             stop,
             last_size,
@@ -70,32 +76,35 @@ impl HostReader {
         self.check()?;
         let mut buffer = [0; 1024];
         let mut out = Vec::new();
-        match self.file.read(&mut buffer) {
+        let count = match self.file.read(&mut buffer) {
             Ok(0) => {
                 self.stop.fail(HostFault::InputClosed);
                 return Err(io::Error::other("host terminal input closed"));
             }
-            Ok(count) => {
-                for event in
-                    self.parser
-                        .advance(&buffer[..count], count == buffer.len(), Instant::now())
-                {
-                    match event {
-                        Decoded::Event(event) => out.push(HostAction::Input(event)),
-                        Decoded::PasteRejected => out.push(HostAction::PasteRejected),
-                        Decoded::KeyboardSupported => self.keyboard_supported = true,
-                        Decoded::DeviceAttributes => self.device_attributes = true,
-                    }
-                }
-            }
+            Ok(count) => count,
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
+                ) =>
+            {
+                0
+            }
             Err(error) => {
                 self.stop.fail(HostFault::InputFailed);
                 return Err(error);
+            }
+        };
+        for event in self
+            .parser
+            .advance(&buffer[..count], count == buffer.len(), Instant::now())
+        {
+            match event {
+                Decoded::Event(event) => out.push(HostAction::Input(event)),
+                Decoded::Color(reply) => self.colors.record(reply, Instant::now()),
+                Decoded::PasteRejected => out.push(HostAction::PasteRejected),
+                Decoded::KeyboardSupported => self.keyboard_supported = true,
+                Decoded::DeviceAttributes => self.device_attributes = true,
             }
         }
         self.check()?;
