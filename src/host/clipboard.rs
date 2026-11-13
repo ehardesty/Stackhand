@@ -90,6 +90,9 @@ impl ClipboardService {
         if text.len() > COPY_LIMIT_BYTES {
             return CopyOutcome::TooLarge;
         }
+        if output.stopping() {
+            return CopyOutcome::Failed;
+        }
         match self.backend {
             ClipboardBackend::Osc52 => {
                 let mut command = String::new();

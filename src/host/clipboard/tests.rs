@@ -114,6 +114,27 @@ fn finish_copy(
 }
 
 #[test]
+fn cancelled_copy_keeps_the_same_writer_available_for_shutdown_progress() {
+    let wire = Wire::default();
+    let stop = SessionStop::default();
+    let mut output = HostOutput::new(wire.clone(), stop.clone());
+    let mut service = ClipboardService::new(ClipboardBackend::Osc52);
+    stop.stop();
+
+    assert_eq!(
+        service.copy("selection".into(), &mut output),
+        CopyOutcome::Failed
+    );
+    output
+        .send_until(
+            b"shutdown progress".to_vec(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(*wire.0.lock().unwrap(), b"shutdown progress");
+}
+
+#[test]
 fn terminal_and_logs_user_copies_share_owned_output_and_failure_keeps_terminal_selection() {
     let (reader, mut peer) = UnixStream::pair().unwrap();
     let session = TerminalSession::spawn(
