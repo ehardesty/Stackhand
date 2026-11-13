@@ -138,6 +138,7 @@ impl OuterTerminal {
         )?;
         let colors = crate::host::colors::HostColorQuery::new(
             Instant::now() + crate::host::colors::QUERY_BUDGET,
+            crate::host::colors::ColorQueries::for_environment(),
         );
         let reader = HostReader::new(input, stop.clone(), colors.clone())?;
         Ok((
@@ -158,10 +159,7 @@ impl OuterTerminal {
 
     pub(crate) fn query_colors(&mut self) -> Result<()> {
         self.output
-            .send_until(
-                crate::host::colors::HostColorQuery::request(),
-                self.colors.deadline(),
-            )
+            .send_until(self.colors.request(), self.colors.deadline())
             .context("could not query host colors")
     }
 

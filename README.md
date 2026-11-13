@@ -313,7 +313,11 @@ It does not start a newly enabled Process automatically.
 
 Interactive sessions query the host terminal's default foreground, background,
 and all 256 indexed colors with read-only OSC 10, OSC 11, and OSC 4 requests.
-The palette requests share one 750 ms startup deadline. Keyboard negotiation
+Inside tmux older than 3.7, or with unrecognized tmux version metadata, only
+foreground/background are queried. Those versions can turn fragmented palette
+replies into keystrokes (tmux #4749). Indexed colors retain Ghostty defaults;
+upgrade tmux to 3.7 or newer for host palette inheritance.
+The color requests share one 750 ms startup deadline. Keyboard negotiation
 continues to use its existing timeout. Input typed during negotiation stays
 queued for the application.
 
