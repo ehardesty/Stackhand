@@ -1,3 +1,4 @@
+use libghostty_vt::color::Rgb;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::style::{self, StyleColor, Underline};
 use libghostty_vt::terminal::Terminal;
@@ -96,7 +97,7 @@ fn cursor_state(
     })
 }
 
-fn rgb(color: style::RgbColor) -> Color {
+fn rgb(color: Rgb) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
