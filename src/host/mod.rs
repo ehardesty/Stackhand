@@ -1,3 +1,4 @@
+pub(crate) mod clipboard;
 pub(crate) mod colors;
 mod decoder;
 mod framing;

@@ -49,6 +49,10 @@ impl<W: OutputSink> HostOutput<W> {
         self.submit(bytes, None)
     }
 
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.requested()
+    }
+
     pub(crate) fn send_until(&mut self, bytes: Vec<u8>, deadline: Instant) -> io::Result<()> {
         self.submit(bytes, Some(deadline))
     }

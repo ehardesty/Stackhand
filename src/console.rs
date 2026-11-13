@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -10,7 +10,7 @@ use crate::pipe_scroll::{scale, scrollbar_thumb};
 use crate::process_logs::{LogsNavigation, ProcessLogs};
 use crate::runtime::TerminalHandle;
 use crate::terminal::{
-    CopyRequest, OwnedTerminalScrollbar, PasteCompletion, PasteRejection, PasteRequest,
+    OwnedTerminalScrollbar, PasteCompletion, PasteRejection, PasteRequest,
     SelectionDirection as CopyDirection,
 };
 use crate::tui::{
@@ -79,7 +79,7 @@ pub(crate) struct ConsoleInteraction {
     view: ConsoleViewState,
     mouse: MouseRouter,
     paste_requests: Vec<PasteRequest>,
-    copy_requests: Vec<CopyRequest>,
+    copy_request: Option<copy::PendingCopy>,
     selection_requests: Vec<SelectionMove>,
     lifecycle_requests: Vec<LifecycleCommand>,
     selection_clock: Instant,
@@ -94,7 +94,7 @@ impl Default for ConsoleInteraction {
             view: ConsoleViewState::default(),
             mouse: MouseRouter::default(),
             paste_requests: Vec::new(),
-            copy_requests: Vec::new(),
+            copy_request: None,
             selection_requests: Vec::new(),
             lifecycle_requests: Vec::new(),
             selection_clock: Instant::now(),
@@ -227,23 +227,6 @@ impl ConsoleInteraction {
         std::mem::take(&mut self.lifecycle_requests)
     }
 
-    pub fn poll_requests(&mut self) -> bool {
-        let mut changed = self.poll_paste_requests();
-        let mut copy_results = Vec::new();
-        self.copy_requests.retain(|request| {
-            let Some(result) = request.poll() else {
-                return true;
-            };
-            copy_results.push(result);
-            false
-        });
-        for result in copy_results {
-            self.view.warning = copy_warning(result, write_clipboard);
-            changed = true;
-        }
-        changed
-    }
-
     pub fn route_pane_key(
         &mut self,
         pane: ConsolePaneKind,
@@ -357,18 +340,6 @@ impl ConsoleInteraction {
                 true
             }
         }
-    }
-
-    /// Copy the visible Logs projection. Logs coordinates never cross the
-    /// terminal seam, and a clipboard failure leaves the visible text intact.
-    pub fn copy_logs(&mut self, text: String) {
-        self.view.warning = if text.is_empty() {
-            Some(ConsoleWarning::NoLogsToCopy)
-        } else {
-            write_clipboard(text)
-                .err()
-                .map(|_| ConsoleWarning::ClipboardFailed)
-        };
     }
 
     pub fn handle_paste(&mut self, data: &str, session: &TerminalHandle<'_>) {
@@ -686,8 +657,7 @@ impl ConsoleInteraction {
                 true
             }
             KeyCode::Char('c') | KeyCode::Char('y') => {
-                self.copy_requests.push(session.request_copy());
-                self.view.warning = None;
+                self.request_terminal_copy(session);
                 true
             }
             KeyCode::PageUp => {
@@ -744,25 +714,7 @@ fn scroll_page(session: &TerminalHandle<'_>, page_rows: u16, direction: isize) {
     session.scroll_lines(direction * page);
 }
 
-fn copy_warning(
-    result: Result<Option<String>, String>,
-    write: impl FnOnce(String) -> Result<()>,
-) -> Option<ConsoleWarning> {
-    match result {
-        Ok(Some(text)) if !text.is_empty() => {
-            write(text).err().map(|_| ConsoleWarning::ClipboardFailed)
-        }
-        Ok(_) => Some(ConsoleWarning::NothingSelected),
-        Err(_) => Some(ConsoleWarning::ClipboardFailed),
-    }
-}
-
-fn write_clipboard(text: String) -> Result<()> {
-    let mut clipboard = arboard::Clipboard::new().context("system clipboard is unavailable")?;
-    clipboard
-        .set_text(text)
-        .context("could not write selected text to the system clipboard")
-}
+mod copy;
 
 #[cfg(test)]
 mod tests;

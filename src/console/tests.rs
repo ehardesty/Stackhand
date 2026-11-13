@@ -602,21 +602,16 @@ fn live_pty_mouse_selection_reaches_copy_request() {
     assert_eq!(interaction.view().mode, ConsoleViewMode::Copy);
 
     assert!(interaction.handle_key(key(KeyCode::Char('c')), &handle, 20));
-    let request = interaction
-        .copy_requests
-        .pop()
-        .expect("Copy mode must enqueue a PTY copy request");
     let copy_deadline = Instant::now() + Duration::from_secs(1);
-    let copied = loop {
-        if let Some(result) = request.poll() {
-            break result.unwrap();
-        }
-        assert!(
-            Instant::now() < copy_deadline,
-            "PTY copy request did not complete"
-        );
+    let mut copied = None;
+    while copied.is_none() {
+        interaction.poll_requests(|text| {
+            copied = Some(text);
+            crate::host::clipboard::CopyOutcome::Submitted
+        });
+        assert!(Instant::now() < copy_deadline, "PTY copy did not complete");
         std::thread::sleep(Duration::from_millis(1));
-    };
+    }
     assert_eq!(copied.as_deref(), Some("alpha"));
 
     drop(peer);
@@ -711,8 +706,8 @@ fn a_wheel_burst_does_not_block_the_next_mouse_selection() {
 
 #[test]
 fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
-    let warning = copy_warning(Ok(Some("selected".to_string())), |_| {
-        Err(anyhow::anyhow!("clipboard unavailable"))
+    let warning = copy::copy_warning(Ok(Some("selected".to_string())), |_| {
+        crate::host::clipboard::CopyOutcome::Failed
     });
 
     assert_eq!(warning, Some(ConsoleWarning::ClipboardFailed));
@@ -720,7 +715,7 @@ fn clipboard_failure_is_a_visible_warning_not_a_terminal_failure() {
 
 #[test]
 fn empty_selection_does_not_call_the_clipboard() {
-    let warning = copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
+    let warning = copy::copy_warning(Ok(None), |_| panic!("clipboard must not be called"));
 
     assert_eq!(warning, Some(ConsoleWarning::NothingSelected));
 }

@@ -399,6 +399,27 @@ recorded in [`packaging/build-metadata.toml`](./packaging/build-metadata.toml).
 - [Implementation plan](./docs/implementation-plan.md): prototype milestones,
   risks, and validation work.
 
+## Clipboard over SSH
+
+User copies from Terminal and Logs share one host-session clipboard service.
+`STACKHAND_CLIPBOARD=auto|native|osc52|off` selects its backend. The default
+`auto` uses OSC52 when SSH environment variables are present, even with a remote
+display. It also uses OSC52 on headless Linux. Local macOS uses the native
+clipboard. Use an explicit backend when inherited SSH variables or outer tmux
+make automatic detection ambiguous.
+
+OSC52 submits the copy to your local terminal. Stackhand cannot confirm delivery
+because OSC52 has no success acknowledgement. Your terminal must permit clipboard
+writes. In Ghostty, this is controlled by
+[`clipboard-write`](https://ghostty.org/docs/config/reference#clipboard-write).
+Outer tmux needs `set-clipboard on` and an `Ms` capability, as described in the
+[tmux clipboard guide](https://github.com/tmux/tmux/wiki/Clipboard). Stackhand does
+not change tmux settings or wrap commands in DCS passthrough. Copies above 64 KiB
+of UTF-8 are rejected whole with a warning. Terminal limits vary and may be lower.
+Native mode retains clipboard ownership for the session. Child clipboard reads
+and writes remain denied, including from an inner tmux. Host paste uses bracketed
+paste and does not read the clipboard.
+
 ## License
 
 Stackhand is available under the [MIT License](./LICENSE).
