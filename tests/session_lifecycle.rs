@@ -132,14 +132,15 @@ fn oversized_host_paste_never_delivers_its_command_like_suffix() {
     terminal.send(b"\x1b[200~");
     terminal.send(&vec![b'p'; 64 * 1024 + 1]);
     terminal.send(b"\nexecute-me\r\x03\x1b[201x\x1b[20");
-    terminal.send(b"1~x");
-    wait_until(
-        || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == b"x"),
-        "only the post-paste key to reach the child",
-    );
+    terminal.send(b"1~");
     wait_until(
         || terminal.text().contains("paste exceeds the 64 KiB limit"),
         "oversized host paste warning to describe its size limit",
+    );
+    terminal.send(b"x");
+    wait_until(
+        || fs::read(project.root.join("input")).is_ok_and(|bytes| bytes == b"x"),
+        "only the post-paste key to reach the child",
     );
     terminal.send(b"\x11");
     assert!(terminal.wait().success());
