@@ -1,3 +1,5 @@
+mod warnings;
+
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -561,7 +563,7 @@ fn footer_content(
         content.hints.push(Hint::text(owner, Essential));
     }
     if let Some(warning) = view.warning {
-        append_warning(&mut content.hints, warning);
+        warnings::append_warning(&mut content.hints, warning);
         return content;
     }
     if view.logs_selection {
@@ -637,69 +639,6 @@ fn mode_badge(view: ConsoleViewState, prompt: Option<PromptKind>) -> (&'static s
         ConsoleViewMode::Console => ("TERMINAL", ModeTone::Focus),
         ConsoleViewMode::Copy => ("COPY", ModeTone::Modal),
     }
-}
-
-fn append_warning(hints: &mut Vec<Hint>, warning: ConsoleWarning) {
-    let (message, follow_ups): (&str, &[(&str, VisibleAction)]) = match warning {
-        ConsoleWarning::PasteRejected => (
-            "WARNING: paste rejected; focus an input-enabled console first",
-            &[],
-        ),
-        ConsoleWarning::PasteTooLarge => {
-            ("WARNING: paste exceeds the 64 KiB limit; nothing sent", &[])
-        }
-        ConsoleWarning::PasteRefused => (
-            "WARNING: paste not sent: the focused process could treat it as commands (line break without bracketed paste, or a paste terminator)",
-            &[],
-        ),
-        ConsoleWarning::InputRejected => (
-            "WARNING: terminal input was rejected; Run is stopping or its queue is full",
-            &[],
-        ),
-        ConsoleWarning::InputBackpressure => (
-            "WARNING: child input queue is saturated; delivery is bounded",
-            &[],
-        ),
-        ConsoleWarning::OutputTruncated => (
-            "Earlier Logs expired at the history limit; recent output continues",
-            &[],
-        ),
-        ConsoleWarning::PasteDeliveryFailed => (
-            "WARNING: an admitted paste may not have fully reached the child",
-            &[],
-        ),
-        ConsoleWarning::ClipboardFailed => (
-            "WARNING: clipboard write failed; selection remains available",
-            &[],
-        ),
-        ConsoleWarning::NothingSelected => (
-            "WARNING: no terminal text is selected",
-            &[("v: start selection", VisibleAction::ToggleSelection)],
-        ),
-        ConsoleWarning::NoLogsToCopy => ("WARNING: no Logs text is available to copy", &[]),
-        ConsoleWarning::InputDisabled => (
-            "WARNING: input is not enabled for this Process",
-            &[("Ctrl-A: Processes", VisibleAction::FocusProcesses)],
-        ),
-        ConsoleWarning::LogsCommandOnly => (
-            "WARNING: Logs is read-only",
-            &[
-                ("Ctrl-F /: search", VisibleAction::SearchEdit),
-                ("Esc: Processes", VisibleAction::FocusProcesses),
-            ],
-        ),
-        ConsoleWarning::SelectionUnavailable => (
-            "WARNING: terminal selection is available only in Terminal view",
-            &[],
-        ),
-        ConsoleWarning::LinkOpenFailed => ("WARNING: could not open the port in a browser", &[]),
-    };
-    hints.push(Hint::text(message, Essential));
-    hints.extend(
-        follow_ups
-            .iter()
-            .map(|(label, action)| Hint::action(*label, *action, Essential)),
-    );
 }
 
 fn append_process_list_controls(hints: &mut Vec<Hint>, view: ConsoleViewState) {

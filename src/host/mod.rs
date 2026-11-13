@@ -1,3 +1,4 @@
+pub(crate) mod clipboard;
 mod decoder;
 mod framing;
 mod input;

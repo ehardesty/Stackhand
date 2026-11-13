@@ -109,6 +109,7 @@ pub(crate) struct OuterTerminal {
     terminal: ApplicationTerminal,
     staging: CommandStager,
     output: HostOutput,
+    clipboard: crate::host::clipboard::ClipboardService,
     raw: RawMode,
     modes: OuterModes,
     finished: bool,
@@ -116,6 +117,7 @@ pub(crate) struct OuterTerminal {
 
 impl OuterTerminal {
     pub(crate) fn acquire(stop: SessionStop) -> Result<(Self, HostReader)> {
+        let clipboard = crate::host::clipboard::ClipboardService::from_environment()?;
         let input =
             open_terminal(libc::STDIN_FILENO, true).context("could not acquire host input")?;
         let output =
@@ -138,6 +140,7 @@ impl OuterTerminal {
                 terminal,
                 staging,
                 output: HostOutput::new(output, stop),
+                clipboard,
                 raw,
                 modes: OuterModes::default(),
                 finished: false,
@@ -150,6 +153,10 @@ impl OuterTerminal {
         self.output
             .send(b"\x1b[?u\x1b[c".to_vec())
             .context("could not query host keyboard support")
+    }
+
+    pub(crate) fn copy(&mut self, text: String) -> crate::host::clipboard::CopyOutcome {
+        self.clipboard.copy(text, &mut self.output)
     }
 
     pub(crate) fn enable_modes(&mut self, keyboard: bool) -> Result<()> {
