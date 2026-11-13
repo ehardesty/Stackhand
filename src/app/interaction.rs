@@ -105,8 +105,11 @@ impl ProjectInteraction {
         )
     }
 
-    pub(super) fn poll_requests(&mut self) -> bool {
-        self.console.poll_requests()
+    pub(super) fn poll_requests(
+        &mut self,
+        copy: impl FnMut(String) -> crate::host::clipboard::CopyOutcome,
+    ) -> bool {
+        self.console.poll_requests(copy)
     }
 
     pub(super) fn warn(&mut self, warning: ConsoleWarning) {

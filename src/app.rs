@@ -193,7 +193,7 @@ fn run_event_loop(
         if observe_shutdown_signal(project, input, signals, &mut dirty) {
             return Ok(());
         }
-        if interaction.poll_requests() {
+        if !project.is_shutting_down() && interaction.poll_requests(|text| outer.copy(text)) {
             dirty = true;
         }
         let snapshot: ProjectSnapshot = project

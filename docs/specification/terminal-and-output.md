@@ -288,8 +288,12 @@ which can retain about 16 MiB of accepted paste plus event overhead.
 ### 20.9 Clipboard policy
 
 - User-initiated copy to the system clipboard is allowed.
-- OSC clipboard read is denied by default.
-- OSC clipboard write is denied or requires explicit opt-in/prompt.
+- Child OSC clipboard reads and writes are denied.
+- User copies from Terminal and Logs use one session-owned clipboard service.
+- `STACKHAND_CLIPBOARD=auto|native|osc52|off` selects the host backend.
+- Remote auto mode submits OSC52 through the sole host writer, without native fallback.
+- Copies above 64 KiB of UTF-8 are rejected before mutation. Selection survives errors.
+- OSC52 submission does not confirm delivery to the physical clipboard.
 - Clipboard contents are not logged.
 - Terminal clipboard effects are dispatched outside Ghostty callbacks.
 
