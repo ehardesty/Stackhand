@@ -154,7 +154,7 @@ impl MouseController {
                 padding_bottom: 0,
                 padding_right: 0,
                 padding_left: 0,
-            })
+            })?
             .set_any_button_pressed(self.pressed.is_some())
             .set_track_last_cell(true);
 

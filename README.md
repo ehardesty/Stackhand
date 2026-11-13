@@ -39,7 +39,7 @@ The current prototype is developed and validated on macOS arm64. Linux builds
 may work, but Linux interactive behavior is not yet validated. Windows is not
 supported.
 
-Homebrew is not required for local builds. The repository pins Rust in
+Homebrew is not required for local builds. The repository pins Rust `1.96.0` in
 [`rust-toolchain.toml`](./rust-toolchain.toml). The build helper uses Zig
 `0.17.0` from its cache, `STACKHAND_ZIG`, or `PATH`. If none is available, it
 downloads the release, checks its SHA-256 checksum, and caches it in your user
@@ -392,6 +392,10 @@ versions.
 The Rust dependency graph is pinned by [`Cargo.lock`](./Cargo.lock). The native
 build inputs, including the Ghostty revision and Zig release checksums, are
 recorded in [`packaging/build-metadata.toml`](./packaging/build-metadata.toml).
+Stackhand uses the third-party `libghostty-rs` bridge at revision
+`cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf`, which builds Ghostty `vt-1.0.1`.
+Both wrapper crates report version `0.2.1`; the exact Git revision selects the
+native engine.
 
 ## Documentation
 

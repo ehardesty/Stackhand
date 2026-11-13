@@ -255,6 +255,27 @@ fn copy_is_independent_of_resize_reflow() {
 }
 
 #[test]
+fn copying_blank_cells_returns_empty_text_without_copying_unselected_content() {
+    let mut terminal = terminal(20, 3);
+    terminal.vt_write(b"unselected\r\n   ");
+    let start = terminal
+        .grid_ref(Point::Active(Coordinate { x: 0, y: 1 }))
+        .unwrap();
+    let end = terminal
+        .grid_ref(Point::Active(Coordinate { x: 2, y: 1 }))
+        .unwrap();
+    terminal
+        .set_selection(Some(&Selection::new(start, end, false)))
+        .unwrap();
+    let mut selection = SelectionController::new().unwrap();
+
+    assert_eq!(selection.text(&terminal).unwrap().as_deref(), Some(""));
+
+    selection.clear(&terminal).unwrap();
+    assert_eq!(selection.text(&terminal).unwrap(), None);
+}
+
+#[test]
 fn double_and_triple_click_copy_words_and_lines() {
     let mut terminal = terminal(20, 3);
     terminal.vt_write(b"alpha beta\r\nnext line");
@@ -374,7 +395,7 @@ fn drag_outside_viewport_requests_autoscroll_into_history() {
 
 #[test]
 fn each_autoscroll_tick_moves_the_viewport_by_one_row() {
-    use libghostty_vt::terminal::PointSpace;
+    use libghostty_vt::point::Space;
 
     let mut terminal = terminal(12, 3);
     for index in 0..12 {
@@ -401,13 +422,13 @@ fn each_autoscroll_tick_moves_the_viewport_by_one_row() {
         )
         .unwrap();
     let tracked = terminal
-        .track_grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))
+        .track_grid_ref(Point::Viewport(Coordinate { x: 0, y: 0 }))
         .unwrap();
-    let before = tracked.point(PointSpace::Viewport).unwrap().unwrap().y;
+    let before = tracked.point(Space::Viewport).unwrap().unwrap().y;
 
     assert!(selection.tick_autoscroll(&mut terminal).unwrap());
 
-    let after = tracked.point(PointSpace::Viewport).unwrap().unwrap().y;
+    let after = tracked.point(Space::Viewport).unwrap().unwrap().y;
     assert_eq!(after, before + 1);
 }
 

@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::TryRecvError;
-use libghostty_vt::terminal::{ClipboardWrite, ClipboardWriteError, CompressionResult, Terminal};
+use libghostty_vt::effect::{ClipboardWrite, ClipboardWriteError};
+use libghostty_vt::terminal::{CompressionResult, Terminal};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 

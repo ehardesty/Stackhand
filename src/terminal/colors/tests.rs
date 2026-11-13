@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use libghostty_vt::color::{Palette, PaletteIndex, Rgb};
 use libghostty_vt::render::RenderState;
-use libghostty_vt::style::{Palette, PaletteIndex, RgbColor};
 use libghostty_vt::terminal::Terminal;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -13,12 +13,12 @@ use crate::terminal::{new_terminal_with_colors, render};
 
 fn profile() -> HostColorProfile {
     let mut profile = HostColorProfile {
-        foreground: Some(RgbColor {
+        foreground: Some(Rgb {
             r: 18,
             g: 52,
             b: 86,
         }),
-        background: Some(RgbColor {
+        background: Some(Rgb {
             r: 33,
             g: 67,
             b: 101,
@@ -26,7 +26,7 @@ fn profile() -> HostColorProfile {
         ..Default::default()
     };
     for (index, color) in profile.indexed.iter_mut().enumerate() {
-        *color = Some(RgbColor {
+        *color = Some(Rgb {
             r: index as u8,
             g: 27,
             b: 73,

@@ -3,10 +3,11 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender as CompletionSender;
 
 use anyhow::{Result, anyhow};
+use libghostty_vt::effect::ClipboardMime;
+use libghostty_vt::mode::Mode;
 use libghostty_vt::render::RenderState;
 use libghostty_vt::terminal::{
-    ClipboardMime, CompressionActivity, CompressionMode, CompressionResult, Mode, ScrollViewport,
-    Terminal,
+    CompressionActivity, CompressionMode, CompressionResult, ScrollViewport, Terminal,
 };
 use libghostty_vt::{focus, key, paste};
 use ratatui::buffer::Buffer;
@@ -184,7 +185,7 @@ impl TerminalState {
             Effects::capture(&self.effects, data.len() + PASTE_FRAMING_BYTES, || {
                 self.terminal.paste(
                     paste::Options::new(),
-                    &[ClipboardMime::new("text/plain")],
+                    &[ClipboardMime::new(b"text/plain")],
                     |_, writer| writer.write_all(data),
                 )
             });

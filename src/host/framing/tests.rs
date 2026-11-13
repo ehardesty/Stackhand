@@ -183,14 +183,14 @@ fn fragmented_color_replies_are_private_and_paste_keeps_literal_osc() {
             .flat_map(|part| parser.advance(part, false, now))
             .collect::<Vec<_>>();
         use super::super::colors::ColorReply::*;
-        use libghostty_vt::style::RgbColor;
+        use libghostty_vt::color::Rgb;
         assert_eq!(
             out,
             vec![
                 key(KeyCode::Char('x'), KeyModifiers::NONE),
                 Decoded::Color(Indexed(
                     1,
-                    RgbColor {
+                    Rgb {
                         r: 0x12,
                         g: 0x34,
                         b: 0x56
@@ -198,18 +198,18 @@ fn fragmented_color_replies_are_private_and_paste_keeps_literal_osc() {
                 )),
                 Decoded::Color(Indexed(
                     255,
-                    RgbColor {
+                    Rgb {
                         r: 0xab,
                         g: 0xcd,
                         b: 0xef
                     }
                 )),
-                Decoded::Color(Foreground(RgbColor {
+                Decoded::Color(Foreground(Rgb {
                     r: 255,
                     g: 128,
                     b: 0
                 })),
-                Decoded::Color(Background(RgbColor {
+                Decoded::Color(Background(Rgb {
                     r: 16,
                     g: 32,
                     b: 48
@@ -299,7 +299,7 @@ fn legacy_alt_bracket_keeps_following_keys_and_ctrl_c_out_of_reply_quarantine() 
 #[test]
 fn ready_color_reply_continuations_survive_reader_scheduling_delays() {
     use super::super::colors::ColorReply;
-    use libghostty_vt::style::RgbColor;
+    use libghostty_vt::color::Rgb;
 
     let reply = b"\x1b]4;1;rgb:1111/2222/3333\x07x";
     for split in 1..=3 {
@@ -312,7 +312,7 @@ fn ready_color_reply_continuations_survive_reader_scheduling_delays() {
             vec![
                 Decoded::Color(ColorReply::Indexed(
                     1,
-                    RgbColor {
+                    Rgb {
                         r: 17,
                         g: 34,
                         b: 51

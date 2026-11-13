@@ -1,11 +1,11 @@
-use libghostty_vt::style::{Palette, PaletteIndex, RgbColor};
+use libghostty_vt::color::{Palette, PaletteIndex, Rgb};
 use libghostty_vt::terminal::Terminal;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostColorProfile {
-    pub(crate) foreground: Option<RgbColor>,
-    pub(crate) background: Option<RgbColor>,
-    pub(crate) indexed: [Option<RgbColor>; 256],
+    pub(crate) foreground: Option<Rgb>,
+    pub(crate) background: Option<Rgb>,
+    pub(crate) indexed: [Option<Rgb>; 256],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

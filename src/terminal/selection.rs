@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-use libghostty_vt::fmt::Format;
-use libghostty_vt::screen::TrackedGridRef;
+use libghostty_vt::fmt::{Format, Formatter};
+use libghostty_vt::grid_ref::TrackedGridRef;
+use libghostty_vt::point::{Coordinate, Point, Space};
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
-use libghostty_vt::selection::{Adjustment, FormatOptions, Selection};
-use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace, ScrollViewport, Terminal};
+use libghostty_vt::selection::{Adjustment, Selection};
+use libghostty_vt::terminal::{ScrollViewport, Terminal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionPoint {
@@ -81,7 +82,7 @@ impl SelectionController {
         }
 
         let cursor = terminal
-            .track_grid_ref(Point::Active(PointCoordinate {
+            .track_grid_ref(Point::Active(Coordinate {
                 x: terminal.cursor_x()?.min(terminal.cols()?.saturating_sub(1)),
                 y: u32::from(terminal.cursor_y()?.min(terminal.rows()?.saturating_sub(1))),
             }))
@@ -203,7 +204,7 @@ impl SelectionController {
         let mut selection = Selection::new(start, end, self.rectangle);
         selection.adjust(terminal, direction.into())?;
         let end_point = terminal
-            .point_from_grid_ref(&selection.end(), PointSpace::Screen)?
+            .point_from_grid_ref(&selection.end(), Space::Screen)?
             .ok_or(libghostty_vt::Error::InvalidValue)?;
         let next_cursor = terminal.track_grid_ref(Point::Screen(end_point))?;
         terminal.set_selection(Some(&selection))?;
@@ -281,7 +282,7 @@ impl SelectionController {
         if direction == Autoscroll::None {
             return Ok(false);
         }
-        let viewport = PointCoordinate {
+        let viewport = Coordinate {
             x: point.col.min(terminal.cols()?.saturating_sub(1)),
             y: clamped_row(terminal, point.surface_row),
         };
@@ -359,13 +360,15 @@ impl SelectionController {
         &self,
         terminal: &Terminal<'_, '_>,
     ) -> Result<Option<String>, libghostty_vt::Error> {
-        let options = FormatOptions::new()
-            .with_emit_format(Format::Plain)
-            .with_unwrap(true)
-            .with_trim(true);
-        Ok(terminal
-            .format_selection_alloc(None, options)?
-            .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).into_owned()))
+        let Some(mut formatter) = Formatter::new_selection(terminal)? else {
+            return Ok(None);
+        };
+        formatter
+            .set_format(Format::Plain)?
+            .set_unwrap(true)?
+            .set_trim(true)?;
+        let bytes = formatter.format_alloc(None)?;
+        Ok(Some(String::from_utf8_lossy(bytes.as_ref()).into_owned()))
     }
 }
 
@@ -373,7 +376,7 @@ fn tracked_viewport_point(
     terminal: &Terminal<'_, '_>,
     tracked: &TrackedGridRef,
 ) -> Result<Option<SelectionPoint>, libghostty_vt::Error> {
-    let Some(point) = tracked.point(PointSpace::Viewport)? else {
+    let Some(point) = tracked.point(Space::Viewport)? else {
         return Ok(None);
     };
     if point.x >= terminal.cols()? || point.y >= u32::from(terminal.rows()?) {
@@ -387,10 +390,10 @@ fn tracked_viewport_point(
 
 fn track_grid_ref(
     terminal: &Terminal<'_, '_>,
-    grid_ref: libghostty_vt::screen::GridRef<'_>,
+    grid_ref: libghostty_vt::grid_ref::GridRef<'_>,
 ) -> Result<TrackedGridRef, libghostty_vt::Error> {
     let point = terminal
-        .point_from_grid_ref(&grid_ref, PointSpace::Screen)?
+        .point_from_grid_ref(&grid_ref, Space::Screen)?
         .ok_or(libghostty_vt::Error::InvalidValue)?;
     terminal.track_grid_ref(Point::Screen(point))
 }
@@ -446,7 +449,7 @@ fn geometry(terminal: &Terminal<'_, '_>) -> Geometry {
 }
 
 fn viewport_point(terminal: &Terminal<'_, '_>, point: SelectionPoint) -> Point {
-    Point::Viewport(PointCoordinate {
+    Point::Viewport(Coordinate {
         x: point
             .col
             .min(terminal.cols().unwrap_or(1).saturating_sub(1)),

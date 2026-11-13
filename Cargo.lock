@@ -702,7 +702,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libghostty-vt"
 version = "0.2.1"
-source = "git+https://github.com/uzaaft/libghostty-rs?rev=326be19c26da0a1bae0873101452b257cbf09d4b#326be19c26da0a1bae0873101452b257cbf09d4b"
+source = "git+https://github.com/uzaaft/libghostty-rs?rev=cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf#cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf"
 dependencies = [
  "bitflags 2.13.1",
  "int-enum",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "libghostty-vt-sys"
 version = "0.2.1"
-source = "git+https://github.com/uzaaft/libghostty-rs?rev=326be19c26da0a1bae0873101452b257cbf09d4b#326be19c26da0a1bae0873101452b257cbf09d4b"
+source = "git+https://github.com/uzaaft/libghostty-rs?rev=cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf#cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf"
 
 [[package]]
 name = "libm"

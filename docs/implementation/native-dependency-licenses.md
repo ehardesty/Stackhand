@@ -5,9 +5,9 @@ terminal prototype. It is part of the packaging evidence for issue #10.
 
 | Component | Revision | License | Source and packaging note |
 | --- | --- | --- | --- |
-| Ghostty source used by `libghostty-vt-sys` | `521cf2c5d30bd48028ca61546c64e7913764073d` | MIT | [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty); linked into the application from the vendored static library |
-| `libghostty-vt-sys` | crate `0.2.1`, upstream revision `326be19c26da0a1bae0873101452b257cbf09d4b` | MIT OR Apache-2.0 | [uzaaft/libghostty-rs](https://github.com/uzaaft/libghostty-rs); raw FFI and native build script |
-| `libghostty-vt` | crate `0.2.1`, upstream revision `326be19c26da0a1bae0873101452b257cbf09d4b` | MIT OR Apache-2.0 | [uzaaft/libghostty-rs](https://github.com/uzaaft/libghostty-rs); safe Rust API |
+| Ghostty `vt-1.0.1` source used by `libghostty-vt-sys` | `108cacb17ed8990840cd14abfce43d8ed8503ca1` | MIT | [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty); linked into the application from the vendored static library |
+| `libghostty-vt-sys` | crate `0.2.1`, upstream revision `cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf` | MIT OR Apache-2.0 | [uzaaft/libghostty-rs](https://github.com/uzaaft/libghostty-rs); raw FFI and native build script |
+| `libghostty-vt` | crate `0.2.1`, upstream revision `cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf` | MIT OR Apache-2.0 | [uzaaft/libghostty-rs](https://github.com/uzaaft/libghostty-rs); safe Rust API |
 
 Stackhand now owns the small Crossterm input and Ratatui render adapters. The
 former `ratatui-ghostty` dependency is not in the package. The Rust dependency
@@ -23,13 +23,14 @@ The packaged artifact includes this native inventory in
 Ghostty library. The exact Ghostty source and wrapper revisions are also
 recorded in `packaging/build-metadata.toml`.
 
-The Rust dependencies use an exact Git revision from upstream
-[PR #115](https://github.com/uzaaft/libghostty-rs/pull/115), rather than the
-published crates. This provides safe runtime byte/line scrollback limits and
-native memory measurements. Both wrappers and their native source are pinned;
-`Cargo.lock` and the packaging source stamp must agree with this inventory.
-Ghostty's incremental compression remains caller-driven. Snapshot persistence
-is not enabled. The pinned native build requires Zig 0.17.0.
+The Rust dependencies use an exact upstream Git revision of the third-party
+`libghostty-rs` bridge. This revision embeds Ghostty `vt-1.0.1` and retains
+runtime byte/line scrollback limits, native memory measurements, and
+caller-driven incremental compression. Both wrapper crates still report version
+`0.2.1`. Their Git revision and native source are pinned; `Cargo.lock` and the
+packaging source stamp must agree with this inventory. Snapshot persistence is
+not enabled. The bridge requires Rust 1.96, and the native build requires Zig
+0.17.0.
 
 ## Host decoder snapshot
 

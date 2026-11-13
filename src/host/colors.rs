@@ -1,7 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::color::Rgb;
 
 use super::SessionStop;
 use crate::terminal::colors::{ColorSupport, HostColorProfile};
@@ -57,9 +57,9 @@ fn safe_tmux_version(version: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ColorReply {
-    Foreground(RgbColor),
-    Background(RgbColor),
-    Indexed(u8, RgbColor),
+    Foreground(Rgb),
+    Background(Rgb),
+    Indexed(u8, Rgb),
 }
 
 // Ghostty's OSC parser classifies color operations but does not expose their data.
@@ -72,7 +72,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Vec<ColorReply> {
         Some("4") => {
             let mut replies = Vec::new();
             while let (Some(index), Some(value)) = (fields.next(), fields.next()) {
-                if let (Ok(index), Ok(color)) = (index.parse::<u8>(), RgbColor::parse(value)) {
+                if let (Ok(index), Ok(color)) = (index.parse::<u8>(), Rgb::parse(value)) {
                     replies.push(ColorReply::Indexed(index, color));
                 }
             }
@@ -85,7 +85,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Vec<ColorReply> {
             if fields.next().is_some() {
                 return Vec::new();
             }
-            RgbColor::parse(value)
+            Rgb::parse(value)
                 .ok()
                 .map(|color| match command {
                     "10" => ColorReply::Foreground(color),
@@ -191,14 +191,14 @@ mod tests {
     fn partial_and_absent_profiles_freeze_without_accepting_late_colors() {
         let now = Instant::now();
         let query = HostColorQuery::new(now + Duration::from_secs(1), ColorQueries::FullPalette);
-        query.record(ColorReply::Background(RgbColor { r: 1, g: 2, b: 3 }), now);
+        query.record(ColorReply::Background(Rgb { r: 1, g: 2, b: 3 }), now);
         let stop = SessionStop::default();
         stop.stop();
         let profile = query.finish(&stop);
         assert_eq!(profile.support(), ColorSupport::Partial);
-        assert_eq!(profile.background, Some(RgbColor { r: 1, g: 2, b: 3 }));
+        assert_eq!(profile.background, Some(Rgb { r: 1, g: 2, b: 3 }));
         assert_eq!(profile.foreground, None);
-        query.record(ColorReply::Background(RgbColor { r: 9, g: 8, b: 7 }), now);
+        query.record(ColorReply::Background(Rgb { r: 9, g: 8, b: 7 }), now);
         assert_eq!(query.finish(&stop), profile);
         let fallback =
             HostColorQuery::new(now, ColorQueries::FullPalette).finish(&SessionStop::default());
@@ -209,13 +209,13 @@ mod tests {
     fn all_palette_answers_complete_one_profile_without_per_index_waits() {
         let now = Instant::now();
         let query = HostColorQuery::new(now + Duration::from_secs(10), ColorQueries::FullPalette);
-        query.record(ColorReply::Foreground(RgbColor { r: 1, g: 2, b: 3 }), now);
-        query.record(ColorReply::Background(RgbColor { r: 4, g: 5, b: 6 }), now);
+        query.record(ColorReply::Foreground(Rgb { r: 1, g: 2, b: 3 }), now);
+        query.record(ColorReply::Background(Rgb { r: 4, g: 5, b: 6 }), now);
         for index in 0..=255 {
             query.record(
                 ColorReply::Indexed(
                     index,
-                    RgbColor {
+                    Rgb {
                         r: index,
                         g: 17,
                         b: 29,
@@ -228,13 +228,13 @@ mod tests {
         assert_eq!(profile.support(), ColorSupport::Supported);
         assert_eq!(
             profile.indexed[255],
-            Some(RgbColor {
+            Some(Rgb {
                 r: 255,
                 g: 17,
                 b: 29
             })
         );
-        query.record(ColorReply::Foreground(RgbColor::default()), now);
+        query.record(ColorReply::Foreground(Rgb::default()), now);
         assert_eq!(query.finish(&SessionStop::default()), profile);
     }
 
@@ -255,8 +255,8 @@ mod tests {
                 ColorQueries::for_host(true, Some("tmux"), version),
             );
             assert_eq!(query.request(), b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-            query.record(ColorReply::Foreground(RgbColor { r: 1, g: 2, b: 3 }), now);
-            query.record(ColorReply::Background(RgbColor { r: 4, g: 5, b: 6 }), now);
+            query.record(ColorReply::Foreground(Rgb { r: 1, g: 2, b: 3 }), now);
+            query.record(ColorReply::Background(Rgb { r: 4, g: 5, b: 6 }), now);
             assert!(matches!(
                 *query.0.state.lock().unwrap(),
                 QueryState::Frozen(_)
